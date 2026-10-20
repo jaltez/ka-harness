@@ -21,6 +21,10 @@ pub struct PathfinderSource {
     pub catalog: ka_dialect::Catalog,
     /// Model selector for the nested voice.
     pub model: Option<String>,
+    /// Active strand id — nested voices seed their requests with it so
+    /// gateways that route by conversation see stable traffic
+    /// (engine writes it at strand attach).
+    pub session_id: Option<String>,
 }
 
 /// The pathfinder tool.
@@ -91,6 +95,7 @@ impl Hand for PathfinderHand {
             let mut voice =
                 Voice::new_readonly(source.catalog, ctx.cwd.clone(), ka_protocol::Mode::Free, 12);
             voice.set_model_selector(&model, 4.0);
+            voice.set_session_id(source.session_id.clone());
             // system rides via the voice's git line; inject the subagent
             // framing by prefixing the query
             let prompt = format!("{PATHFINDER_SYSTEM}\\n\\nResearch query: {query}");

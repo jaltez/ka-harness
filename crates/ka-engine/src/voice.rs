@@ -206,6 +206,11 @@ pub struct Voice {
     /// Reasoning-effort level name from the engine's live settings
     /// (`SetEffort`); a selector `@effort` suffix still wins per model.
     effort: Option<String>,
+    /// Active strand id — every request carries it for gateways that
+    /// route by conversation (the wire maps the vendor to a header via
+    /// `providers::session_header`; opencode-go needs
+    /// `x-opencode-session` or the call fails).
+    session_id: Option<String>,
     /// Chars-per-token ratio of the active model (estimates).
     ratio: f64,
     /// Active digest summary (prepended to requests, not part of history).
@@ -320,6 +325,7 @@ impl Voice {
             history: Vec::new(),
             model_selector: None,
             effort: None,
+            session_id: None,
             ratio: 4.0,
             digest: None,
             last_context: 0,
@@ -518,6 +524,7 @@ impl Voice {
             history: Vec::new(),
             model_selector: None,
             effort: None,
+            session_id: None,
             ratio: 4.0,
             digest: None,
             last_context: 0,
@@ -560,6 +567,13 @@ impl Voice {
     /// selector `@effort` suffix still overrides per model.
     pub fn set_effort(&mut self, level: Option<String>) {
         self.effort = level;
+    }
+
+    /// Record the active strand id (attach/transfer); every request
+    /// carries it so gateways that route by conversation can route and
+    /// cache. Nested voices inherit it through the pathfinder slot.
+    pub fn set_session_id(&mut self, id: Option<String>) {
+        self.session_id = id;
     }
 
     /// Set configured hooks (engine bootstrap).
@@ -647,12 +661,14 @@ impl Voice {
             .cloned()
             .unwrap_or_else(|| ka_dialect::speaker_for(dialect.wire));
         let slot = self.speculative.clone();
+        let session_id = self.session_id.clone();
         tokio::spawn(async move {
             let summary = Self::summarize_with(
                 speaker,
                 model_id.clone(),
                 dialect,
                 token,
+                session_id,
                 system,
                 messages,
                 std::time::Duration::from_secs(120),
@@ -1121,12 +1137,14 @@ impl Voice {
             "Summarize the conversation above now, in at most 300 words.",
         ));
         let speaker = self.speaker(dialect.wire);
+        let session_id = self.session_id.clone();
         let _ = ratio;
         Self::summarize_with(
             speaker,
             model_id,
             dialect,
             token,
+            session_id,
             system,
             messages,
             window_deadline,
@@ -1137,11 +1155,13 @@ impl Voice {
     /// Shared summarize core: one bounded completion collecting the
     /// text (falling back to the reasoning tail). Static so the
     /// speculative digest can run it without `&mut self`.
+    #[allow(clippy::too_many_arguments)]
     async fn summarize_with(
         speaker: std::sync::Arc<dyn Speaker>,
         model_id: String,
         dialect: ka_dialect::Dialect,
         token: Option<String>,
+        session_id: Option<String>,
         system: String,
         messages: Vec<TurnMessage>,
         window_deadline: std::time::Duration,
@@ -1155,6 +1175,7 @@ impl Voice {
             tools: Vec::new(),
             token,
             cache_key: None,
+            session_id,
             schema: None,
             native_search: false,
         };
@@ -1239,6 +1260,7 @@ impl Voice {
             tools: Vec::new(),
             token,
             cache_key: None,
+            session_id: self.session_id.clone(),
             schema: None,
             native_search: false,
         };
@@ -1766,6 +1788,7 @@ impl Voice {
                 tools: self.specs(),
                 token: token.clone(),
                 cache_key: None,
+                session_id: self.session_id.clone(),
                 schema: schema.clone(),
                 native_search,
             };
@@ -3913,6 +3936,83 @@ mod tests {
                 }
             })
         }
+    }
+
+    /// Records the session id of every request it sees.
+    struct SessionSpeaker {
+        seen: std::sync::Arc<parking_lot::Mutex<Vec<Option<String>>>>,
+    }
+
+    impl Speaker for SessionSpeaker {
+        fn speak<'a>(
+            &'a self,
+            req: SpeakRequest,
+            out: tokio::sync::mpsc::Sender<StreamEvent>,
+        ) -> SpeakFuture<'a> {
+            Box::pin(async move {
+                self.seen.lock().push(req.session_id.clone());
+                out.send(StreamEvent::Finished {
+                    stop: Stop::Done,
+                    usage: ka_protocol::Usage::default(),
+                })
+                .await
+                .ok();
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn session_id_rides_every_request() {
+        use ka_protocol::Event;
+        use tokio::sync::mpsc;
+
+        let catalog = Catalog::parse(
+            "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000\n",
+        )
+        .unwrap();
+        let seen = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let mut voice = Voice::new(
+            catalog,
+            std::env::temp_dir(),
+            ka_protocol::Mode::Guarded,
+            10,
+        )
+        .with_speaker(
+            Wire::OpenaiChat,
+            std::sync::Arc::new(SessionSpeaker { seen: seen.clone() }),
+        );
+        voice.set_session_id(Some("strand-42".to_string()));
+
+        let (_cmd_tx, mut cmd_rx) = mpsc::channel(16);
+        let (evt_tx, mut evt_rx) = mpsc::channel(256);
+        let mut steers = Vec::new();
+        let mut queue = std::collections::VecDeque::new();
+        let handle = tokio::spawn(async move {
+            voice
+                .turn(
+                    "test/m",
+                    "hi".into(),
+                    &mut cmd_rx,
+                    &evt_tx,
+                    &mut steers,
+                    &mut queue,
+                    &mut GuardRuntime::default(),
+                    None,
+                    Vec::new(),
+                )
+                .await;
+        });
+        while let Some(evt) = evt_rx.recv().await {
+            if matches!(evt, Event::TurnFinished { .. }) {
+                break;
+            }
+        }
+        handle.await.unwrap();
+        assert_eq!(
+            seen.lock().as_slice(),
+            &[Some("strand-42".to_string())],
+            "every wire request must carry the active strand id"
+        );
     }
 
     #[tokio::test]

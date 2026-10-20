@@ -2456,7 +2456,12 @@ async fn attach_strand(
         .await
         .ok();
     // the snapshot journal follows the active strand (undo is session-scoped)
-    voice.snapshot_sink().lock().set_strand(id);
+    voice.snapshot_sink().lock().set_strand(id.clone());
+    // and so does the per-request session id gateways route by
+    // (opencode-go's `x-opencode-session`); nested voices inherit it
+    // through the pathfinder slot
+    voice.set_session_id(Some(id.clone()));
+    voice.pathfinder_slot().write().session_id = Some(id);
     if let Some(selector) = &state.model {
         events
             .send(Event::ModelChanged {

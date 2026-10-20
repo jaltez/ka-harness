@@ -256,9 +256,6 @@ enum CliCommand {
     Providers,
     /// Generate a starter AGENTS.md from a quick repo scan
     Init,
-    /// Print a shell wrapper that puts the just-exited session's resume
-    /// command into the live shell's history (↑ + Enter restores it)
-    ShellIntegration,
     /// Inspect configuration
     Config {
         #[command(subcommand)]
@@ -702,10 +699,6 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
         Some(CliCommand::Agents) => run_agents(),
         Some(CliCommand::Providers) => run_providers(),
         Some(CliCommand::Init) => run_init(),
-        Some(CliCommand::ShellIntegration) => {
-            print!("{}", shell_integration_snippet());
-            Ok(ExitCode::SUCCESS)
-        }
         Some(CliCommand::Sessions { json }) => run_sessions(json),
         Some(CliCommand::Rewind { turns }) => run_rewind(turns).await,
         Some(CliCommand::Export { out, session, html }) => run_export(out, session, html),
@@ -1388,6 +1381,72 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
     .map_err(|e| format!("tui: {e}"))?;
     match exit {
         ka_term::tui::Exit::Quit | ka_term::tui::Exit::EngineEnded => Ok(ExitCode::SUCCESS),
+        ka_term::tui::Exit::Update { session } => {
+            // /update: run the updater in this terminal, then re-exec
+            // attached to the same session — the atomic swap has
+            // already landed on disk, so the exec picks up whichever
+            // binary is current (new on success, old on failure)
+            let trust = trust_for_cwd(false);
+            let cfg = load_config(&[], None, None, trust, &FeatureFlags::default())?;
+            let repo = cfg
+                .update
+                .repo
+                .clone()
+                .unwrap_or_else(|| update::DEFAULT_REPO.to_string());
+            let channel =
+                std::env::var("KA_UPDATE_CHANNEL").unwrap_or_else(|_| "stable".to_string());
+            match update::run(&channel, false, &repo).await {
+                Ok(msg) => println!("{msg}"),
+                Err(e) => eprintln!("ka: update failed: {e}"),
+            }
+            if session.is_empty() {
+                return Ok(ExitCode::SUCCESS);
+            }
+            let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+            let mut relaunch = std::process::Command::new(exe);
+            relaunch.arg("--session").arg(&session);
+            // startup flags are never written to the strand (only
+            // in-session changes are), so the re-exec must carry them
+            // or the resumed session silently changes model and
+            // sandbox posture
+            if let Some(model) = &cli.model {
+                relaunch.arg("--model").arg(model);
+            }
+            if let Some(mode) = &cli.mode {
+                relaunch.arg("--mode").arg(mode);
+            }
+            if let Some(sandbox) = &cli.sandbox {
+                relaunch.arg("--sandbox").arg(sandbox);
+            }
+            for spec in &cli.disable {
+                relaunch.arg("--disable").arg(spec.to_string());
+            }
+            for spec in &cli.enable {
+                relaunch.arg("--enable").arg(spec.to_string());
+            }
+            // startup flags are never written to the strand, so the
+            // re-exec must carry them or the resumed session silently
+            // changes model and sandbox posture
+            for path in &cli.configs {
+                relaunch.arg("--config").arg(path);
+            }
+            for path in &cli.dialects {
+                relaunch.arg("--dialects").arg(path);
+            }
+            if cli.no_discovery {
+                relaunch.arg("--no-discovery");
+            }
+            if cli.safe_mode {
+                relaunch.arg("--safe-mode");
+            }
+            if cli.trust {
+                relaunch.arg("--trust");
+            }
+            println!("⟳ resuming session…");
+            use std::os::unix::process::CommandExt;
+            let err = relaunch.exec();
+            Err(format!("resume after update failed: {err}"))
+        }
     }
 }
 
@@ -1760,32 +1819,6 @@ fn warn_untrusted_conventions(cwd: &std::path::Path) {
 /// Deterministic starter AGENTS.md from repo shape (no model call).
 /// Generated at the root project — the nearest `.git` ancestor of the
 /// launch dir, else the launch dir — where ka and other agents read it.
-/// The `ka shell-integration` snippet: a `ka()` shell function that,
-/// after every run, reads `<data dir>/last-resume` (written by the TUI
-/// on exit) and registers the resume command in the LIVE shell's
-/// history — zsh `print -s`, bash `history -s`. Sourced with
-/// `eval "$(ka shell-integration)"` from .zshrc/.bashrc.
-fn shell_integration_snippet() -> String {
-    r#"# ka session resume: after each ka run, the resume command of the
-# session you just left enters THIS shell's history — press ↑ then
-# Enter to bring it back.
-ka() {
-  command ka "$@"
-  local rc=$?
-  local f="${KA_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/ka}/last-resume"
-  if [ -r "$f" ]; then
-    local cmd
-    cmd=$(cat "$f" 2>/dev/null)
-    if [ -n "$cmd" ]; then
-      if [ -n "${ZSH_VERSION:-}" ]; then print -s -- "$cmd"; else history -s -- "$cmd"; fi
-    fi
-  fi
-  return $rc
-}
-"#
-    .to_string()
-}
-
 fn run_init() -> Result<ExitCode, String> {
     let cwd = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
     let root = ka_engine::project_root(&cwd);
@@ -2172,28 +2205,6 @@ mod print_tests {
                 kind: ka_protocol::DeltaKind::Text(_)
             }
         ));
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::shell_integration_snippet;
-
-    #[test]
-    fn shell_integration_registers_history_in_the_live_shell() {
-        let snip = shell_integration_snippet();
-        // both shell dialects covered, reading the TUI's last-resume file
-        assert!(snip.contains("print -s"), "zsh: {snip}");
-        assert!(snip.contains("history -s"), "bash: {snip}");
-        assert!(snip.contains("last-resume"), "{snip}");
-        // the wrapper must read exactly where ka_strand::data_dir()
-        // writes (KA_DATA_DIR > XDG_DATA_HOME > ~/.local/share, +/ka)
-        assert!(
-            snip.contains("KA_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/ka"),
-            "{snip}"
-        );
-        assert!(snip.contains("command ka \"$@\""), "{snip}");
-        assert!(snip.contains("return $rc"), "exit code preserved: {snip}");
     }
 }
 

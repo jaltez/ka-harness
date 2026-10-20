@@ -520,6 +520,7 @@ async fn run_agent_once(
             )
         };
         voice.set_model_selector(&model, 4.0);
+        voice.set_session_id(source.session_id.clone());
         if let Some(tools) = &agent_tools {
             voice.restrict_tools(tools);
         }

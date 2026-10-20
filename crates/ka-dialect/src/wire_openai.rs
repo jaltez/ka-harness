@@ -23,6 +23,7 @@ impl OpenaiChat {
     pub fn new() -> Self {
         let client = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
+            .user_agent(concat!("ka/", env!("CARGO_PKG_VERSION")))
             .build()
             .unwrap_or_default();
         Self { client }
@@ -68,6 +69,16 @@ async fn speak_openai(
         vec![("content-type".into(), "application/json".into())];
     if let Some(token) = req.token.clone() {
         headers.push(("authorization".into(), format!("Bearer {token}")));
+    }
+    // gateways that route by conversation require a stable session id on
+    // every request (opencode-go answers HTTP 400 without
+    // `x-opencode-session`)
+    if let Some(header) =
+        crate::providers::session_header(req.model_id.split('/').next().unwrap_or_default())
+    {
+        if let Some(sid) = req.session_id.as_deref().filter(|s| !s.is_empty()) {
+            headers.push((header.to_string(), sid.to_string()));
+        }
     }
 
     let wire_model = dialect.wire_model.clone().unwrap_or_else(|| {

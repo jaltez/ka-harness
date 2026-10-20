@@ -28,6 +28,18 @@ priced = true
 input_per_mtok = 1.4
 output_per_mtok = 4.4
 
+[dialects."alibaba/kimi-k3"]
+wire = "openai_chat"
+base_url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+api_key_env = "DASHSCOPE_API_KEY"
+doc_url = "https://www.alibabacloud.com/help/en/model-studio/models"
+context = 1048576
+max_output = 1048576
+priced = true
+[dialects."alibaba/kimi-k3".price]
+input_per_mtok = 3
+output_per_mtok = 15
+
 [dialects."alibaba/qvq-max"]
 wire = "openai_chat"
 base_url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
@@ -472,6 +484,18 @@ priced = true
 input_per_mtok = 0.6
 output_per_mtok = 3.6
 
+[dialects."alibaba/qwen3.5-flash"]
+wire = "openai_chat"
+base_url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+api_key_env = "DASHSCOPE_API_KEY"
+doc_url = "https://www.alibabacloud.com/help/en/model-studio/models"
+context = 1000000
+max_output = 65536
+priced = true
+[dialects."alibaba/qwen3.5-flash".price]
+input_per_mtok = 0.1
+output_per_mtok = 0.4
+
 [dialects."alibaba/qwen3.5-plus"]
 wire = "openai_chat"
 base_url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
@@ -544,13 +568,25 @@ priced = true
 input_per_mtok = 0.5
 output_per_mtok = 3
 
+[dialects."alibaba/qwen3.7-flash"]
+wire = "openai_chat"
+base_url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+api_key_env = "DASHSCOPE_API_KEY"
+doc_url = "https://www.alibabacloud.com/help/en/model-studio/models"
+context = 1000000
+max_output = 131072
+priced = true
+[dialects."alibaba/qwen3.7-flash".price]
+input_per_mtok = 0.03
+output_per_mtok = 0.13
+
 [dialects."alibaba/qwen3.7-max"]
 wire = "openai_chat"
 base_url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
 api_key_env = "DASHSCOPE_API_KEY"
 doc_url = "https://www.alibabacloud.com/help/en/model-studio/models"
 context = 1000000
-max_output = 65536
+max_output = 131072
 priced = true
 [dialects."alibaba/qwen3.7-max".price]
 input_per_mtok = 2.5
@@ -562,11 +598,11 @@ base_url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
 api_key_env = "DASHSCOPE_API_KEY"
 doc_url = "https://www.alibabacloud.com/help/en/model-studio/models"
 context = 1000000
-max_output = 65536
+max_output = 131072
 priced = true
 [dialects."alibaba/qwen3.7-plus".price]
-input_per_mtok = 0.5
-output_per_mtok = 3
+input_per_mtok = 0.4
+output_per_mtok = 1.6
 
 [dialects."alibaba/qwen3.8-flash"]
 wire = "openai_chat"
@@ -591,6 +627,18 @@ priced = true
 [dialects."alibaba/qwen3.8-max".price]
 input_per_mtok = 2
 output_per_mtok = 6
+
+[dialects."alibaba/qwen3.8-omni-flash"]
+wire = "openai_chat"
+base_url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+api_key_env = "DASHSCOPE_API_KEY"
+doc_url = "https://www.alibabacloud.com/help/en/model-studio/models"
+context = 1000000
+max_output = 131072
+priced = true
+[dialects."alibaba/qwen3.8-omni-flash".price]
+input_per_mtok = 0.15
+output_per_mtok = 0.47
 
 [dialects."alibaba/qwq-plus"]
 wire = "openai_chat"
@@ -676,18 +724,6 @@ context = 1000000
 max_output = 65536
 priced = false
 
-[dialects."alibaba-coding-plan/qwen3.6-flash"]
-wire = "openai_chat"
-base_url = "https://coding-intl.dashscope.aliyuncs.com/v1"
-api_key_env = "ALIBABA_CODING_PLAN_API_KEY"
-doc_url = "https://www.alibabacloud.com/help/en/model-studio/coding-plan"
-context = 1000000
-max_output = 65536
-priced = true
-[dialects."alibaba-coding-plan/qwen3.6-flash".price]
-input_per_mtok = 0.1875
-output_per_mtok = 1.125
-
 [dialects."alibaba-coding-plan/qwen3.6-plus"]
 wire = "openai_chat"
 base_url = "https://coding-intl.dashscope.aliyuncs.com/v1"
@@ -696,18 +732,6 @@ doc_url = "https://www.alibabacloud.com/help/en/model-studio/coding-plan"
 context = 1000000
 max_output = 65536
 priced = false
-
-[dialects."alibaba-coding-plan/qwen3.7-max"]
-wire = "openai_chat"
-base_url = "https://coding-intl.dashscope.aliyuncs.com/v1"
-api_key_env = "ALIBABA_CODING_PLAN_API_KEY"
-doc_url = "https://www.alibabacloud.com/help/en/model-studio/coding-plan"
-context = 1000000
-max_output = 65536
-priced = true
-[dialects."alibaba-coding-plan/qwen3.7-max".price]
-input_per_mtok = 2.5
-output_per_mtok = 7.5
 
 [dialects."alibaba-coding-plan/qwen3.7-plus"]
 wire = "openai_chat"
@@ -790,18 +814,6 @@ context = 1000000
 max_output = 65536
 priced = false
 
-[dialects."alibaba-coding-plan-cn/qwen3.6-flash"]
-wire = "openai_chat"
-base_url = "https://coding.dashscope.aliyuncs.com/v1"
-api_key_env = "ALIBABA_CODING_PLAN_API_KEY"
-doc_url = "https://help.aliyun.com/zh/model-studio/coding-plan"
-context = 1000000
-max_output = 65536
-priced = true
-[dialects."alibaba-coding-plan-cn/qwen3.6-flash".price]
-input_per_mtok = 0.1875
-output_per_mtok = 1.125
-
 [dialects."alibaba-coding-plan-cn/qwen3.6-plus"]
 wire = "openai_chat"
 base_url = "https://coding.dashscope.aliyuncs.com/v1"
@@ -810,18 +822,6 @@ doc_url = "https://help.aliyun.com/zh/model-studio/coding-plan"
 context = 1000000
 max_output = 65536
 priced = false
-
-[dialects."alibaba-coding-plan-cn/qwen3.7-max"]
-wire = "openai_chat"
-base_url = "https://coding.dashscope.aliyuncs.com/v1"
-api_key_env = "ALIBABA_CODING_PLAN_API_KEY"
-doc_url = "https://help.aliyun.com/zh/model-studio/coding-plan"
-context = 1000000
-max_output = 65536
-priced = true
-[dialects."alibaba-coding-plan-cn/qwen3.7-max".price]
-input_per_mtok = 2.5
-output_per_mtok = 7.5
 
 [dialects."alibaba-coding-plan-cn/qwen3.7-plus"]
 wire = "openai_chat"
@@ -886,6 +886,15 @@ context = 1000000
 max_output = 384000
 priced = false
 
+[dialects."alibaba-token-plan/deepseek-v4.1-flash"]
+wire = "openai_chat"
+base_url = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"
+api_key_env = "ALIBABA_TOKEN_PLAN_API_KEY"
+doc_url = "https://www.alibabacloud.com/help/en/model-studio/token-plan-overview"
+context = 1000000
+max_output = 384000
+priced = false
+
 [dialects."alibaba-token-plan/glm-5"]
 wire = "openai_chat"
 base_url = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"
@@ -905,6 +914,15 @@ max_output = 128000
 priced = false
 
 [dialects."alibaba-token-plan/glm-5.2"]
+wire = "openai_chat"
+base_url = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"
+api_key_env = "ALIBABA_TOKEN_PLAN_API_KEY"
+doc_url = "https://www.alibabacloud.com/help/en/model-studio/token-plan-overview"
+context = 1000000
+max_output = 131072
+priced = false
+
+[dialects."alibaba-token-plan/glm-5.3"]
 wire = "openai_chat"
 base_url = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"
 api_key_env = "ALIBABA_TOKEN_PLAN_API_KEY"
@@ -1057,6 +1075,24 @@ context = 1000000
 max_output = 384000
 priced = false
 
+[dialects."alibaba-token-plan-cn/deepseek-v4.1-flash"]
+wire = "openai_chat"
+base_url = "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
+api_key_env = "ALIBABA_TOKEN_PLAN_API_KEY"
+doc_url = "https://www.alibabacloud.com/help/zh/model-studio/token-plan-overview"
+context = 1000000
+max_output = 384000
+priced = false
+
+[dialects."alibaba-token-plan-cn/deepseek-v4.1-flash-1017"]
+wire = "openai_chat"
+base_url = "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
+api_key_env = "ALIBABA_TOKEN_PLAN_API_KEY"
+doc_url = "https://www.alibabacloud.com/help/zh/model-studio/token-plan-overview"
+context = 1000000
+max_output = 384000
+priced = false
+
 [dialects."alibaba-token-plan-cn/glm-5"]
 wire = "openai_chat"
 base_url = "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
@@ -1076,6 +1112,15 @@ max_output = 128000
 priced = false
 
 [dialects."alibaba-token-plan-cn/glm-5.2"]
+wire = "openai_chat"
+base_url = "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
+api_key_env = "ALIBABA_TOKEN_PLAN_API_KEY"
+doc_url = "https://www.alibabacloud.com/help/zh/model-studio/token-plan-overview"
+context = 1000000
+max_output = 131072
+priced = false
+
+[dialects."alibaba-token-plan-cn/glm-5.3"]
 wire = "openai_chat"
 base_url = "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
 api_key_env = "ALIBABA_TOKEN_PLAN_API_KEY"
@@ -1180,11 +1225,11 @@ base_url = "https://api.deepseek.com"
 api_key_env = "DEEPSEEK_API_KEY"
 doc_url = "https://api-docs.deepseek.com/quick_start/pricing"
 context = 1000000
-max_output = 384000
+max_output = 393216
 priced = true
 [dialects."deepseek/deepseek-v4-flash".price]
-input_per_mtok = 0.14
-output_per_mtok = 0.28
+input_per_mtok = 0.15
+output_per_mtok = 0.6
 
 [dialects."deepseek/deepseek-v4-flash-vision-exp"]
 wire = "openai_chat"
@@ -1192,11 +1237,11 @@ base_url = "https://api.deepseek.com"
 api_key_env = "DEEPSEEK_API_KEY"
 doc_url = "https://api-docs.deepseek.com/quick_start/pricing"
 context = 1000000
-max_output = 384000
+max_output = 393216
 priced = true
 [dialects."deepseek/deepseek-v4-flash-vision-exp".price]
-input_per_mtok = 0.14
-output_per_mtok = 0.28
+input_per_mtok = 0.15
+output_per_mtok = 0.6
 
 [dialects."deepseek/deepseek-v4-pro"]
 wire = "openai_chat"
@@ -1204,11 +1249,23 @@ base_url = "https://api.deepseek.com"
 api_key_env = "DEEPSEEK_API_KEY"
 doc_url = "https://api-docs.deepseek.com/quick_start/pricing"
 context = 1000000
-max_output = 384000
+max_output = 393216
 priced = true
 [dialects."deepseek/deepseek-v4-pro".price]
-input_per_mtok = 0.435
-output_per_mtok = 0.87
+input_per_mtok = 0.66
+output_per_mtok = 1.98
+
+[dialects."huggingface/MiniMaxAI/MiniMax-M1-80k"]
+wire = "openai_chat"
+base_url = "https://router.huggingface.co/v1"
+api_key_env = "HF_TOKEN"
+doc_url = "https://huggingface.co/docs/inference-providers"
+context = 1000000
+max_output = 80000
+priced = true
+[dialects."huggingface/MiniMaxAI/MiniMax-M1-80k".price]
+input_per_mtok = 0.55
+output_per_mtok = 2.2
 
 [dialects."huggingface/MiniMaxAI/MiniMax-M2"]
 wire = "openai_chat"
@@ -1546,6 +1603,18 @@ priced = true
 input_per_mtok = 0.14
 output_per_mtok = 0.28
 
+[dialects."huggingface/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp"]
+wire = "openai_chat"
+base_url = "https://router.huggingface.co/v1"
+api_key_env = "HF_TOKEN"
+doc_url = "https://huggingface.co/docs/inference-providers"
+context = 1048576
+max_output = 384000
+priced = true
+[dialects."huggingface/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp".price]
+input_per_mtok = 0.44
+output_per_mtok = 1.32
+
 [dialects."huggingface/deepseek-ai/DeepSeek-V4-Pro"]
 wire = "openai_chat"
 base_url = "https://router.huggingface.co/v1"
@@ -1569,6 +1638,18 @@ priced = true
 [dialects."huggingface/deepseek-ai/DeepSeek-V4-Pro-0813".price]
 input_per_mtok = 1.32
 output_per_mtok = 3.96
+
+[dialects."huggingface/deepseek-ai/DeepSeek-V4.1-Flash"]
+wire = "openai_chat"
+base_url = "https://router.huggingface.co/v1"
+api_key_env = "HF_TOKEN"
+doc_url = "https://huggingface.co/docs/inference-providers"
+context = 1048576
+max_output = 384000
+priced = true
+[dialects."huggingface/deepseek-ai/DeepSeek-V4.1-Flash".price]
+input_per_mtok = 0.3
+output_per_mtok = 1.2
 
 [dialects."huggingface/google/gemma-4-26B-A4B-it"]
 wire = "openai_chat"
@@ -1708,11 +1789,23 @@ base_url = "https://router.huggingface.co/v1"
 api_key_env = "HF_TOKEN"
 doc_url = "https://huggingface.co/docs/inference-providers"
 context = 262144
-max_output = 64000
+max_output = 128000
 priced = true
 [dialects."huggingface/tencent/Hy3".price]
 input_per_mtok = 0.14
 output_per_mtok = 0.58
+
+[dialects."huggingface/tencent/Hy4-preview"]
+wire = "openai_chat"
+base_url = "https://router.huggingface.co/v1"
+api_key_env = "HF_TOKEN"
+doc_url = "https://huggingface.co/docs/inference-providers"
+context = 1000000
+max_output = 64000
+priced = true
+[dialects."huggingface/tencent/Hy4-preview".price]
+input_per_mtok = 0.834
+output_per_mtok = 2.501
 
 [dialects."huggingface/thinkingmachines/Inkling"]
 wire = "openai_chat"
@@ -1879,6 +1972,78 @@ priced = true
 input_per_mtok = 0.15
 output_per_mtok = 0.5
 
+[dialects."kimi-code-plan-cn/k3"]
+wire = "openai_chat"
+base_url = "https://api.kimi.com/coding/v1"
+api_key_env = "KIMI_API_KEY"
+doc_url = "https://www.kimi.com/code/docs/en/kimi-code/models.html"
+context = 1048576
+max_output = 131072
+priced = false
+
+[dialects."kimi-code-plan-cn/k3-256k"]
+wire = "openai_chat"
+base_url = "https://api.kimi.com/coding/v1"
+api_key_env = "KIMI_API_KEY"
+doc_url = "https://www.kimi.com/code/docs/en/kimi-code/models.html"
+context = 262144
+max_output = 131072
+priced = false
+
+[dialects."kimi-code-plan-cn/kimi-for-coding"]
+wire = "openai_chat"
+base_url = "https://api.kimi.com/coding/v1"
+api_key_env = "KIMI_API_KEY"
+doc_url = "https://www.kimi.com/code/docs/en/kimi-code/models.html"
+context = 1048576
+max_output = 32768
+priced = false
+
+[dialects."kimi-code-plan-cn/kimi-for-coding-highspeed"]
+wire = "openai_chat"
+base_url = "https://api.kimi.com/coding/v1"
+api_key_env = "KIMI_API_KEY"
+doc_url = "https://www.kimi.com/code/docs/en/kimi-code/models.html"
+context = 262144
+max_output = 32768
+priced = false
+
+[dialects."kimi-code-plan-global/k3"]
+wire = "openai_chat"
+base_url = "https://api.kimi.ai/coding/v1"
+api_key_env = "KIMI_API_KEY"
+doc_url = "https://www.kimi.ai/code/docs/en/kimi-code/models.html"
+context = 1048576
+max_output = 131072
+priced = false
+
+[dialects."kimi-code-plan-global/k3-256k"]
+wire = "openai_chat"
+base_url = "https://api.kimi.ai/coding/v1"
+api_key_env = "KIMI_API_KEY"
+doc_url = "https://www.kimi.ai/code/docs/en/kimi-code/models.html"
+context = 262144
+max_output = 131072
+priced = false
+
+[dialects."kimi-code-plan-global/kimi-for-coding"]
+wire = "openai_chat"
+base_url = "https://api.kimi.ai/coding/v1"
+api_key_env = "KIMI_API_KEY"
+doc_url = "https://www.kimi.ai/code/docs/en/kimi-code/models.html"
+context = 1048576
+max_output = 32768
+priced = false
+
+[dialects."kimi-code-plan-global/kimi-for-coding-highspeed"]
+wire = "openai_chat"
+base_url = "https://api.kimi.ai/coding/v1"
+api_key_env = "KIMI_API_KEY"
+doc_url = "https://www.kimi.ai/code/docs/en/kimi-code/models.html"
+context = 262144
+max_output = 32768
+priced = false
+
 [dialects."kuae-cloud-coding-plan/GLM-4.7"]
 wire = "openai_chat"
 base_url = "https://coding-plan-endpoint.kuaecloud.net/v1"
@@ -1893,8 +2058,8 @@ wire = "openai_chat"
 base_url = "https://api.meta.ai/v1"
 api_key_env = "META_MODEL_API_KEY"
 doc_url = "https://dev.meta.ai/docs"
-context = 1000000
-max_output = 32000
+context = 1048576
+max_output = 131072
 priced = true
 [dialects."meta/muse-spark-1.1".price]
 input_per_mtok = 1.25
@@ -1923,6 +2088,42 @@ priced = true
 [dialects."meta/muse-spark-1.2-contributor".price]
 input_per_mtok = 0.1
 output_per_mtok = 0.2
+
+[dialects."meta/muse-spark-1.3"]
+wire = "openai_chat"
+base_url = "https://api.meta.ai/v1"
+api_key_env = "META_MODEL_API_KEY"
+doc_url = "https://dev.meta.ai/docs"
+context = 1048576
+max_output = 131072
+priced = true
+[dialects."meta/muse-spark-1.3".price]
+input_per_mtok = 1.25
+output_per_mtok = 4.25
+
+[dialects."meta/muse-spark-1.3-contributor"]
+wire = "openai_chat"
+base_url = "https://api.meta.ai/v1"
+api_key_env = "META_MODEL_API_KEY"
+doc_url = "https://dev.meta.ai/docs"
+context = 1048576
+max_output = 131072
+priced = true
+[dialects."meta/muse-spark-1.3-contributor".price]
+input_per_mtok = 0.1
+output_per_mtok = 0.2
+
+[dialects."meta/muse-wonder-1.0"]
+wire = "openai_chat"
+base_url = "https://api.meta.ai/v1"
+api_key_env = "META_MODEL_API_KEY"
+doc_url = "https://dev.meta.ai/docs"
+context = 1048576
+max_output = 131072
+priced = true
+[dialects."meta/muse-wonder-1.0".price]
+input_per_mtok = 4
+output_per_mtok = 20
 
 [dialects."minimax/MiniMax-M2"]
 wire = "anthropic_messages"
@@ -2001,7 +2202,7 @@ wire = "anthropic_messages"
 base_url = "https://api.minimax.io/anthropic/v1"
 api_key_env = "MINIMAX_API_KEY"
 doc_url = "https://platform.minimax.io/docs/guides/quickstart"
-context = 1048576
+context = 1000000
 max_output = 512000
 priced = true
 [dialects."minimax/MiniMax-M3".price]
@@ -2010,7 +2211,7 @@ output_per_mtok = 1.2
 
 [dialects."minimax-cn-coding-plan/MiniMax-M2"]
 wire = "anthropic_messages"
-base_url = "https://api.minimaxi.com/anthropic/v1"
+base_url = "https://api.minimax.cn/anthropic/v1"
 api_key_env = "MINIMAX_API_KEY"
 doc_url = "https://platform.minimaxi.com/docs/token-plan/intro"
 context = 204800
@@ -2019,7 +2220,7 @@ priced = false
 
 [dialects."minimax-cn-coding-plan/MiniMax-M2.1"]
 wire = "anthropic_messages"
-base_url = "https://api.minimaxi.com/anthropic/v1"
+base_url = "https://api.minimax.cn/anthropic/v1"
 api_key_env = "MINIMAX_API_KEY"
 doc_url = "https://platform.minimaxi.com/docs/token-plan/intro"
 context = 204800
@@ -2028,7 +2229,7 @@ priced = false
 
 [dialects."minimax-cn-coding-plan/MiniMax-M2.5"]
 wire = "anthropic_messages"
-base_url = "https://api.minimaxi.com/anthropic/v1"
+base_url = "https://api.minimax.cn/anthropic/v1"
 api_key_env = "MINIMAX_API_KEY"
 doc_url = "https://platform.minimaxi.com/docs/token-plan/intro"
 context = 204800
@@ -2037,7 +2238,7 @@ priced = false
 
 [dialects."minimax-cn-coding-plan/MiniMax-M2.5-highspeed"]
 wire = "anthropic_messages"
-base_url = "https://api.minimaxi.com/anthropic/v1"
+base_url = "https://api.minimax.cn/anthropic/v1"
 api_key_env = "MINIMAX_API_KEY"
 doc_url = "https://platform.minimaxi.com/docs/token-plan/intro"
 context = 204800
@@ -2046,7 +2247,7 @@ priced = false
 
 [dialects."minimax-cn-coding-plan/MiniMax-M2.7"]
 wire = "anthropic_messages"
-base_url = "https://api.minimaxi.com/anthropic/v1"
+base_url = "https://api.minimax.cn/anthropic/v1"
 api_key_env = "MINIMAX_API_KEY"
 doc_url = "https://platform.minimaxi.com/docs/token-plan/intro"
 context = 204800
@@ -2055,7 +2256,7 @@ priced = false
 
 [dialects."minimax-cn-coding-plan/MiniMax-M2.7-highspeed"]
 wire = "anthropic_messages"
-base_url = "https://api.minimaxi.com/anthropic/v1"
+base_url = "https://api.minimax.cn/anthropic/v1"
 api_key_env = "MINIMAX_API_KEY"
 doc_url = "https://platform.minimaxi.com/docs/token-plan/intro"
 context = 204800
@@ -2064,10 +2265,19 @@ priced = false
 
 [dialects."minimax-cn-coding-plan/MiniMax-M3"]
 wire = "anthropic_messages"
-base_url = "https://api.minimaxi.com/anthropic/v1"
+base_url = "https://api.minimax.cn/anthropic/v1"
 api_key_env = "MINIMAX_API_KEY"
 doc_url = "https://platform.minimaxi.com/docs/token-plan/intro"
 context = 1048576
+max_output = 512000
+priced = false
+
+[dialects."minimax-cn-coding-plan/MiniMax-M3.1-Flash-Preview"]
+wire = "anthropic_messages"
+base_url = "https://api.minimax.cn/anthropic/v1"
+api_key_env = "MINIMAX_API_KEY"
+doc_url = "https://platform.minimaxi.com/docs/token-plan/intro"
+context = 1000000
 max_output = 512000
 priced = false
 
@@ -2131,6 +2341,15 @@ base_url = "https://api.minimax.io/anthropic/v1"
 api_key_env = "MINIMAX_API_KEY"
 doc_url = "https://platform.minimax.io/docs/token-plan/intro"
 context = 1048576
+max_output = 512000
+priced = false
+
+[dialects."minimax-coding-plan/MiniMax-M3.1-Flash-Preview"]
+wire = "anthropic_messages"
+base_url = "https://api.minimax.io/anthropic/v1"
+api_key_env = "MINIMAX_API_KEY"
+doc_url = "https://platform.minimax.io/docs/token-plan/intro"
+context = 1000000
 max_output = 512000
 priced = false
 
@@ -2237,6 +2456,24 @@ api_key_env = "NVIDIA_API_KEY"
 doc_url = "https://docs.api.nvidia.com/nim/"
 context = 1000000
 max_output = 384000
+priced = false
+
+[dialects."nvidia/deepseek-ai/deepseek-v4.1-flash"]
+wire = "openai_chat"
+base_url = "https://integrate.api.nvidia.com/v1"
+api_key_env = "NVIDIA_API_KEY"
+doc_url = "https://docs.api.nvidia.com/nim/"
+context = 1000000
+max_output = 384000
+priced = false
+
+[dialects."nvidia/google/diffusiongemma-26b-a4b-it"]
+wire = "openai_chat"
+base_url = "https://integrate.api.nvidia.com/v1"
+api_key_env = "NVIDIA_API_KEY"
+doc_url = "https://docs.api.nvidia.com/nim/"
+context = 250000
+max_output = 32768
 priced = false
 
 [dialects."nvidia/google/gemma-4-31b-it"]
@@ -2383,18 +2620,6 @@ context = 256000
 max_output = 65536
 priced = false
 
-[dialects."nvidia/nvidia/nemotron-3-super-120b-a12b"]
-wire = "openai_chat"
-base_url = "https://integrate.api.nvidia.com/v1"
-api_key_env = "NVIDIA_API_KEY"
-doc_url = "https://docs.api.nvidia.com/nim/"
-context = 262144
-max_output = 262144
-priced = true
-[dialects."nvidia/nvidia/nemotron-3-super-120b-a12b".price]
-input_per_mtok = 0.2
-output_per_mtok = 0.8
-
 [dialects."nvidia/nvidia/nemotron-3-ultra-550b-a55b"]
 wire = "openai_chat"
 base_url = "https://integrate.api.nvidia.com/v1"
@@ -2416,6 +2641,15 @@ context = 262144
 max_output = 262144
 priced = false
 
+[dialects."nvidia/nvidia/nemotron-3.5-super-vl-120b-a12b"]
+wire = "openai_chat"
+base_url = "https://integrate.api.nvidia.com/v1"
+api_key_env = "NVIDIA_API_KEY"
+doc_url = "https://docs.api.nvidia.com/nim/"
+context = 1048576
+max_output = 8192
+priced = false
+
 [dialects."nvidia/nvidia/nemotron-nano-12b-v2-vl"]
 wire = "openai_chat"
 base_url = "https://integrate.api.nvidia.com/v1"
@@ -2432,15 +2666,6 @@ api_key_env = "NVIDIA_API_KEY"
 doc_url = "https://docs.api.nvidia.com/nim/"
 context = 131072
 max_output = 131072
-priced = false
-
-[dialects."nvidia/openai/gpt-oss-120b"]
-wire = "openai_chat"
-base_url = "https://integrate.api.nvidia.com/v1"
-api_key_env = "NVIDIA_API_KEY"
-doc_url = "https://docs.api.nvidia.com/nim/"
-context = 128000
-max_output = 8192
 priced = false
 
 [dialects."nvidia/openai/gpt-oss-20b"]
@@ -2497,6 +2722,15 @@ context = 256000
 max_output = 16384
 priced = false
 
+[dialects."nvidia/stepfun-ai/step-5-preview"]
+wire = "openai_chat"
+base_url = "https://integrate.api.nvidia.com/v1"
+api_key_env = "NVIDIA_API_KEY"
+doc_url = "https://docs.api.nvidia.com/nim/"
+context = 1048576
+max_output = 1048576
+priced = false
+
 [dialects."nvidia/thinkingmachines/inkling"]
 wire = "openai_chat"
 base_url = "https://integrate.api.nvidia.com/v1"
@@ -2513,6 +2747,396 @@ api_key_env = "NVIDIA_API_KEY"
 doc_url = "https://docs.api.nvidia.com/nim/"
 context = 1000000
 max_output = 131072
+priced = false
+
+[dialects."nvidia/z-ai/glm-5.3"]
+wire = "openai_chat"
+base_url = "https://integrate.api.nvidia.com/v1"
+api_key_env = "NVIDIA_API_KEY"
+doc_url = "https://docs.api.nvidia.com/nim/"
+context = 1000000
+max_output = 131072
+priced = false
+
+[dialects."nvidia/z-ai/glm-5.3-flash"]
+wire = "openai_chat"
+base_url = "https://integrate.api.nvidia.com/v1"
+api_key_env = "NVIDIA_API_KEY"
+doc_url = "https://docs.api.nvidia.com/nim/"
+context = 1000000
+max_output = 131072
+priced = false
+
+[dialects."opencode-go/beam-free"]
+wire = "openai_chat"
+base_url = "https://opencode.ai/inference/go/openai/v1"
+api_key_env = "OPENCODE_API_KEY"
+doc_url = "https://opencode.ai/v2/docs/console/go/"
+context = 1048576
+max_output = 131072
+priced = false
+
+[dialects."opencode-go/cat-jam-free"]
+wire = "openai_chat"
+base_url = "https://opencode.ai/inference/go/openai/v1"
+api_key_env = "OPENCODE_API_KEY"
+doc_url = "https://opencode.ai/v2/docs/console/go/"
+context = 1048576
+max_output = 131072
+priced = false
+
+[dialects."opencode-go/claude-haiku-5-5"]
+wire = "openai_chat"
+base_url = "https://opencode.ai/inference/go/openai/v1"
+api_key_env = "OPENCODE_API_KEY"
+doc_url = "https://opencode.ai/v2/docs/console/go/"
+context = 1000000
+max_output = 128000
+priced = true
+[dialects."opencode-go/claude-haiku-5-5".price]
+input_per_mtok = 0.1
+output_per_mtok = 0.5
+
+[dialects."opencode-go/deepseek-v4-pro"]
+wire = "openai_chat"
+base_url = "https://opencode.ai/inference/go/openai/v1"
+api_key_env = "OPENCODE_API_KEY"
+doc_url = "https://opencode.ai/v2/docs/console/go/"
+context = 1000000
+max_output = 384000
+priced = true
+[dialects."opencode-go/deepseek-v4-pro".price]
+input_per_mtok = 0.66
+output_per_mtok = 1.98
+
+[dialects."opencode-go/deepseek-v4.1-flash"]
+wire = "openai_chat"
+base_url = "https://opencode.ai/inference/go/openai/v1"
+api_key_env = "OPENCODE_API_KEY"
+doc_url = "https://opencode.ai/v2/docs/console/go/"
+context = 1000000
+max_output = 384000
+priced = true
+[dialects."opencode-go/deepseek-v4.1-flash".price]
+input_per_mtok = 0.15
+output_per_mtok = 0.6
+
+[dialects."opencode-go/gemini-4-argon-contributor"]
+wire = "openai_chat"
+base_url = "https://opencode.ai/inference/go/openai/v1"
+api_key_env = "OPENCODE_API_KEY"
+doc_url = "https://opencode.ai/v2/docs/console/go/"
+context = 1048576
+max_output = 65536
+priced = true
+[dialects."opencode-go/gemini-4-argon-contributor".price]
+input_per_mtok = 4
+output_per_mtok = 20
+
+[dialects."opencode-go/glm-5.2"]
+wire = "openai_chat"
+base_url = "https://opencode.ai/inference/go/openai/v1"
+api_key_env = "OPENCODE_API_KEY"
+doc_url = "https://opencode.ai/v2/docs/console/go/"
+context = 1000000
+max_output = 131072
+priced = true
+[dialects."opencode-go/glm-5.2".price]
+input_per_mtok = 1.4
+output_per_mtok = 4.4
+
+[dialects."opencode-go/glm-5.3"]
+wire = "openai_chat"
+base_url = "https://opencode.ai/inference/go/openai/v1"
+api_key_env = "OPENCODE_API_KEY"
+doc_url = "https://opencode.ai/v2/docs/console/go/"
+context = 1000000
+max_output = 131072
+priced = true
+[dialects."opencode-go/glm-5.3".price]
+input_per_mtok = 1.4
+output_per_mtok = 4.4
+
+[dialects."opencode-go/glm-5.3-flash"]
+wire = "openai_chat"
+base_url = "https://opencode.ai/inference/go/openai/v1"
+api_key_env = "OPENCODE_API_KEY"
+doc_url = "https://opencode.ai/v2/docs/console/go/"
+context = 1000000
+max_output = 131072
+priced = true
+[dialects."opencode-go/glm-5.3-flash".price]
+input_per_mtok = 0.15
+output_per_mtok = 0.5
+
+[dialects."opencode-go/gpt-5.6-luna"]
+wire = "openai_chat"
+base_url = "https://opencode.ai/inference/go/openai/v1"
+api_key_env = "OPENCODE_API_KEY"
+doc_url = "https://opencode.ai/v2/docs/console/go/"
+context = 1050000
+max_output = 128000
+priced = true
+[dialects."opencode-go/gpt-5.6-luna".price]
+input_per_mtok = 0.2
+output_per_mtok = 1.2
+
+[dialects."opencode-go/gpt-6-luna"]
+wire = "openai_chat"
+base_url = "https://opencode.ai/inference/go/openai/v1"
+api_key_env = "OPENCODE_API_KEY"
+doc_url = "https://opencode.ai/v2/docs/console/go/"
+context = 1050000
+max_output = 128000
+priced = true
+[dialects."opencode-go/gpt-6-luna".price]
+input_per_mtok = 0.1
+output_per_mtok = 0.5
+
+[dialects."opencode-go/grok-4.7"]
+wire = "openai_chat"
+base_url = "https://opencode.ai/inference/go/openai/v1"
+api_key_env = "OPENCODE_API_KEY"
+doc_url = "https://opencode.ai/v2/docs/console/go/"
+context = 500000
+max_output = 500000
+priced = true
+[dialects."opencode-go/grok-4.7".price]
+input_per_mtok = 2
+output_per_mtok = 6
+
+[dialects."opencode-go/hy3"]
+wire = "openai_chat"
+base_url = "https://opencode.ai/inference/go/openai/v1"
+api_key_env = "OPENCODE_API_KEY"
+doc_url = "https://opencode.ai/v2/docs/console/go/"
+context = 256000
+max_output = 128000
+priced = true
+[dialects."opencode-go/hy3".price]
+input_per_mtok = 0.14
+output_per_mtok = 0.58
+
+[dialects."opencode-go/hy4-preview"]
+wire = "openai_chat"
+base_url = "https://opencode.ai/inference/go/openai/v1"
+api_key_env = "OPENCODE_API_KEY"
+doc_url = "https://opencode.ai/v2/docs/console/go/"
+context = 1024000
+max_output = 64000
+priced = true
+[dialects."opencode-go/hy4-preview".price]
+input_per_mtok = 0.834
+output_per_mtok = 2.501
+
+[dialects."opencode-go/kimi-k2.7-code"]
+wire = "openai_chat"
+base_url = "https://opencode.ai/inference/go/openai/v1"
+api_key_env = "OPENCODE_API_KEY"
+doc_url = "https://opencode.ai/v2/docs/console/go/"
+context = 262144
+max_output = 262144
+priced = true
+[dialects."opencode-go/kimi-k2.7-code".price]
+input_per_mtok = 0.95
+output_per_mtok = 4
+
+[dialects."opencode-go/kimi-k3"]
+wire = "openai_chat"
+base_url = "https://opencode.ai/inference/go/openai/v1"
+api_key_env = "OPENCODE_API_KEY"
+doc_url = "https://opencode.ai/v2/docs/console/go/"
+context = 1048576
+max_output = 131072
+priced = true
+[dialects."opencode-go/kimi-k3".price]
+input_per_mtok = 3
+output_per_mtok = 15
+
+[dialects."opencode-go/longcat-2.0"]
+wire = "openai_chat"
+base_url = "https://opencode.ai/inference/go/openai/v1"
+api_key_env = "OPENCODE_API_KEY"
+doc_url = "https://opencode.ai/v2/docs/console/go/"
+context = 1000000
+max_output = 131072
+priced = true
+[dialects."opencode-go/longcat-2.0".price]
+input_per_mtok = 0.3
+output_per_mtok = 1.2
+
+[dialects."opencode-go/longcat-2.5-preview-free"]
+wire = "openai_chat"
+base_url = "https://opencode.ai/inference/go/openai/v1"
+api_key_env = "OPENCODE_API_KEY"
+doc_url = "https://opencode.ai/v2/docs/console/go/"
+context = 1000000
+max_output = 131072
+priced = false
+
+[dialects."opencode-go/mimo-v2.5"]
+wire = "openai_chat"
+base_url = "https://opencode.ai/inference/go/openai/v1"
+api_key_env = "OPENCODE_API_KEY"
+doc_url = "https://opencode.ai/v2/docs/console/go/"
+context = 1000000
+max_output = 128000
+priced = true
+[dialects."opencode-go/mimo-v2.5".price]
+input_per_mtok = 0.14
+output_per_mtok = 0.28
+
+[dialects."opencode-go/mimo-v2.5-pro"]
+wire = "openai_chat"
+base_url = "https://opencode.ai/inference/go/openai/v1"
+api_key_env = "OPENCODE_API_KEY"
+doc_url = "https://opencode.ai/v2/docs/console/go/"
+context = 1048576
+max_output = 128000
+priced = true
+[dialects."opencode-go/mimo-v2.5-pro".price]
+input_per_mtok = 0.435
+output_per_mtok = 0.87
+
+[dialects."opencode-go/mimo-v2.6-flash"]
+wire = "openai_chat"
+base_url = "https://opencode.ai/inference/go/openai/v1"
+api_key_env = "OPENCODE_API_KEY"
+doc_url = "https://opencode.ai/v2/docs/console/go/"
+context = 1048576
+max_output = 131072
+priced = true
+[dialects."opencode-go/mimo-v2.6-flash".price]
+input_per_mtok = 0.14
+output_per_mtok = 0.28
+
+[dialects."opencode-go/mimo-v2.6-pro"]
+wire = "openai_chat"
+base_url = "https://opencode.ai/inference/go/openai/v1"
+api_key_env = "OPENCODE_API_KEY"
+doc_url = "https://opencode.ai/v2/docs/console/go/"
+context = 1048576
+max_output = 131072
+priced = true
+[dialects."opencode-go/mimo-v2.6-pro".price]
+input_per_mtok = 0.435
+output_per_mtok = 0.87
+
+[dialects."opencode-go/minimax-m2.7"]
+wire = "openai_chat"
+base_url = "https://opencode.ai/inference/go/openai/v1"
+api_key_env = "OPENCODE_API_KEY"
+doc_url = "https://opencode.ai/v2/docs/console/go/"
+context = 204800
+max_output = 131072
+priced = true
+[dialects."opencode-go/minimax-m2.7".price]
+input_per_mtok = 0.3
+output_per_mtok = 1.2
+
+[dialects."opencode-go/minimax-m3"]
+wire = "openai_chat"
+base_url = "https://opencode.ai/inference/go/openai/v1"
+api_key_env = "OPENCODE_API_KEY"
+doc_url = "https://opencode.ai/v2/docs/console/go/"
+context = 1000000
+max_output = 131072
+priced = true
+[dialects."opencode-go/minimax-m3".price]
+input_per_mtok = 0.3
+output_per_mtok = 1.2
+
+[dialects."opencode-go/muse-spark-1.2-contributor"]
+wire = "openai_chat"
+base_url = "https://opencode.ai/inference/go/openai/v1"
+api_key_env = "OPENCODE_API_KEY"
+doc_url = "https://opencode.ai/v2/docs/console/go/"
+context = 1048576
+max_output = 131072
+priced = true
+[dialects."opencode-go/muse-spark-1.2-contributor".price]
+input_per_mtok = 0.1
+output_per_mtok = 0.2
+
+[dialects."opencode-go/muse-spark-1.3-contributor"]
+wire = "openai_chat"
+base_url = "https://opencode.ai/inference/go/openai/v1"
+api_key_env = "OPENCODE_API_KEY"
+doc_url = "https://opencode.ai/v2/docs/console/go/"
+context = 1048576
+max_output = 131072
+priced = true
+[dialects."opencode-go/muse-spark-1.3-contributor".price]
+input_per_mtok = 0.1
+output_per_mtok = 0.2
+
+[dialects."opencode-go/qwen3.7-plus"]
+wire = "openai_chat"
+base_url = "https://opencode.ai/inference/go/openai/v1"
+api_key_env = "OPENCODE_API_KEY"
+doc_url = "https://opencode.ai/v2/docs/console/go/"
+context = 1000000
+max_output = 65536
+priced = true
+[dialects."opencode-go/qwen3.7-plus".price]
+input_per_mtok = 0.4
+output_per_mtok = 1.6
+
+[dialects."opencode-go/qwen3.8-flash"]
+wire = "openai_chat"
+base_url = "https://opencode.ai/inference/go/openai/v1"
+api_key_env = "OPENCODE_API_KEY"
+doc_url = "https://opencode.ai/v2/docs/console/go/"
+context = 1000000
+max_output = 131072
+priced = true
+[dialects."opencode-go/qwen3.8-flash".price]
+input_per_mtok = 0.15
+output_per_mtok = 0.47
+
+[dialects."opencode-go/qwen3.8-max"]
+wire = "openai_chat"
+base_url = "https://opencode.ai/inference/go/openai/v1"
+api_key_env = "OPENCODE_API_KEY"
+doc_url = "https://opencode.ai/v2/docs/console/go/"
+context = 1000000
+max_output = 131072
+priced = true
+[dialects."opencode-go/qwen3.8-max".price]
+input_per_mtok = 2
+output_per_mtok = 6
+
+[dialects."opencode-go/space-bunny"]
+wire = "openai_chat"
+base_url = "https://opencode.ai/inference/go/openai/v1"
+api_key_env = "OPENCODE_API_KEY"
+doc_url = "https://opencode.ai/v2/docs/console/go/"
+context = 1048576
+max_output = 524288
+priced = true
+[dialects."opencode-go/space-bunny".price]
+input_per_mtok = 0.15
+output_per_mtok = 0.6
+
+[dialects."opencode-go/step-5-preview"]
+wire = "openai_chat"
+base_url = "https://opencode.ai/inference/go/openai/v1"
+api_key_env = "OPENCODE_API_KEY"
+doc_url = "https://opencode.ai/v2/docs/console/go/"
+context = 1000000
+max_output = 65536
+priced = true
+[dialects."opencode-go/step-5-preview".price]
+input_per_mtok = 1
+output_per_mtok = 2.7
+
+[dialects."opencode-go/step-5-preview-free"]
+wire = "openai_chat"
+base_url = "https://opencode.ai/inference/go/openai/v1"
+api_key_env = "OPENCODE_API_KEY"
+doc_url = "https://opencode.ai/v2/docs/console/go/"
+context = 1000000
+max_output = 65536
 priced = false
 
 [dialects."openrouter/aion-labs/aion-2.0"]
@@ -2548,6 +3172,30 @@ context = 131072
 max_output = 32768
 priced = true
 [dialects."openrouter/aion-labs/aion-3.0-mini".price]
+input_per_mtok = 0.7
+output_per_mtok = 1.4
+
+[dialects."openrouter/aion-labs/aion-3.5"]
+wire = "openai_chat"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+doc_url = "https://openrouter.ai/models"
+context = 262144
+max_output = 32768
+priced = true
+[dialects."openrouter/aion-labs/aion-3.5".price]
+input_per_mtok = 3
+output_per_mtok = 6
+
+[dialects."openrouter/aion-labs/aion-3.5-mini"]
+wire = "openai_chat"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+doc_url = "https://openrouter.ai/models"
+context = 262144
+max_output = 32768
+priced = true
+[dialects."openrouter/aion-labs/aion-3.5-mini".price]
 input_per_mtok = 0.7
 output_per_mtok = 1.4
 
@@ -2599,17 +3247,17 @@ priced = true
 input_per_mtok = 1
 output_per_mtok = 5
 
-[dialects."openrouter/anthropic/claude-opus-4"]
+[dialects."openrouter/anthropic/claude-haiku-5.5"]
 wire = "openai_chat"
 base_url = "https://openrouter.ai/api/v1"
 api_key_env = "OPENROUTER_API_KEY"
 doc_url = "https://openrouter.ai/models"
-context = 200000
-max_output = 32000
+context = 1000000
+max_output = 128000
 priced = true
-[dialects."openrouter/anthropic/claude-opus-4".price]
-input_per_mtok = 15
-output_per_mtok = 75
+[dialects."openrouter/anthropic/claude-haiku-5.5".price]
+input_per_mtok = 0.1
+output_per_mtok = 0.5
 
 [dialects."openrouter/anthropic/claude-opus-4.1"]
 wire = "openai_chat"
@@ -2683,17 +3331,17 @@ priced = true
 input_per_mtok = 5
 output_per_mtok = 25
 
-[dialects."openrouter/anthropic/claude-sonnet-4"]
+[dialects."openrouter/anthropic/claude-opus-5.5"]
 wire = "openai_chat"
 base_url = "https://openrouter.ai/api/v1"
 api_key_env = "OPENROUTER_API_KEY"
 doc_url = "https://openrouter.ai/models"
 context = 1000000
-max_output = 64000
+max_output = 128000
 priced = true
-[dialects."openrouter/anthropic/claude-sonnet-4".price]
-input_per_mtok = 3
-output_per_mtok = 15
+[dialects."openrouter/anthropic/claude-opus-5.5".price]
+input_per_mtok = 4
+output_per_mtok = 20
 
 [dialects."openrouter/anthropic/claude-sonnet-4.5"]
 wire = "openai_chat"
@@ -2728,6 +3376,18 @@ context = 1000000
 max_output = 128000
 priced = true
 [dialects."openrouter/anthropic/claude-sonnet-5".price]
+input_per_mtok = 2
+output_per_mtok = 10
+
+[dialects."openrouter/anthropic/claude-sonnet-5.5"]
+wire = "openai_chat"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+doc_url = "https://openrouter.ai/models"
+context = 1000000
+max_output = 128000
+priced = true
+[dialects."openrouter/anthropic/claude-sonnet-5.5".price]
 input_per_mtok = 2
 output_per_mtok = 10
 
@@ -2815,6 +3475,18 @@ priced = true
 input_per_mtok = 0.1
 output_per_mtok = 0.4
 
+[dialects."openrouter/cohere/command-a-plus"]
+wire = "openai_chat"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+doc_url = "https://openrouter.ai/models"
+context = 192000
+max_output = 64000
+priced = true
+[dialects."openrouter/cohere/command-a-plus".price]
+input_per_mtok = 0.3
+output_per_mtok = 1.5
+
 [dialects."openrouter/cohere/north-mini-code:free"]
 wire = "openai_chat"
 base_url = "https://openrouter.ai/api/v1"
@@ -2866,7 +3538,7 @@ base_url = "https://openrouter.ai/api/v1"
 api_key_env = "OPENROUTER_API_KEY"
 doc_url = "https://openrouter.ai/models"
 context = 163840
-max_output = 32768
+max_output = 147456
 priced = true
 [dialects."openrouter/deepseek/deepseek-v3.1-terminus".price]
 input_per_mtok = 0.27
@@ -2881,8 +3553,8 @@ context = 163840
 max_output = 65536
 priced = true
 [dialects."openrouter/deepseek/deepseek-v3.2".price]
-input_per_mtok = 0.269
-output_per_mtok = 0.4
+input_per_mtok = 0.28
+output_per_mtok = 0.42
 
 [dialects."openrouter/deepseek/deepseek-v3.2-exp"]
 wire = "openai_chat"
@@ -2890,7 +3562,7 @@ base_url = "https://openrouter.ai/api/v1"
 api_key_env = "OPENROUTER_API_KEY"
 doc_url = "https://openrouter.ai/models"
 context = 163840
-max_output = 65536
+max_output = 147456
 priced = true
 [dialects."openrouter/deepseek/deepseek-v3.2-exp".price]
 input_per_mtok = 0.27
@@ -2902,23 +3574,23 @@ base_url = "https://openrouter.ai/api/v1"
 api_key_env = "OPENROUTER_API_KEY"
 doc_url = "https://openrouter.ai/models"
 context = 1048576
-max_output = 384000
+max_output = 943717
 priced = true
 [dialects."openrouter/deepseek/deepseek-v4-flash".price]
-input_per_mtok = 0.088606
-output_per_mtok = 0.177212
+input_per_mtok = 0.091
+output_per_mtok = 0.182
 
 [dialects."openrouter/deepseek/deepseek-v4-flash-0731"]
 wire = "openai_chat"
 base_url = "https://openrouter.ai/api/v1"
 api_key_env = "OPENROUTER_API_KEY"
 doc_url = "https://openrouter.ai/models"
-context = 1310720
+context = 1048576
 max_output = 943718
 priced = true
 [dialects."openrouter/deepseek/deepseek-v4-flash-0731".price]
-input_per_mtok = 0.065
-output_per_mtok = 0.18
+input_per_mtok = 0.15
+output_per_mtok = 0.15
 
 [dialects."openrouter/deepseek/deepseek-v4-flash-vision-exp"]
 wire = "openai_chat"
@@ -2926,11 +3598,11 @@ base_url = "https://openrouter.ai/api/v1"
 api_key_env = "OPENROUTER_API_KEY"
 doc_url = "https://openrouter.ai/models"
 context = 1048576
-max_output = 384000
+max_output = 262144
 priced = true
 [dialects."openrouter/deepseek/deepseek-v4-flash-vision-exp".price]
-input_per_mtok = 0.44
-output_per_mtok = 1.32
+input_per_mtok = 0.2156
+output_per_mtok = 0.6468
 
 [dialects."openrouter/deepseek/deepseek-v4-pro"]
 wire = "openai_chat"
@@ -2941,8 +3613,8 @@ context = 1048576
 max_output = 384000
 priced = true
 [dialects."openrouter/deepseek/deepseek-v4-pro".price]
-input_per_mtok = 1.04226
-output_per_mtok = 2.08452
+input_per_mtok = 0.95526
+output_per_mtok = 1.91052
 
 [dialects."openrouter/deepseek/deepseek-v4-pro-0813"]
 wire = "openai_chat"
@@ -2953,8 +3625,32 @@ context = 1048576
 max_output = 384000
 priced = true
 [dialects."openrouter/deepseek/deepseek-v4-pro-0813".price]
-input_per_mtok = 1.1154
-output_per_mtok = 3.3462
+input_per_mtok = 0.66
+output_per_mtok = 1.98
+
+[dialects."openrouter/deepseek/deepseek-v4.1-flash"]
+wire = "openai_chat"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+doc_url = "https://openrouter.ai/models"
+context = 1048576
+max_output = 943718
+priced = true
+[dialects."openrouter/deepseek/deepseek-v4.1-flash".price]
+input_per_mtok = 0.0456
+output_per_mtok = 0.08
+
+[dialects."openrouter/deepseek/deepseek-v4.1-flash-1017"]
+wire = "openai_chat"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+doc_url = "https://openrouter.ai/models"
+context = 1048576
+max_output = 393216
+priced = true
+[dialects."openrouter/deepseek/deepseek-v4.1-flash-1017".price]
+input_per_mtok = 0.3
+output_per_mtok = 1.2
 
 [dialects."openrouter/dots-studio/dots-3-note-preview:free"]
 wire = "openai_chat"
@@ -2964,6 +3660,30 @@ doc_url = "https://openrouter.ai/models"
 context = 512000
 max_output = 460800
 priced = false
+
+[dialects."openrouter/elorian/glimpse"]
+wire = "openai_chat"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+doc_url = "https://openrouter.ai/models"
+context = 262144
+max_output = 256000
+priced = true
+[dialects."openrouter/elorian/glimpse".price]
+input_per_mtok = 0.6
+output_per_mtok = 3
+
+[dialects."openrouter/fireworks/ember-1"]
+wire = "openai_chat"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+doc_url = "https://openrouter.ai/models"
+context = 1048576
+max_output = 943718
+priced = true
+[dialects."openrouter/fireworks/ember-1".price]
+input_per_mtok = 3
+output_per_mtok = 15
 
 [dialects."openrouter/google/gemini-2.5-flash"]
 wire = "openai_chat"
@@ -3010,18 +3730,6 @@ context = 1048576
 max_output = 65536
 priced = true
 [dialects."openrouter/google/gemini-2.5-pro-preview".price]
-input_per_mtok = 1.25
-output_per_mtok = 10
-
-[dialects."openrouter/google/gemini-2.5-pro-preview-05-06"]
-wire = "openai_chat"
-base_url = "https://openrouter.ai/api/v1"
-api_key_env = "OPENROUTER_API_KEY"
-doc_url = "https://openrouter.ai/models"
-context = 1048576
-max_output = 65535
-priced = true
-[dialects."openrouter/google/gemini-2.5-pro-preview-05-06".price]
 input_per_mtok = 1.25
 output_per_mtok = 10
 
@@ -3145,17 +3853,53 @@ priced = true
 input_per_mtok = 0.75
 output_per_mtok = 3.75
 
+[dialects."openrouter/google/gemini-3.8-flash"]
+wire = "openai_chat"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+doc_url = "https://openrouter.ai/models"
+context = 1048576
+max_output = 65536
+priced = true
+[dialects."openrouter/google/gemini-3.8-flash".price]
+input_per_mtok = 0.825
+output_per_mtok = 4.125
+
+[dialects."openrouter/google/gemini-4-argon"]
+wire = "openai_chat"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+doc_url = "https://openrouter.ai/models"
+context = 1048576
+max_output = 943718
+priced = true
+[dialects."openrouter/google/gemini-4-argon".price]
+input_per_mtok = 2
+output_per_mtok = 10
+
+[dialects."openrouter/google/gemini-nano-banana-2.1"]
+wire = "openai_chat"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+doc_url = "https://openrouter.ai/models"
+context = 65536
+max_output = 58982
+priced = true
+[dialects."openrouter/google/gemini-nano-banana-2.1".price]
+input_per_mtok = 1.5
+output_per_mtok = 7.5
+
 [dialects."openrouter/google/gemma-4-26b-a4b-it"]
 wire = "openai_chat"
 base_url = "https://openrouter.ai/api/v1"
 api_key_env = "OPENROUTER_API_KEY"
 doc_url = "https://openrouter.ai/models"
 context = 262144
-max_output = 16384
+max_output = 235929
 priced = true
 [dialects."openrouter/google/gemma-4-26b-a4b-it".price]
-input_per_mtok = 0.07
-output_per_mtok = 0.34
+input_per_mtok = 0.09
+output_per_mtok = 0.3
 
 [dialects."openrouter/google/gemma-4-26b-a4b-it:free"]
 wire = "openai_chat"
@@ -3175,8 +3919,8 @@ context = 262144
 max_output = 16384
 priced = true
 [dialects."openrouter/google/gemma-4-31b-it".price]
-input_per_mtok = 0.09
-output_per_mtok = 0.34
+input_per_mtok = 0.2
+output_per_mtok = 0.4
 
 [dialects."openrouter/google/gemma-4-31b-it:free"]
 wire = "openai_chat"
@@ -3196,8 +3940,8 @@ context = 131072
 max_output = 117964
 priced = true
 [dialects."openrouter/ibm-granite/granite-4.2-8b".price]
-input_per_mtok = 0.1
-output_per_mtok = 0.15
+input_per_mtok = 0.06
+output_per_mtok = 0.25
 
 [dialects."openrouter/inception/mercury-2"]
 wire = "openai_chat"
@@ -3211,7 +3955,7 @@ priced = true
 input_per_mtok = 0.25
 output_per_mtok = 0.75
 
-[dialects."openrouter/inception/mercury-2.5-preview"]
+[dialects."openrouter/inception/mercury-2.5"]
 wire = "openai_chat"
 base_url = "https://openrouter.ai/api/v1"
 api_key_env = "OPENROUTER_API_KEY"
@@ -3219,7 +3963,7 @@ doc_url = "https://openrouter.ai/models"
 context = 260000
 max_output = 65536
 priced = true
-[dialects."openrouter/inception/mercury-2.5-preview".price]
+[dialects."openrouter/inception/mercury-2.5".price]
 input_per_mtok = 0.04
 output_per_mtok = 0.15
 
@@ -3235,14 +3979,29 @@ priced = true
 input_per_mtok = 0.021
 output_per_mtok = 0.063
 
-[dialects."openrouter/inclusionai/ling-3.0-flash-fin:free"]
+[dialects."openrouter/inclusionai/ling-3.0-flash-vl"]
+wire = "openai_chat"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+doc_url = "https://openrouter.ai/models"
+context = 131072
+max_output = 32768
+priced = true
+[dialects."openrouter/inclusionai/ling-3.0-flash-vl".price]
+input_per_mtok = 0.06
+output_per_mtok = 0.18
+
+[dialects."openrouter/inclusionai/ling-3.1-flash"]
 wire = "openai_chat"
 base_url = "https://openrouter.ai/api/v1"
 api_key_env = "OPENROUTER_API_KEY"
 doc_url = "https://openrouter.ai/models"
 context = 262144
-max_output = 32768
-priced = false
+max_output = 235929
+priced = true
+[dialects."openrouter/inclusionai/ling-3.1-flash".price]
+input_per_mtok = 0.075
+output_per_mtok = 0.225
 
 [dialects."openrouter/liquid/lfm-2.5-2.6b:free"]
 wire = "openai_chat"
@@ -3252,6 +4011,18 @@ doc_url = "https://openrouter.ai/models"
 context = 65536
 max_output = 8192
 priced = false
+
+[dialects."openrouter/liquid/lfm-2.5-24b-a2b"]
+wire = "openai_chat"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+doc_url = "https://openrouter.ai/models"
+context = 128000
+max_output = 8192
+priced = true
+[dialects."openrouter/liquid/lfm-2.5-24b-a2b".price]
+input_per_mtok = 0.05
+output_per_mtok = 0.7
 
 [dialects."openrouter/meituan/longcat-2.0"]
 wire = "openai_chat"
@@ -3313,6 +4084,54 @@ priced = true
 input_per_mtok = 0.1
 output_per_mtok = 0.2
 
+[dialects."openrouter/meta/muse-spark-1.3"]
+wire = "openai_chat"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+doc_url = "https://openrouter.ai/models"
+context = 1048576
+max_output = 943718
+priced = true
+[dialects."openrouter/meta/muse-spark-1.3".price]
+input_per_mtok = 1.25
+output_per_mtok = 4.25
+
+[dialects."openrouter/meta/muse-spark-1.3-contributor"]
+wire = "openai_chat"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+doc_url = "https://openrouter.ai/models"
+context = 1048576
+max_output = 943718
+priced = true
+[dialects."openrouter/meta/muse-spark-1.3-contributor".price]
+input_per_mtok = 0.1
+output_per_mtok = 0.2
+
+[dialects."openrouter/meta/muse-spark-open"]
+wire = "openai_chat"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+doc_url = "https://openrouter.ai/models"
+context = 1048576
+max_output = 943718
+priced = true
+[dialects."openrouter/meta/muse-spark-open".price]
+input_per_mtok = 1.25
+output_per_mtok = 4.25
+
+[dialects."openrouter/meta/muse-wonder"]
+wire = "openai_chat"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+doc_url = "https://openrouter.ai/models"
+context = 1048576
+max_output = 943718
+priced = true
+[dialects."openrouter/meta/muse-wonder".price]
+input_per_mtok = 4
+output_per_mtok = 20
+
 [dialects."openrouter/minimax/minimax-m1"]
 wire = "openai_chat"
 base_url = "https://openrouter.ai/api/v1"
@@ -3355,11 +4174,11 @@ base_url = "https://openrouter.ai/api/v1"
 api_key_env = "OPENROUTER_API_KEY"
 doc_url = "https://openrouter.ai/models"
 context = 204800
-max_output = 128000
+max_output = 32768
 priced = true
 [dialects."openrouter/minimax/minimax-m2.5".price]
 input_per_mtok = 0.27
-output_per_mtok = 1.08
+output_per_mtok = 0.95
 
 [dialects."openrouter/minimax/minimax-m2.7"]
 wire = "openai_chat"
@@ -3373,15 +4192,6 @@ priced = true
 input_per_mtok = 0.3
 output_per_mtok = 1.2
 
-[dialects."openrouter/minimax/minimax-m2.7:free"]
-wire = "openai_chat"
-base_url = "https://openrouter.ai/api/v1"
-api_key_env = "OPENROUTER_API_KEY"
-doc_url = "https://openrouter.ai/models"
-context = 196608
-max_output = 176947
-priced = false
-
 [dialects."openrouter/minimax/minimax-m3"]
 wire = "openai_chat"
 base_url = "https://openrouter.ai/api/v1"
@@ -3394,14 +4204,17 @@ priced = true
 input_per_mtok = 0.3
 output_per_mtok = 1.2
 
-[dialects."openrouter/minimax/minimax-m3:free"]
+[dialects."openrouter/mistralai/mistral-large-4-0"]
 wire = "openai_chat"
 base_url = "https://openrouter.ai/api/v1"
 api_key_env = "OPENROUTER_API_KEY"
 doc_url = "https://openrouter.ai/models"
 context = 1048576
-max_output = 943718
-priced = false
+max_output = 262144
+priced = true
+[dialects."openrouter/mistralai/mistral-large-4-0".price]
+input_per_mtok = 0.68
+output_per_mtok = 2.09
 
 [dialects."openrouter/mistralai/mistral-medium-3-5"]
 wire = "openai_chat"
@@ -3433,7 +4246,7 @@ base_url = "https://openrouter.ai/api/v1"
 api_key_env = "OPENROUTER_API_KEY"
 doc_url = "https://openrouter.ai/models"
 context = 262144
-max_output = 100352
+max_output = 98304
 priced = true
 [dialects."openrouter/moonshotai/kimi-k2-thinking".price]
 input_per_mtok = 0.6
@@ -3448,8 +4261,8 @@ context = 262144
 max_output = 235929
 priced = true
 [dialects."openrouter/moonshotai/kimi-k2.5".price]
-input_per_mtok = 0.45
-output_per_mtok = 2.25
+input_per_mtok = 0.5
+output_per_mtok = 2.5
 
 [dialects."openrouter/moonshotai/kimi-k2.6"]
 wire = "openai_chat"
@@ -3460,8 +4273,8 @@ context = 262144
 max_output = 235929
 priced = true
 [dialects."openrouter/moonshotai/kimi-k2.6".price]
-input_per_mtok = 0.95
-output_per_mtok = 4
+input_per_mtok = 0.65
+output_per_mtok = 3.41
 
 [dialects."openrouter/moonshotai/kimi-k2.7-code"]
 wire = "openai_chat"
@@ -3472,8 +4285,8 @@ context = 262144
 max_output = 235929
 priced = true
 [dialects."openrouter/moonshotai/kimi-k2.7-code".price]
-input_per_mtok = 0.66
-output_per_mtok = 3.4
+input_per_mtok = 0.6712
+output_per_mtok = 3.35
 
 [dialects."openrouter/moonshotai/kimi-k3"]
 wire = "openai_chat"
@@ -3484,10 +4297,10 @@ context = 1048576
 max_output = 943718
 priced = true
 [dialects."openrouter/moonshotai/kimi-k3".price]
-input_per_mtok = 3
-output_per_mtok = 15
+input_per_mtok = 0.239
+output_per_mtok = 11.936
 
-[dialects."openrouter/nex-agi/nex-n2-mini"]
+[dialects."openrouter/nex-agi/nex-n2.5-pro"]
 wire = "openai_chat"
 base_url = "https://openrouter.ai/api/v1"
 api_key_env = "OPENROUTER_API_KEY"
@@ -3495,21 +4308,9 @@ doc_url = "https://openrouter.ai/models"
 context = 262144
 max_output = 235929
 priced = true
-[dialects."openrouter/nex-agi/nex-n2-mini".price]
-input_per_mtok = 0.025
-output_per_mtok = 0.1
-
-[dialects."openrouter/nex-agi/nex-n2-pro"]
-wire = "openai_chat"
-base_url = "https://openrouter.ai/api/v1"
-api_key_env = "OPENROUTER_API_KEY"
-doc_url = "https://openrouter.ai/models"
-context = 262144
-max_output = 235929
-priced = true
-[dialects."openrouter/nex-agi/nex-n2-pro".price]
-input_per_mtok = 0.25
-output_per_mtok = 1
+[dialects."openrouter/nex-agi/nex-n2.5-pro".price]
+input_per_mtok = 0.075
+output_per_mtok = 0.25
 
 [dialects."openrouter/nvidia/nemotron-3-nano-30b-a3b"]
 wire = "openai_chat"
@@ -3517,11 +4318,11 @@ base_url = "https://openrouter.ai/api/v1"
 api_key_env = "OPENROUTER_API_KEY"
 doc_url = "https://openrouter.ai/models"
 context = 262144
-max_output = 228000
+max_output = 235929
 priced = true
 [dialects."openrouter/nvidia/nemotron-3-nano-30b-a3b".price]
-input_per_mtok = 0.05
-output_per_mtok = 0.2
+input_per_mtok = 0.06
+output_per_mtok = 0.24
 
 [dialects."openrouter/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"]
 wire = "openai_chat"
@@ -3537,12 +4338,12 @@ wire = "openai_chat"
 base_url = "https://openrouter.ai/api/v1"
 api_key_env = "OPENROUTER_API_KEY"
 doc_url = "https://openrouter.ai/models"
-context = 1000000
-max_output = 16384
+context = 262144
+max_output = 235929
 priced = true
 [dialects."openrouter/nvidia/nemotron-3-super-120b-a12b".price]
-input_per_mtok = 0.085
-output_per_mtok = 0.4
+input_per_mtok = 0.08
+output_per_mtok = 0.45
 
 [dialects."openrouter/nvidia/nemotron-3-super-120b-a12b:free"]
 wire = "openai_chat"
@@ -3559,11 +4360,11 @@ base_url = "https://openrouter.ai/api/v1"
 api_key_env = "OPENROUTER_API_KEY"
 doc_url = "https://openrouter.ai/models"
 context = 262144
-max_output = 32768
+max_output = 182520
 priced = true
 [dialects."openrouter/nvidia/nemotron-3-ultra-550b-a55b".price]
-input_per_mtok = 0.625
-output_per_mtok = 3.125
+input_per_mtok = 0.6
+output_per_mtok = 2.4
 
 [dialects."openrouter/nvidia/nemotron-3-ultra-550b-a55b:free"]
 wire = "openai_chat"
@@ -3580,10 +4381,10 @@ base_url = "https://openrouter.ai/api/v1"
 api_key_env = "OPENROUTER_API_KEY"
 doc_url = "https://openrouter.ai/models"
 context = 262144
-max_output = 131072
+max_output = 235929
 priced = true
 [dialects."openrouter/nvidia/nemotron-3.5-lightning".price]
-input_per_mtok = 0.08
+input_per_mtok = 0.07
 output_per_mtok = 0.2
 
 [dialects."openrouter/nvidia/nemotron-3.5-lightning:free"]
@@ -3593,6 +4394,27 @@ api_key_env = "OPENROUTER_API_KEY"
 doc_url = "https://openrouter.ai/models"
 context = 1000000
 max_output = 65536
+priced = false
+
+[dialects."openrouter/nvidia/nemotron-3.5-super-vl"]
+wire = "openai_chat"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+doc_url = "https://openrouter.ai/models"
+context = 1048576
+max_output = 235929
+priced = true
+[dialects."openrouter/nvidia/nemotron-3.5-super-vl".price]
+input_per_mtok = 0.1
+output_per_mtok = 0.4
+
+[dialects."openrouter/nvidia/nemotron-3.5-super-vl:free"]
+wire = "openai_chat"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+doc_url = "https://openrouter.ai/models"
+context = 1000000
+max_output = 131072
 priced = false
 
 [dialects."openrouter/openai/gpt-5"]
@@ -3844,8 +4666,8 @@ context = 1050000
 max_output = 128000
 priced = true
 [dialects."openrouter/openai/gpt-5.6-sol".price]
-input_per_mtok = 2
-output_per_mtok = 10
+input_per_mtok = 4
+output_per_mtok = 20
 
 [dialects."openrouter/openai/gpt-5.6-sol-pro"]
 wire = "openai_chat"
@@ -3856,8 +4678,8 @@ context = 1050000
 max_output = 128000
 priced = true
 [dialects."openrouter/openai/gpt-5.6-sol-pro".price]
-input_per_mtok = 2
-output_per_mtok = 10
+input_per_mtok = 4
+output_per_mtok = 20
 
 [dialects."openrouter/openai/gpt-5.6-terra"]
 wire = "openai_chat"
@@ -3883,17 +4705,113 @@ priced = true
 input_per_mtok = 2
 output_per_mtok = 12
 
+[dialects."openrouter/openai/gpt-6-astra"]
+wire = "openai_chat"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+doc_url = "https://openrouter.ai/models"
+context = 1050000
+max_output = 128000
+priced = true
+[dialects."openrouter/openai/gpt-6-astra".price]
+input_per_mtok = 10
+output_per_mtok = 50
+
+[dialects."openrouter/openai/gpt-6-astra-pro"]
+wire = "openai_chat"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+doc_url = "https://openrouter.ai/models"
+context = 1050000
+max_output = 128000
+priced = true
+[dialects."openrouter/openai/gpt-6-astra-pro".price]
+input_per_mtok = 10
+output_per_mtok = 50
+
+[dialects."openrouter/openai/gpt-6-luna"]
+wire = "openai_chat"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+doc_url = "https://openrouter.ai/models"
+context = 1050000
+max_output = 128000
+priced = true
+[dialects."openrouter/openai/gpt-6-luna".price]
+input_per_mtok = 0.1
+output_per_mtok = 0.5
+
+[dialects."openrouter/openai/gpt-6-luna-pro"]
+wire = "openai_chat"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+doc_url = "https://openrouter.ai/models"
+context = 1050000
+max_output = 128000
+priced = true
+[dialects."openrouter/openai/gpt-6-luna-pro".price]
+input_per_mtok = 0.1
+output_per_mtok = 0.5
+
+[dialects."openrouter/openai/gpt-6-sol"]
+wire = "openai_chat"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+doc_url = "https://openrouter.ai/models"
+context = 1050000
+max_output = 128000
+priced = true
+[dialects."openrouter/openai/gpt-6-sol".price]
+input_per_mtok = 2
+output_per_mtok = 10
+
+[dialects."openrouter/openai/gpt-6-sol-pro"]
+wire = "openai_chat"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+doc_url = "https://openrouter.ai/models"
+context = 1050000
+max_output = 128000
+priced = true
+[dialects."openrouter/openai/gpt-6-sol-pro".price]
+input_per_mtok = 2
+output_per_mtok = 10
+
+[dialects."openrouter/openai/gpt-6.1-sol"]
+wire = "openai_chat"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+doc_url = "https://openrouter.ai/models"
+context = 1050000
+max_output = 128000
+priced = true
+[dialects."openrouter/openai/gpt-6.1-sol".price]
+input_per_mtok = 2
+output_per_mtok = 10
+
+[dialects."openrouter/openai/gpt-6.1-sol-pro"]
+wire = "openai_chat"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+doc_url = "https://openrouter.ai/models"
+context = 1050000
+max_output = 128000
+priced = true
+[dialects."openrouter/openai/gpt-6.1-sol-pro".price]
+input_per_mtok = 2
+output_per_mtok = 10
+
 [dialects."openrouter/openai/gpt-oss-120b"]
 wire = "openai_chat"
 base_url = "https://openrouter.ai/api/v1"
 api_key_env = "OPENROUTER_API_KEY"
 doc_url = "https://openrouter.ai/models"
 context = 131072
-max_output = 117964
+max_output = 65536
 priced = true
 [dialects."openrouter/openai/gpt-oss-120b".price]
-input_per_mtok = 0.037
-output_per_mtok = 0.17
+input_per_mtok = 0.15
+output_per_mtok = 0.6
 
 [dialects."openrouter/openai/gpt-oss-20b"]
 wire = "openai_chat"
@@ -3901,11 +4819,11 @@ base_url = "https://openrouter.ai/api/v1"
 api_key_env = "OPENROUTER_API_KEY"
 doc_url = "https://openrouter.ai/models"
 context = 131072
-max_output = 117964
+max_output = 32768
 priced = true
 [dialects."openrouter/openai/gpt-oss-20b".price]
-input_per_mtok = 0.03
-output_per_mtok = 0.13
+input_per_mtok = 0.018
+output_per_mtok = 0.09
 
 [dialects."openrouter/openai/gpt-oss-safeguard-20b"]
 wire = "openai_chat"
@@ -4021,6 +4939,18 @@ context = 200000
 max_output = 8000
 priced = false
 
+[dialects."openrouter/perceptron/perceptron-mk1.5"]
+wire = "openai_chat"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+doc_url = "https://openrouter.ai/models"
+context = 36864
+max_output = 8192
+priced = true
+[dialects."openrouter/perceptron/perceptron-mk1.5".price]
+input_per_mtok = 0.15
+output_per_mtok = 1.5
+
 [dialects."openrouter/poolside/laguna-s-2.1"]
 wire = "openai_chat"
 base_url = "https://openrouter.ai/api/v1"
@@ -4063,65 +4993,53 @@ context = 262144
 max_output = 32768
 priced = false
 
+[dialects."openrouter/prism-ml/ternary-bonsai-2-27b"]
+wire = "openai_chat"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+doc_url = "https://openrouter.ai/models"
+context = 262144
+max_output = 32768
+priced = true
+[dialects."openrouter/prism-ml/ternary-bonsai-2-27b".price]
+input_per_mtok = 0.075
+output_per_mtok = 0.5
+
 [dialects."openrouter/qwen/qwen3-14b"]
 wire = "openai_chat"
 base_url = "https://openrouter.ai/api/v1"
 api_key_env = "OPENROUTER_API_KEY"
 doc_url = "https://openrouter.ai/models"
-context = 131072
+context = 40960
 max_output = 16384
 priced = true
 [dialects."openrouter/qwen/qwen3-14b".price]
 input_per_mtok = 0.12
 output_per_mtok = 0.24
 
-[dialects."openrouter/qwen/qwen3-235b-a22b"]
-wire = "openai_chat"
-base_url = "https://openrouter.ai/api/v1"
-api_key_env = "OPENROUTER_API_KEY"
-doc_url = "https://openrouter.ai/models"
-context = 131072
-max_output = 8192
-priced = true
-[dialects."openrouter/qwen/qwen3-235b-a22b".price]
-input_per_mtok = 0.455
-output_per_mtok = 1.82
-
 [dialects."openrouter/qwen/qwen3-235b-a22b-thinking-2507"]
 wire = "openai_chat"
 base_url = "https://openrouter.ai/api/v1"
 api_key_env = "OPENROUTER_API_KEY"
 doc_url = "https://openrouter.ai/models"
-context = 131072
-max_output = 117964
+context = 128000
+max_output = 16384
 priced = true
 [dialects."openrouter/qwen/qwen3-235b-a22b-thinking-2507".price]
-input_per_mtok = 0.23
-output_per_mtok = 2.3
+input_per_mtok = 0.45
+output_per_mtok = 3.5
 
 [dialects."openrouter/qwen/qwen3-30b-a3b"]
 wire = "openai_chat"
 base_url = "https://openrouter.ai/api/v1"
 api_key_env = "OPENROUTER_API_KEY"
 doc_url = "https://openrouter.ai/models"
-context = 131072
+context = 40960
 max_output = 16384
 priced = true
 [dialects."openrouter/qwen/qwen3-30b-a3b".price]
 input_per_mtok = 0.12
 output_per_mtok = 0.5
-
-[dialects."openrouter/qwen/qwen3-30b-a3b-thinking-2507"]
-wire = "openai_chat"
-base_url = "https://openrouter.ai/api/v1"
-api_key_env = "OPENROUTER_API_KEY"
-doc_url = "https://openrouter.ai/models"
-context = 81920
-max_output = 32768
-priced = true
-[dialects."openrouter/qwen/qwen3-30b-a3b-thinking-2507".price]
-input_per_mtok = 0.2
-output_per_mtok = 2.4
 
 [dialects."openrouter/qwen/qwen3-32b"]
 wire = "openai_chat"
@@ -4135,53 +5053,17 @@ priced = true
 input_per_mtok = 0.08
 output_per_mtok = 0.28
 
-[dialects."openrouter/qwen/qwen3-8b"]
-wire = "openai_chat"
-base_url = "https://openrouter.ai/api/v1"
-api_key_env = "OPENROUTER_API_KEY"
-doc_url = "https://openrouter.ai/models"
-context = 131072
-max_output = 8192
-priced = true
-[dialects."openrouter/qwen/qwen3-8b".price]
-input_per_mtok = 0.117
-output_per_mtok = 0.455
-
-[dialects."openrouter/qwen/qwen3-max-thinking"]
-wire = "openai_chat"
-base_url = "https://openrouter.ai/api/v1"
-api_key_env = "OPENROUTER_API_KEY"
-doc_url = "https://openrouter.ai/models"
-context = 262144
-max_output = 65536
-priced = true
-[dialects."openrouter/qwen/qwen3-max-thinking".price]
-input_per_mtok = 0.78
-output_per_mtok = 3.9
-
 [dialects."openrouter/qwen/qwen3-next-80b-a3b-thinking"]
 wire = "openai_chat"
 base_url = "https://openrouter.ai/api/v1"
 api_key_env = "OPENROUTER_API_KEY"
 doc_url = "https://openrouter.ai/models"
 context = 262144
-max_output = 32768
+max_output = 235929
 priced = true
 [dialects."openrouter/qwen/qwen3-next-80b-a3b-thinking".price]
 input_per_mtok = 0.15
 output_per_mtok = 1.2
-
-[dialects."openrouter/qwen/qwen3-vl-235b-a22b-thinking"]
-wire = "openai_chat"
-base_url = "https://openrouter.ai/api/v1"
-api_key_env = "OPENROUTER_API_KEY"
-doc_url = "https://openrouter.ai/models"
-context = 131072
-max_output = 32768
-priced = true
-[dialects."openrouter/qwen/qwen3-vl-235b-a22b-thinking".price]
-input_per_mtok = 0.4
-output_per_mtok = 4
 
 [dialects."openrouter/qwen/qwen3-vl-30b-a3b-thinking"]
 wire = "openai_chat"
@@ -4189,23 +5071,11 @@ base_url = "https://openrouter.ai/api/v1"
 api_key_env = "OPENROUTER_API_KEY"
 doc_url = "https://openrouter.ai/models"
 context = 262144
-max_output = 32768
+max_output = 235929
 priced = true
 [dialects."openrouter/qwen/qwen3-vl-30b-a3b-thinking".price]
-input_per_mtok = 0.2
-output_per_mtok = 2.4
-
-[dialects."openrouter/qwen/qwen3-vl-8b-thinking"]
-wire = "openai_chat"
-base_url = "https://openrouter.ai/api/v1"
-api_key_env = "OPENROUTER_API_KEY"
-doc_url = "https://openrouter.ai/models"
-context = 131072
-max_output = 32768
-priced = true
-[dialects."openrouter/qwen/qwen3-vl-8b-thinking".price]
-input_per_mtok = 0.18
-output_per_mtok = 2.1
+input_per_mtok = 0.29
+output_per_mtok = 1
 
 [dialects."openrouter/qwen/qwen3.5-122b-a10b"]
 wire = "openai_chat"
@@ -4213,11 +5083,11 @@ base_url = "https://openrouter.ai/api/v1"
 api_key_env = "OPENROUTER_API_KEY"
 doc_url = "https://openrouter.ai/models"
 context = 262144
-max_output = 81920
+max_output = 65536
 priced = true
 [dialects."openrouter/qwen/qwen3.5-122b-a10b".price]
-input_per_mtok = 0.29
-output_per_mtok = 2.4
+input_per_mtok = 0.26
+output_per_mtok = 2.08
 
 [dialects."openrouter/qwen/qwen3.5-27b"]
 wire = "openai_chat"
@@ -4228,8 +5098,8 @@ context = 262144
 max_output = 65536
 priced = true
 [dialects."openrouter/qwen/qwen3.5-27b".price]
-input_per_mtok = 0.195
-output_per_mtok = 1.56
+input_per_mtok = 0.27
+output_per_mtok = 2.16
 
 [dialects."openrouter/qwen/qwen3.5-35b-a3b"]
 wire = "openai_chat"
@@ -4240,8 +5110,8 @@ context = 262144
 max_output = 235929
 priced = true
 [dialects."openrouter/qwen/qwen3.5-35b-a3b".price]
-input_per_mtok = 0.25
-output_per_mtok = 1.25
+input_per_mtok = 0.15
+output_per_mtok = 1
 
 [dialects."openrouter/qwen/qwen3.5-397b-a17b"]
 wire = "openai_chat"
@@ -4249,11 +5119,11 @@ base_url = "https://openrouter.ai/api/v1"
 api_key_env = "OPENROUTER_API_KEY"
 doc_url = "https://openrouter.ai/models"
 context = 262144
-max_output = 65536
+max_output = 235929
 priced = true
 [dialects."openrouter/qwen/qwen3.5-397b-a17b".price]
-input_per_mtok = 0.39
-output_per_mtok = 2.34
+input_per_mtok = 0.5
+output_per_mtok = 3.6
 
 [dialects."openrouter/qwen/qwen3.5-9b"]
 wire = "openai_chat"
@@ -4261,7 +5131,7 @@ base_url = "https://openrouter.ai/api/v1"
 api_key_env = "OPENROUTER_API_KEY"
 doc_url = "https://openrouter.ai/models"
 context = 262144
-max_output = 235929
+max_output = 32768
 priced = true
 [dialects."openrouter/qwen/qwen3.5-9b".price]
 input_per_mtok = 0.1
@@ -4309,11 +5179,11 @@ base_url = "https://openrouter.ai/api/v1"
 api_key_env = "OPENROUTER_API_KEY"
 doc_url = "https://openrouter.ai/models"
 context = 262144
-max_output = 235929
+max_output = 65536
 priced = true
 [dialects."openrouter/qwen/qwen3.6-27b".price]
-input_per_mtok = 0.6
-output_per_mtok = 3.6
+input_per_mtok = 0.25
+output_per_mtok = 2
 
 [dialects."openrouter/qwen/qwen3.6-35b-a3b"]
 wire = "openai_chat"
@@ -4324,8 +5194,8 @@ context = 262144
 max_output = 235929
 priced = true
 [dialects."openrouter/qwen/qwen3.6-35b-a3b".price]
-input_per_mtok = 0.1
-output_per_mtok = 0.9
+input_per_mtok = 0.15
+output_per_mtok = 1
 
 [dialects."openrouter/qwen/qwen3.6-flash"]
 wire = "openai_chat"
@@ -4338,18 +5208,6 @@ priced = true
 [dialects."openrouter/qwen/qwen3.6-flash".price]
 input_per_mtok = 0.1875
 output_per_mtok = 1.125
-
-[dialects."openrouter/qwen/qwen3.6-max-preview"]
-wire = "openai_chat"
-base_url = "https://openrouter.ai/api/v1"
-api_key_env = "OPENROUTER_API_KEY"
-doc_url = "https://openrouter.ai/models"
-context = 262144
-max_output = 65536
-priced = true
-[dialects."openrouter/qwen/qwen3.6-max-preview".price]
-input_per_mtok = 1.027
-output_per_mtok = 6.162
 
 [dialects."openrouter/qwen/qwen3.6-plus"]
 wire = "openai_chat"
@@ -4417,11 +5275,11 @@ base_url = "https://openrouter.ai/api/v1"
 api_key_env = "OPENROUTER_API_KEY"
 doc_url = "https://openrouter.ai/models"
 context = 1000000
-max_output = 131072
+max_output = 235929
 priced = true
 [dialects."openrouter/qwen/qwen3.8-27b".price]
-input_per_mtok = 0.425
-output_per_mtok = 2.55
+input_per_mtok = 0.24
+output_per_mtok = 2.2
 
 [dialects."openrouter/qwen/qwen3.8-flash"]
 wire = "openai_chat"
@@ -4435,7 +5293,7 @@ priced = true
 input_per_mtok = 0.15
 output_per_mtok = 0.47
 
-[dialects."openrouter/qwen/qwen3.8-max"]
+[dialects."openrouter/qwen/qwen3.8-max-0902"]
 wire = "openai_chat"
 base_url = "https://openrouter.ai/api/v1"
 api_key_env = "OPENROUTER_API_KEY"
@@ -4443,7 +5301,55 @@ doc_url = "https://openrouter.ai/models"
 context = 1000000
 max_output = 131072
 priced = true
-[dialects."openrouter/qwen/qwen3.8-max".price]
+[dialects."openrouter/qwen/qwen3.8-max-0902".price]
+input_per_mtok = 2
+output_per_mtok = 6
+
+[dialects."openrouter/qwen/qwen3.8-max-prime"]
+wire = "openai_chat"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+doc_url = "https://openrouter.ai/models"
+context = 1000000
+max_output = 131072
+priced = true
+[dialects."openrouter/qwen/qwen3.8-max-prime".price]
+input_per_mtok = 4
+output_per_mtok = 12
+
+[dialects."openrouter/qwen/qwen3.8-omni-flash"]
+wire = "openai_chat"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+doc_url = "https://openrouter.ai/models"
+context = 1000000
+max_output = 131072
+priced = true
+[dialects."openrouter/qwen/qwen3.8-omni-flash".price]
+input_per_mtok = 0.15
+output_per_mtok = 0.47
+
+[dialects."openrouter/reflection/beam-1.0-501b-a23b"]
+wire = "openai_chat"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+doc_url = "https://openrouter.ai/models"
+context = 1048576
+max_output = 943718
+priced = true
+[dialects."openrouter/reflection/beam-1.0-501b-a23b".price]
+input_per_mtok = 1
+output_per_mtok = 3
+
+[dialects."openrouter/sakana/fugu-max"]
+wire = "openai_chat"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+doc_url = "https://openrouter.ai/models"
+context = 1000000
+max_output = 128000
+priced = true
+[dialects."openrouter/sakana/fugu-max".price]
 input_per_mtok = 2
 output_per_mtok = 6
 
@@ -4456,6 +5362,18 @@ context = 1000000
 max_output = 128000
 priced = true
 [dialects."openrouter/sakana/fugu-ultra".price]
+input_per_mtok = 5
+output_per_mtok = 30
+
+[dialects."openrouter/sakana/fugu-ultra-v2"]
+wire = "openai_chat"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+doc_url = "https://openrouter.ai/models"
+context = 1000000
+max_output = 128000
+priced = true
+[dialects."openrouter/sakana/fugu-ultra-v2".price]
 input_per_mtok = 5
 output_per_mtok = 30
 
@@ -4494,6 +5412,18 @@ priced = true
 [dialects."openrouter/stepfun/step-3.7-flash".price]
 input_per_mtok = 0.2
 output_per_mtok = 1.15
+
+[dialects."openrouter/stepfun/step-5-preview"]
+wire = "openai_chat"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+doc_url = "https://openrouter.ai/models"
+context = 1048576
+max_output = 64000
+priced = true
+[dialects."openrouter/stepfun/step-5-preview".price]
+input_per_mtok = 1
+output_per_mtok = 2.7
 
 [dialects."openrouter/tencent/hy3"]
 wire = "openai_chat"
@@ -4536,7 +5466,7 @@ wire = "openai_chat"
 base_url = "https://openrouter.ai/api/v1"
 api_key_env = "OPENROUTER_API_KEY"
 doc_url = "https://openrouter.ai/models"
-context = 1048576
+context = 524288
 max_output = 471859
 priced = true
 [dialects."openrouter/thinkingmachines/inkling".price]
@@ -4548,7 +5478,7 @@ wire = "openai_chat"
 base_url = "https://openrouter.ai/api/v1"
 api_key_env = "OPENROUTER_API_KEY"
 doc_url = "https://openrouter.ai/models"
-context = 1048576
+context = 524288
 max_output = 262144
 priced = true
 [dialects."openrouter/thinkingmachines/inkling-small".price]
@@ -4573,6 +5503,18 @@ context = 1048576
 max_output = 262144
 priced = false
 
+[dialects."openrouter/upstage/solar-mini4"]
+wire = "openai_chat"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+doc_url = "https://openrouter.ai/models"
+context = 524288
+max_output = 131072
+priced = true
+[dialects."openrouter/upstage/solar-mini4".price]
+input_per_mtok = 0.05
+output_per_mtok = 0.2
+
 [dialects."openrouter/upstage/solar-pro-3"]
 wire = "openai_chat"
 base_url = "https://openrouter.ai/api/v1"
@@ -4594,8 +5536,8 @@ context = 524288
 max_output = 131072
 priced = true
 [dialects."openrouter/upstage/solar-pro4".price]
-input_per_mtok = 0.03
-output_per_mtok = 0.12
+input_per_mtok = 0.09
+output_per_mtok = 0.36
 
 [dialects."openrouter/x-ai/grok-4.20"]
 wire = "openai_chat"
@@ -4645,6 +5587,18 @@ priced = true
 input_per_mtok = 2
 output_per_mtok = 6
 
+[dialects."openrouter/x-ai/grok-4.7"]
+wire = "openai_chat"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+doc_url = "https://openrouter.ai/models"
+context = 500000
+max_output = 450000
+priced = true
+[dialects."openrouter/x-ai/grok-4.7".price]
+input_per_mtok = 2
+output_per_mtok = 6
+
 [dialects."openrouter/x-ai/grok-build-0.1"]
 wire = "openai_chat"
 base_url = "https://openrouter.ai/api/v1"
@@ -4680,6 +5634,51 @@ priced = true
 [dialects."openrouter/xiaomi/mimo-v2.5-pro".price]
 input_per_mtok = 0.435
 output_per_mtok = 0.87
+
+[dialects."openrouter/xiaomi/mimo-v2.6-flash"]
+wire = "openai_chat"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+doc_url = "https://openrouter.ai/models"
+context = 1050000
+max_output = 131072
+priced = true
+[dialects."openrouter/xiaomi/mimo-v2.6-flash".price]
+input_per_mtok = 0.14
+output_per_mtok = 0.28
+
+[dialects."openrouter/xiaomi/mimo-v2.6-pro"]
+wire = "openai_chat"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+doc_url = "https://openrouter.ai/models"
+context = 1050000
+max_output = 131072
+priced = true
+[dialects."openrouter/xiaomi/mimo-v2.6-pro".price]
+input_per_mtok = 0.435
+output_per_mtok = 0.87
+
+[dialects."openrouter/xiaomi/mimo-v2.6-pro-ultraspeed"]
+wire = "openai_chat"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+doc_url = "https://openrouter.ai/models"
+context = 1048576
+max_output = 131072
+priced = true
+[dialects."openrouter/xiaomi/mimo-v2.6-pro-ultraspeed".price]
+input_per_mtok = 4.35
+output_per_mtok = 8.7
+
+[dialects."openrouter/xingchen-agi/xing4.0-29b-a4b:free"]
+wire = "openai_chat"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+doc_url = "https://openrouter.ai/models"
+context = 262144
+max_output = 235929
+priced = false
 
 [dialects."openrouter/z-ai/glm-4.5"]
 wire = "openai_chat"
@@ -4723,11 +5722,11 @@ base_url = "https://openrouter.ai/api/v1"
 api_key_env = "OPENROUTER_API_KEY"
 doc_url = "https://openrouter.ai/models"
 context = 204800
-max_output = 16384
+max_output = 131072
 priced = true
 [dialects."openrouter/z-ai/glm-4.6".price]
-input_per_mtok = 0.43
-output_per_mtok = 1.75
+input_per_mtok = 0.55
+output_per_mtok = 2.2
 
 [dialects."openrouter/z-ai/glm-4.6v"]
 wire = "openai_chat"
@@ -4750,19 +5749,19 @@ context = 204800
 max_output = 131072
 priced = true
 [dialects."openrouter/z-ai/glm-4.7".price]
-input_per_mtok = 0.4
-output_per_mtok = 1.75
+input_per_mtok = 0.54
+output_per_mtok = 1.98
 
 [dialects."openrouter/z-ai/glm-4.7-flash"]
 wire = "openai_chat"
 base_url = "https://openrouter.ai/api/v1"
 api_key_env = "OPENROUTER_API_KEY"
 doc_url = "https://openrouter.ai/models"
-context = 202752
-max_output = 16384
+context = 200000
+max_output = 117964
 priced = true
 [dialects."openrouter/z-ai/glm-4.7-flash".price]
-input_per_mtok = 0.06
+input_per_mtok = 0.0605
 output_per_mtok = 0.4
 
 [dialects."openrouter/z-ai/glm-5"]
@@ -4771,11 +5770,11 @@ base_url = "https://openrouter.ai/api/v1"
 api_key_env = "OPENROUTER_API_KEY"
 doc_url = "https://openrouter.ai/models"
 context = 204800
-max_output = 128000
+max_output = 131072
 priced = true
 [dialects."openrouter/z-ai/glm-5".price]
-input_per_mtok = 0.6
-output_per_mtok = 1.92
+input_per_mtok = 1
+output_per_mtok = 3.2
 
 [dialects."openrouter/z-ai/glm-5-turbo"]
 wire = "openai_chat"
@@ -4807,44 +5806,35 @@ base_url = "https://openrouter.ai/api/v1"
 api_key_env = "OPENROUTER_API_KEY"
 doc_url = "https://openrouter.ai/models"
 context = 1048576
-max_output = 131072
+max_output = 943718
 priced = true
 [dialects."openrouter/z-ai/glm-5.2".price]
-input_per_mtok = 0.966
-output_per_mtok = 3.036
+input_per_mtok = 0.62
+output_per_mtok = 2.42
 
-[dialects."openrouter/z-ai/glm-5.2:free"]
+[dialects."openrouter/z-ai/glm-5.3-flashx"]
 wire = "openai_chat"
 base_url = "https://openrouter.ai/api/v1"
 api_key_env = "OPENROUTER_API_KEY"
 doc_url = "https://openrouter.ai/models"
-context = 256000
-max_output = 230400
-priced = false
-
-[dialects."openrouter/z-ai/glm-5.3"]
-wire = "openai_chat"
-base_url = "https://openrouter.ai/api/v1"
-api_key_env = "OPENROUTER_API_KEY"
-doc_url = "https://openrouter.ai/models"
-context = 1310720
+context = 1048576
 max_output = 131072
 priced = true
-[dialects."openrouter/z-ai/glm-5.3".price]
-input_per_mtok = 1.4
-output_per_mtok = 4.4
+[dialects."openrouter/z-ai/glm-5.3-flashx".price]
+input_per_mtok = 0.37
+output_per_mtok = 1.25
 
-[dialects."openrouter/z-ai/glm-5.3-flash"]
+[dialects."openrouter/z-ai/glm-5.3-prime"]
 wire = "openai_chat"
 base_url = "https://openrouter.ai/api/v1"
 api_key_env = "OPENROUTER_API_KEY"
 doc_url = "https://openrouter.ai/models"
-context = 1310720
+context = 1000000
 max_output = 131072
 priced = true
-[dialects."openrouter/z-ai/glm-5.3-flash".price]
-input_per_mtok = 0.075
-output_per_mtok = 0.25
+[dialects."openrouter/z-ai/glm-5.3-prime".price]
+input_per_mtok = 2.8
+output_per_mtok = 8.8
 
 [dialects."openrouter/z-ai/glm-5v-turbo"]
 wire = "openai_chat"
@@ -4875,12 +5865,12 @@ wire = "openai_chat"
 base_url = "https://openrouter.ai/api/v1"
 api_key_env = "OPENROUTER_API_KEY"
 doc_url = "https://openrouter.ai/models"
-context = 200000
-max_output = 64000
+context = 1000000
+max_output = 128000
 priced = true
 [dialects."openrouter/~anthropic/claude-haiku-latest".price]
-input_per_mtok = 1
-output_per_mtok = 5
+input_per_mtok = 0.1
+output_per_mtok = 0.5
 
 [dialects."openrouter/~anthropic/claude-opus-latest"]
 wire = "openai_chat"
@@ -4891,8 +5881,8 @@ context = 1000000
 max_output = 128000
 priced = true
 [dialects."openrouter/~anthropic/claude-opus-latest".price]
-input_per_mtok = 5
-output_per_mtok = 25
+input_per_mtok = 4
+output_per_mtok = 20
 
 [dialects."openrouter/~anthropic/claude-sonnet-latest"]
 wire = "openai_chat"
@@ -4906,17 +5896,41 @@ priced = true
 input_per_mtok = 2
 output_per_mtok = 10
 
+[dialects."openrouter/~deepseek/deepseek-flash-latest"]
+wire = "openai_chat"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+doc_url = "https://openrouter.ai/models"
+context = 1048576
+max_output = 943718
+priced = true
+[dialects."openrouter/~deepseek/deepseek-flash-latest".price]
+input_per_mtok = 0.05
+output_per_mtok = 0.15
+
+[dialects."openrouter/~deepseek/deepseek-pro-latest"]
+wire = "openai_chat"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+doc_url = "https://openrouter.ai/models"
+context = 1048576
+max_output = 393216
+priced = true
+[dialects."openrouter/~deepseek/deepseek-pro-latest".price]
+input_per_mtok = 0.225
+output_per_mtok = 8
+
 [dialects."openrouter/~deepseek/deepseek-v4-flash-latest"]
 wire = "openai_chat"
 base_url = "https://openrouter.ai/api/v1"
 api_key_env = "OPENROUTER_API_KEY"
 doc_url = "https://openrouter.ai/models"
-context = 1310720
-max_output = 393216
+context = 1048576
+max_output = 943718
 priced = true
 [dialects."openrouter/~deepseek/deepseek-v4-flash-latest".price]
-input_per_mtok = 0.05
-output_per_mtok = 0.16
+input_per_mtok = 0.0052
+output_per_mtok = 0.12
 
 [dialects."openrouter/~google/gemini-flash-latest"]
 wire = "openai_chat"
@@ -4936,11 +5950,11 @@ base_url = "https://openrouter.ai/api/v1"
 api_key_env = "OPENROUTER_API_KEY"
 doc_url = "https://openrouter.ai/models"
 context = 1048576
-max_output = 65536
+max_output = 943718
 priced = true
 [dialects."openrouter/~google/gemini-pro-latest".price]
 input_per_mtok = 2
-output_per_mtok = 12
+output_per_mtok = 10
 
 [dialects."openrouter/~moonshotai/kimi-latest"]
 wire = "openai_chat"
@@ -4951,10 +5965,10 @@ context = 1048576
 max_output = 943718
 priced = true
 [dialects."openrouter/~moonshotai/kimi-latest".price]
-input_per_mtok = 2.55
-output_per_mtok = 12.75
+input_per_mtok = 0.238
+output_per_mtok = 16
 
-[dialects."openrouter/~openai/gpt-latest"]
+[dialects."openrouter/~openai/gpt-astra-latest"]
 wire = "openai_chat"
 base_url = "https://openrouter.ai/api/v1"
 api_key_env = "OPENROUTER_API_KEY"
@@ -4962,9 +5976,21 @@ doc_url = "https://openrouter.ai/models"
 context = 1050000
 max_output = 128000
 priced = true
-[dialects."openrouter/~openai/gpt-latest".price]
-input_per_mtok = 2
-output_per_mtok = 10
+[dialects."openrouter/~openai/gpt-astra-latest".price]
+input_per_mtok = 10
+output_per_mtok = 50
+
+[dialects."openrouter/~openai/gpt-luna-latest"]
+wire = "openai_chat"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+doc_url = "https://openrouter.ai/models"
+context = 1050000
+max_output = 128000
+priced = true
+[dialects."openrouter/~openai/gpt-luna-latest".price]
+input_per_mtok = 0.1
+output_per_mtok = 0.5
 
 [dialects."openrouter/~openai/gpt-mini-latest"]
 wire = "openai_chat"
@@ -4977,6 +6003,30 @@ priced = true
 [dialects."openrouter/~openai/gpt-mini-latest".price]
 input_per_mtok = 0.75
 output_per_mtok = 4.5
+
+[dialects."openrouter/~openai/gpt-sol-latest"]
+wire = "openai_chat"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+doc_url = "https://openrouter.ai/models"
+context = 1050000
+max_output = 128000
+priced = true
+[dialects."openrouter/~openai/gpt-sol-latest".price]
+input_per_mtok = 2
+output_per_mtok = 10
+
+[dialects."openrouter/~openai/gpt-terra-latest"]
+wire = "openai_chat"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+doc_url = "https://openrouter.ai/models"
+context = 1050000
+max_output = 128000
+priced = true
+[dialects."openrouter/~openai/gpt-terra-latest".price]
+input_per_mtok = 2
+output_per_mtok = 12
 
 [dialects."openrouter/~x-ai/grok-latest"]
 wire = "openai_chat"
@@ -4995,33 +6045,24 @@ wire = "openai_chat"
 base_url = "https://openrouter.ai/api/v1"
 api_key_env = "OPENROUTER_API_KEY"
 doc_url = "https://openrouter.ai/models"
-context = 1310720
-max_output = 131072
+context = 1048576
+max_output = 943718
 priced = true
 [dialects."openrouter/~z-ai/glm-flash-latest".price]
-input_per_mtok = 0.075
-output_per_mtok = 0.25
+input_per_mtok = 0.0352
+output_per_mtok = 0.2
 
 [dialects."openrouter/~z-ai/glm-latest"]
 wire = "openai_chat"
 base_url = "https://openrouter.ai/api/v1"
 api_key_env = "OPENROUTER_API_KEY"
 doc_url = "https://openrouter.ai/models"
-context = 1310720
+context = 1048576
 max_output = 943718
 priced = true
 [dialects."openrouter/~z-ai/glm-latest".price]
-input_per_mtok = 1.17
-output_per_mtok = 3.96
-
-[dialects."scnet-token-plan/DeepSeek-V3.2"]
-wire = "openai_chat"
-base_url = "https://api.scnet.cn/api/llm/v1"
-api_key_env = "SCNET_API_KEY"
-doc_url = "https://www.scnet.cn/ac/openapi/doc/2.0/moduleapi/plans/token-plan.html"
-context = 128000
-max_output = 64000
-priced = false
+input_per_mtok = 0.04
+output_per_mtok = 6
 
 [dialects."scnet-token-plan/DeepSeek-V4-Flash"]
 wire = "openai_chat"
@@ -5059,6 +6100,15 @@ context = 1000000
 max_output = 384000
 priced = false
 
+[dialects."scnet-token-plan/DeepSeek-V4.1-Flash"]
+wire = "openai_chat"
+base_url = "https://api.scnet.cn/api/llm/v1"
+api_key_env = "SCNET_API_KEY"
+doc_url = "https://www.scnet.cn/ac/openapi/doc/2.0/moduleapi/plans/token-plan.html"
+context = 1000000
+max_output = 384000
+priced = false
+
 [dialects."scnet-token-plan/GLM-5"]
 wire = "openai_chat"
 base_url = "https://api.scnet.cn/api/llm/v1"
@@ -5078,6 +6128,24 @@ max_output = 131072
 priced = false
 
 [dialects."scnet-token-plan/GLM-5.2"]
+wire = "openai_chat"
+base_url = "https://api.scnet.cn/api/llm/v1"
+api_key_env = "SCNET_API_KEY"
+doc_url = "https://www.scnet.cn/ac/openapi/doc/2.0/moduleapi/plans/token-plan.html"
+context = 1000000
+max_output = 131072
+priced = false
+
+[dialects."scnet-token-plan/GLM-5.3"]
+wire = "openai_chat"
+base_url = "https://api.scnet.cn/api/llm/v1"
+api_key_env = "SCNET_API_KEY"
+doc_url = "https://www.scnet.cn/ac/openapi/doc/2.0/moduleapi/plans/token-plan.html"
+context = 1000000
+max_output = 131072
+priced = false
+
+[dialects."scnet-token-plan/GLM-5.3-Flash"]
 wire = "openai_chat"
 base_url = "https://api.scnet.cn/api/llm/v1"
 api_key_env = "SCNET_API_KEY"
@@ -5122,15 +6190,6 @@ context = 1048576
 max_output = 131072
 priced = false
 
-[dialects."scnet-token-plan/MiMo-V2.5-Pro"]
-wire = "openai_chat"
-base_url = "https://api.scnet.cn/api/llm/v1"
-api_key_env = "SCNET_API_KEY"
-doc_url = "https://www.scnet.cn/ac/openapi/doc/2.0/moduleapi/plans/token-plan.html"
-context = 1048576
-max_output = 131072
-priced = false
-
 [dialects."scnet-token-plan/MiniMax-M2.5"]
 wire = "openai_chat"
 base_url = "https://api.scnet.cn/api/llm/v1"
@@ -5156,6 +6215,15 @@ api_key_env = "SCNET_API_KEY"
 doc_url = "https://www.scnet.cn/ac/openapi/doc/2.0/moduleapi/plans/token-plan.html"
 context = 1048576
 max_output = 512000
+priced = false
+
+[dialects."scnet-token-plan/Qwen3.8-Flash"]
+wire = "openai_chat"
+base_url = "https://api.scnet.cn/api/llm/v1"
+api_key_env = "SCNET_API_KEY"
+doc_url = "https://www.scnet.cn/ac/openapi/doc/2.0/moduleapi/plans/token-plan.html"
+context = 1000000
+max_output = 131072
 priced = false
 
 [dialects."scnet-token-plan/Qwen3.8-Max"]
@@ -5194,6 +6262,15 @@ context = 256000
 max_output = 256000
 priced = false
 
+[dialects."stepfun-ai-step-plan/step-5-preview"]
+wire = "openai_chat"
+base_url = "https://api.stepfun.ai/step_plan/v1"
+api_key_env = "STEPFUN_API_KEY"
+doc_url = "https://platform.stepfun.ai/docs/en/step-plan/integrations/reasoning-api"
+context = 1000000
+max_output = 65536
+priced = false
+
 [dialects."stepfun-step-plan/step-3.5-flash"]
 wire = "openai_chat"
 base_url = "https://api.stepfun.com/step_plan/v1"
@@ -5219,6 +6296,15 @@ api_key_env = "STEPFUN_API_KEY"
 doc_url = "https://platform.stepfun.com/docs/zh/step-plan/integrations/reasoning-api"
 context = 256000
 max_output = 256000
+priced = false
+
+[dialects."stepfun-step-plan/step-5-preview"]
+wire = "openai_chat"
+base_url = "https://api.stepfun.com/step_plan/v1"
+api_key_env = "STEPFUN_API_KEY"
+doc_url = "https://platform.stepfun.com/docs/zh/step-plan/integrations/reasoning-api"
+context = 1000000
+max_output = 65536
 priced = false
 
 [dialects."stepfun-step-plan/step-router-v1"]
@@ -5308,7 +6394,7 @@ base_url = "https://api.lkeap.cloud.tencent.com/plan/v3"
 api_key_env = "TENCENT_TOKEN_PLAN_API_KEY"
 doc_url = "https://cloud.tencent.com/document/product/1823/130060"
 context = 256000
-max_output = 64000
+max_output = 128000
 priced = false
 
 [dialects."tencent-token-plan/hy4-preview"]
@@ -5328,8 +6414,8 @@ wire = "openai_chat"
 base_url = "https://api.code.umans.ai/v1"
 api_key_env = "UMANS_AI_CODING_PLAN_API_KEY"
 doc_url = "https://app.umans.ai/offers/code/docs"
-context = 262144
-max_output = 262144
+context = 1048576
+max_output = 131071
 priced = false
 
 [dialects."umans-ai-coding-plan/umans-deepseek-v4-flash-0731"]
@@ -5341,7 +6427,7 @@ context = 1048576
 max_output = 393215
 priced = false
 
-[dialects."umans-ai-coding-plan/umans-deepseek-v4-pro-0813"]
+[dialects."umans-ai-coding-plan/umans-deepseek-v4.1-flash"]
 wire = "openai_chat"
 base_url = "https://api.code.umans.ai/v1"
 api_key_env = "UMANS_AI_CODING_PLAN_API_KEY"
@@ -5359,22 +6445,22 @@ context = 262144
 max_output = 262144
 priced = false
 
-[dialects."umans-ai-coding-plan/umans-glm-5.2"]
+[dialects."umans-ai-coding-plan/umans-glm-5.3"]
 wire = "openai_chat"
 base_url = "https://api.code.umans.ai/v1"
 api_key_env = "UMANS_AI_CODING_PLAN_API_KEY"
 doc_url = "https://app.umans.ai/offers/code/docs"
-context = 405504
-max_output = 131072
+context = 1048576
+max_output = 131071
 priced = false
 
-[dialects."umans-ai-coding-plan/umans-kimi-k2.7"]
+[dialects."umans-ai-coding-plan/umans-glm-5.3-flash"]
 wire = "openai_chat"
 base_url = "https://api.code.umans.ai/v1"
 api_key_env = "UMANS_AI_CODING_PLAN_API_KEY"
 doc_url = "https://app.umans.ai/offers/code/docs"
-context = 262144
-max_output = 262144
+context = 1048576
+max_output = 131071
 priced = false
 
 [dialects."umans-ai-coding-plan/umans-kimi-k3"]
@@ -5449,6 +6535,15 @@ context = 1000000
 max_output = 131072
 priced = false
 
+[dialects."volcengine-coding-plan/glm-5.3-flash"]
+wire = "openai_chat"
+base_url = "https://ark.cn-beijing.volces.com/api/coding/v3"
+api_key_env = "ARK_CODING_PLAN_API_KEY"
+doc_url = "https://www.volcengine.com/docs/82379/1928261"
+context = 1000000
+max_output = 131072
+priced = false
+
 [dialects."volcengine-coding-plan/kimi-k2.7-code"]
 wire = "openai_chat"
 base_url = "https://ark.cn-beijing.volces.com/api/coding/v3"
@@ -5456,6 +6551,15 @@ api_key_env = "ARK_CODING_PLAN_API_KEY"
 doc_url = "https://www.volcengine.com/docs/82379/1928261"
 context = 262144
 max_output = 262144
+priced = false
+
+[dialects."volcengine-coding-plan/kimi-k3"]
+wire = "openai_chat"
+base_url = "https://ark.cn-beijing.volces.com/api/coding/v3"
+api_key_env = "ARK_CODING_PLAN_API_KEY"
+doc_url = "https://www.volcengine.com/docs/82379/1928261"
+context = 1048576
+max_output = 131072
 priced = false
 
 [dialects."volcengine-coding-plan/minimax-m3"]
@@ -5494,6 +6598,24 @@ context = 1048576
 max_output = 131072
 priced = false
 
+[dialects."xiaomi-token-plan-ams/mimo-v2.6-flash"]
+wire = "openai_chat"
+base_url = "https://token-plan-ams.xiaomimimo.com/v1"
+api_key_env = "XIAOMI_API_KEY"
+doc_url = "https://platform.xiaomimimo.com/#/docs"
+context = 1048576
+max_output = 131072
+priced = false
+
+[dialects."xiaomi-token-plan-ams/mimo-v2.6-pro"]
+wire = "openai_chat"
+base_url = "https://token-plan-ams.xiaomimimo.com/v1"
+api_key_env = "XIAOMI_API_KEY"
+doc_url = "https://platform.xiaomimimo.com/#/docs"
+context = 1048576
+max_output = 131072
+priced = false
+
 [dialects."xiaomi-token-plan-cn/mimo-v2-pro"]
 wire = "openai_chat"
 base_url = "https://token-plan-cn.xiaomimimo.com/v1"
@@ -5521,6 +6643,24 @@ context = 1048576
 max_output = 131072
 priced = false
 
+[dialects."xiaomi-token-plan-cn/mimo-v2.6-flash"]
+wire = "openai_chat"
+base_url = "https://token-plan-cn.xiaomimimo.com/v1"
+api_key_env = "XIAOMI_API_KEY"
+doc_url = "https://platform.xiaomimimo.com/#/docs"
+context = 1048576
+max_output = 131072
+priced = false
+
+[dialects."xiaomi-token-plan-cn/mimo-v2.6-pro"]
+wire = "openai_chat"
+base_url = "https://token-plan-cn.xiaomimimo.com/v1"
+api_key_env = "XIAOMI_API_KEY"
+doc_url = "https://platform.xiaomimimo.com/#/docs"
+context = 1048576
+max_output = 131072
+priced = false
+
 [dialects."xiaomi-token-plan-sgp/mimo-v2-pro"]
 wire = "openai_chat"
 base_url = "https://token-plan-sgp.xiaomimimo.com/v1"
@@ -5540,6 +6680,24 @@ max_output = 131072
 priced = false
 
 [dialects."xiaomi-token-plan-sgp/mimo-v2.5-pro"]
+wire = "openai_chat"
+base_url = "https://token-plan-sgp.xiaomimimo.com/v1"
+api_key_env = "XIAOMI_API_KEY"
+doc_url = "https://platform.xiaomimimo.com/#/docs"
+context = 1048576
+max_output = 131072
+priced = false
+
+[dialects."xiaomi-token-plan-sgp/mimo-v2.6-flash"]
+wire = "openai_chat"
+base_url = "https://token-plan-sgp.xiaomimimo.com/v1"
+api_key_env = "XIAOMI_API_KEY"
+doc_url = "https://platform.xiaomimimo.com/#/docs"
+context = 1048576
+max_output = 131072
+priced = false
+
+[dialects."xiaomi-token-plan-sgp/mimo-v2.6-pro"]
 wire = "openai_chat"
 base_url = "https://token-plan-sgp.xiaomimimo.com/v1"
 api_key_env = "XIAOMI_API_KEY"
@@ -5616,6 +6774,15 @@ priced = true
 [dialects."zai/glm-4.6v".price]
 input_per_mtok = 0.3
 output_per_mtok = 0.9
+
+[dialects."zai/glm-4.6v-flash"]
+wire = "openai_chat"
+base_url = "https://api.z.ai/api/paas/v4"
+api_key_env = "ZHIPU_API_KEY"
+doc_url = "https://docs.z.ai/guides/overview/pricing"
+context = 128000
+max_output = 32768
+priced = false
 
 [dialects."zai/glm-4.7"]
 wire = "openai_chat"
@@ -5698,7 +6865,7 @@ priced = true
 input_per_mtok = 1.4
 output_per_mtok = 4.4
 
-[dialects."zai/glm-5.3"]
+[dialects."zai/glm-5.3-flashx"]
 wire = "openai_chat"
 base_url = "https://api.z.ai/api/paas/v4"
 api_key_env = "ZHIPU_API_KEY"
@@ -5706,21 +6873,9 @@ doc_url = "https://docs.z.ai/guides/overview/pricing"
 context = 1000000
 max_output = 131072
 priced = true
-[dialects."zai/glm-5.3".price]
-input_per_mtok = 1.4
-output_per_mtok = 4.4
-
-[dialects."zai/glm-5.3-flash"]
-wire = "openai_chat"
-base_url = "https://api.z.ai/api/paas/v4"
-api_key_env = "ZHIPU_API_KEY"
-doc_url = "https://docs.z.ai/guides/overview/pricing"
-context = 1000000
-max_output = 131072
-priced = true
-[dialects."zai/glm-5.3-flash".price]
-input_per_mtok = 0.075
-output_per_mtok = 0.25
+[dialects."zai/glm-5.3-flashx".price]
+input_per_mtok = 0.37
+output_per_mtok = 1.25
 
 [dialects."zai/glm-5v-turbo"]
 wire = "openai_chat"
@@ -5770,29 +6925,245 @@ context = 1000000
 max_output = 131072
 priced = false
 
-[dialects."zai-coding-plan/glm-5.3"]
-wire = "openai_chat"
-base_url = "https://api.z.ai/api/coding/paas/v4"
-api_key_env = "ZHIPU_API_KEY"
-doc_url = "https://docs.z.ai/devpack/overview"
-context = 1000000
-max_output = 131072
-priced = false
-
-[dialects."zai-coding-plan/glm-5.3-flash"]
-wire = "openai_chat"
-base_url = "https://api.z.ai/api/coding/paas/v4"
-api_key_env = "ZHIPU_API_KEY"
-doc_url = "https://docs.z.ai/devpack/overview"
-context = 1000000
-max_output = 131072
-priced = false
-
 [dialects."zai-coding-plan/glm-5.3-highspeed"]
 wire = "openai_chat"
 base_url = "https://api.z.ai/api/coding/paas/v4"
 api_key_env = "ZHIPU_API_KEY"
 doc_url = "https://docs.z.ai/devpack/overview"
+context = 1000000
+max_output = 131072
+priced = false
+
+[dialects."zhipuai/glm-4.5"]
+wire = "openai_chat"
+base_url = "https://open.bigmodel.cn/api/paas/v4"
+api_key_env = "ZHIPU_API_KEY"
+doc_url = "https://docs.z.ai/guides/overview/pricing"
+context = 131072
+max_output = 98304
+priced = true
+[dialects."zhipuai/glm-4.5".price]
+input_per_mtok = 0.6
+output_per_mtok = 2.2
+
+[dialects."zhipuai/glm-4.5-air"]
+wire = "openai_chat"
+base_url = "https://open.bigmodel.cn/api/paas/v4"
+api_key_env = "ZHIPU_API_KEY"
+doc_url = "https://docs.z.ai/guides/overview/pricing"
+context = 131072
+max_output = 98304
+priced = true
+[dialects."zhipuai/glm-4.5-air".price]
+input_per_mtok = 0.2
+output_per_mtok = 1.1
+
+[dialects."zhipuai/glm-4.5-flash"]
+wire = "openai_chat"
+base_url = "https://open.bigmodel.cn/api/paas/v4"
+api_key_env = "ZHIPU_API_KEY"
+doc_url = "https://docs.z.ai/guides/overview/pricing"
+context = 131072
+max_output = 98304
+priced = false
+
+[dialects."zhipuai/glm-4.5v"]
+wire = "openai_chat"
+base_url = "https://open.bigmodel.cn/api/paas/v4"
+api_key_env = "ZHIPU_API_KEY"
+doc_url = "https://docs.z.ai/guides/overview/pricing"
+context = 64000
+max_output = 16384
+priced = true
+[dialects."zhipuai/glm-4.5v".price]
+input_per_mtok = 0.6
+output_per_mtok = 1.8
+
+[dialects."zhipuai/glm-4.6"]
+wire = "openai_chat"
+base_url = "https://open.bigmodel.cn/api/paas/v4"
+api_key_env = "ZHIPU_API_KEY"
+doc_url = "https://docs.z.ai/guides/overview/pricing"
+context = 204800
+max_output = 131072
+priced = true
+[dialects."zhipuai/glm-4.6".price]
+input_per_mtok = 0.6
+output_per_mtok = 2.2
+
+[dialects."zhipuai/glm-4.6v"]
+wire = "openai_chat"
+base_url = "https://open.bigmodel.cn/api/paas/v4"
+api_key_env = "ZHIPU_API_KEY"
+doc_url = "https://docs.z.ai/guides/overview/pricing"
+context = 128000
+max_output = 32768
+priced = true
+[dialects."zhipuai/glm-4.6v".price]
+input_per_mtok = 0.3
+output_per_mtok = 0.9
+
+[dialects."zhipuai/glm-4.6v-flash"]
+wire = "openai_chat"
+base_url = "https://open.bigmodel.cn/api/paas/v4"
+api_key_env = "ZHIPU_API_KEY"
+doc_url = "https://docs.z.ai/guides/overview/pricing"
+context = 128000
+max_output = 32768
+priced = false
+
+[dialects."zhipuai/glm-4.7"]
+wire = "openai_chat"
+base_url = "https://open.bigmodel.cn/api/paas/v4"
+api_key_env = "ZHIPU_API_KEY"
+doc_url = "https://docs.z.ai/guides/overview/pricing"
+context = 204800
+max_output = 131072
+priced = true
+[dialects."zhipuai/glm-4.7".price]
+input_per_mtok = 0.6
+output_per_mtok = 2.2
+
+[dialects."zhipuai/glm-4.7-flash"]
+wire = "openai_chat"
+base_url = "https://open.bigmodel.cn/api/paas/v4"
+api_key_env = "ZHIPU_API_KEY"
+doc_url = "https://docs.z.ai/guides/overview/pricing"
+context = 200000
+max_output = 131072
+priced = false
+
+[dialects."zhipuai/glm-4.7-flashx"]
+wire = "openai_chat"
+base_url = "https://open.bigmodel.cn/api/paas/v4"
+api_key_env = "ZHIPU_API_KEY"
+doc_url = "https://docs.z.ai/guides/overview/pricing"
+context = 200000
+max_output = 131072
+priced = true
+[dialects."zhipuai/glm-4.7-flashx".price]
+input_per_mtok = 0.07
+output_per_mtok = 0.4
+
+[dialects."zhipuai/glm-5"]
+wire = "openai_chat"
+base_url = "https://open.bigmodel.cn/api/paas/v4"
+api_key_env = "ZHIPU_API_KEY"
+doc_url = "https://docs.z.ai/guides/overview/pricing"
+context = 204800
+max_output = 131072
+priced = true
+[dialects."zhipuai/glm-5".price]
+input_per_mtok = 1
+output_per_mtok = 3.2
+
+[dialects."zhipuai/glm-5.1"]
+wire = "openai_chat"
+base_url = "https://open.bigmodel.cn/api/paas/v4"
+api_key_env = "ZHIPU_API_KEY"
+doc_url = "https://docs.z.ai/guides/overview/pricing"
+context = 200000
+max_output = 131072
+priced = true
+[dialects."zhipuai/glm-5.1".price]
+input_per_mtok = 1.4
+output_per_mtok = 4.4
+
+[dialects."zhipuai/glm-5.2"]
+wire = "openai_chat"
+base_url = "https://open.bigmodel.cn/api/paas/v4"
+api_key_env = "ZHIPU_API_KEY"
+doc_url = "https://docs.z.ai/guides/overview/pricing"
+context = 1000000
+max_output = 131072
+priced = true
+[dialects."zhipuai/glm-5.2".price]
+input_per_mtok = 1.4
+output_per_mtok = 4.4
+
+[dialects."zhipuai/glm-5.3"]
+wire = "openai_chat"
+base_url = "https://open.bigmodel.cn/api/paas/v4"
+api_key_env = "ZHIPU_API_KEY"
+doc_url = "https://docs.z.ai/guides/overview/pricing"
+context = 1000000
+max_output = 131072
+priced = true
+[dialects."zhipuai/glm-5.3".price]
+input_per_mtok = 1.4
+output_per_mtok = 4.4
+
+[dialects."zhipuai/glm-5.3-flash"]
+wire = "openai_chat"
+base_url = "https://open.bigmodel.cn/api/paas/v4"
+api_key_env = "ZHIPU_API_KEY"
+doc_url = "https://docs.z.ai/guides/overview/pricing"
+context = 1000000
+max_output = 131072
+priced = true
+[dialects."zhipuai/glm-5.3-flash".price]
+input_per_mtok = 0.15
+output_per_mtok = 0.5
+
+[dialects."zhipuai/glm-5.3-flashx"]
+wire = "openai_chat"
+base_url = "https://open.bigmodel.cn/api/paas/v4"
+api_key_env = "ZHIPU_API_KEY"
+doc_url = "https://docs.z.ai/guides/overview/pricing"
+context = 1000000
+max_output = 131072
+priced = true
+[dialects."zhipuai/glm-5.3-flashx".price]
+input_per_mtok = 0.37
+output_per_mtok = 1.25
+
+[dialects."zhipuai/glm-5v-turbo"]
+wire = "openai_chat"
+base_url = "https://open.bigmodel.cn/api/paas/v4"
+api_key_env = "ZHIPU_API_KEY"
+doc_url = "https://docs.z.ai/guides/overview/pricing"
+context = 200000
+max_output = 131072
+priced = true
+[dialects."zhipuai/glm-5v-turbo".price]
+input_per_mtok = 5
+output_per_mtok = 22
+
+[dialects."zhipuai-coding-plan/glm-4.6v"]
+wire = "openai_chat"
+base_url = "https://open.bigmodel.cn/api/coding/paas/v4"
+api_key_env = "ZHIPU_API_KEY"
+doc_url = "https://docs.bigmodel.cn/cn/coding-plan/overview"
+context = 128000
+max_output = 32768
+priced = true
+[dialects."zhipuai-coding-plan/glm-4.6v".price]
+input_per_mtok = 0.3
+output_per_mtok = 0.9
+
+[dialects."zhipuai-coding-plan/glm-5.3"]
+wire = "openai_chat"
+base_url = "https://open.bigmodel.cn/api/coding/paas/v4"
+api_key_env = "ZHIPU_API_KEY"
+doc_url = "https://docs.bigmodel.cn/cn/coding-plan/overview"
+context = 1000000
+max_output = 131072
+priced = false
+
+[dialects."zhipuai-coding-plan/glm-5.3-flash"]
+wire = "openai_chat"
+base_url = "https://open.bigmodel.cn/api/coding/paas/v4"
+api_key_env = "ZHIPU_API_KEY"
+doc_url = "https://docs.bigmodel.cn/cn/coding-plan/overview"
+context = 1000000
+max_output = 131072
+priced = false
+
+[dialects."zhipuai-coding-plan/glm-5.3-highspeed"]
+wire = "openai_chat"
+base_url = "https://open.bigmodel.cn/api/coding/paas/v4"
+api_key_env = "ZHIPU_API_KEY"
+doc_url = "https://docs.bigmodel.cn/cn/coding-plan/overview"
 context = 1000000
 max_output = 131072
 priced = false

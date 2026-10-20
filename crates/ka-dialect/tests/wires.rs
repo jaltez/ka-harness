@@ -183,6 +183,7 @@ fn request(dialect: Dialect, system: &str) -> SpeakRequest {
         tools: Vec::new(),
         token: Some("k-test-token".to_string()),
         cache_key: None,
+        session_id: None,
         schema: None,
         native_search: false,
     }
@@ -239,6 +240,38 @@ async fn openai_basic_stream_text_and_usage() {
         "system role expected:\n{raw}"
     );
     assert!(raw.contains("be brief"), "{raw}");
+}
+
+/// Vendor-declared session header (opencode-go routes by conversation):
+/// present for a mapped vendor with a session id, absent otherwise.
+#[tokio::test]
+async fn openai_session_header_rides_mapped_vendor_only() {
+    let (addr, captured) = serve_sse(OPENAI_BASIC).await;
+    let dialect = dialect_for("openai_chat", addr, "");
+    let mut req = request(dialect, "be brief");
+    req.model_id = "opencode-go/kimi-k3".to_string();
+    req.session_id = Some("sess-42".to_string());
+    let _ = collect(&OpenaiChat::new(), req).await;
+    let raw = captured.lock().clone().unwrap();
+    assert!(
+        raw.contains("x-opencode-session: sess-42"),
+        "session header missing for opencode-go:\n{raw}"
+    );
+    assert!(
+        raw.to_lowercase().contains("user-agent: ka/"),
+        "wire must identify itself with the ka user agent:\n{raw}"
+    );
+
+    // unmapped vendor: the id must not leak under any header name
+    let (addr2, captured2) = serve_sse(OPENAI_BASIC).await;
+    let mut req2 = request(dialect_for("openai_chat", addr2, ""), "be brief");
+    req2.session_id = Some("sess-42".to_string());
+    let _ = collect(&OpenaiChat::new(), req2).await;
+    let raw2 = captured2.lock().clone().unwrap();
+    assert!(
+        !raw2.contains("x-opencode-session"),
+        "unexpected session header for unmapped vendor:\n{raw2}"
+    );
 }
 
 #[tokio::test]

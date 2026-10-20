@@ -174,6 +174,10 @@ pub struct SpeakRequest {
     pub token: Option<String>,
     /// Cache key for providers that take one.
     pub cache_key: Option<String>,
+    /// Stable per-conversation id (the active strand) — the wire sends
+    /// it under the header named by `providers::session_header` for
+    /// gateways that route on it (opencode-go: `x-opencode-session`).
+    pub session_id: Option<String>,
     /// Structured-output schema the reply must satisfy (None = free-form).
     pub schema: Option<serde_json::Value>,
     /// The voice's go-ahead for provider-native server-side search:

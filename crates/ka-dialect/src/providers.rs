@@ -129,6 +129,13 @@ pub const PROVIDERS: &[Provider] = &[
         note: "NVIDIA AI Foundation models",
     },
     Provider {
+        name: "opencode-go",
+        wire: Wire::OpenaiChat,
+        base_url: "https://opencode.ai/inference/go/openai/v1",
+        key_env: Some("OPENCODE_API_KEY"),
+        note: "OpenCode Go subscription gateway — open coding models",
+    },
+    Provider {
         name: "openrouter",
         wire: Wire::OpenaiChat,
         base_url: "https://openrouter.ai/api/v1",
@@ -212,6 +219,18 @@ pub fn find(vendor: &str) -> Option<&'static Provider> {
     PROVIDERS.iter().find(|p| p.name == canonical)
 }
 
+/// Extra per-request header some vendors require on every call, when
+/// any — the value is the request's session id (`SpeakRequest.session_id`,
+/// usually the active strand). opencode-go routes by conversation and
+/// rejects requests without a stable per-session id in
+/// `x-opencode-session` (HTTP 400 `MissingSessionID`, observed live).
+pub fn session_header(vendor: &str) -> Option<&'static str> {
+    match vendor {
+        "opencode-go" => Some("x-opencode-session"),
+        _ => None,
+    }
+}
+
 /// Synthesize a dialect for `provider/model` when the catalog has no row.
 /// Context window unknown (0); conservative defaults elsewhere.
 pub fn synthetic_dialect(provider: &Provider, model: &str) -> Dialect {
@@ -251,6 +270,7 @@ mod tests {
             "groq",
             "deepseek",
             "qwen",
+            "opencode-go",
             "openrouter",
             "ollama",
         ] {
@@ -278,6 +298,27 @@ mod tests {
         assert_eq!(d.api_key_env.as_deref(), Some("GROQ_API_KEY"));
         assert_eq!(d.wire, Wire::OpenaiChat);
         assert_eq!(d.wire_model.as_deref(), Some("llama-3.3-70b-versatile"));
+    }
+
+    #[test]
+    fn opencode_go_selector_synthesizes_without_catalog_row() {
+        // any opencode-go/<model> selector must resolve even when the
+        // catalog has no row (gateway models churn faster than seeds)
+        let p = find("opencode-go").unwrap();
+        let d = synthetic_dialect(p, "some-future-model");
+        assert_eq!(
+            d.base_url.as_deref(),
+            Some("https://opencode.ai/inference/go/openai/v1")
+        );
+        assert_eq!(d.api_key_env.as_deref(), Some("OPENCODE_API_KEY"));
+        assert_eq!(d.wire, Wire::OpenaiChat);
+    }
+
+    #[test]
+    fn session_header_maps_opencode_go_only() {
+        assert_eq!(session_header("opencode-go"), Some("x-opencode-session"));
+        assert_eq!(session_header("openai"), None);
+        assert_eq!(session_header("openrouter"), None);
     }
 
     #[test]

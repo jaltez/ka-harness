@@ -361,6 +361,30 @@ mod tests {
     }
 
     #[test]
+    fn opencode_go_rows_merge_from_overlay() {
+        let c = Catalog::embedded();
+        let k = c
+            .get("opencode-go/kimi-k3")
+            .expect("opencode-go/kimi-k3 row");
+        assert_eq!(k.wire, Wire::OpenaiChat);
+        assert_eq!(
+            k.base_url.as_deref(),
+            Some("https://opencode.ai/inference/go/openai/v1")
+        );
+        assert_eq!(k.api_key_env.as_deref(), Some("OPENCODE_API_KEY"));
+        assert_eq!(k.context, 1_048_576);
+        assert_eq!(k.max_output, 131_072);
+        assert!(k.priced, "OpenCode Go publishes real per-token pricing");
+        assert_eq!(k.price.input_per_mtok, 3.0);
+        assert_eq!(k.price.output_per_mtok, 15.0);
+        // free preview rows carry 0/0 costs — not per-token pricing
+        let free = c
+            .get("opencode-go/cat-jam-free")
+            .expect("opencode-go/cat-jam-free row");
+        assert!(!free.priced);
+    }
+
+    #[test]
     fn embedded_catalog_parses() {
         let c = Catalog::embedded();
         assert!(c.dialects.len() >= 3);

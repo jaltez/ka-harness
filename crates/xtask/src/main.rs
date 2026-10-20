@@ -926,6 +926,7 @@ fn models_sync() -> i32 {
             "meta",
             "minimax",
             "modelscope",
+            "opencode-go",
         ];
         const ROUTERS: &[&str] = &["openrouter", "huggingface", "nvidia"];
         let is_plan = pid.contains("plan");

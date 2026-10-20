@@ -25,6 +25,7 @@ impl OpenaiResponses {
     pub fn new() -> Self {
         let client = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
+            .user_agent(concat!("ka/", env!("CARGO_PKG_VERSION")))
             .build()
             .unwrap_or_default();
         Self { client }
