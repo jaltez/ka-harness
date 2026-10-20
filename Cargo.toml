@@ -17,20 +17,20 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 license = "MIT"
 rust-version = "1.85"
 repository = "https://github.com/jaltez/ka-harness"
 
 [workspace.dependencies]
-ka-protocol = { path = "crates/ka-protocol", version = "0.3.0" }
-ka-strand = { path = "crates/ka-strand", version = "0.3.0" }
-ka-dialect = { path = "crates/ka-dialect", version = "0.3.0" }
-ka-engine = { path = "crates/ka-engine", version = "0.3.0" }
-ka-term = { path = "crates/ka-term", version = "0.3.0" }
-ka-index = { path = "crates/ka-index", version = "0.3.0" }
-ka-sandbox = { path = "crates/ka-sandbox", version = "0.3.0" }
+ka-protocol = { path = "crates/ka-protocol", version = "0.4.0" }
+ka-strand = { path = "crates/ka-strand", version = "0.4.0" }
+ka-dialect = { path = "crates/ka-dialect", version = "0.4.0" }
+ka-engine = { path = "crates/ka-engine", version = "0.4.0" }
+ka-term = { path = "crates/ka-term", version = "0.4.0" }
+ka-index = { path = "crates/ka-index", version = "0.4.0" }
+ka-sandbox = { path = "crates/ka-sandbox", version = "0.4.0" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.9"
