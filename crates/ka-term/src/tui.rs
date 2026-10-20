@@ -17,6 +17,12 @@ pub enum Exit {
     Quit,
     /// Engine ended.
     EngineEnded,
+    /// `/update`: hand the session to the updater, which re-execs ka
+    /// attached to the same strand when done.
+    Update {
+        /// Strand id to re-attach after the update.
+        session: String,
+    },
 }
 
 /// Editable single-line-ish input buffer with history (pure logic, tested).
@@ -604,23 +610,31 @@ pub enum Line {
     Assistant(String),
     /// Reasoning (rendered dim).
     Thought(String),
-    /// One or more consecutive tool calls, each one a boxed card.
+    /// One or more consecutive tool calls, each a timeline row
+    /// (status, tool, detail) with its threaded body.
     ToolBlock(Vec<ToolCall>),
-    /// System/status note (`· ` gutter).
+    /// System/status note (`• ` gutter).
     Info(String),
-    /// Caution row (`⚠ ` gutter): refused actions, usage errors.
+    /// Caution row (`▲ ` gutter): refused actions, usage errors.
     Warn(String),
-    /// Failure row (`! ` gutter, bold): the loudest system tier.
+    /// Failure row (`✗ ` gutter, bold): the loudest system tier.
     Err(String),
     /// Turn report: empty = a blank separator row, else `─ {msg}`.
     Report(String),
     /// `!cmd` passthrough output: plain foreground, no gutter.
     Shell(String),
     /// One-row turn verdict (`✓ done · 2.1s · 1.2k in · $0.0042`).
+    /// A failure longer than the inline budget keeps its full text as
+    /// `detail`; the row then folds (▸/▾) — click to expand.
     Summary {
         glyph: char,
         tone: SummaryTone,
         text: String,
+        /// Untruncated error text, shown wrapped when expanded; None =
+        /// nothing hidden (no fold affordance, no chevron).
+        detail: Option<String>,
+        /// Fold state of the detail body (click toggles).
+        expanded: bool,
     },
 }
 
@@ -639,6 +653,8 @@ pub enum RowRef {
     Entry(usize),
     /// One call within a [`Line::ToolBlock`]: `(entry, call)`.
     ToolCall(usize, usize),
+    /// A verdict summary carrying hidden detail (folds on click).
+    Summary(usize),
 }
 
 /// One finished tool call inside a [`Line::ToolBlock`] row.
@@ -723,11 +739,13 @@ impl Transcript {
         self.thoughts_open ^ self.thought_overrides.contains(&entry)
     }
 
-    /// Toggle one thinking block (click target). Only multi-line
-    /// blocks participate — a one-liner has nothing to hide.
+    /// Toggle one thinking block (click target). Only blocks taller
+    /// than the collapsed band participate — a shorter one has nothing
+    /// to hide, so toggling it would look broken.
     pub fn toggle_thought(&mut self, entry: usize) {
-        let multi = matches!(self.lines.get(entry), Some(Line::Thought(t)) if t.contains('\n'));
-        if !multi {
+        let foldable =
+            matches!(self.lines.get(entry), Some(Line::Thought(t)) if thought_foldable(t));
+        if !foldable {
             return;
         }
         if !self.thought_overrides.remove(&entry) {
@@ -743,9 +761,9 @@ impl Transcript {
     }
 
     /// Flush one streamed thinking block into the cache, rendering it
-    /// as the live tail band — the head plus the last three lines,
-    /// pixel-identical to the live rows it replaces, so the swap never
-    /// jumps the viewport (equal heights while body lines fit one row). The
+    /// as the live tail band — spacer, head, the last three lines,
+    /// spacer — row-for-row the live rows it replaces (minus the live
+    /// head's shimmer), so the swap never jumps the viewport. The
     /// entry joins `streamed_open` and settles to the ordinary
     /// collapsed band later: once fully scrolled out of view
     /// ([`Transcript::collapse_streamed_above`]) or at the next turn
@@ -763,7 +781,7 @@ impl Transcript {
         }
         self.streamed_open.push(idx);
         let w = self.width;
-        let tail = thought_rows_tail(&text, w as usize);
+        let tail = thought_rows_tail(&text, w as usize, None);
         self.lines.push(Line::Thought(text));
         self.rendered.push(tail);
         self.renders += 1;
@@ -827,14 +845,18 @@ impl Transcript {
 
     /// What a rendered row belongs to (click mapping): a plain entry
     /// (thought-toggle target) or one specific call inside a tool
-    /// block (expand target, `(entry, call)`). Every row of a card —
-    /// borders included — maps to that card's call.
+    /// block (expand target, `(entry, call)`). Every row of a call —
+    /// header and threaded body alike — maps to that call; calls stack
+    /// with no rows between them.
     pub fn row_ref_at(&self, row: usize) -> Option<RowRef> {
         let mut acc = 0usize;
         for (i, (line, rows)) in self.lines.iter().zip(&self.rendered).enumerate() {
             let next = acc + rows.len();
             if row < next {
                 return Some(match line {
+                    Line::Summary {
+                        detail: Some(_), ..
+                    } => RowRef::Summary(i),
                     Line::ToolBlock(calls) => {
                         let mut off = row - acc;
                         for (j, call) in calls.iter().enumerate() {
@@ -843,14 +865,6 @@ impl Transcript {
                                 return Some(RowRef::ToolCall(i, j));
                             }
                             off -= h;
-                            // the quiet rule between cards belongs to
-                            // the call that follows it
-                            if j + 1 < calls.len() {
-                                if off == 0 {
-                                    return Some(RowRef::ToolCall(i, j + 1));
-                                }
-                                off -= 1;
-                            }
                         }
                         RowRef::Entry(i)
                     }
@@ -910,6 +924,26 @@ impl Transcript {
         }
     }
 
+    /// Toggle a verdict summary's detail fold (click target) and
+    /// re-render just that entry. Summaries without hidden detail
+    /// no-op, like a card with nothing to reveal.
+    pub fn toggle_summary(&mut self, entry: usize) {
+        let Some(Line::Summary {
+            detail: Some(_),
+            expanded,
+            ..
+        }) = self.lines.get_mut(entry)
+        else {
+            return;
+        };
+        *expanded = !*expanded;
+        let line = self.lines[entry].clone();
+        if let Some(slot) = self.rendered.get_mut(entry) {
+            *slot = render_line(&line, self.width, false);
+            self.renders += 1;
+        }
+    }
+
     /// `(entry, call)` of the most recent call in the last block — the
     /// Ctrl+O target.
     pub fn last_tool_ref(&self) -> Option<(usize, usize)> {
@@ -924,8 +958,8 @@ impl Transcript {
     }
 
     /// Append a finished tool call, merging into the trailing block
-    /// when consecutive: a run of calls reads as one stack of adjacent
-    /// cards; any other push between calls ends the group.
+    /// when consecutive: a run of calls reads as one timeline; any
+    /// other push between calls ends the group.
     pub fn push_tool_call(&mut self, call: ToolCall) {
         if let Some(Line::ToolBlock(v)) = self.lines.last_mut() {
             v.push(call);
@@ -1015,10 +1049,22 @@ impl Transcript {
         self.rendered.iter().map(Vec::len).sum()
     }
 
-    /// Whether one entry is a multi-line thinking block — the only
-    /// thought rows a click (or hover) can fold.
+    /// Whether one entry is a thinking block that collapsing would
+    /// shorten — the only thought rows a click (or hover) can fold.
     pub fn is_foldable(&self, entry: usize) -> bool {
-        matches!(self.lines.get(entry), Some(Line::Thought(t)) if t.contains('\n'))
+        matches!(self.lines.get(entry), Some(Line::Thought(t)) if thought_foldable(t))
+    }
+
+    /// Whether one entry is a verdict summary with hidden detail (the
+    /// fold a click expands).
+    pub fn summary_foldable(&self, entry: usize) -> bool {
+        matches!(
+            self.lines.get(entry),
+            Some(Line::Summary {
+                detail: Some(_),
+                ..
+            })
+        )
     }
 
     /// Rendered row span of one entry: `(first_row, row_count)`.
@@ -1166,241 +1212,374 @@ fn separate_before(transcript: &mut Transcript, incoming: Family) {
     }
     transcript.push(Line::Report(String::new()));
 }
-/// Render one transcript entry into styled rows at `width`. Thinking
-/// entries collapse to their first line plus a count marker unless
-/// `thoughts_open`.
+/// Render one transcript entry into styled rows at content width
+/// `width` (W). Blocks sit on the canvas and take their structure from
+/// rails, rules, and type weight; only user turns (`BG_USER`) and
+/// expanded tool output (`BG_TOOL` / `BG_ERR_TINT`) lift off it. No
+/// block pads itself with blank rows — air between blocks is
+/// [`separate_before`]'s job (thinking blocks excepted: they carry
+/// their own canvas spacers, see below). Thinking entries collapse to
+/// their first lines plus a "more" row unless `thoughts_open`.
 fn render_line(line: &Line, width: u16, thoughts_open: bool) -> Vec<ratatui::text::Line<'static>> {
-    use ratatui::text::Line as TuiLine;
+    use crate::palette;
+    use ratatui::style::{Modifier, Style};
+    use ratatui::text::{Line as TuiLine, Span};
+    use unicode_width::UnicodeWidthStr;
+    let w = width as usize;
     let mut out: Vec<TuiLine> = Vec::new();
     match line {
         Line::User(text) => push_block(&mut out, text, width),
+        // assistant prose sits on the canvas: markdown at W-2, every
+        // row indented two columns. The live stream renders at the
+        // same width and indent (`live_region_rows`), so the hand-off
+        // never reflows.
         Line::Assistant(text) => {
-            // assistant output on a subtle full-width surface: background
-            // fill only, never border glyphs; blank rows above and below
-            // carry the same fill, giving the card inner top/bottom air
-            let bg = crate::palette::BG_OUTPUT;
-            out.push(surface_blank(width, bg));
-            let inner = width.saturating_sub(2 * CARD_MARGIN as u16);
-            let mut rows = crate::markdown::render(text, inner);
-            apply_output_surface(&mut rows, inner, bg);
-            inset_rows(&mut rows, width, bg);
+            let mut rows = crate::markdown::render(text, assistant_md_width(width));
+            indent_assistant(&mut rows);
             out.extend(rows);
-            out.push(surface_blank(width, bg));
         }
-        // thinking bands carry one blank spacer row above and below —
-        // the borderless tint gets air from every neighbor, and the
-        // trailing blank keeps the input box clear when a band is last
+        // thinking blocks carry one canvas spacer row above and below:
+        // the live tail band ships the same air, so its flush lands in
+        // place whatever the neighbors are, and the trailing spacer
+        // keeps the composer clear when a block is last
         Line::Thought(text) => {
             out.push(TuiLine::default());
-            out.extend(thought_rows(text, width as usize, thoughts_open));
+            out.extend(thought_rows(text, w, thoughts_open));
             out.push(TuiLine::default());
         }
-        // finished tool calls cache as boxed cards — one per call, top
-        // border carrying icon + detail + duration + verdict, state
-        // tint underneath; an expanded card reveals its full output
+        // finished tool calls cache as a timeline: one header row per
+        // call plus its threaded body, stacked with no rule between
+        // calls (the status glyph leading each header marks the beat)
         Line::ToolBlock(calls) => {
-            for (j, call) in calls.iter().enumerate() {
-                if j > 0 {
-                    // a quiet rule between consecutive cards — two
-                    // boxes butted together read as one
-                    out.push(TuiLine::from(ratatui::text::Span::styled(
-                        "╌".repeat(width as usize),
-                        crate::palette::BORDER_STYLE,
-                    )));
-                }
+            for call in calls {
                 out.extend(tool_call_rows(call, width));
             }
         }
-        Line::Info(text) => push_gutter(&mut out, text, width, "· ", crate::palette::META.into()),
-        Line::Warn(text) => push_gutter(&mut out, text, width, "⚠ ", crate::palette::WARN.into()),
+        Line::Info(text) => {
+            push_gutter(&mut out, text, width, "• ", Style::new().fg(palette::META))
+        }
+        Line::Warn(text) => {
+            push_gutter(&mut out, text, width, "▲ ", Style::new().fg(palette::WARN))
+        }
         Line::Err(text) => push_gutter(
             &mut out,
             text,
             width,
-            "! ",
-            ratatui::style::Style::new()
-                .fg(crate::palette::ERR)
-                .add_modifier(ratatui::style::Modifier::BOLD),
+            "✗ ",
+            Style::new().fg(palette::ERR).add_modifier(Modifier::BOLD),
         ),
         // `!cmd` passthrough output: plain prose color, no gutter
-        Line::Shell(text) => out.push(TuiLine::from(vec![ratatui::text::Span::styled(
+        Line::Shell(text) => out.push(TuiLine::from(vec![Span::styled(
             text.clone(),
-            ratatui::style::Style::new().fg(crate::palette::FG),
+            Style::new().fg(palette::FG),
         )])),
-        // the turn verdict: tone-colored glyph, muted text, no `─ ` prefix
-        Line::Summary { glyph, tone, text } => {
+        // the turn verdict: tone-colored glyph, faint text, then a rule
+        // closing the turn like a chapter break
+        Line::Summary {
+            glyph,
+            tone,
+            text,
+            detail,
+            expanded,
+        } => {
             let tone_style = match tone {
-                SummaryTone::Ok => ratatui::style::Style::new().fg(crate::palette::OK),
-                SummaryTone::Warn => ratatui::style::Style::new().fg(crate::palette::WARN),
-                SummaryTone::Err => ratatui::style::Style::new()
-                    .fg(crate::palette::ERR)
-                    .add_modifier(ratatui::style::Modifier::BOLD),
+                SummaryTone::Ok => Style::new().fg(palette::OK),
+                SummaryTone::Warn => Style::new().fg(palette::WARN),
+                SummaryTone::Err => Style::new().fg(palette::ERR).add_modifier(Modifier::BOLD),
             };
-            out.push(TuiLine::from(vec![
-                ratatui::text::Span::styled(format!("{glyph} "), tone_style),
-                ratatui::text::Span::styled(
-                    text.clone(),
-                    ratatui::style::Style::new().fg(crate::palette::META),
-                ),
-            ]));
+            let faint = Style::new().fg(palette::FAINT);
+            // the fold chevron trails the verdict text, which truncates
+            // to leave room for it — a long verdict can never clip the
+            // marker off the pane edge
+            let chevron = match detail {
+                Some(_) if *expanded => " ▾",
+                Some(_) => " ▸",
+                None => "",
+            };
+            let lead = format!("{glyph} ");
+            let lead_w = lead.width();
+            let room = w.saturating_sub(lead_w + chevron.width() + 1).max(1);
+            let head = trunc_cols(text, room);
+            let used = lead_w + head.width() + chevron.width();
+            let mut spans = vec![Span::styled(lead, tone_style), Span::styled(head, faint)];
+            if !chevron.is_empty() {
+                spans.push(Span::styled(chevron, faint));
+            }
+            if w > used + 1 {
+                spans.push(Span::raw(" "));
+                spans.push(Span::styled("─".repeat(w - used - 1), palette::RULE_STYLE));
+            }
+            out.push(TuiLine::from(spans));
+            if *expanded && let Some(d) = detail {
+                // the full error, wrapped like prose in the faint tier
+                // so the verdict row stays the visual anchor
+                for row in wrap_rows(d, w.saturating_sub(2)) {
+                    out.push(TuiLine::styled(format!("  {}", row.text), faint));
+                }
+            }
         }
         // the vertical separator is one true canvas-blank row (gutter
         // text is empty, so the prefix loop would emit nothing)
         Line::Report(text) if text.is_empty() => out.push(TuiLine::default()),
-        Line::Report(text) => push_gutter(&mut out, text, width, "─ ", crate::palette::META.into()),
+        Line::Report(text) => push_gutter(&mut out, text, width, "─ ", palette::META.into()),
     }
     out
 }
 
-/// Thinking-block rows: a borderless pink band — head row
-/// `🧠 Thinking {▾|▸} · N lines`, body rows on the same tint. Collapsed
-/// keeps at most three body rows; expanded carries every line wrapped.
-/// The fold chevron rides the head only on multi-line blocks — its
-/// absence marks a single-liner with nothing to fold. Exactly one 🧠
-/// per block: it rides the head; body rows carry no icon.
-fn thought_rows(text: &str, w: usize, open: bool) -> Vec<ratatui::text::Line<'static>> {
-    let n = text.lines().count();
-    let mut rows = vec![tint_blank(w), thought_head(n, open, w)];
-    // body: every line open; the first three collapsed, one row each
-    for line in text.lines().take(if open { usize::MAX } else { 3 }) {
-        push_tint_row(&mut rows, line, w);
+/// Columns of canvas indent in front of assistant prose.
+const ASSISTANT_INDENT: usize = 2;
+
+/// Markdown fold width of an assistant block at content width `width`
+/// — the one authority shared by the cache ([`render_line`]) and the
+/// run loop's live markdown cache, so streamed and settled rows fold
+/// identically.
+fn assistant_md_width(width: u16) -> u16 {
+    width.saturating_sub(ASSISTANT_INDENT as u16)
+}
+
+/// Indent markdown rows by [`ASSISTANT_INDENT`] canvas columns. Blank
+/// rows stay span-less (true canvas blanks).
+fn indent_assistant(rows: &mut [ratatui::text::Line<'static>]) {
+    for row in rows.iter_mut().filter(|r| !r.spans.is_empty()) {
+        row.spans
+            .insert(0, ratatui::text::Span::raw(" ".repeat(ASSISTANT_INDENT)));
     }
-    rows.push(tint_blank(w));
+}
+
+/// The collapsed band shows at most this many body lines, so a block
+/// no taller than it has nothing to fold.
+const THOUGHT_COLLAPSED_LINES: usize = 3;
+
+/// Whether collapsing a thinking block hides anything: the chevron,
+/// the click/hover target, and the toggle all key on this, so a short
+/// block never shows a dead indicator.
+fn thought_foldable(text: &str) -> bool {
+    text.trim().lines().count() > THOUGHT_COLLAPSED_LINES
+}
+
+/// Thinking-block rows (between the canvas spacers [`render_line`]
+/// adds): head `✻ Thinking {▸|▾}`, then body rows `│ {text}` — the
+/// rail in `RULE`, the prose in [`crate::palette::THOUGHT`], wrapped at
+/// W-2. Collapsed keeps the first [`THOUGHT_COLLAPSED_LINES`] source
+/// lines plus a `│ ⋯ +N more` row while anything is hidden; open
+/// carries every line. The chevron (and the head's right-aligned
+/// `N lines` count while collapsed) rides only blocks collapsing would
+/// actually shorten.
+fn thought_rows(text: &str, w: usize, open: bool) -> Vec<ratatui::text::Line<'static>> {
+    // blank lines at the edges of a reasoning stream are noise, never
+    // content: every thought view (fold test, band, tail) trims them
+    let text = text.trim();
+    let foldable = thought_foldable(text);
+    let n = text.lines().count();
+    let mut rows = vec![thought_head(foldable, open, n, w, None)];
+    let keep = if open {
+        usize::MAX
+    } else {
+        THOUGHT_COLLAPSED_LINES
+    };
+    for line in text.lines().take(keep) {
+        push_thought_body(&mut rows, line, w);
+    }
+    // collapsed with more to show: the "more" row, gone again the
+    // moment the block opens
+    if foldable && !open {
+        rows.push(thought_more_row(n.saturating_sub(THOUGHT_COLLAPSED_LINES)));
+    }
     rows
 }
 
-/// The live tail band: the same head plus the LAST three lines — the
-/// streaming view keeps at most three thinking rows on screen, and the
-/// flush caches exactly these rows so the hand-off never jumps (the
-/// band height equals the collapsed band while body lines fit one
-/// row — wrapped long lines can differ, but the swap is still
-/// pixel-identical and the settle happens out of view).
-fn thought_rows_tail(text: &str, w: usize) -> Vec<ratatui::text::Line<'static>> {
+/// The live tail band: canvas spacer, the same head (open chevron),
+/// the LAST [`THOUGHT_COLLAPSED_LINES`] lines, canvas spacer — the
+/// streaming view keeps at most three thinking lines on screen. The
+/// live region passes `shimmer_ms` (the head label shimmers); the flush
+/// ([`Transcript::push_thought_streamed`]) caches the same rows with
+/// `None`, so the hand-off never jumps the viewport — only the label's
+/// light settles. The tail is the collapsed band minus its "more" row
+/// while body lines fit one row; the settle to the collapsed band
+/// happens out of view.
+fn thought_rows_tail(
+    text: &str,
+    w: usize,
+    shimmer_ms: Option<u128>,
+) -> Vec<ratatui::text::Line<'static>> {
+    let text = text.trim();
     let n = text.lines().count();
     let mut rows = vec![
         ratatui::text::Line::default(),
-        tint_blank(w),
-        thought_head(n, true, w),
+        thought_head(thought_foldable(text), true, n, w, shimmer_ms),
     ];
-    let skip = n.saturating_sub(3);
-    for line in text.lines().skip(skip) {
-        push_tint_row(&mut rows, line, w);
+    for line in text.lines().skip(n.saturating_sub(THOUGHT_COLLAPSED_LINES)) {
+        push_thought_body(&mut rows, line, w);
     }
-    rows.push(tint_blank(w));
     rows.push(ratatui::text::Line::default());
     rows
 }
 
-/// Head row of a thinking band: ` 🧠 Thinking {▾|▸} · N lines ` — the
-/// icon and label in the border pink, chevron and count faint. The
-/// count and chevron ride only multi-line blocks; a single-liner
-/// carries neither.
-fn thought_head(n: usize, open: bool, w: usize) -> ratatui::text::Line<'static> {
+/// Head row of a thinking block: `✻ Thinking` in `THINK`, the fold
+/// chevron ` ▸|▾` faint (foldable blocks only — no dead indicator),
+/// and while collapsed a right-aligned faint `{lines} lines` count
+/// (dropped when the row has no room). `shimmer_ms` sweeps a light
+/// band across the label (the live head); `None` paints it flat.
+fn thought_head(
+    foldable: bool,
+    open: bool,
+    lines: usize,
+    w: usize,
+    shimmer_ms: Option<u128>,
+) -> ratatui::text::Line<'static> {
+    use ratatui::style::Style;
     use ratatui::text::Span;
     use unicode_width::UnicodeWidthStr;
-    let tint = crate::palette::BG_THINK_TINT;
-    let faint = ratatui::style::Style::new()
-        .fg(crate::palette::FAINT)
-        .bg(tint);
-    let (chevron, count) = if n > 1 {
-        (
-            if open { " ▾" } else { " ▸" }.to_string(),
-            format!(" · {n} lines"),
-        )
-    } else {
-        (String::new(), String::new())
-    };
-    let lead = format!(" {} Thinking", crate::icons::THOUGHT);
-    let pad = w.saturating_sub(lead.width() + chevron.width() + count.width());
-    ratatui::text::Line::from(vec![
-        Span::styled(
-            lead,
-            ratatui::style::Style::new()
-                .fg(crate::palette::THINK_BORDER)
-                .bg(tint),
-        ),
-        Span::styled(chevron, faint),
-        Span::styled(count, faint),
-        Span::styled(" ".repeat(pad), faint),
-    ])
+    let think = Style::new().fg(crate::palette::THINK);
+    let faint = Style::new().fg(crate::palette::FAINT);
+    let mut spans = vec![Span::styled(format!("{} ", crate::icons::THOUGHT), think)];
+    match shimmer_ms {
+        Some(ms) => spans.extend(crate::fx::shimmer(
+            "Thinking",
+            crate::palette::THINK,
+            crate::palette::STRONG,
+            ms,
+            Style::new(),
+        )),
+        None => spans.push(Span::styled("Thinking", think)),
+    }
+    if foldable {
+        spans.push(Span::styled(if open { " ▾" } else { " ▸" }, faint));
+        if !open {
+            let count = format!("{lines} lines");
+            let used: usize = spans.iter().map(|s| s.content.width()).sum();
+            let pad = w.saturating_sub(used + count.width());
+            if pad > 0 {
+                spans.push(Span::raw(" ".repeat(pad)));
+                spans.push(Span::styled(count, faint));
+            }
+        }
+    }
+    ratatui::text::Line::from(spans)
 }
 
-/// One blank tinted row — the band's inner margin above the head and
-/// below the last body row (the assistant slab's inner-air pattern).
-fn tint_blank(w: usize) -> ratatui::text::Line<'static> {
-    ratatui::text::Line::from(vec![ratatui::text::Span::styled(
-        " ".repeat(w.max(1)),
-        ratatui::style::Style::new().bg(crate::palette::BG_THINK_TINT),
-    )])
-}
-
-/// One tinted body row: ` {line} ` truncated to a single row and
-/// padded to the full width.
-fn push_tint_row(rows: &mut Vec<ratatui::text::Line<'static>>, line: &str, w: usize) {
+/// One source line of thinking as body rows: `│ ` rail (`RULE`) plus
+/// the prose in [`crate::palette::THOUGHT`], word-wrapped at W-2.
+fn push_thought_body(rows: &mut Vec<ratatui::text::Line<'static>>, line: &str, w: usize) {
     use ratatui::text::Span;
-    use unicode_width::UnicodeWidthStr;
-    let tint = crate::palette::BG_THINK_TINT;
-    let faint = ratatui::style::Style::new()
-        .fg(crate::palette::FAINT)
-        .bg(tint);
     let room = w.saturating_sub(2).max(1);
-    for seg in wrap_cols(line, room) {
-        let seg = trunc_cols(&seg, room);
-        let pad = w.saturating_sub(1).saturating_sub(seg.width());
+    for seg in wrap_rows(line, room) {
         rows.push(ratatui::text::Line::from(vec![
-            Span::styled(" ", faint),
-            Span::styled(seg, faint),
-            Span::styled(" ".repeat(pad), faint),
+            Span::styled("│ ", crate::palette::RULE_STYLE),
+            Span::styled(trunc_cols(&seg.text, room), crate::palette::THOUGHT),
         ]));
     }
 }
 
-/// Cached ToolBlock rows for one call: a boxed card — top border
-/// `╭─ {icon} {tool} · {detail} ─╌╌ {dur} {✓|✗} ─╮`, the note as the
-/// collapsed body row, and when expanded the full output plus the spill
-/// pointer inside the box. The card exactly fills the content width and
-/// carries a state tint: sage for ok, coral for failed. Rows clip at
-/// the pane edge, never wrap.
-fn tool_call_rows(call: &ToolCall, width: u16) -> Vec<ratatui::text::Line<'static>> {
+/// The collapsed band's "more" row: `│ ⋯ +{hidden} more`, drawn only
+/// while lines are actually hidden.
+fn thought_more_row(hidden: usize) -> ratatui::text::Line<'static> {
     use ratatui::text::Span;
+    ratatui::text::Line::from(vec![
+        Span::styled("│ ", crate::palette::RULE_STYLE),
+        Span::styled(
+            format!("⋯ +{hidden} more"),
+            ratatui::style::Style::new().fg(crate::palette::FAINT),
+        ),
+    ])
+}
+
+/// One body row of a tool call.
+#[derive(Debug, Clone, PartialEq)]
+enum CallRow {
+    /// A note line on the thread, faint.
+    Note(String),
+    /// A line of expanded output on the state panel, in the given ink.
+    Output(String, ratatui::style::Color),
+}
+
+/// Cached rows for one finished call, timeline style: the header row
+/// ([`tool_call_header`]) then its body threaded down column 0 — `│`
+/// on every body row but the last, which turns the thread with `╰`
+/// (`RULE`). Note rows read `│ {note}` faint; expanded output rows put
+/// a panel from column 2 to W on `BG_TOOL` (ok) / `BG_ERR_TINT`
+/// (failed), output in `INK_DIM`, the spill pointer in `META`. No box
+/// borders, no header tint. Rows clip at the pane edge, never wrap.
+fn tool_call_rows(call: &ToolCall, width: u16) -> Vec<ratatui::text::Line<'static>> {
+    use ratatui::style::Style;
+    use ratatui::text::Span;
+    use unicode_width::UnicodeWidthStr;
     let w = width as usize;
-    let (border_fg, bg) = card_state(call.ok);
-    let mut rows = vec![tool_call_header(call, width)];
-    for (text, fg) in tool_card_body(call, width) {
-        rows.push(card_content_row(&text, fg, border_fg, bg, w));
+    let body = tool_card_body(call, width);
+    let panel = Style::new().bg(if call.ok {
+        crate::palette::BG_TOOL
+    } else {
+        crate::palette::BG_ERR_TINT
+    });
+    let mut rows = Vec::with_capacity(1 + body.len());
+    rows.push(tool_call_header(call, w));
+    let last = body.len().saturating_sub(1);
+    for (i, row) in body.into_iter().enumerate() {
+        let turn = i == last;
+        rows.push(match row {
+            CallRow::Note(text) => thread_row(turn, text),
+            CallRow::Output(text, fg) => {
+                // `│ ` + panel(` {text}{pad} `) = W
+                let room = w.saturating_sub(4).max(1);
+                let pad = room.saturating_sub(text.width());
+                ratatui::text::Line::from(vec![
+                    Span::styled(if turn { "╰" } else { "│" }, crate::palette::RULE_STYLE),
+                    Span::raw(" "),
+                    Span::styled(" ", panel),
+                    Span::styled(text, panel.fg(fg)),
+                    Span::styled(" ".repeat(pad + 1), panel),
+                ])
+            }
+        });
     }
-    rows.push(ratatui::text::Line::from(Span::styled(
-        format!("╰{}╯", "─".repeat(w.saturating_sub(2))),
-        ratatui::style::Style::new().fg(border_fg).bg(bg),
-    )));
     rows
 }
 
-/// Cached row count of one call's card: top border + body + bottom
-/// border. The single height authority shared by the renderer and
-/// [`Transcript::row_ref_at`]'s click mapping.
-fn tool_card_height(call: &ToolCall, width: u16) -> usize {
-    2 + tool_card_body(call, width).len()
+/// One thread row under a call header: `│ {text}` (or `╰ {text}` when
+/// `turn`, the body's last row) — rail in `RULE`, text faint.
+fn thread_row(turn: bool, text: String) -> ratatui::text::Line<'static> {
+    use ratatui::text::Span;
+    ratatui::text::Line::from(vec![
+        Span::styled(if turn { "╰ " } else { "│ " }, crate::palette::RULE_STYLE),
+        Span::styled(text, ratatui::style::Style::new().fg(crate::palette::FAINT)),
+    ])
 }
 
-/// A card's inner rows as `(text, text tier)`: the note row (always —
-/// it is the collapsed body), plus when expanded the excerpt wrapped
-/// into the box and the spill pointer.
-fn tool_card_body(call: &ToolCall, width: u16) -> Vec<(String, ratatui::style::Color)> {
-    let mut body = vec![(call.note.clone(), crate::palette::FAINT)];
+/// Cached row count of one call: the header plus its body rows. The
+/// single height authority shared by the renderer and
+/// [`Transcript::row_ref_at`]'s click mapping.
+fn tool_card_height(call: &ToolCall, width: u16) -> usize {
+    1 + tool_card_body(call, width).len()
+}
+
+/// A call's body rows: one note row per note line (the collapsed
+/// body), plus when expanded the excerpt hard-wrapped onto the panel
+/// and the spill pointer. A call that produced nothing readable gets no
+/// body at all — its header stands alone.
+fn tool_card_body(call: &ToolCall, width: u16) -> Vec<CallRow> {
+    let w = width as usize;
+    let note_room = w.saturating_sub(2).max(1);
+    let mut body: Vec<CallRow> = call
+        .note
+        .lines()
+        .map(|l| CallRow::Note(trunc_cols(l, note_room)))
+        .collect();
     let expandable = !call.excerpt.is_empty() || call.spill.is_some();
     if !call.expanded || !expandable {
         return body;
     }
-    // `│ ` + text + ` │` leaves four columns of chrome
-    let room = width.saturating_sub(4).max(1) as usize;
+    // `│ ` thread + one column of panel air each side
+    let room = w.saturating_sub(4).max(1);
     for line in call.excerpt.lines() {
         for seg in wrap_cols(line, room) {
-            body.push((trunc_cols(&seg, room), crate::palette::INK_DIM));
+            body.push(CallRow::Output(
+                trunc_cols(&seg, room),
+                crate::palette::INK_DIM,
+            ));
         }
     }
     if call.spill.is_some() {
-        body.push((
+        body.push(CallRow::Output(
             trunc_cols("… full output parked in a spill file — /spills", room),
             crate::palette::META,
         ));
@@ -1408,19 +1587,9 @@ fn tool_card_body(call: &ToolCall, width: u16) -> Vec<(String, ratatui::style::C
     body
 }
 
-/// Card state palette: box-drawing fg + background fill. Sage tint for
-/// a clean exit, coral tint for a failure.
-fn card_state(ok: bool) -> (ratatui::style::Color, ratatui::style::Color) {
-    if ok {
-        (crate::palette::OK, crate::palette::BG_OK_TINT)
-    } else {
-        (crate::palette::ERR, crate::palette::BG_ERR_TINT)
-    }
-}
-
 /// The bash hand leads failed output with `(exit N)` as the excerpt's
-/// first line (ka-engine `hands/bash.rs`); surface it as `⏎ exit N` on
-/// the card's top border.
+/// first line (ka-engine `hands/bash.rs`); surface it as `⏎ exit N` in
+/// the call header's right cluster.
 fn bash_exit_code(note: &str) -> Option<i32> {
     note.lines()
         .next()?
@@ -1431,130 +1600,104 @@ fn bash_exit_code(note: &str) -> Option<i32> {
         .ok()
 }
 
-/// Card title text: the tool's icon, the fold chevron (thinking-block
-/// vocabulary, left-aligned like every other block's marker), and the
-/// call head minus its live `→ ` rail.
-fn card_head(head: &str, fold: Option<&str>) -> String {
-    let inner = head.strip_prefix("→ ").unwrap_or(head);
-    let (tool, rest) = inner.split_once(" · ").unwrap_or((inner, ""));
-    let fold = fold.unwrap_or("");
-    if rest.is_empty() {
-        format!("{} {tool}{fold}", crate::icons::tool_icon(tool))
+/// A finished call's header row: `{✓|✗} {icon} {tool}  {detail}{ ▸|▾}`
+/// left, `{⏎ exit N}  {dur}` right-aligned. The duration only earns
+/// cells once it measured at least a tenth of a second (replayed calls
+/// carry none); the exit note appears only on failed bash calls; the
+/// chevron only on calls with something to reveal (excerpt or spill).
+fn tool_call_header(call: &ToolCall, w: usize) -> ratatui::text::Line<'static> {
+    use ratatui::style::Style;
+    use ratatui::text::Span;
+    let status = if call.ok {
+        Span::styled("✓", Style::new().fg(crate::palette::OK))
     } else {
-        format!("{} {tool}{fold} · {rest}", crate::icons::tool_icon(tool))
+        Span::styled("✗", Style::new().fg(crate::palette::ERR))
+    };
+    let mut cluster = Vec::with_capacity(3);
+    if !call.ok
+        && let Some(n) = bash_exit_code(&call.note)
+    {
+        cluster.push(Span::styled(
+            format!("⏎ exit {n}"),
+            Style::new().fg(crate::palette::ERR),
+        ));
     }
+    if let Some(d) = call.dur.filter(|d| *d >= 0.1) {
+        if !cluster.is_empty() {
+            cluster.push(Span::raw("  "));
+        }
+        cluster.push(Span::styled(
+            fmt_dur(d),
+            Style::new().fg(crate::palette::FAINT),
+        ));
+    }
+    let fold = (!call.excerpt.is_empty() || call.spill.is_some()).then_some(if call.expanded {
+        " ▾"
+    } else {
+        " ▸"
+    });
+    timeline_head(status, &call.head, fold, cluster, w)
 }
 
-/// The one top border row of a card: `╭─ {head} ─╌╌ {cluster} ─╮` with
-/// head left, the right-aligned cluster (duration / exit note / verdict
-/// for cached cards, the spinner for live ones), a dotted `─╌╌` leader
-/// absorbing the slack, and the head truncating first. Every span
-/// carries `bg` so the row fills the content width exactly.
-fn card_top_row(
-    head: String,
+/// The one timeline header shape shared by finished and running calls:
+/// `{status} {icon} {tool}  {detail}{fold}` left, `cluster` right-
+/// aligned after at least two columns of air. `head` is the call head
+/// (`→ {tool} · {detail}`, the live `→ ` optional). Icon and tool in
+/// `TOOL` (tool bold), detail `INK_DIM`, chevron faint. The detail
+/// truncates first, then the tool name; the chevron always survives.
+fn timeline_head(
+    status: ratatui::text::Span<'static>,
+    head: &str,
+    fold: Option<&'static str>,
     cluster: Vec<ratatui::text::Span<'static>>,
     w: usize,
-    border_fg: ratatui::style::Color,
-    head_fg: ratatui::style::Color,
-    bg: ratatui::style::Color,
 ) -> ratatui::text::Line<'static> {
+    use ratatui::style::{Modifier, Style};
     use ratatui::text::Span;
     use unicode_width::UnicodeWidthStr;
+    let inner = head.strip_prefix("→ ").unwrap_or(head);
+    let (tool, detail) = inner.split_once(" · ").unwrap_or((inner, ""));
+    let icon = crate::icons::tool_icon(tool);
+    let fold = fold.unwrap_or("");
     let cluster_w: usize = cluster.iter().map(|s| s.content.width()).sum();
-    let budget = w.saturating_sub(8 + cluster_w).max(1);
-    let head = trunc_cols(&head, budget);
-    // `╭─ ` + head + leader zone + cluster + ` ─╮` = w
-    let zone = w.saturating_sub(3 + head.width() + cluster_w + 3);
-    let leader = match zone.saturating_sub(2) {
-        0 => " ".repeat(zone),
-        // one true dash at the head, dotted dash for the rest
-        middle => format!(" ─{} ", "╌".repeat(middle - 1)),
+    // everything left of the cluster and its two-column gap
+    let budget = if cluster_w == 0 {
+        w
+    } else {
+        w.saturating_sub(cluster_w + 2)
     };
-    let border = ratatui::style::Style::new().fg(border_fg).bg(bg);
+    let lead_w = status.content.width() + 1 + icon.width() + 1;
+    let tool = trunc_cols(tool, budget.saturating_sub(lead_w + fold.width()).max(1));
+    let mut used = lead_w + tool.width();
+    let detail_room = budget.saturating_sub(used + fold.width() + 2);
+    let tool_style = Style::new().fg(crate::palette::TOOL);
     let mut spans = vec![
-        Span::styled("╭─ ", border),
-        Span::styled(head, ratatui::style::Style::new().fg(head_fg).bg(bg)),
-        Span::styled(leader, border),
+        status,
+        Span::raw(" "),
+        Span::styled(icon, tool_style),
+        Span::raw(" "),
+        Span::styled(tool, tool_style.add_modifier(Modifier::BOLD)),
     ];
-    spans.extend(cluster);
-    spans.push(Span::styled(" ─╮", border));
+    if !detail.is_empty() && detail_room >= 2 {
+        let detail = trunc_cols(detail, detail_room);
+        used += 2 + detail.width();
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            detail,
+            Style::new().fg(crate::palette::INK_DIM),
+        ));
+    }
+    if !fold.is_empty() {
+        used += fold.width();
+        spans.push(Span::styled(fold, Style::new().fg(crate::palette::FAINT)));
+    }
+    if cluster_w > 0 {
+        spans.push(Span::raw(
+            " ".repeat(w.saturating_sub(used + cluster_w).max(2)),
+        ));
+        spans.extend(cluster);
+    }
     ratatui::text::Line::from(spans)
-}
-
-/// One inner row of a card: `│ {text} │`, padded to the exact content
-/// width with the state tint behind every cell.
-fn card_content_row(
-    text: &str,
-    fg: ratatui::style::Color,
-    border_fg: ratatui::style::Color,
-    bg: ratatui::style::Color,
-    w: usize,
-) -> ratatui::text::Line<'static> {
-    use ratatui::text::Span;
-    use unicode_width::UnicodeWidthStr;
-    let room = w.saturating_sub(4).max(1);
-    let text = trunc_cols(text, room);
-    let pad = room.saturating_sub(text.width());
-    let border = ratatui::style::Style::new().fg(border_fg).bg(bg);
-    ratatui::text::Line::from(vec![
-        Span::styled("│", border),
-        Span::styled(" ", border),
-        Span::styled(text, ratatui::style::Style::new().fg(fg).bg(bg)),
-        Span::styled(" ".repeat(pad), border),
-        Span::styled(" │", border),
-    ])
-}
-
-/// The cached card's top border: head left, `{dur}⏎ exit N ✗` right.
-/// The duration only earns cells once it measured at least a tenth of
-/// a second (replayed calls carry none), and the exit note appears only
-/// on failed bash calls.
-fn tool_call_header(call: &ToolCall, width: u16) -> ratatui::text::Line<'static> {
-    use ratatui::text::Span;
-    let w = width as usize;
-    let (border_fg, bg) = card_state(call.ok);
-    let dur = call.dur.filter(|d| *d >= 0.1).map(|d| format!("{d:.1}s "));
-    let exit = if call.ok {
-        None
-    } else {
-        bash_exit_code(&call.note).map(|n| format!("⏎ exit {n} "))
-    };
-    let verdict = if call.ok { "✓" } else { "✗" };
-    let mut cluster = Vec::with_capacity(3);
-    if let Some(d) = &dur {
-        cluster.push(Span::styled(
-            d.clone(),
-            ratatui::style::Style::new()
-                .fg(crate::palette::FAINT)
-                .bg(bg),
-        ));
-    }
-    if let Some(e) = &exit {
-        cluster.push(Span::styled(
-            e.clone(),
-            ratatui::style::Style::new().fg(border_fg).bg(bg),
-        ));
-    }
-    cluster.push(Span::styled(
-        verdict,
-        ratatui::style::Style::new().fg(border_fg).bg(bg),
-    ));
-    // the expand chevron rides in the head (left-aligned, the
-    // thinking-block fold vocabulary) — only on calls that actually
-    // have something to reveal; a bare card carries no dead indicator
-    let fold = if !call.excerpt.is_empty() || call.spill.is_some() {
-        Some(if call.expanded { " ▾" } else { " ▸" })
-    } else {
-        None
-    };
-    card_top_row(
-        card_head(&call.head, fold),
-        cluster,
-        w,
-        border_fg,
-        crate::palette::TOOL,
-        bg,
-    )
 }
 
 /// Split one line into width-fitting segments of at most `room` display
@@ -1631,12 +1774,12 @@ fn rail_drag_anchor(
     Some(anchor.min(max_anchor)).filter(|a| *a < max_anchor)
 }
 
-/// Visible transcript rows for a terminal height: the top margin, the
-/// transcript top border with its blank row of air beneath it, the
-/// input area, and the footer are
-/// the rows carved out of the viewport.
+/// Visible transcript rows for a terminal height: the header bar, the
+/// row of air under it, the composer, the row of air under it, and the
+/// status line are the rows carved out of the viewport (the transcript
+/// has no border row).
 fn visible_rows(term_h: u16, input_h: u16) -> usize {
-    term_h.saturating_sub(input_h + 5) as usize
+    term_h.saturating_sub(input_h + 4) as usize
 }
 /// Cursor `(row, col)` in `text` for a char-index cursor position.
 fn cursor_row_col(text: &str, cursor_chars: usize) -> (usize, usize) {
@@ -1734,10 +1877,12 @@ fn visual_cursor_row(rows: &[VisualRow], cursor: usize) -> usize {
     rows.iter().rposition(|r| r.start <= cursor).unwrap_or(0)
 }
 
-/// Inner text width of the input box at terminal width `term_w`:
-/// 2 outer margin cols + 2 borders + 2 horizontal padding.
+/// Draft text width of the composer at terminal width `term_w`:
+/// 2 outer margin cols + 2 borders + 2 horizontal padding + the 2-col
+/// `❯ ` lead ([`COMPOSER_LEAD`]). The draft wraps at exactly this width
+/// and the cursor math adds the lead back.
 fn input_inner_w(term_w: u16) -> usize {
-    term_w.saturating_sub(6) as usize
+    term_w.saturating_sub(6 + COMPOSER_LEAD) as usize
 }
 
 /// Max rows of diff detail shown in an ask form. The input box grows
@@ -1754,38 +1899,48 @@ fn ask_detail_budget(question_lines: usize) -> usize {
         .saturating_sub(1)
 }
 
-/// Body rows of the permission-ask modal: the question in the strong
-/// foreground, the budgeted diff detail, then one numbered option per
-/// row — the selected row wears the pink selection bar.
+/// Body rows of the permission-ask modal, `width` cols wide: the
+/// question wrapped in bold GOLD_HI, the budgeted diff detail, then one
+/// option per row as a FAINT `N ` key cap plus its label. The selected
+/// row leads with the `▌ ` pointer and wears the selection style;
+/// unselected rows lead two blank cols so the caps align.
 fn ask_modal_body(ask: &PendingAsk, width: usize) -> Vec<ratatui::text::Line<'static>> {
-    use ratatui::text::Line as TuiLine;
-    use ratatui::text::Span;
-    let mut rows: Vec<ratatui::text::Line<'static>> = Vec::new();
-    push_gutter(
-        &mut rows,
-        &ask.question,
-        width as u16,
-        "",
-        ratatui::style::Style::new()
-            .fg(crate::palette::FG_STRONG)
-            .add_modifier(ratatui::style::Modifier::BOLD),
-    );
+    use ratatui::style::{Modifier, Style};
+    use ratatui::text::{Line as TuiLine, Span};
+    use unicode_width::UnicodeWidthStr;
+    let strong = Style::new()
+        .fg(crate::palette::STRONG)
+        .add_modifier(Modifier::BOLD);
+    let mut rows: Vec<TuiLine<'static>> = wrap_rows(&ask.question, width)
+        .into_iter()
+        .map(|r| TuiLine::from(Span::styled(r.text, strong)))
+        .collect();
     let q_lines = ask.question.split('\n').count();
     let budget = ask_detail_budget(q_lines);
-    if budget > 0 {
-        if let Some(detail) = &ask.detail {
-            rows.extend(ask_detail_rows(detail, budget));
-        }
+    if budget > 0
+        && let Some(detail) = &ask.detail
+    {
+        rows.extend(ask_detail_rows(detail, budget));
     }
+    let sel_bg = Style::new().bg(crate::palette::SEL_BG);
     for (i, opt) in ask.options.iter().enumerate() {
-        let row = format!("{} {opt}", i + 1);
+        let cap = format!("{} ", i + 1);
         if i == ask.selected {
-            rows.push(TuiLine::from(Span::styled(
-                pad_to_width(row, width),
-                selection_style(),
-            )));
+            let room = width.saturating_sub(2 + cap.width());
+            rows.push(TuiLine::from(vec![
+                Span::styled(
+                    format!("{} ", crate::icons::RAIL),
+                    sel_bg.fg(crate::palette::ACCENT),
+                ),
+                Span::styled(cap, sel_bg.fg(crate::palette::FAINT)),
+                Span::styled(pad_to_width(opt.clone(), room), selection_style()),
+            ]));
         } else {
-            rows.push(TuiLine::raw(row));
+            rows.push(TuiLine::from(vec![
+                Span::raw("  "),
+                Span::styled(cap, crate::palette::FAINT),
+                Span::raw(opt.clone()),
+            ]));
         }
     }
     rows
@@ -1825,14 +1980,10 @@ fn ask_detail_rows(detail: &str, max: usize) -> Vec<ratatui::text::Line<'static>
     rows
 }
 
-/// The input title while busy: only the queue hint — the action hints
-/// live in the status bar now.
-fn busy_input_title(queued: usize) -> String {
-    if queued == 0 {
-        "input".to_string()
-    } else {
-        format!("input · {queued} queued")
-    }
+/// The composer title while a queue is waiting: `N queued` (None with
+/// an empty queue — the action hints ride the bottom border).
+fn busy_input_title(queued: usize) -> Option<String> {
+    (queued > 0).then(|| format!("{queued} queued"))
 }
 
 /// Take the queue head (FIFO) to auto-send on turn settle.
@@ -1896,39 +2047,135 @@ fn queue_refusal(draft: &str) -> Option<String> {
     }
 }
 
-/// Braille spinner frame for an elapsed-milliseconds clock.
+/// Braille spinner frame for an elapsed-milliseconds clock (80 ms per
+/// frame).
 fn spin_frame(elapsed_ms: u128) -> char {
     const F: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-    F[(elapsed_ms / 120) as usize % F.len()]
+    F[(elapsed_ms / 80) as usize % F.len()]
 }
 
-/// The transient live working-indicator row: spinner glyph + elapsed
-/// seconds while a turn streams, a static WARN line while a permission
-/// ask holds the turn. Never cached — rebuilt every frame.
+/// The transient live working-indicator row: `{spinner} ` (ACCENT) +
+/// a shimmering `Working` (META under a GOLD_HI light band) + faint
+/// ` · {s}s · esc to interrupt` while a turn streams; a static WARN
+/// `◆ waiting for approval · {s}s` while a permission ask holds the
+/// turn. Never cached — rebuilt every frame, a pure function of the
+/// clock.
 fn working_row(
     ask: Option<&PendingAsk>,
     busy_since: Option<Instant>,
     now: Instant,
 ) -> ratatui::text::Line<'static> {
+    use ratatui::style::Style;
     use ratatui::text::Span;
-    let ms = busy_since.map_or(0, |t0| now.duration_since(t0).as_millis());
+    let ms = busy_since.map_or(0, |t0| now.saturating_duration_since(t0).as_millis());
+    let secs = ms as f64 / 1000.0;
     // span-level styling: Paragraph paints span styles, not line styles
-    let (text, style) = if ask.is_some() {
-        (
-            format!("… waiting for approval · {:.1}s", ms as f64 / 1000.0),
-            crate::palette::WARN,
-        )
-    } else {
-        (
-            format!("{} working · {:.1}s", spin_frame(ms), ms as f64 / 1000.0),
-            crate::palette::META,
-        )
-    };
-    ratatui::text::Line::from(vec![Span::styled(text, style)])
+    if ask.is_some() {
+        return ratatui::text::Line::from(vec![Span::styled(
+            format!("◆ waiting for approval · {secs:.1}s"),
+            Style::new().fg(crate::palette::WARN),
+        )]);
+    }
+    let mut spans = vec![Span::styled(
+        format!("{} ", spin_frame(ms)),
+        crate::palette::ACCENT_STYLE,
+    )];
+    spans.extend(crate::fx::shimmer(
+        "Working",
+        crate::palette::META,
+        crate::palette::STRONG,
+        ms,
+        Style::new(),
+    ));
+    spans.push(Span::styled(
+        format!(" · {secs:.1}s · esc to interrupt"),
+        Style::new().fg(crate::palette::FAINT),
+    ));
+    ratatui::text::Line::from(spans)
+}
+
+/// The live (never cached) region under the transcript cache, rebuilt
+/// every frame at the render width `w`: the thinking tail band (own
+/// spacer rows, shimmering head), the running tool call, the streaming
+/// assistant markdown (indented like its cached twin, the `▌` cursor
+/// riding its last row), then the working row between air rows.
+///
+/// Air mirrors what the flush will cache, so hand-offs land in place:
+/// the thinking band is row-for-row its flushed tail; the running call
+/// gets no leading air (it follows a just-flushed thinking band's
+/// spacer or merges into the preceding tool block); the streaming text
+/// gets the one blank [`separate_before`] will push ahead of the
+/// cached assistant block — skipped right after the thinking band,
+/// whose trailing spacer already is that air.
+fn live_region_rows(
+    lb: &LiveBlock,
+    ask: Option<&PendingAsk>,
+    busy_since: Option<Instant>,
+    now: Instant,
+    w: usize,
+) -> Vec<ratatui::text::Line<'static>> {
+    use ratatui::text::Line as TuiLine;
+    // one blank row of air unless the tail already is one
+    fn air(rows: &mut Vec<TuiLine<'static>>) {
+        if rows.last().is_none_or(|r| !r.spans.is_empty()) {
+            rows.push(TuiLine::default());
+        }
+    }
+    let ms = busy_since.map_or(0, |t0| now.saturating_duration_since(t0).as_millis());
+    let mut rows: Vec<TuiLine<'static>> = Vec::new();
+    if !lb.thought.trim().is_empty() {
+        rows.extend(thought_rows_tail(&lb.thought, w, Some(ms)));
+    }
+    rows.extend(tool_live_rows(
+        &lb.tool_header,
+        lb.live_tool.as_ref(),
+        w,
+        now,
+    ));
+    if !lb.md.is_empty() {
+        air(&mut rows);
+        // the markdown cache stays cursor-free: clone, trim room for the
+        // cursor, then append it
+        let mut md = lb.md.clone();
+        if let Some(last) = md.last_mut() {
+            live_cursor(last, w.saturating_sub(ASSISTANT_INDENT));
+        }
+        indent_assistant(&mut md);
+        rows.extend(md);
+    }
+    // transient tail: the working indicator between air rows, so it
+    // never crowds the live blocks or the composer
+    air(&mut rows);
+    rows.push(working_row(ask, busy_since, now));
+    rows.push(TuiLine::default());
+    rows
 }
 
 fn live_stale(cached_at: Instant, now: Instant) -> bool {
     now.duration_since(cached_at).as_millis() >= 80
+}
+
+/// Append the streaming cursor `▌` to a live markdown row that must fit
+/// `width` columns: code panels and rules pad to the full fold width, so
+/// the row first gives up trailing whitespace (then, if a full line of
+/// text leaves no column, its last glyph) — the cursor never clips off
+/// the pane edge.
+fn live_cursor(row: &mut ratatui::text::Line<'static>, width: usize) {
+    use ratatui::text::Span;
+    use unicode_width::UnicodeWidthStr;
+    let used = |row: &ratatui::text::Line<'static>| -> usize {
+        row.spans.iter().map(|s| s.content.width()).sum()
+    };
+    while used(row) >= width.max(1) {
+        let Some(last) = row.spans.last_mut() else {
+            return;
+        };
+        if last.content.to_mut().pop().is_none() {
+            row.spans.pop();
+        }
+    }
+    row.spans
+        .push(Span::styled("▌", crate::palette::ACCENT_STYLE));
 }
 
 /// Format a duration for turn reports: sub-minute `3.2s`, else `m:ss`.
@@ -2149,9 +2396,11 @@ pub struct SidebarState {
     pub title: Option<String>,
 }
 
-/// Clickable bottom-strip buttons, recorded at render time so the
-/// mouse handler can hit-test without duplicating the layout math
-/// (capture mode only — native mode uses the keyboard shortcuts).
+/// Clickable strip buttons on the composer's bottom border, recorded at
+/// render time from the exact drawn cells so the mouse handler can
+/// hit-test without duplicating the layout math (capture mode only —
+/// native mode uses the keyboard shortcuts). A button the border had
+/// no room for keeps an empty rect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct StripZones {
     /// The todos button.
@@ -2186,8 +2435,8 @@ impl StripZones {
     }
 }
 
-/// Clickable ▲▼ jump targets on the transcript title row (recorded at
-/// render time like [`SidebarZone`]).
+/// Clickable ▲▼ jump targets at the right end of the header bar
+/// (recorded at render time from the drawn cells, like [`StripZones`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TitleArrows {
     /// ▲ — jump to the previous user message.
@@ -2459,7 +2708,7 @@ fn feature_rows(sidebar: &SidebarState) -> Vec<FeatureRow> {
     out
 }
 
-/// Popup rows for the info strip button: cwd 🌿 branch, session, model,
+/// Popup rows for the info strip button: cwd ⎇ branch, session, model,
 /// effort, cost, context — the old sidebar's session + info sections.
 fn info_rows(
     sidebar: &SidebarState,
@@ -3029,14 +3278,10 @@ pub struct ModelInfo {
 #[derive(Debug, Clone)]
 pub struct ModelPicker {
     pub models: Vec<ModelInfo>,
-    /// Vendor lock (stage two of `/provider`): when set, only this
-    /// vendor's models are listed and Esc returns to the provider stage.
+    /// Vendor lock (stage two of `/provider`, or `/model <vendor>`):
+    /// when set, only this vendor's models are listed and Esc returns
+    /// to the provider stage.
     pub vendor: Option<String>,
-    /// List only models of configured providers (keyless or key
-    /// present). The vendor-locked post-connect drill sets this; the
-    /// unified `/model` list leaves it off and partitions
-    /// configured-first instead.
-    pub configured_only: bool,
     /// Selected row.
     pub selected: usize,
     /// Typed filter (substring over the id).
@@ -3044,22 +3289,30 @@ pub struct ModelPicker {
 }
 
 /// One picker row for a model. Must stay on a single line under the
-/// modal's inner width (68 - 2 borders = 66) or Paragraph wraps and the
+/// picker's row budget (62 display cols: 68 wide minus borders,
+/// padding, and the 2-col selection pointer) or Paragraph wraps and the
 /// tail models clip off the picker — the exact bug that hid installed
 /// ollama models behind two-line rows.
 fn model_row(m: &ModelInfo, ctx: &str, key: &str) -> String {
-    // the reasoning segment rides last: `medium` abbreviates (four
-    // levels read low/med/high/max) and the id column shrinks to
-    // whatever the 66-display-col budget leaves (the id always
-    // truncates first — same philosophy as the card heads)
-    let think = (!m.efforts.is_empty()).then(|| {
-        let levels: Vec<&str> = m
-            .efforts
-            .iter()
-            .map(|e| if e == "medium" { "med" } else { e.as_str() })
-            .collect();
-        format!("🧠 {}", levels.join("/"))
-    });
+    use unicode_width::UnicodeWidthStr;
+    // reasoning levels ride last as the effort battery (`✻◔◑◕`); a
+    // level with no battery glyph falls back to its name, so nothing is
+    // hidden — the id column absorbs any extra width
+    let think = if m.efforts.is_empty() {
+        String::new()
+    } else {
+        let mut s = format!(" {}", crate::icons::THOUGHT);
+        for e in &m.efforts {
+            match crate::icons::effort_glyph(e) {
+                Some(g) => s.push_str(g),
+                None => {
+                    s.push(' ');
+                    s.push_str(e);
+                }
+            }
+        }
+        s
+    };
     let wire = m
         .wire
         .trim_end_matches("_messages")
@@ -3078,70 +3331,36 @@ fn model_row(m: &ModelInfo, ctx: &str, key: &str) -> String {
     } else {
         "-".to_string()
     };
-    match &think {
-        None => format!(
-            "{id:<34} {ctx:>5} {price:<10} {wire:<7}{key}",
-            id = m.id.chars().take(34).collect::<String>()
-        ),
-        Some(seg) => {
-            // the picker's inner width is 64 display cols (68 minus
-            // borders and padding): 63 chars + the 2-col 🧠 counts
-            // once extra. Fixed overhead: three joins + " · ".
-            let budget = 63usize.saturating_sub(
-                seg.chars().count()
-                    + 6
-                    + ctx.chars().count()
-                    + price.chars().count()
-                    + wire.chars().count()
-                    + key.chars().count(),
-            );
-            let id: String = m.id.chars().take(budget.max(8)).collect();
-            format!("{id} {ctx} {price} {wire}{key} · {seg}")
-        }
-    }
+    // 26 + 1 + 5 + 1 + 10 + 1 + 9 + key (≤2) + battery (≤6) = 61
+    let id_w = 26usize
+        .saturating_sub(think.width().saturating_sub(6))
+        .max(8);
+    let id: String = m.id.chars().take(id_w).collect();
+    format!("{id:<id_w$} {ctx:>5} {price:<10} {wire:<9}{key:<2}{think}")
 }
 
 impl ModelPicker {
-    /// Rows after filtering. A vendor lock (the provider stage of
-    /// `/provider`) narrows the pool, `configured_only` drops models
-    /// whose key is missing, and the substring filter applies last.
-    /// The unified list (no vendor lock, `configured_only` off) puts
-    /// models of configured providers first — keyless or keyed-in —
-    /// the rest after; order is stable within both groups.
+    /// Rows after filtering: only models of configured providers
+    /// (keyless, or key present) — narrowed by a vendor lock, with the
+    /// substring filter applied last. Models of unconfigured providers
+    /// stay reachable by typing a `vendor/model` selector (see
+    /// [`pick`](Self::pick)).
     pub fn rows(&self) -> Vec<&ModelInfo> {
         let f = self.filter.to_lowercase();
-        let matches = |m: &ModelInfo| {
-            self.vendor
-                .as_deref()
-                .is_none_or(|v| m.id.split('/').next() == Some(v))
-                && (!self.configured_only || m.key_env.is_empty() || m.key_set)
-                && (f.is_empty() || m.id.to_lowercase().contains(&f))
-        };
-        if self.unified() {
-            let mut configured: Vec<&ModelInfo> = Vec::new();
-            let mut rest: Vec<&ModelInfo> = Vec::new();
-            for m in self.models.iter().filter(|m| matches(m)) {
-                if Self::configured(m) {
-                    configured.push(m);
-                } else {
-                    rest.push(m);
-                }
-            }
-            configured.extend(rest);
-            configured
-        } else {
-            self.models.iter().filter(|m| matches(m)).collect()
-        }
-    }
-
-    /// The unified `/model` list: no vendor lock, configured-only off.
-    fn unified(&self) -> bool {
-        !self.configured_only && self.vendor.is_none()
+        self.models
+            .iter()
+            .filter(|m| {
+                Self::configured(m)
+                    && self
+                        .vendor
+                        .as_deref()
+                        .is_none_or(|v| m.id.split('/').next() == Some(v))
+                    && (f.is_empty() || m.id.to_lowercase().contains(&f))
+            })
+            .collect()
     }
 
     /// A model of a configured provider: keyless, or its key is set.
-    /// Drives the partition in [`rows`](Self::rows) and the
-    /// `─ not configured ─` separator in the modal render.
     fn configured(m: &ModelInfo) -> bool {
         m.key_env.is_empty() || m.key_set
     }
@@ -3243,6 +3462,20 @@ fn mark_key_set(models: &mut [ModelInfo], providers: &mut [ProviderInfo], env_va
     }
 }
 
+/// What Enter does on a `/tree` row.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TreeAction {
+    /// Non-selectable section header.
+    Header,
+    /// Attach the strand with this id.
+    Attach(String),
+    /// Fork the current strand before the nth-last user input — the
+    /// picked input and everything after it drop from the fork. The
+    /// prompt prefills the composer after the fork (⏎ and `e` alike),
+    /// so the user can resend, edit, or delete it.
+    Fork { turns: u32, prompt: String },
+}
+
 /// Which modal is open (drawn above everything).
 #[derive(Debug, Clone)]
 pub enum Modal {
@@ -3307,12 +3540,13 @@ pub enum Modal {
         /// Rendered rows (bars + footer).
         rows: Vec<String>,
     },
-    /// Strand tree (/tree): current session + descendants.
+    /// Strand tree (/tree): the session's family plus fork points.
     Tree {
-        /// Rendered rows (`title · date · N msgs`).
+        /// Rendered rows (`title · date · N msgs` sessions, `⑂ prompt`
+        /// fork points, dim section headers).
         items: Vec<String>,
-        /// Switch targets aligned with `items`.
-        targets: Vec<String>,
+        /// Row actions aligned with `items`.
+        actions: Vec<TreeAction>,
         /// Selected row index.
         selected: usize,
     },
@@ -3424,7 +3658,7 @@ fn mouse_setting(captured: bool) -> Option<String> {
 /// `[tui] mouse` values.
 fn mouse_mode_text(captured: bool) -> String {
     format!(
-        "🖱 mouse {} — {}",
+        "mouse {} — {}",
         if captured { "capture" } else { "native" },
         if captured {
             "everything clickable; hover previews what a click touches; drag over the transcript selects & copies; ⇧drag = native selection; ↑/↓ = prompt history"
@@ -3493,9 +3727,19 @@ pub struct KeyPrompt {
 /// modifiers survive — without it, terminals never report Shift+Enter
 /// distinctly (it arrives as plain `\r`), so the draft sends instead of
 /// breaking the line.
+///
+/// `REPORT_ALTERNATE_KEYS` is what makes shifted symbols type: the
+/// `CSI u` main codepoint is *always* the un-shifted key, so with only
+/// the flags above `?` (Shift+`'` on a Spanish/Latin American layout)
+/// arrives as `CSI 39;2u` and types `'`. The flag adds the shifted
+/// codepoint in the alternate field (`CSI 39:63;2u`), which crossterm
+/// resolves back into the layout's own character.
 fn startup_keyboard_flags() -> crossterm::event::KeyboardEnhancementFlags {
     use crossterm::event::KeyboardEnhancementFlags as F;
-    F::DISAMBIGUATE_ESCAPE_CODES | F::REPORT_EVENT_TYPES | F::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+    F::DISAMBIGUATE_ESCAPE_CODES
+        | F::REPORT_EVENT_TYPES
+        | F::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+        | F::REPORT_ALTERNATE_KEYS
 }
 
 /// Run the TUI over an engine handle. Blocks until exit.
@@ -3588,14 +3832,9 @@ pub async fn run(
     // shell is left unable to echo keystrokes.
     let _ = crossterm::terminal::disable_raw_mode();
     let (exit, resume) = result?;
-    if let Some((hint, resume_cmd)) = resume {
+    if let Some(hint) = resume {
         println!();
         println!("{hint}");
-        // the shell's ↑ should offer the way back too (best effort —
-        // bash only shows it in new shells / after `history -n`);
-        // the wrapper path covers the LIVE shell via last-resume
-        append_shell_history(&resume_cmd);
-        write_last_resume(&resume_cmd);
     }
     Ok(exit)
 }
@@ -3613,7 +3852,7 @@ async fn app(
     header_glyph: &str,
     mut mouse_captured: bool,
     mut fresh: bool,
-) -> std::io::Result<(Exit, Option<(String, String)>)> {
+) -> std::io::Result<(Exit, Option<String>)> {
     use crossterm::event::{Event as TermEvent, KeyCode, KeyModifiers};
     let _ = agents.clone();
 
@@ -3708,16 +3947,18 @@ async fn app(
     // and frame can never disagree about the band/surface width
     let tx_width: std::cell::Cell<u16> = std::cell::Cell::new(0);
     let mut term_events = crossterm::event::EventStream::new();
-    let mut spin = tokio::time::interval(Duration::from_millis(120));
+    // 80 ms: the spinner's frame step, fast enough for a smooth comet
+    let mut spin = tokio::time::interval(Duration::from_millis(80));
     // last mouse mode actually applied to the terminal — the loop owns
     // every capture transition (base toggle, overlay open/close,
     // run_external restore) through this single reconcile point
     let mut applied_capture: Option<bool> = None;
     // left-drag selection over the transcript: `press` is an
-    // undispatched click anchor, `sel` the picked (first, last) row
-    // span in transcript-row space once the drag passes click tolerance
+    // undispatched click anchor, `sel` the picked text span once the
+    // drag passes click tolerance — (row, column) anchors in reading
+    // order, columns relative to the content area's left edge
     let mut press: Option<(u16, u16)> = None;
-    let mut sel: Option<(usize, usize)> = None;
+    let mut sel: Option<((usize, u16), (usize, u16))> = None;
     // what the pointer currently hovers (capture mode; motion events)
     let mut hover: Option<Hover> = None;
     let mut was_overlay_open = false;
@@ -3758,15 +3999,16 @@ async fn app(
             Ok(s) => (s.width, s.height),
             Err(_) => (80, 24),
         };
-        // the markdown cache keys on the width render actually used
-        // (one tick of staleness after a resize is fine: the surface
-        // fill re-pads live rows at the frame's width)
+        // the markdown cache keys on the width render actually used,
+        // folded exactly like a cached assistant block (W minus its
+        // indent), so the flush never reflows; one tick of staleness
+        // after a resize is fine
         let last_w = tx_width.get();
-        let md_width = if last_w == 0 {
+        let md_width = assistant_md_width(if last_w == 0 {
             transcript_width(term_w)
         } else {
             last_w
-        };
+        });
         let input_h = input_height(input_area_rows(
             picker.as_ref(),
             &input.text,
@@ -3999,7 +4241,7 @@ async fn app(
                                         features: None,
                                         })
                                         .await;
-                                    pop_toast(&mut toast, format!("🧠 {}", effort_label(level)));
+                                    pop_toast(&mut toast, format!("{} {}", crate::icons::THOUGHT, effort_label(level)));
                                 }
                                 _ => {}
                             },
@@ -4087,7 +4329,6 @@ async fn app(
                                             Modal::Model(ModelPicker {
                                                 models: models.clone(),
                                                 vendor: Some(vendor),
-                                                configured_only: true,
                                                 selected: 0,
                                                 filter: String::new(),
                                             })
@@ -4118,7 +4359,6 @@ async fn app(
                                             modal = Some(Modal::Model(ModelPicker {
                                                 models: models.clone(),
                                                 vendor: Some(p.name),
-                                                configured_only: true,
                                                 selected: 0,
                                                 filter: String::new(),
                                             }));
@@ -4467,25 +4707,84 @@ async fn app(
                             },
                             Modal::Tree {
                                 items,
-                                targets,
+                                actions,
                                 selected,
                             } => match key.code {
                                 KeyCode::Esc => modal = None,
+                                // headers are scenery: navigation skips
                                 KeyCode::Up => {
-                                    *selected = selected.saturating_sub(1);
-                                }
-                                KeyCode::Down => {
-                                    if *selected + 1 < items.len() {
-                                        *selected += 1;
+                                    if let Some(prev) = (0..*selected)
+                                        .rev()
+                                        .find(|&i| !matches!(actions[i], TreeAction::Header))
+                                    {
+                                        *selected = prev;
                                     }
                                 }
-                                KeyCode::Enter => {
-                                    if let Some(id) = targets.get(*selected).cloned() {
-                                        fresh = id == "new";
-                                        let _ = commands
-                                            .send(Command::SwitchStrand { id })
-                                            .await;
-                                        busy = true;
+                                KeyCode::Down => {
+                                    if let Some(next) = (*selected + 1..items.len())
+                                        .find(|&i| !matches!(actions[i], TreeAction::Header))
+                                    {
+                                        *selected = next;
+                                    }
+                                }
+                                KeyCode::Enter | KeyCode::Char('e') => {
+                                    let edit = key.code == KeyCode::Char('e');
+                                    match actions.get(*selected).cloned() {
+                                        Some(TreeAction::Attach(id)) if !edit => {
+                                            fresh = id == "new";
+                                            let _ = commands
+                                                .send(Command::SwitchStrand { id })
+                                                .await;
+                                            busy = true;
+                                            // close on attach: a stale tree
+                                            // over the replayed session
+                                            // swallows the next keys
+                                            modal = None;
+                                        }
+                                        Some(TreeAction::Fork { turns, prompt }) => {
+                                            // mid-turn the turn's command
+                                            // drain swallows ForkStrand —
+                                            // fork only from idle, like
+                                            // /update
+                                            if busy {
+                                                transcript.push_separated(Line::Warn(
+                                                    "⏳ turn running — esc to abort first"
+                                                        .into(),
+                                                ));
+                                                continue;
+                                            }
+                                            // branch point: the current
+                                            // strand stays intact, the
+                                            // fork child continues from
+                                            // before the picked input
+                                            let _ = commands
+                                                .send(Command::ForkStrand { turns })
+                                                .await;
+                                            busy = true;
+                                            modal = None;
+                                            // going back lands the picked
+                                            // prompt in the composer: the
+                                            // user decides whether to reuse,
+                                            // edit, or delete it. An existing
+                                            // draft is parked in the kill ring
+                                            // (Ctrl+Y) rather than dropped.
+                                            if !input.text.is_empty() {
+                                                input.clear_draft();
+                                            }
+                                            input.text = prompt;
+                                            input.cursor = input.text.chars().count();
+                                            transcript.push_separated(Line::Info(
+                                                if edit {
+                                                    "✎ forked — edit & resend, ⏎ sends when ready"
+                                                        .to_string()
+                                                } else {
+                                                    format!(
+                                                        "⑂ forked {turns} turn(s) back — prompt in the box; original intact in /tree"
+                                                    )
+                                                },
+                                            ));
+                                        }
+                                        _ => {}
                                     }
                                 }
                                 _ => {}
@@ -4866,7 +5165,9 @@ async fn app(
                                     .iter()
                                     .rev()
                                     .filter_map(|l| match l {
-                                        Line::User(t) => Some(t.clone()),
+                                        Line::User(t) if !t.trim_start().starts_with('/') => {
+                                            Some(t.clone())
+                                        }
                                         _ => None,
                                     })
                                     .take(20)
@@ -5119,6 +5420,29 @@ async fn app(
                                 }
                                 continue;
                             }
+                            // /update: exit into the updater, which
+                            // re-execs ka on the same session — only
+                            // from an idle app, never mid-turn
+                            if text.split_whitespace().next() == Some("/update") {
+                                if text.trim() != "/update" {
+                                    transcript.push_separated(Line::Warn(
+                                        "usage: /update (no arguments)".into(),
+                                    ));
+                                    continue;
+                                }
+                                transcript.push_separated(Line::User(text));
+                                if busy || pending.is_some() || !queue.is_empty() {
+                                    transcript.push_separated(Line::Warn(
+                                        "update waits for idle — finish or stop the turn first"
+                                            .into(),
+                                    ));
+                                } else {
+                                    exit = Some(Exit::Update {
+                                        session: meters.session.clone(),
+                                    });
+                                }
+                                continue;
+                            }
                             // /skill:<name> [args]: explicit invocation —
                             // intercepted before slash dispatch so the
                             // literal line never runs as a prompt
@@ -5151,8 +5475,8 @@ async fn app(
                                         Line::Info(note)
                                     });
                                 }
-                                        if let Some(kind) = cmd.modal {
-                                            match kind {
+                                        if let Some(kind) = cmd.modal.clone() {
+                                            match &kind {
                                                 ModalKind::Mode => {
                                                     // the picker borrows the input
                                                     // box, preselecting the mode
@@ -5242,10 +5566,9 @@ async fn app(
                                             })
                                         }
                                         ModalKind::Help => Modal::Help,
-                                        ModalKind::Model => Modal::Model(ModelPicker {
+                                        ModalKind::Model(vendor) => Modal::Model(ModelPicker {
                                             models: models.clone(),
-                                            vendor: None,
-                                            configured_only: false,
+                                            vendor: vendor.clone(),
                                             selected: 0,
                                             filter: String::new(),
                                         }),
@@ -5313,12 +5636,67 @@ async fn app(
                                             } else {
                                                 Some(meters.session.clone())
                                             };
-                                            let inner_w = 68usize.saturating_sub(4);
-                                            let (items, targets) =
-                                                tree_modal_rows(&all, current.as_deref(), inner_w);
+                                            let inner_w = 110usize.saturating_sub(4);
+                                            // the session's user inputs,
+                                            // oldest first, read from the
+                                            // CURRENT STRAND: ForkStrand
+                                            // counts strand user messages,
+                                            // so fork depths must count the
+                                            // same list — transcript
+                                            // Line::User rows drift (steers
+                                            // never persist, /plan-style
+                                            // followups persist without an
+                                            // echo, rewinds keep stale
+                                            // records)
+                                            let history: Vec<String> = current
+                                                .as_deref()
+                                                .map(|id| {
+                                                    all.iter()
+                                                        .find(|s| s.id == id)
+                                                        .and_then(|s| {
+                                                            ka_strand::read(&s.path).ok()
+                                                        })
+                                                        .unwrap_or_default()
+                                                })
+                                                .map(|records| {
+                                                    records
+                                                        .iter()
+                                                        .filter_map(|r| match r {
+                                                            ka_strand::Record::Message {
+                                                                role:
+                                                                    ka_strand::Role::User,
+                                                                content,
+                                                                ..
+                                                            } => Some(content.clone()),
+                                                            _ => None,
+                                                        })
+                                                        .rev()
+                                                        .take(20)
+                                                        .collect::<Vec<_>>()
+                                                        .into_iter()
+                                                        .rev()
+                                                        .collect()
+                                                })
+                                                .unwrap_or_default();
+                                            let (items, actions) = tree_modal_rows(
+                                                &all,
+                                                current.as_deref(),
+                                                &history,
+                                                inner_w,
+                                                // fork-point labels need the
+                                                // strands' records; missing
+                                                // files read as empty and
+                                                // simply drop the label
+                                                |id| {
+                                                    all.iter()
+                                                        .find(|s| s.id == id)
+                                                        .and_then(|s| ka_strand::read(&s.path).ok())
+                                                        .unwrap_or_default()
+                                                },
+                                            );
                                             Modal::Tree {
                                                 items,
-                                                targets,
+                                                actions,
                                                 selected: 0,
                                             }
                                         }
@@ -5407,7 +5785,7 @@ async fn app(
                             transcript.push_separated(Line::User(text.clone()));
                             let cmd = if busy {
                                 transcript.push_separated(Line::Info(
-                                    "⚡ steering this turn".into(),
+                                    "steering this turn".into(),
                                 ));
                                 Command::Steer { text }
                             } else {
@@ -6016,14 +6394,14 @@ async fn app(
                             ) => {
                                 if let Some(p) = press
                                     && let Some((area, start)) = tx_content.get()
-                                    && let Some((lo, hi)) = drag_span(
+                                    && let Some(span) = drag_span(
                                         area,
                                         start,
                                         p,
                                         (mouse_evt.column, mouse_evt.row),
                                     )
                                 {
-                                    sel = Some((lo, hi));
+                                    sel = Some(span);
                                 }
                             }
                             // left release: a picked span copies to the
@@ -6034,23 +6412,16 @@ async fn app(
                             crossterm::event::MouseEventKind::Up(
                                 crossterm::event::MouseButton::Left,
                             ) => {
-                                if let Some((lo, hi)) = sel {
-                                    let mut picked = String::new();
-                                    for row in lo..=hi {
-                                        if let Some(t) = transcript.row_text(row) {
-                                            picked.push_str(t.trim_end());
-                                            picked.push('\n');
-                                        }
-                                    }
+                                if let Some(span) = sel {
+                                    let picked = selection_text(&transcript, span);
                                     if !picked.is_empty() {
                                         let mut stdout = std::io::stdout().lock();
                                         let _ = stdout.write_all(b"\x1b]52;c;");
-                                        let _ = stdout.write_all(
-                                            b64encode(picked.trim_end()).as_bytes(),
-                                        );
+                                        let _ =
+                                            stdout.write_all(b64encode(&picked).as_bytes());
                                         let _ = stdout.write_all(b"\x07");
                                         let _ = stdout.flush();
-                                        let n = hi - lo + 1;
+                                        let n = span.1.0 - span.0.0 + 1;
                                         pop_toast(
                                             &mut toast,
                                             format!(
@@ -6073,6 +6444,9 @@ async fn app(
                                         }
                                         Click::Thought { entry } => {
                                             transcript.toggle_thought(entry);
+                                        }
+                                        Click::Summary { entry } => {
+                                            transcript.toggle_summary(entry);
                                         }
                                         Click::JumpUp => {
                                             let rows = transcript.user_entry_rows();
@@ -6362,102 +6736,20 @@ async fn app(
 }
 
 /// The after-exit resume hint: the command that brings this session
-/// back. Worth printing whenever the session exists and something
-/// happened in it — a finished turn, a turn still in flight when the
-/// user quit, or history replayed from an earlier run: closing an
-/// older chat without a new turn still deserves the way back.
-fn resume_hint(
-    session: &str,
-    turns: u64,
-    busy: bool,
-    has_history: bool,
-) -> Option<(String, String)> {
+/// back, printed as plain text on the way out — the terminal's own
+/// history and state stay untouched. Worth printing whenever the
+/// session exists and something happened in it — a finished turn, a
+/// turn still in flight when the user quit, or history replayed from
+/// an earlier run: closing an older chat without a new turn still
+/// deserves the way back.
+fn resume_hint(session: &str, turns: u64, busy: bool, has_history: bool) -> Option<String> {
     if session.is_empty() || (turns == 0 && !busy && !has_history) {
         return None;
     }
     let tag = short_session(session).unwrap_or("?");
-    let resume_cmd = format!("ka --session {tag}");
-    let hint = format!(
-        "⟡ session saved — resume with: ka -c   (or: {resume_cmd}; with `ka shell-integration` installed, ↑ + Enter)"
-    );
-    Some((hint, resume_cmd))
-}
-
-/// Shape of one appended history line, sniffed from the file's last
-/// non-empty line: zsh extended history (`: <start>:<elapsed>;cmd`)
-/// gets the matching `:<ts>:0;<cmd>` shape, anything else (bash is
-/// plain lines, empty file) appends the bare command.
-fn history_line(existing_last: Option<&str>, cmd: &str, ts: u64) -> String {
-    let zsh = existing_last.and_then(|l| {
-        let rest = l.strip_prefix(": ")?;
-        let (start, rest) = rest.split_once(':')?;
-        let (elapsed, _) = rest.split_once(';')?;
-        (!start.is_empty()
-            && start.chars().all(|c| c.is_ascii_digit())
-            && !elapsed.is_empty()
-            && elapsed.chars().all(|c| c.is_ascii_digit()))
-        .then_some(())
-    });
-    match zsh {
-        Some(()) => format!(":{ts}:0;{cmd}"),
-        None => cmd.to_string(),
-    }
-}
-
-/// Append to an explicit history file (missing/unreadable files are
-/// skipped — never created here).
-fn append_history_to(path: &std::path::Path, cmd: &str, ts: u64) {
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return;
-    };
-    let last = content.lines().rev().find(|l| !l.trim().is_empty());
-    let line = history_line(last, cmd, ts);
-    let mut out = content;
-    if !out.is_empty() && !out.ends_with('\n') {
-        out.push('\n');
-    }
-    out.push_str(&line);
-    out.push('\n');
-    let _ = std::fs::write(path, out);
-}
-
-/// Write the just-exited session's resume command to
-/// `<data dir>/last-resume`. The `ka shell-integration` wrapper reads
-/// this file after every run and registers the command in the LIVE
-/// shell's history (`print -s` / `history -s`), so ↑ + Enter restores
-/// the session in the same terminal. Best effort — never fails exit.
-fn write_last_resume(cmd: &str) {
-    use std::io::Write;
-    let dir = ka_strand::data_dir();
-    let _ = std::fs::create_dir_all(&dir);
-    let Ok(mut f) = std::fs::File::create(dir.join("last-resume")) else {
-        return;
-    };
-    let _ = f.write_all(cmd.as_bytes());
-    let _ = f.write_all(b"\n");
-}
-
-/// Append the resume command to $HISTFILE. Skips silently when unset;
-/// never fails the exit — history bookkeeping is best effort.
-fn append_shell_history(cmd: &str) {
-    // bash and zsh do NOT export HISTFILE to children — falling back to
-    // the conventional files is what makes this work at all there
-    let target = std::env::var("HISTFILE").ok().or_else(|| {
-        let home = std::env::var("HOME").ok()?;
-        let zsh = std::path::Path::new(&home).join(".zsh_history");
-        if zsh.is_file() {
-            return Some(zsh.to_string_lossy().into_owned());
-        }
-        let bash = std::path::Path::new(&home).join(".bash_history");
-        bash.is_file().then(|| bash.to_string_lossy().into_owned())
-    });
-    if let Some(p) = target {
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        append_history_to(std::path::Path::new(&p), cmd, ts);
-    }
+    Some(format!(
+        "⟡ session saved — resume with: ka -c   (this session: ka --session {tag})"
+    ))
 }
 
 /// Live in-flight tool call: rolling output preview (live region only)
@@ -6741,34 +7033,54 @@ fn apply_event(
                 fire_notifications("turn_finished", stop_label);
             }
             if !silent {
-                let (glyph, tone, text) = match stop {
-                    ka_protocol::Stop::Done => ('✓', SummaryTone::Ok, format!("done{tail}")),
+                let (glyph, tone, text, detail) = match stop {
+                    ka_protocol::Stop::Done => ('✓', SummaryTone::Ok, format!("done{tail}"), None),
                     ka_protocol::Stop::Aborted => (
                         '◐',
                         SummaryTone::Warn,
                         format!("aborted · partial kept{tail}"),
+                        None,
                     ),
                     ka_protocol::Stop::Length => (
                         '◑',
                         SummaryTone::Warn,
                         format!("stopped at output limit{tail}"),
+                        None,
                     ),
-                    ka_protocol::Stop::Error => {
-                        let body = match last_error.take() {
-                            Some(msg) => {
-                                let msg: String = if msg.chars().count() > 90 {
-                                    msg.chars().take(89).chain(std::iter::once('…')).collect()
-                                } else {
-                                    msg
-                                };
-                                format!("failed · {msg} · /retry{tail}")
-                            }
-                            None => format!("failed · /retry{tail}"),
-                        };
-                        ('✗', SummaryTone::Err, body)
-                    }
+                    ka_protocol::Stop::Error => match last_error.take() {
+                        // the row keeps a 90-char preview; the full text
+                        // stays one click away (▸ expands the detail)
+                        Some(msg) if msg.chars().count() > 90 => {
+                            let short: String =
+                                msg.chars().take(89).chain(std::iter::once('…')).collect();
+                            (
+                                '✗',
+                                SummaryTone::Err,
+                                format!("failed · {short} · /retry{tail}"),
+                                Some(msg),
+                            )
+                        }
+                        Some(msg) => (
+                            '✗',
+                            SummaryTone::Err,
+                            format!("failed · {msg} · /retry{tail}"),
+                            None,
+                        ),
+                        None => (
+                            '✗',
+                            SummaryTone::Err,
+                            format!("failed · /retry{tail}"),
+                            None,
+                        ),
+                    },
                 };
-                transcript.push_separated(Line::Summary { glyph, tone, text });
+                transcript.push_separated(Line::Summary {
+                    glyph,
+                    tone,
+                    text,
+                    detail,
+                    expanded: false,
+                });
                 // best-effort desktop notification (OSC 9); one write
                 let label = match stop {
                     ka_protocol::Stop::Done => format!("done · {}", fmt_dur(elapsed)),
@@ -7278,14 +7590,17 @@ pub fn available_slash_commands() -> Vec<(String, String)> {
 
 fn builtin_slash_commands() -> Vec<(String, String)> {
     let mut cmds = vec![
-        ("/model".to_string(), "pick a model".to_string()),
+        (
+            "/model".to_string(),
+            "pick a model (/model <vendor> filters)".to_string(),
+        ),
         (
             "/mcp".to_string(),
             "refresh MCP tool lists (/mcp refresh)".to_string(),
         ),
         (
             "/tree".to_string(),
-            "current session's fork tree".to_string(),
+            "fork tree — branch from any input".to_string(),
         ),
         (
             "/memory".to_string(),
@@ -7407,6 +7722,10 @@ fn builtin_slash_commands() -> Vec<(String, String)> {
             "set an api key for the current model".to_string(),
         ),
         ("/quit".to_string(), "exit".to_string()),
+        (
+            "/update".to_string(),
+            "update ka, then resume this session (idle only)".to_string(),
+        ),
     ];
     if let Ok(cwd) = std::env::current_dir() {
         let home = std::env::var("HOME").ok();
@@ -7714,7 +8033,7 @@ pub struct Slash {
 }
 
 /// Modal a slash command opens.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModalKind {
     /// `/mode` permission picker (borrows the input box).
     Mode,
@@ -7724,8 +8043,10 @@ pub enum ModalKind {
     Session,
     /// Settings panel.
     Settings,
-    /// Model picker.
-    Model,
+    /// Model picker; the carried vendor lock makes `/model <vendor>`
+    /// open the list narrowed to that vendor (None = every configured
+    /// provider).
+    Model(Option<String>),
     /// Provider picker.
     Provider,
     /// API key prompt.
@@ -7962,9 +8283,10 @@ pub fn skill_invocation(text: &str, inventory: &Inventory) -> Option<Result<Comm
             // bare `/skill` (or the space form): teach the syntax and
             // list what's on offer — same shape as bare /agents
             if inventory.skills.is_empty() {
-                return Some(Err(
-                    "no skills discovered (⚡ lists what ka found)".to_string()
-                ));
+                return Some(Err(format!(
+                    "no skills discovered ({} skills lists what ka found)",
+                    crate::icons::STRIP_SKILLS
+                )));
             }
             return Some(Err(format!(
                 "invoke one by name: /skill:<name> [args] — {}",
@@ -7996,7 +8318,8 @@ pub fn skill_invocation(text: &str, inventory: &Inventory) -> Option<Result<Comm
             )));
         }
         return Some(Err(format!(
-            "no such skill: {name} (⚡ lists what ka found)"
+            "no such skill: {name} ({} skills lists what ka found)",
+            crate::icons::STRIP_SKILLS
         )));
     }
     Some(Ok(Command::Prompt {
@@ -8071,22 +8394,49 @@ pub fn slash_command(text: &str) -> Option<Slash> {
             followup: None,
             modal: None,
         }),
+        // dispatched by the /update intercept before this table; a
+        // real row keeps the queue refusal and completions honest
+        "/update" => Some(Slash {
+            note: None,
+            event: None,
+            quit: true,
+            followup: None,
+            modal: None,
+        }),
         "/model" => match rest {
-            Some(selector) => Some(Slash {
-                note: None,
-                event: Some(Command::SetModel {
-                    selector: selector.to_string(),
-                }),
-                quit: false,
-                followup: None,
-                modal: None,
-            }),
+            // `vendor/model[@effort]` sets the model outright; a bare
+            // `vendor` (no `/`) opens the picker locked to that vendor
+            // instead — `/model opencode-go` lists opencode-go's models
+            Some(selector) => {
+                let base = selector.split('@').next().unwrap_or("");
+                if base.contains('/') {
+                    Some(Slash {
+                        note: None,
+                        event: Some(Command::SetModel {
+                            selector: selector.to_string(),
+                        }),
+                        quit: false,
+                        followup: None,
+                        modal: None,
+                    })
+                } else {
+                    Some(Slash {
+                        note: None,
+                        event: None,
+                        quit: false,
+                        followup: None,
+                        modal: Some(ModalKind::Model(
+                            (!base.is_empty()).then(|| base.to_string()),
+                        )),
+                    })
+                }
+            }
             None => Some(Slash {
                 note: None,
                 event: None,
                 quit: false,
                 followup: None,
-                modal: Some(ModalKind::Model),
+                modal: Some(ModalKind::Model(None)),
             }),
         },
         "/provider" => Some(Slash {
@@ -8539,56 +8889,45 @@ fn observe_preview(window: &mut Vec<String>, excerpt: &str) {
     }
 }
 
-/// Live tool card while a call is running: the same boxed shape as the
-/// cached cards, state-neutral — deep-violet fill, tool-colored border
-/// and title, a braille spinner on the top border, up to
-/// [`PREVIEW_WINDOW`] preview rows inside, bottom border present (the
-/// whole card rebuilds every frame).
+/// The running call, timeline style: the same header as a finished
+/// call ([`timeline_head`]) led by a spinner glyph (`TOOL`) instead of
+/// ✓/✗, the live elapsed time in the right cluster, then up to
+/// [`PREVIEW_WINDOW`] preview rows threaded `│ ` (the last `╰ `), text
+/// faint. Rebuilt every frame at `now`. With nothing to preview yet it
+/// is the header alone, exactly like a settled call with no body.
 fn tool_live_rows(
     header: &str,
     live: Option<&LiveTool>,
     width: usize,
+    now: Instant,
 ) -> Vec<ratatui::text::Line<'static>> {
+    use ratatui::style::Style;
     use ratatui::text::Span;
     let Some(lt) = live else {
         return Vec::new();
     };
-    let border = |fg: ratatui::style::Color| {
-        ratatui::style::Style::new()
-            .fg(fg)
-            .bg(crate::palette::BG_TOOL)
-    };
+    let ms = now.saturating_duration_since(lt.started).as_millis();
+    let status = Span::styled(
+        spin_frame(ms).to_string(),
+        Style::new().fg(crate::palette::TOOL),
+    );
     let cluster = vec![Span::styled(
-        spin_frame(lt.started.elapsed().as_millis()).to_string(),
-        border(crate::palette::TOOL),
-    )];
-    let mut rows = vec![card_top_row(
-        card_head(header, None),
-        cluster,
-        width,
-        crate::palette::TOOL,
-        crate::palette::TOOL,
-        crate::palette::BG_TOOL,
+        fmt_dur(ms as f64 / 1000.0),
+        Style::new().fg(crate::palette::FAINT),
     )];
     let start = lt.preview.len().saturating_sub(PREVIEW_WINDOW);
-    for line in &lt.preview[start..] {
-        rows.push(card_content_row(
-            line,
-            crate::palette::FAINT,
-            crate::palette::TOOL,
-            crate::palette::BG_TOOL,
-            width,
-        ));
+    let preview = &lt.preview[start..];
+    let mut rows = vec![timeline_head(status, header, None, cluster, width)];
+    let room = width.saturating_sub(2).max(1);
+    for (i, line) in preview.iter().enumerate() {
+        rows.push(thread_row(i + 1 == preview.len(), trunc_cols(line, room)));
     }
-    rows.push(ratatui::text::Line::from(Span::styled(
-        format!("╰{}╯", "─".repeat(width.saturating_sub(2))),
-        border(crate::palette::TOOL),
-    )));
     rows
 }
 
-/// The one selection identity of the whole TUI: a full-row pink bar
-/// carrying near-black text (pad_to_width fills the row with SEL_BG).
+/// The one selection identity of the whole TUI: gold ink, bold, on the
+/// lifted violet row (overlay rows add the `▌ ` ACCENT pointer and pad
+/// to the width — see [`list_row`]).
 fn selection_style() -> ratatui::style::Style {
     use ratatui::style::Modifier;
     ratatui::style::Style::new()
@@ -8608,8 +8947,6 @@ fn pad_to_width(s: String, width: usize) -> String {
     s + &" ".repeat(width - used)
 }
 
-/// Status-bar key hints: each entry is a bold key plus a dim action,
-/// separated by dim ` · `.
 /// Memory tier files for /memory: project MEMORY.md, then the
 /// user-level one. Mirrors the engine's system-prompt fold.
 /// Rows for the /memory modal: loaded MEMORY.md tiers.
@@ -8724,33 +9061,268 @@ fn discover_memory_files(cwd: &std::path::Path) -> Vec<(std::path::PathBuf, Stri
     out
 }
 
-fn hint_spans(pairs: &[(&str, &str)]) -> Vec<ratatui::text::Span<'static>> {
-    use ratatui::style::{Modifier, Style};
+/// Contextual key hints as spans — key in ACCENT, action FAINT, two
+/// spaces between pairs — dropping pairs from the end until the row
+/// fits `max` display columns (empty when not even the first fits).
+fn hint_spans(pairs: &[(&str, &str)], max: usize) -> Vec<ratatui::text::Span<'static>> {
     use ratatui::text::Span;
-    let key = Style::new().add_modifier(Modifier::BOLD);
+    use unicode_width::UnicodeWidthStr;
     let mut out: Vec<Span<'static>> = Vec::new();
-    for (i, (k, v)) in pairs.iter().enumerate() {
-        if i > 0 {
-            out.push(Span::styled(" · ".to_string(), crate::palette::META));
+    let mut used = 0usize;
+    for (k, v) in pairs {
+        let gap = if out.is_empty() { 0 } else { 2 };
+        let w = gap + k.width() + 1 + v.width();
+        if used + w > max {
+            break;
         }
-        out.push(Span::styled((*k).to_string(), key));
-        out.push(Span::styled(format!(" {v}"), crate::palette::META));
+        if gap > 0 {
+            out.push(Span::raw("  "));
+        }
+        out.push(Span::styled((*k).to_string(), crate::palette::ACCENT_STYLE));
+        out.push(Span::styled(format!(" {v}"), crate::palette::FAINT));
+        used += w;
     }
     out
 }
 
-/// `"{icon} {word}"` for the status/welcome meters; the word alone when
-/// no icon is known yet.
-fn mode_segment(meters: &Meters) -> String {
-    if meters.mode_icon.is_empty() {
-        meters.mode.clone()
+/// Hints on the permission ask's bottom border.
+const ASK_HINTS: &[(&str, &str)] = &[
+    ("↑↓", "select"),
+    ("1-9", "pick"),
+    ("⏎", "confirm"),
+    ("esc", "deny"),
+];
+/// Hints on the slash popup's bottom border.
+const POPUP_HINTS: &[(&str, &str)] = &[("↑↓", "select"), ("tab", "complete"), ("esc", "close")];
+/// Hints on the path popup's bottom border.
+const PATH_HINTS: &[(&str, &str)] = &[("↑↓", "choose"), ("tab", "accept"), ("esc", "close")];
+
+/// Hints on the composer's bottom border: the borrowed picker's keys,
+/// the reverse search's, the busy turn's steer/queue/abort, or the
+/// idle send/select/history story for whichever mouse mode is live.
+fn composer_hints(
+    picker: bool,
+    rsearch: bool,
+    busy: bool,
+    mouse_captured: bool,
+) -> &'static [(&'static str, &'static str)] {
+    if picker {
+        &[
+            ("↑↓", "select"),
+            ("1-4", "jump"),
+            ("⏎", "apply"),
+            ("esc", "close"),
+        ]
+    } else if rsearch {
+        &[("^r", "next"), ("⏎", "accept"), ("esc", "cancel")]
+    } else if busy {
+        &[("⏎", "steer"), ("+ · alt+q", "queue"), ("esc", "abort")]
+    } else if mouse_captured {
+        &[
+            ("⏎", "send"),
+            ("drag", "select+copy"),
+            ("↑↓ ^p/^n", "history"),
+            ("/", "commands"),
+        ]
     } else {
-        format!("{} {}", meters.mode_icon, meters.mode)
+        &[
+            ("⏎", "send"),
+            ("drag", "select"),
+            ("↑↓", "scroll"),
+            ("^p/^n", "history"),
+            ("/", "commands"),
+        ]
     }
 }
 
-/// Effort segment: `🧠 {glyph} {level}` when the level has a battery
-/// glyph, `🧠 {level}` otherwise (unknown levels hide the glyph).
+/// Hints on an open modal's bottom border.
+fn modal_hints(open: &Modal) -> &'static [(&'static str, &'static str)] {
+    match open {
+        Modal::Session(_) => &[("type", "filter"), ("⏎", "switch"), ("esc", "close")],
+        Modal::Model(_) => &[("type", "filter"), ("⏎", "select"), ("esc", "back")],
+        Modal::Provider(_) => &[("type", "filter"), ("⏎", "connect"), ("esc", "close")],
+        Modal::Settings(p) if p.edit.is_some() => {
+            &[("type", "edit selector"), ("⏎", "apply"), ("esc", "cancel")]
+        }
+        Modal::Settings(_) => &[("⏎", "edit/cycle"), ("s", "save"), ("esc", "close")],
+        Modal::Spills { .. } => &[("↑↓", "choose"), ("⏎", "open"), ("esc", "close")],
+        Modal::Prompts { .. } => &[("↑↓", "choose"), ("⏎", "run / fill args"), ("esc", "close")],
+        Modal::Tree { .. } => &[
+            ("↑↓", "choose"),
+            ("⏎", "attach / fork at prompt"),
+            ("e", "fork & edit"),
+            ("esc", "close"),
+        ],
+        Modal::Rewind { .. } => &[
+            ("↑↓", "choose"),
+            ("⏎", "rewind"),
+            ("e", "edit"),
+            ("esc", "close"),
+        ],
+        Modal::Memory { inbox, .. } if inbox.is_empty() => &[("esc", "close")],
+        Modal::Memory { .. } => &[
+            ("↑↓", "choose"),
+            ("⏎", "project"),
+            ("u", "user"),
+            ("d", "discard"),
+            ("esc", "close"),
+        ],
+        Modal::Usage { .. } | Modal::Todos { .. } | Modal::Skills { .. } | Modal::Info { .. } => {
+            &[("any", "close")]
+        }
+        Modal::Features { .. } => &[
+            ("↑↓", "choose"),
+            ("⏎", "toggle"),
+            ("s", "save as default"),
+            ("esc", "close"),
+        ],
+        Modal::Context { .. } => &[("esc", "close")],
+        Modal::Tasks { .. } => &[("↑↓", "choose"), ("⏎", "page result"), ("esc", "close")],
+        Modal::TaskDetail { .. } | Modal::Debug { .. } => &[
+            ("pgup/pgdn", "scroll"),
+            ("home/end", "top/tail"),
+            ("esc", "close"),
+        ],
+        Modal::Key(_) => &[("type", "value"), ("⏎", "save"), ("esc", "cancel")],
+        Modal::Help => &[("⏎", "close")],
+    }
+}
+
+/// `Buffer::set_line` guarded against an origin outside the buffer
+/// (tiny terminals squeeze rects to nothing); the width clips at the
+/// buffer edge.
+fn put_line(buf: &mut ratatui::buffer::Buffer, x: u16, y: u16, line: &ratatui::text::Line<'_>) {
+    if buf.area.contains(ratatui::layout::Position { x, y }) {
+        buf.set_line(x, y, line, line.width() as u16);
+    }
+}
+
+/// Paint contextual hints right-aligned on a border row: they end at
+/// column `right` (exclusive), never start left of `left`, and carry
+/// one cell of air each side. Pairs drop from the end to fit.
+fn paint_hints(
+    buf: &mut ratatui::buffer::Buffer,
+    left: u16,
+    right: u16,
+    y: u16,
+    pairs: &[(&str, &str)],
+) {
+    use ratatui::text::{Line as TuiLine, Span};
+    let room = right.saturating_sub(left) as usize;
+    let spans = hint_spans(pairs, room.saturating_sub(2));
+    if spans.is_empty() {
+        return;
+    }
+    let mut row = vec![Span::raw(" ")];
+    row.extend(spans);
+    row.push(Span::raw(" "));
+    let line = TuiLine::from(row);
+    put_line(buf, right.saturating_sub(line.width() as u16), y, &line);
+}
+
+/// The composer's bottom-border buttons in drawn order:
+/// `(button, icon, label, key)`.
+const STRIP_BUTTONS: [(StripButton, &str, &str, &str); 3] = [
+    (
+        StripButton::Todos,
+        crate::icons::STRIP_TODOS,
+        "todos",
+        "alt+o",
+    ),
+    (
+        StripButton::Skills,
+        crate::icons::STRIP_SKILLS,
+        "skills",
+        "^t",
+    ),
+    (StripButton::Info, crate::icons::STRIP_INFO, "info", "alt+i"),
+];
+
+/// Draw the strip buttons ` {icon} {label} {key} ` (icon ACCENT, label
+/// META, key FAINT) on a border row from column `x0`, one border cell
+/// apart, never reaching `limit`. Returns the zones taken from the
+/// exact drawn cells (a button that did not fit keeps an empty rect,
+/// which no click can hit) and the first column past the last button's
+/// trailing gap.
+fn paint_strip(
+    buf: &mut ratatui::buffer::Buffer,
+    x0: u16,
+    limit: u16,
+    y: u16,
+) -> (StripZones, u16) {
+    use ratatui::text::{Line as TuiLine, Span};
+    let mut zones = StripZones::default();
+    let mut x = x0;
+    for (button, icon, label, key) in STRIP_BUTTONS {
+        let line = TuiLine::from(vec![
+            Span::raw(" "),
+            Span::styled(icon, crate::palette::ACCENT_STYLE),
+            Span::raw(" "),
+            Span::styled(label, crate::palette::META_STYLE),
+            Span::raw(" "),
+            Span::styled(key, crate::palette::FAINT),
+            Span::raw(" "),
+        ]);
+        let w = line.width() as u16;
+        if x.saturating_add(w) > limit {
+            break;
+        }
+        put_line(buf, x, y, &line);
+        let rect = ratatui::layout::Rect {
+            x,
+            y,
+            width: w,
+            height: 1,
+        };
+        match button {
+            StripButton::Todos => zones.todos = rect,
+            StripButton::Skills => zones.skills = rect,
+            StripButton::Info => zones.info = rect,
+        }
+        x += w + 1;
+    }
+    (zones, x)
+}
+
+/// The permission mode the meters' word names (`icons::mode_word`
+/// spelling); None for an empty or unknown word.
+fn mode_of(meters: &Meters) -> Option<ka_protocol::Mode> {
+    MODE_CHOICES
+        .iter()
+        .map(|(m, _, _)| *m)
+        .find(|m| crate::icons::mode_word(*m) == meters.mode)
+}
+
+/// The mode pill ` {icon} {word} `: dark chip ink, bold, on the mode's
+/// identity color (META for a word no mode claims). Empty while the
+/// mode is still unknown.
+fn mode_pill(meters: &Meters) -> Vec<ratatui::text::Span<'static>> {
+    use ratatui::style::{Modifier, Style};
+    if meters.mode.is_empty() {
+        return Vec::new();
+    }
+    let mode = mode_of(meters);
+    let icon = match mode {
+        Some(m) => crate::icons::mode_icon(m),
+        None => meters.mode_icon.as_str(),
+    };
+    let bg = mode.map_or(crate::palette::META, crate::palette::mode_color);
+    let text = if icon.is_empty() {
+        format!(" {} ", meters.mode)
+    } else {
+        format!(" {icon} {} ", meters.mode)
+    };
+    vec![ratatui::text::Span::styled(
+        text,
+        Style::new()
+            .fg(crate::palette::CHIP_FG)
+            .bg(bg)
+            .add_modifier(Modifier::BOLD),
+    )]
+}
+
+/// Effort segment: `✻ {glyph} {level}` when the level has a battery
+/// glyph, `✻ {level}` otherwise (unknown levels hide the glyph).
 fn effort_segment(level: &str) -> String {
     match crate::icons::effort_glyph(level) {
         Some(g) => format!("{} {g} {level}", crate::icons::THOUGHT),
@@ -8758,38 +9330,18 @@ fn effort_segment(level: &str) -> String {
     }
 }
 
-/// Status-bar right side: `{model} · {mode} · ctx {gauge} {pct}% ·
-/// ${cost}` — facts joined only when known, cost always on.
-fn status_right(meters: &Meters) -> Vec<ratatui::text::Span<'static>> {
-    let (used, window) = meters.context;
-    let mut segs: Vec<ratatui::text::Span<'static>> = Vec::new();
-    let push = |s: String, segs: &mut Vec<ratatui::text::Span<'static>>| {
-        if !segs.is_empty() {
-            segs.push(ratatui::text::Span::styled(" · ", crate::palette::META));
-        }
-        segs.push(ratatui::text::Span::styled(s, crate::palette::META));
+/// Status-line left: model (INK_DIM), effort (META), the feature-toggle
+/// count and a pending update (WARN) — each fact only when known. The
+/// mode pill closes the row on the right.
+fn status_left(meters: &Meters) -> Vec<ratatui::text::Span<'static>> {
+    use ratatui::text::Span;
+    let mut segs: Vec<Span<'static>> = Vec::new();
+    let mut push = |text: String, color: ratatui::style::Color| {
+        let lead = if segs.is_empty() { "" } else { " " };
+        segs.push(Span::styled(format!("{lead}{text}"), color));
     };
     if !meters.model.is_empty() {
-        push(meters.model.clone(), &mut segs);
-    }
-    if !meters.mode.is_empty() {
-        push(mode_segment(meters), &mut segs);
-    }
-    if meters.toggles > 0 {
-        // feature toggles active: a count keeps the status bar honest
-        // about what the model can no longer see
-        push(format!("\u{2298}{}", meters.toggles), &mut segs);
-    }
-    if let Some(latest) = &meters.update {
-        // a newer release is out: warm-colored so it reads at a glance
-        // (the startup check announced it once — the badge persists)
-        if !segs.is_empty() {
-            segs.push(ratatui::text::Span::styled(" · ", crate::palette::META));
-        }
-        segs.push(ratatui::text::Span::styled(
-            format!("\u{2934} {latest}"),
-            crate::palette::WARN,
-        ));
+        push(meters.model.clone(), crate::palette::INK_DIM);
     }
     if meters.effort_supported {
         // the engine always emits the level now; defensive: a stale
@@ -8799,68 +9351,304 @@ fn status_right(meters: &Meters) -> Vec<ratatui::text::Span<'static>> {
         } else {
             meters.effort.as_str()
         };
-        push(effort_segment(level), &mut segs);
+        push(effort_segment(level), crate::palette::META);
     }
+    if meters.toggles > 0 {
+        // feature toggles active: a count keeps the status line honest
+        // about what the model can no longer see
+        push(format!("\u{2298}{}", meters.toggles), crate::palette::WARN);
+    }
+    if let Some(latest) = &meters.update {
+        // a newer release is out (the startup check announced it once;
+        // the badge persists)
+        push(format!("\u{2934} {latest}"), crate::palette::WARN);
+    }
+    segs
+}
+
+/// Context-gauge cells on the status line.
+const CTX_GAUGE_CELLS: usize = 10;
+
+/// Status-line right: a ten-cell `━` context gauge (filled in OK, WARN
+/// from 80%, ERR from 95%; the rest RULE) plus ` {pct}%` FAINT — or
+/// `~N tok` when the window is unknown — then `  ${cost}` META, and the
+/// mode pill at the very end. Cost always shows; the context facts only
+/// when known.
+fn status_right(meters: &Meters) -> Vec<ratatui::text::Span<'static>> {
+    use ratatui::text::Span;
+    let (used, window) = meters.context;
+    let mut segs: Vec<Span<'static>> = Vec::new();
     if window > 0 {
-        let pct = (used as f64 / window as f64 * 100.0) as u64;
-        // eight cells, one step per 12.5%; the bar warms as the window fills
-        let filled = ((used as f64 / window as f64) * 8.0).round() as usize;
-        let filled = filled.clamp(0, 8);
-        let gauge_color = if pct >= 95 {
+        let frac = used as f64 / window as f64;
+        let pct = (frac * 100.0) as u64;
+        let filled = ((frac * CTX_GAUGE_CELLS as f64).round() as usize).min(CTX_GAUGE_CELLS);
+        let color = if pct >= 95 {
             crate::palette::ERR
         } else if pct >= 80 {
             crate::palette::WARN
         } else {
             crate::palette::OK
         };
-        push("ctx".to_string(), &mut segs);
-        segs.push(ratatui::text::Span::styled(
-            format!(" {}{}", "█".repeat(filled), "·".repeat(8 - filled)),
-            ratatui::style::Style::new().fg(gauge_color),
-        ));
-        segs.push(ratatui::text::Span::styled(
-            format!(" {pct}%"),
-            crate::palette::META,
-        ));
+        if filled > 0 {
+            segs.push(Span::styled("━".repeat(filled), color));
+        }
+        if filled < CTX_GAUGE_CELLS {
+            segs.push(Span::styled(
+                "━".repeat(CTX_GAUGE_CELLS - filled),
+                crate::palette::RULE,
+            ));
+        }
+        segs.push(Span::styled(format!(" {pct}%"), crate::palette::FAINT));
     } else if used > 0 {
-        push(format!("~{} tok", fmt_tok(used)), &mut segs);
+        segs.push(Span::styled(
+            format!("~{} tok", fmt_tok(used)),
+            crate::palette::FAINT,
+        ));
     }
-    push(format!("${:.4}", meters.cost), &mut segs);
+    let lead = if segs.is_empty() { "" } else { "  " };
+    segs.push(Span::styled(
+        format!("{lead}${:.4}", meters.cost),
+        crate::palette::META,
+    ));
+    // the mode pill closes the row: the rightmost cell is the state the
+    // user acts from, and it never shifts when facts appear on the left
+    let pill = mode_pill(meters);
+    if !pill.is_empty() {
+        segs.push(Span::raw(" "));
+        segs.extend(pill);
+    }
     segs
 }
 
-/// The fresh-conversation welcome: quiet rows centered in the
-/// transcript pane. Rendered only while the transcript is empty and no
-/// turn is in flight — the first exchange (or a replayed older chat)
-/// replaces it.
-fn welcome_rows(width: usize, glyph: &str, meters: &Meters) -> Vec<ratatui::text::Line<'static>> {
+/// The welcome logo: "KA" in the ANSI Shadow face (one column per
+/// glyph, every row the same width).
+const WELCOME_LOGO: [&str; 6] = [
+    "██╗  ██╗ █████╗ ",
+    "██║ ██╔╝██╔══██╗",
+    "█████╔╝ ███████║",
+    "██╔═██╗ ██╔══██║",
+    "██║  ██╗██║  ██║",
+    "╚═╝  ╚═╝╚═╝  ╚═╝",
+];
+
+/// The welcome's starter tips: `(key, what it does)`.
+const WELCOME_TIPS: [(&str, &str); 4] = [
+    ("/help", "keys & commands"),
+    ("/session", "past chats"),
+    ("@", "attach files"),
+    ("!", "run shell"),
+];
+
+/// The fresh-conversation welcome, centered in a `width`×`height`
+/// transcript pane: the big brand-gradient "KA" logo, the tagline, the
+/// mode pill + model, `{cwd} ⎇ {branch}`, then a two-column tips grid.
+/// Panes under 44 cols or 16 rows get a one-line gradient `◆ ka`
+/// instead of the logo. Rendered only while the transcript is empty
+/// and no turn is in flight — the first exchange (or a replayed older
+/// chat) replaces it.
+fn welcome_rows(
+    width: usize,
+    height: usize,
+    glyph: &str,
+    meters: &Meters,
+    sidebar: &SidebarState,
+) -> Vec<ratatui::text::Line<'static>> {
+    use ratatui::style::{Modifier, Style};
+    use ratatui::text::{Line as TuiLine, Span};
     use unicode_width::UnicodeWidthStr;
-    let center = |text: &str, style: ratatui::style::Style| -> ratatui::text::Line<'static> {
-        let pad = width.saturating_sub(text.width()) / 2;
-        ratatui::text::Line::from(vec![
-            ratatui::text::Span::raw(" ".repeat(pad)),
-            ratatui::text::Span::styled(text.to_string(), style),
-        ])
+    let center = |spans: Vec<Span<'static>>| -> TuiLine<'static> {
+        let w: usize = spans.iter().map(|s| s.content.width()).sum();
+        let mut row = vec![Span::raw(" ".repeat(width.saturating_sub(w) / 2))];
+        row.extend(spans);
+        TuiLine::from(row)
     };
-    let glyph = if glyph.is_empty() { "◆" } else { glyph };
-    // model + mode ride from the meters; empty segments stay hidden
-    let mode_seg = mode_segment(meters);
-    let config = [meters.model.as_str(), mode_seg.as_str()]
-        .into_iter()
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join(" · ");
-    let faint = ratatui::style::Style::new().fg(crate::palette::FAINT);
-    let mut rows = vec![
-        center(&format!("· {glyph} ·"), crate::palette::ACCENT_STYLE),
-        center("new conversation", crate::palette::THOUGHT),
-    ];
-    if !config.is_empty() {
-        rows.push(center(&config, faint));
+    let bold = Style::new().add_modifier(Modifier::BOLD);
+    let faint = Style::new().fg(crate::palette::FAINT);
+    let glyph = if glyph.is_empty() {
+        crate::icons::BRAND
+    } else {
+        glyph
+    };
+    let mut rows: Vec<TuiLine<'static>> = Vec::new();
+    if width >= 44 && height >= 16 {
+        for row in WELCOME_LOGO {
+            rows.push(center(crate::fx::gradient(
+                row,
+                &crate::palette::BRAND,
+                bold,
+            )));
+        }
+    } else {
+        rows.push(center(crate::fx::gradient(
+            &format!("{glyph} ka"),
+            &crate::palette::BRAND,
+            bold,
+        )));
     }
-    rows.push(center("/help keys · /session past chats", faint));
-    rows
+    rows.push(center(vec![Span::styled(
+        "new conversation",
+        faint.add_modifier(Modifier::ITALIC),
+    )]));
+    rows.push(TuiLine::default());
+    // mode pill + model ride from the meters; unknown facts stay hidden
+    let mut config = mode_pill(meters);
+    if !meters.model.is_empty() {
+        config.push(Span::styled(
+            format!(" {}", meters.model),
+            crate::palette::INK_DIM,
+        ));
+    }
+    if !config.is_empty() {
+        rows.push(center(config));
+    }
+    if !sidebar.cwd.is_empty() {
+        let mut place = vec![Span::styled(sidebar.cwd.clone(), faint)];
+        if let Some(branch) = &sidebar.branch {
+            place.push(Span::styled(
+                format!(" {} ", crate::icons::BRANCH),
+                crate::palette::OK,
+            ));
+            place.push(Span::styled(branch.clone(), crate::palette::INK_DIM));
+        }
+        rows.push(center(place));
+    }
+    rows.push(TuiLine::default());
+    let tip = |(key, desc): (&str, &str)| {
+        vec![
+            Span::styled(format!("{key:<9}"), crate::palette::ACCENT_STYLE),
+            Span::styled(format!("{desc:<15}"), faint),
+        ]
+    };
+    // two columns when they fit (2 × 24 cols + a 3-col gutter)
+    if width >= 51 {
+        for pair in WELCOME_TIPS.chunks_exact(2) {
+            let mut row = tip(pair[0]);
+            row.push(Span::raw("   "));
+            row.extend(tip(pair[1]));
+            rows.push(center(row));
+        }
+    } else {
+        for t in WELCOME_TIPS {
+            rows.push(center(tip(t)));
+        }
+    }
+    let top = height.saturating_sub(rows.len()) / 2;
+    let mut out = vec![TuiLine::default(); top];
+    out.extend(rows);
+    out
 }
+
+/// One selectable list row inside a `width`-col overlay body: the
+/// selected row leads with the `▌ ` pointer (ACCENT on SEL_BG) and
+/// wears [`selection_style`] padded to the width; unselected rows lead
+/// two blank cols (columns stay aligned) in `style`. The text truncates
+/// so a row never wraps.
+fn list_row(
+    text: String,
+    selected: bool,
+    width: usize,
+    style: ratatui::style::Style,
+) -> ratatui::text::Line<'static> {
+    use ratatui::style::Style;
+    use ratatui::text::{Line as TuiLine, Span};
+    let room = width.saturating_sub(2);
+    let text = trunc_cols(&text, room);
+    if selected {
+        TuiLine::from(vec![
+            Span::styled(
+                format!("{} ", crate::icons::RAIL),
+                Style::new()
+                    .fg(crate::palette::ACCENT)
+                    .bg(crate::palette::SEL_BG),
+            ),
+            Span::styled(pad_to_width(text, room), selection_style()),
+        ])
+    } else {
+        TuiLine::from(vec![Span::raw("  "), Span::styled(text, style)])
+    }
+}
+
+/// The filter row atop a filterable picker: `❯ {filter}▌` in ACCENT;
+/// an empty filter shows a FAINT italic `type to filter` instead.
+fn filter_row(filter: &str) -> ratatui::text::Line<'static> {
+    use ratatui::style::{Modifier, Style};
+    use ratatui::text::{Line as TuiLine, Span};
+    let lead = Span::styled(
+        format!("{} ", crate::icons::PROMPT),
+        crate::palette::ACCENT_STYLE,
+    );
+    if filter.is_empty() {
+        TuiLine::from(vec![
+            lead,
+            Span::styled(
+                "type to filter",
+                Style::new()
+                    .fg(crate::palette::FAINT)
+                    .add_modifier(Modifier::ITALIC),
+            ),
+        ])
+    } else {
+        TuiLine::from(vec![
+            lead,
+            Span::styled(filter.to_string(), crate::palette::ACCENT_STYLE),
+            Span::styled(crate::icons::RAIL, crate::palette::ACCENT_STYLE),
+        ])
+    }
+}
+
+/// Drop shadow under an overlay: the column right of `rect` and the
+/// row below it (each offset one cell) take the SHADOW ground with
+/// their truecolor glyphs dimmed toward it. Cells past the buffer are
+/// skipped, so the shadow clips to the frame.
+fn drop_shadow(buf: &mut ratatui::buffer::Buffer, rect: ratatui::layout::Rect) {
+    if rect.width == 0 || rect.height == 0 {
+        return;
+    }
+    let shade = |cell: &mut ratatui::buffer::Cell| {
+        cell.set_bg(crate::palette::SHADOW);
+        if let ratatui::style::Color::Rgb(..) = cell.fg {
+            cell.set_fg(crate::fx::lerp(cell.fg, crate::palette::SHADOW, 0.6));
+        }
+    };
+    let (right, bottom) = (rect.right(), rect.bottom());
+    for y in rect.y.saturating_add(1)..=bottom {
+        if let Some(cell) = buf.cell_mut((right, y)) {
+            shade(cell);
+        }
+    }
+    for x in rect.x.saturating_add(1)..right {
+        if let Some(cell) = buf.cell_mut((x, bottom)) {
+            shade(cell);
+        }
+    }
+}
+
+/// Dim the backdrop behind a modal or ask: every truecolor foreground
+/// inside `area` blends 55% toward the canvas, so the overlay owns the
+/// eye. Grounds stay put (no re-layout, no flicker).
+fn dim_backdrop(buf: &mut ratatui::buffer::Buffer, area: ratatui::layout::Rect) {
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            if let Some(cell) = buf.cell_mut((x, y))
+                && let ratatui::style::Color::Rgb(..) = cell.fg
+            {
+                cell.set_fg(crate::fx::lerp(cell.fg, crate::palette::BG, 0.55));
+            }
+        }
+    }
+}
+
+/// Composer placeholder for an empty idle draft.
+const COMPOSER_PLACEHOLDER: &str = "Ask anything  ·  / commands  ·  @ files  ·  ! shell";
+/// Composer placeholder for an empty draft while a turn runs.
+const COMPOSER_PLACEHOLDER_BUSY: &str = "Steer the turn  ·  + to queue  ·  esc to abort";
+/// Columns the composer's `❯ ` lead (and the continuation indent)
+/// takes before the draft text.
+const COMPOSER_LEAD: u16 = 2;
+/// Busy comet: one column per this many ms across the top border.
+const COMET_STEP_MS: u128 = 24;
+/// Busy comet: half-width of the light band, in columns.
+const COMET_RADIUS: f32 = 10.0;
 
 #[allow(clippy::too_many_arguments)]
 fn render(
@@ -8884,8 +9672,8 @@ fn render(
     meters: &Meters,
     sidebar: &SidebarState,
     fresh: bool,
-    // mouse mode: the idle hint bar teaches the selection/scroll story
-    // for whichever mode is live
+    // mouse mode: the idle hints teach the selection/scroll story for
+    // whichever mode is live; the ▲▼ arrows only exist under capture
     mouse_captured: bool,
     header_glyph: &str,
     strip_zone: &std::cell::Cell<Option<StripZones>>,
@@ -8896,7 +9684,7 @@ fn render(
     // the ✕ chip / click-outside close routing reads it
     modal_zone: &std::cell::Cell<Option<ratatui::layout::Rect>>,
     // the slash/path popup or mode-picker rect this frame drew (the
-    // picker borrows the input box): click-outside close routing
+    // picker borrows the composer): click-outside close routing
     popup_zone: &std::cell::Cell<Option<ratatui::layout::Rect>>,
     // content rows + first visible row: click-to-collapse hit mapping
     tx_content: &std::cell::Cell<Option<(ratatui::layout::Rect, usize)>>,
@@ -8907,104 +9695,75 @@ fn render(
     // the transcript width this frame adopts, published back to the
     // tick so the markdown cache keys on the real render width
     tx_width: &std::cell::Cell<u16>,
-    // the drag-selected transcript row span (first, last), rendered
-    // as a picked block highlight; None most of the time
-    sel: Option<(usize, usize)>,
+    // the drag-selected text span — (row, column) anchors in reading
+    // order — rendered as a picked block highlight; None most of the
+    // time
+    sel: Option<((usize, u16), (usize, u16))>,
     // what the pointer currently hovers (capture mode only): the
-    // hovered rows/chips paint the warm hover band / gold emphasis
+    // hovered rows/chips paint the hover band / gold emphasis
     hover: Option<Hover>,
 ) {
     use ratatui::layout::Constraint::{Length, Min};
+    use ratatui::layout::Rect;
     use ratatui::style::{Modifier, Style};
     use ratatui::text::{Line as TuiLine, Span};
     use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
-    // zones start empty each frame; the arms below publish the rects
-    // they actually draw (no modal/popup drawn → nothing to click)
+    use unicode_width::UnicodeWidthStr;
+    // zones start empty each frame; the code below publishes the rects
+    // it actually draws (nothing drawn → nothing to click)
     modal_zone.set(None);
     popup_zone.set(None);
     rail_zone.set(None);
+    title_arrows.set(None);
+    strip_zone.set(None);
     // ── canvas: paint the whole frame before any widget so the app sits
-    // on the indigo ground with lavender prose, whatever the terminal
-    // theme paints behind it ──
-    frame.render_widget(Block::new().style(crate::palette::CANVAS), frame.area());
-    // one column of air on each side of the frame; rows stay edge to
-    // edge (they are scarce) — except the empty row above the
-    // transcript's top border (the window's top margin) and the blank
-    // row of air between that border and the transcript content.
+    // on the night ground whatever the terminal theme paints behind it
+    let full = frame.area();
+    frame.render_widget(Block::new().style(crate::palette::CANVAS), full);
+    // ── layout: header bar · air · transcript · composer · air · status
+    // line. The header and status line run the full frame width;
+    // transcript and composer keep one column of air on each side.
     // Every width below derives from these chunks, never from the raw
     // frame area.
-    let outer = frame.area().inner(ratatui::layout::Margin::new(1, 0));
     let chunks = ratatui::layout::Layout::vertical([
         Length(1),
-        Min(3),
+        Length(1),
+        Min(0),
         Length(input_height(input_area_rows(
             picker,
             input,
-            input_inner_w(frame.area().width),
+            input_inner_w(full.width),
         ))),
-        Length(1), // bottom strip: popup buttons + cwd:branch
+        Length(1),
         Length(1),
     ])
-    .split(outer);
-    let tx_area = chunks[1];
+    .split(full);
+    let header = chunks[0];
+    let tx_area = chunks[2].inner(ratatui::layout::Margin::new(1, 0));
+    let composer = chunks[3].inner(ratatui::layout::Margin::new(1, 0));
+    let status = chunks[5];
     let tx_inner = tx_area.width.saturating_sub(2);
     // single width authority: the frame's own layout decides the cache
-    // and band width — never a tick-side terminal.size() guess
+    // width — never a tick-side terminal.size() guess
     tx_width.set(tx_inner);
     transcript.set_width(tx_inner);
     // modals center within the transcript pane, one col clear of its
-    // edges: they never touch the input box or the status bar
+    // edges: they never touch the composer or the status line
     let modal_area = tx_area.inner(ratatui::layout::Margin::new(1, 0));
+    // an overlay owns keyboard focus (the composer border steps back)
+    let overlay = modal.is_some() || popup.is_some() || path.is_some() || picker.is_some();
 
     // ── transcript: cached rows + live region under a scroll window ──
-    let mut live_rows: Vec<TuiLine> = Vec::new();
-    if let Some(lb) = live {
-        if !lb.thought.trim().is_empty() {
-            // the band ships its own spacer rows (leading + trailing)
-            // and shows the head plus the last three lines — at most
-            // three thinking rows on screen while streaming — and the
-            // flush caches exactly these rows, so the hand-off never
-            // jumps the viewport.
-            live_rows.extend(thought_rows_tail(&lb.thought, tx_inner as usize));
-        }
-        live_rows.extend(tool_live_rows(
-            lb.tool_header.as_str(),
-            lb.live_tool.as_ref(),
-            tx_inner as usize,
-        ));
-        // cached markdown rows (clone-on-append; the cache stays cursor-free)
-        // live markdown rows get the same surface as final output; the
-        // cursor is appended first so the surface pads around it, and
-        // blank rows above and below give the live card the same inner
-        // air the cached rows carry
-        if !lb.md.is_empty() {
-            let mut md_live: Vec<TuiLine> = lb.md.to_vec();
-            if let Some(last) = md_live.last_mut() {
-                last.spans
-                    .push(Span::styled("▌", crate::palette::ACCENT_STYLE));
-            }
-            live_rows.push(surface_blank(tx_inner, crate::palette::BG_OUTPUT));
-            apply_output_surface(&mut md_live, tx_inner, crate::palette::BG_OUTPUT);
-            live_rows.extend(md_live);
-            live_rows.push(surface_blank(tx_inner, crate::palette::BG_OUTPUT));
-        }
-        // transient tail of the live region: the working indicator
-        // rides below the last live row and is never cached; blank
-        // rows above and below give it a little air so it never
-        // crowds the live card or the input box
-        live_rows.push(TuiLine::default());
-        live_rows.push(working_row(ask, busy_since, now));
-        live_rows.push(TuiLine::default());
-    }
-
+    let live_rows: Vec<TuiLine> = live
+        .map(|lb| live_region_rows(lb, ask, busy_since, now, tx_inner as usize))
+        .unwrap_or_default();
     let cached = transcript.total_rows();
     let total = cached + live_rows.len();
-    // the border row and the blank row of air under it sit above the
-    // content rows
-    let visible = chunks[1].height.saturating_sub(2) as usize;
+    // the pane is all content: no border or title row above it
+    let visible = tx_area.height as usize;
     debug_assert_eq!(
         visible,
-        visible_rows(frame.area().height, chunks[2].height),
+        visible_rows(full.height, composer.height),
         "viewport arithmetic must agree with the layout"
     );
     let (start, pinned) = window_range(total, visible, scroll);
@@ -9019,55 +9778,47 @@ fn render(
             window.push(row.clone());
         }
     }
-    // an empty, idle, fresh transcript opens on a quiet welcome — the
-    // first exchange (or a replayed older chat) replaces it
-    if total == 0 && !busy && fresh {
-        window = welcome_rows(tx_inner as usize, header_glyph, meters);
-    }
-    // the title row: the session glyph, plus the auto-generated session
-    // title once the engine names it; scrolled viewports show how much
-    // history sits above
-    let session_title = sidebar
-        .title
-        .as_deref()
-        .filter(|t| !t.is_empty())
-        .map(|t| trunc_cols(t, 48));
-    let title = match (&session_title, pinned) {
-        (Some(t), true) => format!("{header_glyph} {t}"),
-        (Some(t), false) => format!("{header_glyph} {t} · ↑{} above (pgdn/esc)", start),
-        (None, true) => header_glyph.to_string(),
-        (None, false) => format!("{header_glyph} · ↑{} above (pgdn/esc)", start),
-    };
-    // cells the padded title occupies (one space of air each side)
-    let title_cells = title.chars().count() + 2;
-    let horizon = Block::default()
-        .borders(Borders::TOP)
-        .title(padded_title(title))
-        .border_style(crate::palette::BORDER_HORIZON_STYLE);
-    frame.render_widget(horizon, tx_area);
-    // content rows start one blank row below the horizon border — manual
-    // math, no Block padding. The one-column side air matches the old
-    // horizontal padding; the right column stays blank for the rail.
-    let content_rect = ratatui::layout::Rect {
+    // content rows fill the pane one column in from its left edge; the
+    // right column is the scrollbar rail
+    let content_rect = Rect {
         x: tx_area.x + 1,
-        y: tx_area.y + 2,
-        width: tx_area.width.saturating_sub(2),
-        height: tx_area.height.saturating_sub(2),
+        y: tx_area.y,
+        width: tx_inner,
+        height: tx_area.height,
     };
+    // an empty, idle, fresh transcript opens on the welcome — the first
+    // exchange (or a replayed older chat) replaces it
+    if total == 0 && !busy && fresh {
+        window = welcome_rows(
+            tx_inner as usize,
+            content_rect.height as usize,
+            header_glyph,
+            meters,
+            sidebar,
+        );
+    }
     frame.render_widget(Paragraph::new(window), content_rect);
+    // content rows + the first visible transcript row: click-to-collapse
+    // maps screen rows back to entries through this
+    tx_content.set(Some((content_rect, start)));
 
     // drag-selection highlight: patch the picked rows' cells so the
     // span reads as one block while it is being drawn and after
-    if let Some((a, b)) = sel {
+    if let Some(((r0, c0), (r1, c1))) = sel {
         let last = start + content_rect.height as usize;
-        let lo = a.max(start);
-        let hi = b.min(last.saturating_sub(1));
+        let lo = r0.max(start);
+        let hi = r1.min(last.saturating_sub(1));
         if lo <= hi {
+            let right = content_rect.width.saturating_sub(1);
             let buf = frame.buffer_mut();
             for trow in lo..=hi {
                 let y = content_rect.y + (trow - start) as u16;
-                for x in content_rect.x..content_rect.x + content_rect.width {
-                    if let Some(cell) = buf.cell_mut((x, y)) {
+                // the drag's own rows paint just their picked columns;
+                // rows in between paint edge to edge
+                let x0 = if trow == r0 { c0.min(right) } else { 0 };
+                let x1 = if trow == r1 { c1.min(right) } else { right };
+                for x in x0..=x1 {
+                    if let Some(cell) = buf.cell_mut((content_rect.x + x, y)) {
                         cell.set_bg(crate::palette::BG_SELECT);
                     }
                 }
@@ -9075,45 +9826,118 @@ fn render(
         }
     }
 
-    // ── ▲▼ user-message jump arrows at the end of the title row ──
-    // Only in captured-mouse mode (the zones are click targets — in
-    // native mode they would be dead pixels; Ctrl+↑/↓ are the keyboard
-    // twin and always work), once the user has sent a message, and only
-    // when the pane is wide enough that the arrows never collide with
-    // the title text. ▲ steps to the previous user message, ▼ to the
-    // next.
-    title_arrows.set(None);
-    // content rows (below the title border and its blank margin row) +
-    // the first visible transcript row: click-to-collapse maps screen
-    // rows back to entries through this
-    tx_content.set(Some((content_rect, start)));
-    let has_user = transcript
-        .entries()
-        .iter()
-        .any(|l| matches!(l, Line::User(_)));
-    if has_user && tx_area.width >= 12 && mouse_captured {
-        let need = title_cells + 7;
-        if tx_area.width as usize >= need {
-            let y = tx_area.y;
-            let x0 = tx_area.x + tx_area.width - 4; // ' ', '▲', ' ', '▼'
-            let buf = frame.buffer_mut();
-            for (i, sym) in [' ', '▲', ' ', '▼'].iter().enumerate() {
-                if let Some(c) = buf.cell_mut((x0 + i as u16, y)) {
-                    c.set_symbol(&sym.to_string());
-                    if *sym != ' ' {
-                        c.set_style(crate::palette::ACCENT_STYLE);
-                    }
-                }
+    // ── header bar: brand › title (· scroll %) … cwd ⎇ branch ▲ ▼ ──
+    // The ▲▼ user-message jump arrows ride the right end only in
+    // captured-mouse mode (they are click targets — in native mode they
+    // would be dead pixels; Ctrl+↑/↓ are the keyboard twin) and once
+    // the user has sent a message. Narrow widths drop the place first,
+    // then the arrows, then truncate the title.
+    {
+        let panel = Style::new().bg(crate::palette::BG_PANEL);
+        let glyph = if header_glyph.is_empty() {
+            crate::icons::BRAND
+        } else {
+            header_glyph
+        };
+        let mut left: Vec<Span<'static>> = crate::fx::gradient(
+            &format!(" {glyph} ka "),
+            &crate::palette::BRAND,
+            panel.add_modifier(Modifier::BOLD),
+        );
+        left.push(Span::styled(" › ", crate::palette::FAINT));
+        // how far through the history the viewport sits
+        let scrolled = (!pinned).then(|| {
+            let span = total.saturating_sub(visible).max(1);
+            format!(" · {}%", (start * 100 / span).min(100))
+        });
+        let mut place: Vec<Span<'static>> = Vec::new();
+        if !sidebar.cwd.is_empty() {
+            place.push(Span::styled(sidebar.cwd.clone(), crate::palette::FAINT));
+            if let Some(branch) = &sidebar.branch {
+                place.push(Span::styled(
+                    format!(" {} ", crate::icons::BRANCH),
+                    crate::palette::OK,
+                ));
+                place.push(Span::styled(branch.clone(), crate::palette::INK_DIM));
             }
+        }
+        let cols =
+            |spans: &[Span<'static>]| -> usize { spans.iter().map(|s| s.content.width()).sum() };
+        let hw = header.width as usize;
+        let fixed = cols(&left[..]) + scrolled.as_ref().map_or(0, |s| s.width());
+        let title = sidebar.title.as_deref().filter(|t| !t.is_empty());
+        let title_w = title.map_or("new session".width(), |t| t.width());
+        let has_user = transcript
+            .entries()
+            .iter()
+            .any(|l| matches!(l, Line::User(_)));
+        let arrows_w = if has_user && mouse_captured { 5 } else { 0 };
+        // the place carries its own trailing space of air
+        let place_w = if place.is_empty() {
+            0
+        } else {
+            cols(&place[..]) + 1
+        };
+        let show_place = place_w > 0 && fixed + title_w + 1 + place_w + arrows_w <= hw;
+        let show_arrows = arrows_w > 0 && fixed + title_w.min(8) + 1 + arrows_w <= hw;
+        let right_w =
+            (if show_place { place_w } else { 0 }) + (if show_arrows { arrows_w } else { 0 });
+        let room = hw.saturating_sub(fixed + right_w + 1);
+        if room > 0 {
+            left.push(match title {
+                Some(t) => Span::styled(
+                    trunc_cols(t, room),
+                    Style::new()
+                        .fg(crate::palette::FG)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                None => Span::styled(
+                    trunc_cols("new session", room),
+                    Style::new()
+                        .fg(crate::palette::FAINT)
+                        .add_modifier(Modifier::ITALIC),
+                ),
+            });
+        }
+        if let Some(s) = scrolled {
+            left.push(Span::styled(s, crate::palette::FAINT));
+        }
+        frame.render_widget(
+            Paragraph::new(TuiLine::from(left)).style(panel.fg(crate::palette::FG)),
+            header,
+        );
+        let buf = frame.buffer_mut();
+        let y = header.y;
+        let mut x = header.right().saturating_sub(right_w as u16);
+        if show_place {
+            place.push(Span::raw(" "));
+            put_line(buf, x, y, &TuiLine::from(place));
+            x += place_w as u16;
+        }
+        if show_arrows && header.height > 0 {
+            let arrow = crate::palette::ACCENT_STYLE;
+            put_line(
+                buf,
+                x,
+                y,
+                &TuiLine::from(vec![
+                    Span::raw(" "),
+                    Span::styled("▲", arrow),
+                    Span::raw(" "),
+                    Span::styled("▼", arrow),
+                    Span::raw(" "),
+                ]),
+            );
+            // ' ▲' steps to the previous user message, ' ▼' to the next
             title_arrows.set(Some(TitleArrows {
-                up: ratatui::layout::Rect {
-                    x: x0,
+                up: Rect {
+                    x,
                     y,
                     width: 2,
                     height: 1,
                 },
-                down: ratatui::layout::Rect {
-                    x: x0 + 2,
+                down: Rect {
+                    x: x + 2,
                     y,
                     width: 2,
                     height: 1,
@@ -9122,23 +9946,23 @@ fn render(
         }
     }
 
-    // ── scrollbar rail: painted into the transcript's always-blank
-    // right padding column, so no width math ever learns about it ──
+    // ── scrollbar rail: the pane's rightmost column, so no width math
+    // ever learns about it ──
     if total > visible {
         let (thumb_pos, thumb_len) = rail_thumb(visible, total, visible, start);
         // span-level styling: Paragraph paints span styles, not line styles
         let rail: Vec<TuiLine> = (0..visible)
             .map(|i| {
                 if (thumb_pos..thumb_pos + thumb_len).contains(&i) {
-                    TuiLine::from(vec![Span::styled("█", crate::palette::META_STYLE)])
+                    TuiLine::from(vec![Span::styled("┃", crate::palette::FAINT)])
                 } else {
                     TuiLine::from(vec![Span::styled("│", crate::palette::BORDER_QUIET_STYLE)])
                 }
             })
             .collect();
-        let rect = ratatui::layout::Rect {
-            x: tx_area.x + tx_area.width.saturating_sub(1),
-            y: tx_area.y + 2,
+        let rect = Rect {
+            x: tx_area.right().saturating_sub(1),
+            y: tx_area.y,
             width: 1,
             height: visible as u16,
         };
@@ -9150,480 +9974,425 @@ fn render(
         }
     }
 
-    // ── input ─────────────────────────────────────────────────────
-    // permission asks render as centered modals; the /mode and
-    // /thinking pickers borrow the box. Titles carry only
-    // structural/draft state — the action hints live in the status bar
-    let title = match picker {
-        Some(InputPicker::Mode(_)) => "mode".to_string(),
-        Some(InputPicker::Thinking(_)) => "thinking".to_string(),
-        None if let Some(q) = rsearch => format!("input · {q}"),
-        None => busy_input_title(queued),
-    };
-    let input_border = if modal.is_some() || popup.is_some() || path.is_some() || picker.is_some() {
-        crate::palette::META_STYLE
+    // ── jump pill: scrolled away from the tail, the bottom-right of the
+    // pane says how much sits below and how to get back (display-only)
+    if !pinned {
+        let pill = format!(" ↓ {} below · esc ", total.saturating_sub(end));
+        let w = pill.width() as u16;
+        if content_rect.width > w + 1 && content_rect.height > 0 {
+            put_line(
+                frame.buffer_mut(),
+                content_rect.right() - w - 1,
+                content_rect.bottom() - 1,
+                &TuiLine::from(Span::styled(
+                    pill,
+                    Style::new()
+                        .fg(crate::palette::ACCENT)
+                        .bg(crate::palette::BG_SURFACE),
+                )),
+            );
+        }
+    }
+
+    // ── composer ─────────────────────────────────────────────────────
+    // Border: WARN while an ask is pending; the resting BORDER while an
+    // overlay owns focus; busy → a TOOL-tinted base the comet sweeps;
+    // idle with a draft → BORDER_FOCUS; idle empty → BORDER. The
+    // /mode and /thinking pickers borrow the box. The title carries
+    // structure only (picker name, reverse search, queue count).
+    let busy_base = crate::fx::lerp(crate::palette::BORDER, crate::palette::TOOL, 0.5);
+    let border_fg = if ask.is_some() {
+        crate::palette::WARN
+    } else if overlay {
+        crate::palette::BORDER
     } else if busy {
-        ratatui::style::Style::new().fg(crate::palette::WARN)
+        busy_base
+    } else if input.is_empty() {
+        crate::palette::BORDER
     } else {
-        crate::palette::BORDER_STYLE
+        crate::palette::BORDER_FOCUS
     };
-    // textarea wrap: display rows fold at the box width; the visible
-    // window ends at the cursor's visual row and the terminal cursor
-    // rides its offset inside that window
-    let (draft_window, cursor_vis): (Option<Vec<TuiLine>>, Option<(usize, usize)>) =
-        if picker.is_none() {
-            let inner_w = chunks[2].width.saturating_sub(4) as usize; // borders + padding
-            let rows = wrap_rows(input, inner_w);
+    let title: Option<TuiLine<'static>> = match picker {
+        Some(InputPicker::Mode(_)) => Some(padded_title("mode")),
+        Some(InputPicker::Thinking(_)) => Some(padded_title("thinking")),
+        None => match rsearch {
+            Some(q) => Some(TuiLine::styled(
+                format!(" search · {} ", q.strip_prefix("rsearch: ").unwrap_or(q)),
+                crate::palette::ACCENT_STYLE,
+            )),
+            None => busy_input_title(queued).map(padded_title),
+        },
+    };
+    // picker rows: borders + horizontal padding
+    let picker_w = composer.width.saturating_sub(4) as usize;
+    // the draft's cursor as (visible row, display col) past the lead
+    let mut cursor_at: Option<(u16, u16)> = None;
+    let body: Vec<TuiLine> = match picker {
+        // one row per tier: the label column stays padded so the
+        // descriptions align; unselected descriptions ride FAINT
+        Some(InputPicker::Mode(pk)) => MODE_CHOICES
+            .iter()
+            .enumerate()
+            .map(|(i, (mode, label, desc))| {
+                let icon = crate::icons::mode_icon(*mode);
+                if i == pk.selected {
+                    list_row(
+                        format!("{icon} {label:<15} {desc}"),
+                        true,
+                        picker_w,
+                        Style::new(),
+                    )
+                } else {
+                    TuiLine::from(vec![
+                        Span::raw("  "),
+                        Span::raw(format!("{icon} {label:<15} ")),
+                        Span::styled(*desc, crate::palette::FAINT),
+                    ])
+                }
+            })
+            .collect(),
+        // one row per level, the effort battery glyph leading
+        Some(InputPicker::Thinking(tk)) => tk
+            .choices
+            .iter()
+            .enumerate()
+            .map(|(i, level)| {
+                let label = effort_label(*level);
+                let glyph = crate::icons::effort_glyph(label).unwrap_or(" ");
+                list_row(
+                    format!("{glyph} {label}"),
+                    i == tk.selected,
+                    picker_w,
+                    Style::new(),
+                )
+            })
+            .collect(),
+        // textarea wrap: display rows fold at the draft width (the box
+        // minus borders, padding, and the 2-col lead); the visible
+        // window ends at the cursor's visual row and the terminal cursor
+        // rides its offset inside that window
+        None => {
+            let draft_w = input_inner_w(full.width);
+            let rows = wrap_rows(input, draft_w);
             let cur_row = visual_cursor_row(&rows, cursor);
             let vis = rows.len().min(6);
-            let start = cur_row.saturating_sub(vis - 1).min(rows.len() - vis);
-            let window: Vec<TuiLine> = rows[start..start + vis]
-                .iter()
-                .map(|r| TuiLine::from(r.text.clone()))
-                .collect();
+            let first = cur_row.saturating_sub(vis - 1).min(rows.len() - vis);
             let col: usize = rows[cur_row]
                 .text
                 .chars()
-                .take(cursor - rows[cur_row].start)
+                .take(cursor.saturating_sub(rows[cur_row].start))
                 .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0))
                 .sum();
-            (Some(window), Some((cur_row - start, col)))
-        } else {
-            (None, None)
-        };
-    let body: Vec<TuiLine> = match picker {
-        // one row per tier: the selected row is a full-width inverse
-        // bar, the label column stays padded so descriptions align, and
-        // unselected descriptions ride along in DIM
-        Some(InputPicker::Mode(pk)) => {
-            let inner_w = chunks[2].width.saturating_sub(4) as usize; // borders + padding
-            let mut rows = Vec::with_capacity(MODE_CHOICES.len());
-            for (i, (mode, label, desc)) in MODE_CHOICES.iter().enumerate() {
-                let icon = crate::icons::mode_icon(*mode);
-                if i == pk.selected {
-                    rows.push(TuiLine::styled(
-                        pad_to_width(format!("  {icon} {label:<15} {desc}"), inner_w),
-                        selection_style(),
-                    ));
+            cursor_at = Some(((cur_row - first) as u16, col as u16));
+            let lead_style = Style::new().fg(if busy {
+                crate::palette::FAINT
+            } else {
+                crate::palette::USER
+            });
+            let mut out: Vec<TuiLine> = rows[first..first + vis]
+                .iter()
+                .enumerate()
+                .map(|(i, r)| {
+                    let lead = if i == 0 {
+                        Span::styled(format!("{} ", crate::icons::PROMPT), lead_style)
+                    } else {
+                        Span::raw("  ")
+                    };
+                    TuiLine::from(vec![lead, Span::raw(r.text.clone())])
+                })
+                .collect();
+            if input.is_empty()
+                && rsearch.is_none()
+                && let Some(row) = out.first_mut()
+            {
+                let hint = if busy {
+                    COMPOSER_PLACEHOLDER_BUSY
                 } else {
-                    rows.push(TuiLine::from(vec![
-                        Span::raw(format!("  {icon} {label:<15}")),
-                        Span::styled(*desc, crate::palette::FAINT),
-                    ]));
-                }
+                    COMPOSER_PLACEHOLDER
+                };
+                row.spans.push(Span::styled(
+                    trunc_cols(hint, draft_w),
+                    Style::new()
+                        .fg(crate::palette::FAINT)
+                        .add_modifier(Modifier::ITALIC),
+                ));
             }
-            rows
+            out
         }
-        // one row per level, the effort battery glyph leading
-        Some(InputPicker::Thinking(tk)) => {
-            let inner_w = chunks[2].width.saturating_sub(4) as usize; // borders + padding
-            let mut rows = Vec::with_capacity(tk.choices.len());
-            for (i, level) in tk.choices.iter().enumerate() {
-                let label = effort_label(*level);
-                let glyph = crate::icons::effort_glyph(label).unwrap_or(" ");
-                let row = format!("  {glyph} {label}");
-                if i == tk.selected {
-                    rows.push(TuiLine::styled(
-                        pad_to_width(row, inner_w),
-                        selection_style(),
-                    ));
-                } else {
-                    rows.push(TuiLine::from(Span::raw(row)));
-                }
-            }
-            rows
-        }
-        None => draft_window.clone().unwrap_or_default(),
     };
-    let input_widget = Paragraph::new(body)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .title(padded_title(title))
-                .border_style(input_border)
-                .padding(ratatui::widgets::Padding::horizontal(1)),
-        )
-        .style(ratatui::style::Style::new().bg(crate::palette::BG_PANEL));
-    frame.render_widget(input_widget, chunks[2]);
-    // the mode picker borrows the input box: that chunk is its popup
-    // rect (click-outside closes it without submitting)
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(border_fg))
+        .padding(ratatui::widgets::Padding::horizontal(1))
+        .style(
+            Style::new()
+                .fg(crate::palette::FG)
+                .bg(crate::palette::BG_PANEL),
+        );
+    if let Some(t) = title {
+        block = block.title(t);
+    }
+    frame.render_widget(Paragraph::new(body).block(block), composer);
+    // a picker borrows the composer: that chunk is its popup rect
+    // (click-outside closes it without submitting)
     if picker.is_some() {
-        popup_zone.set(Some(chunks[2]));
+        popup_zone.set(Some(composer));
     }
     // the hardware cursor only rides the draft when it can actually
-    // follow keystrokes (an open ask captures input into its dialog)
-    if ask.is_none() {
-        if let (Some(_), Some((row_off, col))) = (&draft_window, cursor_vis) {
-            let area = chunks[2];
-            frame.set_cursor_position((
-                area.x + 2 + col as u16,
-                area.y + 1 + row_off.min(area.height.saturating_sub(2) as usize) as u16,
-            ));
-        }
-    }
-
-    // ── bottom strip: popup buttons left, cwd 🌿 branch right ───────
-    // capture mode makes the buttons clickable; native mode uses the
-    // keyboard shortcuts printed on them (terminals only deliver clicks
-    // under mouse reporting)
+    // follow keystrokes (an open ask captures input into its dialog);
+    // x = border + padding + the ❯ lead + the display column
+    if ask.is_none()
+        && let Some((row_off, col)) = cursor_at
     {
-        // one span per button: bright label + faint key hint
-        let btn = |label: &str, key: &str| {
-            (
-                Span::styled(
-                    format!(" {label}"),
-                    ratatui::style::Style::new()
-                        .fg(crate::palette::FG_STRONG)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(format!(" {key} "), crate::palette::FAINT),
-            )
-        };
-        let (t, s, i) = (
-            btn(&format!("{} todos", crate::icons::STRIP_TODOS), "alt+o"),
-            btn(&format!("{} skills", crate::icons::STRIP_SKILLS), "^t"),
-            btn(&format!("{} info", crate::icons::STRIP_INFO), "alt+i"),
-        );
-        let sep = Span::styled(" │ ", crate::palette::BORDER_QUIET_STYLE);
-        let span_w = |s: &Span| unicode_width::UnicodeWidthStr::width(s.content.as_ref()) as u16;
-        let (tw, sw, iw) = (
-            span_w(&t.0) + span_w(&t.1),
-            span_w(&s.0) + span_w(&s.1),
-            span_w(&i.0) + span_w(&i.1),
-        );
-        let sep_w: u16 = 3;
-        let x0 = chunks[3].x + 1;
-        let x1 = x0 + tw + sep_w;
-        let x2 = x1 + sw + sep_w;
-        let right = match &sidebar.branch {
-            Some(b) => format!("{} {} {b}", sidebar.cwd, crate::icons::BRANCH),
-            None => sidebar.cwd.clone(),
-        };
-        let w = unicode_width::UnicodeWidthStr::width;
-        let used = 1 + (tw + sep_w + sw + sep_w + iw) as usize;
-        let gap = (chunks[3].width as usize)
-            .saturating_sub(used + w(right.as_str()) + 1)
-            .max(1);
-        let spans = vec![
-            Span::raw(" "),
-            t.0,
-            t.1,
-            sep.clone(),
-            s.0,
-            s.1,
-            sep,
-            i.0,
-            i.1,
-            Span::raw(" ".repeat(gap)),
-            Span::styled(right, crate::palette::FAINT),
-        ];
-        strip_zone.set(Some(StripZones {
-            todos: ratatui::layout::Rect {
-                x: x0,
-                y: chunks[3].y,
-                width: tw,
-                height: 1,
-            },
-            skills: ratatui::layout::Rect {
-                x: x1,
-                y: chunks[3].y,
-                width: sw,
-                height: 1,
-            },
-            info: ratatui::layout::Rect {
-                x: x2,
-                y: chunks[3].y,
-                width: iw,
-                height: 1,
-            },
-        }));
-        frame.render_widget(
-            Paragraph::new(ratatui::text::Line::from(spans))
-                .style(ratatui::style::Style::new().bg(crate::palette::BG_PANEL)),
-            chunks[3],
-        );
+        frame.set_cursor_position((
+            (composer.x + 2 + COMPOSER_LEAD + col).min(composer.right().saturating_sub(2)),
+            composer.y + 1 + row_off.min(composer.height.saturating_sub(2)),
+        ));
     }
-
-    // ── status bar: contextual key hints left, meters right ───────
-    let hints: Vec<Span<'static>> = if ask.is_some() {
-        hint_spans(&[
-            (" ↑↓", "select"),
-            (" 1-9", "pick"),
-            (" ⏎", "confirm"),
-            (" esc", "deny"),
-        ])
-    } else if picker.is_some() {
-        hint_spans(&[
-            (" ↑↓", "select"),
-            (" 1-4", "jump"),
-            (" ⏎", "apply"),
-            (" esc", "close"),
-        ])
-    } else if let Some(open) = modal {
-        match open {
-            Modal::Session(_) => {
-                hint_spans(&[(" type", "filter"), (" ⏎", "switch"), (" esc", "close")])
-            }
-            Modal::Model(_) => {
-                hint_spans(&[(" type", "filter"), (" ⏎", "select"), (" esc", "back")])
-            }
-            Modal::Provider(_) => {
-                hint_spans(&[(" type", "filter"), (" ⏎", "connect"), (" esc", "close")])
-            }
-            Modal::Settings(p) if p.edit.is_some() => hint_spans(&[
-                (" type", "edit selector"),
-                (" ⏎", "apply"),
-                (" esc", "cancel"),
-            ]),
-            Modal::Settings(_) => {
-                hint_spans(&[(" ⏎", "edit/cycle"), (" s", "save"), (" esc", "close")])
-            }
-            Modal::Spills { .. } => {
-                hint_spans(&[(" ↑↓", "choose"), (" ⏎", "open"), (" esc", "close")])
-            }
-            Modal::Prompts { .. } => hint_spans(&[
-                (" ↑↓", "choose"),
-                (" ⏎", "run / fill args"),
-                (" esc", "close"),
-            ]),
-            Modal::Tree { .. } => {
-                hint_spans(&[(" ↑↓", "choose"), (" ⏎", "attach"), (" esc", "close")])
-            }
-            Modal::Rewind { .. } => hint_spans(&[
-                (" ↑↓", "choose"),
-                (" ⏎", "rewind"),
-                (" e", "edit"),
-                (" esc", "close"),
-            ]),
-            Modal::Memory { inbox, .. } => {
-                if inbox.is_empty() {
-                    hint_spans(&[(" esc", "close")])
-                } else {
-                    hint_spans(&[
-                        (" ↑↓", "choose"),
-                        (" ⏎", "project"),
-                        (" u", "user"),
-                        (" d", "discard"),
-                        (" esc", "close"),
-                    ])
+    {
+        let buf = frame.buffer_mut();
+        // busy comet: a brand-colored light band sweeping the top border
+        // (title text keeps its own color — only border glyphs light up)
+        if busy && ask.is_none() && !overlay {
+            let ms = busy_since.map_or(0, |t| now.saturating_duration_since(t).as_millis());
+            let len = composer.width as usize;
+            let span = len.saturating_sub(1).max(1) as f32;
+            for i in 0..len {
+                if let Some(cell) = buf.cell_mut((composer.x + i as u16, composer.y))
+                    && matches!(cell.symbol(), "─" | "╭" | "╮")
+                {
+                    let hi = crate::fx::ramp(&crate::palette::BRAND, i as f32 / span);
+                    let t = crate::fx::sweep(i, len, ms, COMET_STEP_MS, COMET_RADIUS);
+                    cell.set_fg(crate::fx::lerp(busy_base, hi, t));
                 }
             }
-            Modal::Usage { .. } => hint_spans(&[(" any", "close")]),
-            Modal::Todos { .. } | Modal::Skills { .. } | Modal::Info { .. } => {
-                hint_spans(&[(" any", "close")])
-            }
-            Modal::Features { .. } => hint_spans(&[
-                (" ↑↓", "choose"),
-                (" ⏎", "toggle"),
-                (" s", "save as default"),
-                (" esc", "close"),
-            ]),
-            Modal::Context { .. } => hint_spans(&[(" esc", "close")]),
-            Modal::Tasks { .. } => {
-                hint_spans(&[(" ↑↓", "choose"), (" ⏎", "page result"), (" esc", "close")])
-            }
-            Modal::TaskDetail { .. } | Modal::Debug { .. } => hint_spans(&[
-                (" pgup/pgdn", "scroll"),
-                (" home/end", "top/tail"),
-                (" esc", "close"),
-            ]),
-            Modal::Key(_) => hint_spans(&[(" type", "value"), (" ⏎", "save"), (" esc", "cancel")]),
-            Modal::Help => hint_spans(&[(" ⏎", "close")]),
         }
-    } else if popup.is_some() {
-        hint_spans(&[(" ↑↓", "select"), (" tab", "complete"), (" esc", "close")])
-    } else if path.is_some() {
-        hint_spans(&[(" ↑↓", "choose"), (" tab", "accept"), (" esc", "close")])
-    } else if rsearch.is_some() {
-        hint_spans(&[(" ctrl+r", "next"), (" ⏎", "accept"), (" esc", "cancel")])
-    } else if busy {
-        hint_spans(&[
-            (" enter", "steer"),
-            (" + · alt+q", "queue"),
-            (" esc", "abort"),
-        ])
-    } else if mouse_captured {
-        hint_spans(&[
-            (" enter", "send"),
-            (" /", "commands"),
-            (" drag", "select+copy · ↑↓ history"),
-            (" ^p/^n", "history"),
-        ])
-    } else {
-        hint_spans(&[
-            (" enter", "send"),
-            (" /", "commands"),
-            (" drag", "select · ↑↓ scroll"),
-            (" ^p/^n", "history"),
-        ])
-    };
-    let right = status_right(meters);
-    let w = unicode_width::UnicodeWidthStr::width;
-    let left_cols: usize = hints.iter().map(|s| w(s.content.as_ref())).sum();
-    let right_cols: usize = right.iter().map(|s| w(s.content.as_ref())).sum();
-    // one leading + one trailing col of air: the left zone starts a col
-    // in, the right zone ends a col before the chunk edge
-    let pad = chunks[4]
-        .width
-        .saturating_sub(2)
-        .saturating_sub((left_cols + right_cols) as u16)
-        .max(1) as usize;
-    let mut bar: Vec<Span<'static>> = vec![Span::raw(" ")];
-    bar.extend(hints);
-    bar.push(Span::raw(" ".repeat(pad)));
-    bar.extend(right);
-    bar.push(Span::raw(" "));
-    frame.render_widget(Paragraph::new(TuiLine::from(bar)), chunks[4]);
+        // bottom border: strip buttons left (capture mode clicks them;
+        // native mode uses the printed shortcuts), contextual hints right
+        // — unless a modal, the ask, or a popup holds focus, whose own
+        // bottom border carries them
+        if composer.height >= 2 && composer.width >= 4 {
+            let y = composer.bottom() - 1;
+            let limit = composer.right() - 2;
+            let (zones, strip_end) = paint_strip(buf, composer.x + 2, limit, y);
+            strip_zone.set(Some(zones));
+            if ask.is_none() && modal.is_none() && popup.is_none() && path.is_none() {
+                paint_hints(
+                    buf,
+                    strip_end,
+                    limit,
+                    y,
+                    composer_hints(picker.is_some(), rsearch.is_some(), busy, mouse_captured),
+                );
+            }
+        }
+    }
 
-    // ── slash autocomplete popup (above input) ────────────────────
+    // ── status line: mode pill + model/effort/badges left, context
+    // gauge + cost right ──
+    {
+        let left = status_left(meters);
+        let right = status_right(meters);
+        let lw: usize = left.iter().map(|s| s.content.width()).sum();
+        let rw: usize = right.iter().map(|s| s.content.width()).sum();
+        // one col of air at each end
+        let pad = (status.width as usize).saturating_sub(lw + rw + 2).max(1);
+        let mut bar: Vec<Span<'static>> = vec![Span::raw(" ")];
+        bar.extend(left);
+        bar.push(Span::raw(" ".repeat(pad)));
+        bar.extend(right);
+        // the pill closes with its own trailing space; only pad a row
+        // that ends on the cost
+        if meters.mode.is_empty() {
+            bar.push(Span::raw(" "));
+        }
+        frame.render_widget(
+            Paragraph::new(TuiLine::from(bar)).style(
+                Style::new()
+                    .fg(crate::palette::FG)
+                    .bg(crate::palette::BG_PANEL),
+            ),
+            status,
+        );
+    }
+
+    // modals and the ask own the eye: the transcript recedes
+    if modal.is_some() || ask.is_some() {
+        dim_backdrop(frame.buffer_mut(), chunks[2]);
+    }
+
+    // ── slash autocomplete popup (above the composer) ─────────────
     if let Some(popup) = popup {
-        // border(2) + up to 7 items (hints live in the status bar)
-        let rows = popup.items.len().min(7) as u16 + 2;
-        let rect = ratatui::layout::Rect {
-            x: chunks[2].x,
-            y: chunks[2].y.saturating_sub(rows),
-            width: (chunks[2].width).min(56),
+        // borders + up to CAP items (hints ride the bottom border)
+        const CAP: usize = 7;
+        let rows = popup.items.len().min(CAP) as u16 + 2;
+        let rect = Rect {
+            x: composer.x,
+            y: composer.y.saturating_sub(rows),
+            width: composer.width.min(64),
             height: rows,
         };
         popup_zone.set(Some(rect));
         // wipe the covered cells: the paragraph paints only its text
         frame.render_widget(ratatui::widgets::Clear, rect);
         let inner_w = rect.width.saturating_sub(4) as usize; // borders + padding
-        let mut text = Vec::new();
+        // lead 2 + name 14 + a space, the description takes the rest
+        let desc_room = inner_w.saturating_sub(17);
         // window the list so the selection always stays visible: the
-        // filter can match far more commands than the 7 shown rows
-        const CAP: usize = 7;
+        // filter can match far more commands than the shown rows
         let offset = popup
             .selected
             .saturating_sub(CAP - 1)
             .min(popup.items.len().saturating_sub(CAP));
+        let mut text = Vec::new();
         for (i, (name, desc)) in popup.items.iter().skip(offset).take(CAP).enumerate() {
-            let desc_trim: String = desc.chars().take(32).collect();
-            let row = format!("{name:<12} {desc_trim}");
+            let desc = trunc_cols(desc, desc_room);
             if i + offset == popup.selected {
-                text.push(TuiLine::styled(
-                    pad_to_width(row, inner_w),
-                    selection_style(),
-                ));
+                text.push(TuiLine::from(vec![
+                    Span::styled(
+                        format!("{} ", crate::icons::RAIL),
+                        Style::new()
+                            .fg(crate::palette::ACCENT)
+                            .bg(crate::palette::SEL_BG),
+                    ),
+                    Span::styled(format!("{name:<14} "), selection_style()),
+                    Span::styled(
+                        pad_to_width(desc, desc_room),
+                        Style::new()
+                            .fg(crate::palette::FAINT)
+                            .bg(crate::palette::SEL_BG),
+                    ),
+                ]));
             } else {
-                text.push(TuiLine::raw(row));
+                text.push(TuiLine::from(vec![
+                    Span::raw("  "),
+                    Span::styled(format!("{name:<14} "), crate::palette::ACCENT_STYLE),
+                    Span::styled(desc, crate::palette::FAINT),
+                ]));
             }
         }
-        let widget = Paragraph::new(text)
-            .block(
-                modal_frame("commands · tab completes, ↑↓ moves the mark")
-                    .padding(ratatui::widgets::Padding::horizontal(1)),
-            )
-            .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
-            .wrap(Wrap { trim: false });
-        frame.render_widget(widget, rect);
+        frame.render_widget(
+            Paragraph::new(text)
+                .block(modal_frame("commands").padding(ratatui::widgets::Padding::horizontal(1))),
+            rect,
+        );
+        let buf = frame.buffer_mut();
+        drop_shadow(buf, rect);
+        if rect.height >= 2 {
+            paint_hints(
+                buf,
+                rect.x + 2,
+                rect.right().saturating_sub(2),
+                rect.bottom() - 1,
+                POPUP_HINTS,
+            );
+        }
     }
 
-    // ── path completion popup (above input) ────────────────────────
+    // ── path completion popup (above the composer) ─────────────────
     if let Some(path) = path {
-        // border(2) + up to 7 entries (hints live in the status bar)
-        let rows = path.entries.len().min(7) as u16 + 2;
-        let rect = ratatui::layout::Rect {
-            x: chunks[2].x,
-            y: chunks[2].y.saturating_sub(rows),
-            width: (chunks[2].width).min(56),
+        const CAP: usize = 7;
+        let rows = path.entries.len().min(CAP) as u16 + 2;
+        let rect = Rect {
+            x: composer.x,
+            y: composer.y.saturating_sub(rows),
+            width: composer.width.min(64),
             height: rows,
         };
         popup_zone.set(Some(rect));
-        // wipe the covered cells: the paragraph paints only its text
         frame.render_widget(ratatui::widgets::Clear, rect);
         let inner_w = rect.width.saturating_sub(4) as usize; // borders + padding
-        let mut text = Vec::new();
         // window the list so the selection always stays visible
-        const CAP: usize = 7;
         let offset = path
             .selected
             .saturating_sub(CAP - 1)
             .min(path.entries.len().saturating_sub(CAP));
+        let mut text = Vec::new();
         for (i, (name, is_dir)) in path.entries.iter().skip(offset).take(CAP).enumerate() {
-            let slash = if *is_dir { "/" } else { "" };
             if i + offset == path.selected {
-                text.push(TuiLine::styled(
-                    pad_to_width(format!("{name}{slash}"), inner_w),
-                    selection_style(),
-                ));
+                let shown = if *is_dir {
+                    format!("{name}/")
+                } else {
+                    name.clone()
+                };
+                text.push(list_row(shown, true, inner_w, Style::new()));
             } else if *is_dir {
                 text.push(TuiLine::from(vec![
+                    Span::raw("  "),
                     Span::raw(name.clone()),
                     Span::styled("/", crate::palette::META),
                 ]));
             } else {
-                text.push(TuiLine::raw(name.clone()));
+                text.push(TuiLine::from(vec![
+                    Span::raw("  "),
+                    Span::raw(name.clone()),
+                ]));
             }
         }
-        let widget = Paragraph::new(text)
-            .block(
+        frame.render_widget(
+            Paragraph::new(text).block(
                 modal_frame(if path.mentions { "files" } else { "path" })
                     .padding(ratatui::widgets::Padding::horizontal(1)),
-            )
-            .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
-            .wrap(Wrap { trim: false });
-        frame.render_widget(widget, rect);
+            ),
+            rect,
+        );
+        let buf = frame.buffer_mut();
+        drop_shadow(buf, rect);
+        if rect.height >= 2 {
+            paint_hints(
+                buf,
+                rect.x + 2,
+                rect.right().saturating_sub(2),
+                rect.bottom() - 1,
+                PATH_HINTS,
+            );
+        }
     }
 
-    // ── modals (session picker / settings) ────────────────────────
+    // ── modals: each arm sizes its box and builds its body; the frame,
+    // shadow, and bottom-border hints are shared ──
     if let Some(open) = modal {
-        match open {
+        let (fw, fh) = (full.width, full.height);
+        let meta = Style::new().fg(crate::palette::META);
+        // borders + horizontal padding
+        let inner = |w: u16| w.saturating_sub(4) as usize;
+        // the window offset that keeps `selected` inside `cap` rows
+        let window_of = |selected: usize, len: usize, cap: usize| {
+            selected
+                .saturating_sub(cap.saturating_sub(1))
+                .min(len.saturating_sub(cap))
+        };
+        let (width, height, title, text): (u16, u16, String, Vec<TuiLine<'static>>) = match open {
             Modal::Session(picker) => {
                 let rows = picker.rows();
-                // border(2) + vertical padding(2) + filter row(1)
+                // borders(2) + vertical padding(2) + filter row(1)
                 let height = (rows.len() as u16 + 5).min(22);
-                let width = 68.min(frame.area().width);
-                let rect = centered(width, height, modal_area);
-                modal_zone.set(Some(rect));
-                // wipe the covered cells first: the paragraph only paints
-                // its own text, and the transcript would bleed through
-                frame.render_widget(ratatui::widgets::Clear, rect);
-                let mut text = vec![TuiLine::from(vec![
-                    Span::styled("filter: ", ratatui::style::Style::default()),
-                    Span::styled(picker.filter.clone(), crate::palette::ACCENT_STYLE),
-                ])];
-                let inner_w = width.saturating_sub(4) as usize; // borders + padding
+                let width = 68.min(fw);
                 let cap = (height as usize).saturating_sub(5);
-                let offset = picker
-                    .selected
-                    .saturating_sub(cap.saturating_sub(1))
-                    .min(rows.len().saturating_sub(cap));
+                let offset = window_of(picker.selected, rows.len(), cap);
+                let mut text = vec![filter_row(&picker.filter)];
                 for (i, (label, detail)) in rows.iter().skip(offset).take(cap).enumerate() {
-                    let row = pad_to_width(format!("{label}  —  {detail}"), inner_w);
-                    if i + offset == picker.selected {
-                        text.push(TuiLine::styled(row, selection_style()));
-                    } else {
-                        text.push(TuiLine::raw(row));
-                    }
+                    text.push(list_row(
+                        format!("{label}  —  {detail}"),
+                        i + offset == picker.selected,
+                        inner(width),
+                        Style::new(),
+                    ));
                 }
-                let widget = Paragraph::new(text)
-                    .block(modal_frame(modal_title("sessions")))
-                    .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
-                    .wrap(Wrap { trim: false });
-                frame.render_widget(widget, rect);
+                (width, height, modal_title("sessions"), text)
             }
             Modal::Key(prompt) => {
-                // full-frame repaint: switching here from the model picker
-                // must leave no stale pixels outside the prompt rect; the
-                // canvas (not a bare wipe) keeps the warm ground intact
-                frame.render_widget(Block::new().style(crate::palette::CANVAS), frame.area());
-                let height = 10u16.min(frame.area().height.saturating_sub(2));
-                let width = 68.min(frame.area().width);
-                let rect = centered(width, height, modal_area);
-                modal_zone.set(Some(rect));
-                // wipe the covered cells first: the paragraph only paints
-                // its own text, and the transcript would bleed through
-                frame.render_widget(ratatui::widgets::Clear, rect);
+                let height = 10u16.min(fh.saturating_sub(2));
+                let width = 68.min(fw);
                 let mut text = vec![TuiLine::styled("api key", crate::palette::ACCENT_BOLD)];
                 text.push(TuiLine::from(vec![
-                    Span::styled("provider  ", crate::palette::META),
-                    Span::styled(prompt.provider.clone(), Style::default()),
+                    Span::styled("provider  ", meta),
+                    Span::raw(prompt.provider.clone()),
                 ]));
                 text.push(TuiLine::from(vec![
-                    Span::styled("key var   ", crate::palette::META),
-                    Span::styled(prompt.env_var.clone(), Style::default()),
+                    Span::styled("key var   ", meta),
+                    Span::raw(prompt.env_var.clone()),
                 ]));
                 if !prompt.doc_url.is_empty() {
                     // "get one   " (10 cols) + doc must fit the padded inner width
@@ -9633,77 +10402,38 @@ fn render(
                         .take(width.saturating_sub(14) as usize)
                         .collect();
                     text.push(TuiLine::from(vec![
-                        Span::styled("get one   ", crate::palette::META),
+                        Span::styled("get one   ", meta),
                         Span::styled(doc, crate::palette::TOOL),
                     ]));
                 }
                 text.push(TuiLine::default());
                 let masked = "•".repeat(prompt.input.chars().count());
                 text.push(TuiLine::from(vec![
-                    Span::styled("value     ", crate::palette::META),
-                    Span::styled(masked, Style::default()),
-                    Span::styled("▌", crate::palette::ACCENT_STYLE),
+                    Span::styled("value     ", meta),
+                    Span::raw(masked),
+                    Span::styled(crate::icons::RAIL, crate::palette::ACCENT_STYLE),
                 ]));
-                let widget = Paragraph::new(text)
-                    .block(modal_frame(modal_title("api key")))
-                    .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
-                    .wrap(Wrap { trim: false });
-                frame.render_widget(widget, rect);
+                (width, height, modal_title("api key"), text)
             }
             Modal::Help => {
-                let height = 34u16.min(frame.area().height.saturating_sub(2));
-                let width = 80.min(frame.area().width);
-                let rect = centered(width, height, modal_area);
-                modal_zone.set(Some(rect));
-                // wipe the covered cells first: the paragraph only paints
-                // its own text, and the transcript would bleed through
-                frame.render_widget(ratatui::widgets::Clear, rect);
-                let text = help_modal_rows();
-                let widget = Paragraph::new(text)
-                    .block(modal_frame(modal_title("help")))
-                    .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
-                    .wrap(Wrap { trim: false });
-                frame.render_widget(widget, rect);
+                let height = 34u16.min(fh.saturating_sub(2));
+                let width = 80.min(fw);
+                (
+                    width,
+                    height,
+                    modal_title("help"),
+                    help_modal_rows(inner(width)),
+                )
             }
             Modal::Model(picker) => {
                 let rows = picker.rows();
-                // border(2) + vertical padding(2) + filter row(1)
+                // borders(2) + vertical padding(2) + filter row(1)
                 let height = (rows.len() as u16 + 5).min(20);
-                let width = 68.min(frame.area().width);
-                let rect = centered(width, height, modal_area);
-                modal_zone.set(Some(rect));
-                // wipe the covered cells first: the paragraph only paints
-                // its own text, and the transcript would bleed through
-                frame.render_widget(ratatui::widgets::Clear, rect);
-                let mut text = vec![TuiLine::from(vec![
-                    Span::styled("filter: ", ratatui::style::Style::default()),
-                    Span::styled(picker.filter.clone(), crate::palette::ACCENT_STYLE),
-                ])];
+                // 70 wide: the 66-col body fits a model row plus its lead
+                let width = 70.min(fw);
                 let cap = (height as usize).saturating_sub(5);
-                let inner_w = width.saturating_sub(4) as usize; // borders + padding
-                // the unified list splits configured from unconfigured
-                // models with one dim separator row (the same predicate
-                // rows() partitions on)
-                let unified = picker.unified();
-                let split = if unified {
-                    rows.iter()
-                        .take_while(|m| ModelPicker::configured(m))
-                        .count()
-                } else {
-                    rows.len()
-                };
-                let mut shown = 0usize;
-                for (i, m) in rows.iter().enumerate() {
-                    if shown >= cap {
-                        break;
-                    }
-                    if unified && i == split && i > 0 {
-                        text.push(TuiLine::styled("─ not configured ─", crate::palette::META));
-                        shown += 1;
-                        if shown >= cap {
-                            break;
-                        }
-                    }
+                let mut text = vec![filter_row(&picker.filter)];
+                for (i, m) in rows.iter().enumerate().take(cap) {
                     let ctx = if m.context > 0 {
                         format!("{}k", m.context / 1000)
                     } else {
@@ -9716,105 +10446,68 @@ fn render(
                     } else {
                         " ✗".to_string()
                     };
-                    text.push(TuiLine::styled(
-                        pad_to_width(model_row(m, &ctx, &key), inner_w),
-                        if i == picker.selected {
-                            selection_style()
-                        } else {
-                            ratatui::style::Style::default()
-                        },
+                    text.push(list_row(
+                        model_row(m, &ctx, &key),
+                        i == picker.selected,
+                        inner(width),
+                        Style::new(),
                     ));
-                    shown += 1;
                 }
                 if rows.is_empty() {
-                    if picker.configured_only && picker.filter.trim().is_empty() {
-                        text.push(TuiLine::styled(
-                            "no configured providers — /provider to connect",
-                            crate::palette::WARN,
-                        ));
-                    } else if picker.filter.trim().is_empty() {
-                        text.push(TuiLine::styled(
-                            "(no models; type a vendor/model selector)",
-                            crate::palette::META,
-                        ));
+                    let note = if picker.filter.trim().is_empty() {
+                        "no configured providers — /provider to connect".to_string()
                     } else {
-                        text.push(TuiLine::styled(
-                            format!("enter sets '{}' as a custom selector", picker.filter),
-                            crate::palette::WARN,
-                        ));
-                    }
+                        format!("enter sets '{}' as a custom selector", picker.filter)
+                    };
+                    text.push(TuiLine::styled(note, crate::palette::WARN));
                 }
-                let widget = Paragraph::new(text)
-                    .block(modal_frame(
-                        picker
-                            .vendor
-                            .as_ref()
-                            .map_or("model".to_string(), |v| format!("model · {v}")),
-                    ))
-                    .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
-                    .wrap(Wrap { trim: false });
-                frame.render_widget(widget, rect);
+                let title = picker
+                    .vendor
+                    .as_ref()
+                    .map_or("model".to_string(), |v| format!("model · {v}"));
+                (width, height, title, text)
             }
             Modal::Provider(picker) => {
                 let rows = picker.rows();
-                // border(2) + vertical padding(2) + filter row(1)
+                // borders(2) + vertical padding(2) + filter row(1)
                 let height = (rows.len() as u16 + 5).min(20);
-                let width = 68.min(frame.area().width);
-                let rect = centered(width, height, modal_area);
-                modal_zone.set(Some(rect));
-                // wipe the covered cells first: the paragraph only paints
-                // its own text, and the transcript would bleed through
-                frame.render_widget(ratatui::widgets::Clear, rect);
-                let inner_w = width.saturating_sub(4) as usize; // borders + padding
-                let mut text = vec![TuiLine::from(vec![
-                    Span::styled("filter: ", ratatui::style::Style::default()),
-                    Span::styled(picker.filter.clone(), crate::palette::ACCENT_STYLE),
-                ])];
+                let width = 68.min(fw);
                 let cap = (height as usize).saturating_sub(5);
+                let mut text = vec![filter_row(&picker.filter)];
                 for (i, (p, detail)) in rows.iter().take(cap).enumerate() {
                     let name: String = p.name.chars().take(16).collect();
                     let detail: String = detail.chars().take(44).collect();
-                    let key_style = if p.key_set || p.env_var.is_empty() {
-                        crate::palette::OK
-                    } else {
-                        crate::palette::ERR
-                    };
                     if i == picker.selected {
-                        text.push(TuiLine::from(vec![Span::styled(
-                            pad_to_width(format!("{name:<16} {detail}"), inner_w),
-                            selection_style(),
-                        )]));
+                        text.push(list_row(
+                            format!("{name:<16} {detail}"),
+                            true,
+                            inner(width),
+                            Style::new(),
+                        ));
                     } else {
+                        let key = if p.key_set || p.env_var.is_empty() {
+                            crate::palette::OK
+                        } else {
+                            crate::palette::ERR
+                        };
                         text.push(TuiLine::from(vec![
+                            Span::raw("  "),
                             Span::raw(format!("{name:<16} ")),
-                            Span::styled(detail, key_style),
+                            Span::styled(detail, key),
                         ]));
                     }
                 }
                 if rows.is_empty() {
-                    text.push(TuiLine::styled(
-                        "(no providers match)",
-                        crate::palette::META,
-                    ));
+                    text.push(TuiLine::styled("  (no providers match)", meta));
                 }
-                let widget = Paragraph::new(text)
-                    .block(modal_frame(modal_title("providers")))
-                    .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
-                    .wrap(Wrap { trim: false });
-                frame.render_widget(widget, rect);
+                (width, height, modal_title("providers"), text)
             }
             Modal::Settings(panel) => {
-                // border(2) + vertical padding(2) + the ROWS/provider rows
-                let height = (SettingsPanel::ROWS + panel.providers.len() + 7) as u16;
-                let height = height.min(frame.area().height.saturating_sub(2));
-                let width = 80.min(frame.area().width);
-                let rect = centered(width, height, modal_area);
-                modal_zone.set(Some(rect));
-                // wipe the covered cells first: the paragraph only paints
-                // its own text, and the transcript would bleed through
-                frame.render_widget(ratatui::widgets::Clear, rect);
-                let dim = ratatui::style::Style::new().fg(crate::palette::META);
-                let inner_w = width.saturating_sub(4) as usize; // borders + padding
+                // borders(2) + vertical padding(2) + the rows below
+                let height = ((SettingsPanel::ROWS + panel.providers.len() + 7) as u16)
+                    .min(fh.saturating_sub(2));
+                let width = 80.min(fw);
+                let inner_w = inner(width);
                 // mode and effort render as their icon+word/battery forms
                 let mode_str = format!(
                     "{} {}",
@@ -9826,50 +10519,42 @@ fn render(
                     .as_ref()
                     .map(|e| effort_segment(&format!("{e:?}").to_lowercase()))
                     .unwrap_or_else(|| "(default)".to_string());
-                let editing = panel.edit.is_some();
-                // while editing, the row shows a cursor block so the mode
-                // change is unmistakable (nothing else on screen moves)
-                let model_label = match &panel.edit {
-                    Some(buf) => format!("model ✎  {buf}▌"),
-                    None => format!("model    {}", panel.model),
-                };
-                let model_style = if editing {
-                    ratatui::style::Style::new()
-                        .fg(crate::palette::WARN)
-                        .add_modifier(Modifier::BOLD)
-                } else if panel.selected == 0 {
-                    selection_style()
-                } else {
-                    dim
+                // while editing, the row shows a cursor block in WARN so
+                // the mode change is unmistakable (nothing else moves)
+                let model_line = match &panel.edit {
+                    Some(buf) => list_row(
+                        format!("model ✎  {buf}▌"),
+                        false,
+                        inner_w,
+                        Style::new()
+                            .fg(crate::palette::WARN)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    None => list_row(
+                        format!("model    {}", panel.model),
+                        panel.selected == 0,
+                        inner_w,
+                        meta,
+                    ),
                 };
                 let mut text = vec![
-                    TuiLine::styled(pad_to_width(model_label, inner_w), model_style),
-                    TuiLine::styled(
-                        pad_to_width(format!("mode     {mode_str}"), inner_w),
-                        if panel.selected == 1 {
-                            selection_style()
-                        } else {
-                            dim
-                        },
+                    model_line,
+                    list_row(
+                        format!("mode     {mode_str}"),
+                        panel.selected == 1,
+                        inner_w,
+                        meta,
                     ),
-                    TuiLine::styled(
-                        pad_to_width(format!("effort   {effort_str}"), inner_w),
-                        if panel.selected == 2 {
-                            selection_style()
-                        } else {
-                            dim
-                        },
+                    list_row(
+                        format!("effort   {effort_str}"),
+                        panel.selected == 2,
+                        inner_w,
+                        meta,
                     ),
-                    TuiLine::styled(
-                        format!("config: {}", panel.config_path),
-                        crate::palette::META,
-                    ),
+                    TuiLine::styled(format!("  config: {}", panel.config_path), meta),
+                    TuiLine::raw("  providers:"),
                 ];
-                text.push(TuiLine::styled(
-                    "providers:",
-                    ratatui::style::Style::default(),
-                ));
-                let url_room = (width.saturating_sub(40)) as usize;
+                let url_room = (width.saturating_sub(42)) as usize;
                 // keyed providers first; cap the list so the panel stays
                 // readable with a large catalog behind it
                 let mut providers: Vec<&ProviderInfo> = panel.providers.iter().collect();
@@ -9886,7 +10571,7 @@ fn render(
                     };
                     let url: String = p.base_url.chars().take(url_room).collect();
                     text.push(TuiLine::from(vec![
-                        Span::styled(format!("  {:<12}", p.name), dim),
+                        Span::styled(format!("    {:<12}", p.name), meta),
                         Span::styled(
                             key,
                             if p.key_set || p.env_var.is_empty() {
@@ -9895,216 +10580,122 @@ fn render(
                                 crate::palette::ERR
                             },
                         ),
-                        Span::styled(format!("  {url}"), crate::palette::META),
+                        Span::styled(format!("  {url}"), crate::palette::FAINT),
                     ]));
                 }
                 if !rest.is_empty() {
-                    text.push(TuiLine::styled(
-                        format!("… +{} more", rest.len()),
-                        crate::palette::META,
-                    ));
+                    text.push(TuiLine::styled(format!("    … +{} more", rest.len()), meta));
                 }
-                let widget = Paragraph::new(text)
-                    .block(modal_frame(modal_title("settings")))
-                    .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
-                    .wrap(Wrap { trim: false });
-                frame.render_widget(widget, rect);
+                (width, height, modal_title("settings"), text)
             }
             Modal::Spills { items, selected } => {
-                // border(2) + vertical padding(2) + list rows
+                // borders(2) + vertical padding(2) + list rows
                 let height = (items.len() as u16 + 5).clamp(7, 21);
-                let width = 68.min(frame.area().width);
-                let rect = centered(width, height, modal_area);
-                modal_zone.set(Some(rect));
-                // wipe the covered cells first: the paragraph only paints
-                // its own text, and the transcript would bleed through
-                frame.render_widget(ratatui::widgets::Clear, rect);
-                let inner_w = width.saturating_sub(4) as usize; // borders + padding
+                let width = 68.min(fw);
                 let mut text = Vec::new();
                 if items.is_empty() {
                     text.push(TuiLine::styled(
                         "(no spill files yet — full tool output lands here)",
-                        crate::palette::META,
+                        meta,
                     ));
                 }
                 let cap = (height as usize).saturating_sub(5);
-                let offset = (*selected)
-                    .saturating_sub(cap.saturating_sub(1))
-                    .min(items.len().saturating_sub(cap));
+                let offset = window_of(*selected, items.len(), cap);
                 for (i, path) in items.iter().skip(offset).take(cap).enumerate() {
-                    if i + offset == *selected {
-                        text.push(TuiLine::styled(
-                            pad_to_width(path.clone(), inner_w),
-                            selection_style(),
-                        ));
-                    } else {
-                        text.push(TuiLine::raw(path.clone()));
-                    }
+                    text.push(list_row(
+                        path.clone(),
+                        i + offset == *selected,
+                        inner(width),
+                        Style::new(),
+                    ));
                 }
-                let widget = Paragraph::new(text)
-                    .block(modal_frame(modal_title("spills")))
-                    .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
-                    .wrap(Wrap { trim: false });
-                frame.render_widget(widget, rect);
+                (width, height, modal_title("spills"), text)
             }
             Modal::Prompts { items, selected } => {
                 let height = (items.len() as u16 + 5).clamp(7, 21);
-                let width = 68.min(frame.area().width);
-                let rect = centered(width, height, modal_area);
-                modal_zone.set(Some(rect));
-                // wipe the covered cells first: the paragraph only paints
-                // its own text, and the transcript would bleed through
-                frame.render_widget(ratatui::widgets::Clear, rect);
-                let inner_w = width.saturating_sub(4) as usize;
+                let width = 68.min(fw);
                 let mut text = Vec::new();
                 if items.is_empty() {
-                    text.push(TuiLine::styled(
-                        "(no MCP prompts advertised)",
-                        crate::palette::META,
-                    ));
+                    text.push(TuiLine::styled("(no MCP prompts advertised)", meta));
                 }
                 let cap = (height as usize).saturating_sub(5);
-                let offset = (*selected)
-                    .saturating_sub(cap.saturating_sub(1))
-                    .min(items.len().saturating_sub(cap));
+                let offset = window_of(*selected, items.len(), cap);
                 for (i, row) in items.iter().skip(offset).take(cap).enumerate() {
-                    if i + offset == *selected {
-                        text.push(TuiLine::styled(
-                            pad_to_width(row.clone(), inner_w),
-                            selection_style(),
-                        ));
-                    } else {
-                        text.push(TuiLine::raw(row.clone()));
-                    }
+                    text.push(list_row(
+                        row.clone(),
+                        i + offset == *selected,
+                        inner(width),
+                        Style::new(),
+                    ));
                 }
-                let widget = Paragraph::new(text)
-                    .block(modal_frame(modal_title("prompts")))
-                    .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
-                    .wrap(Wrap { trim: false });
-                frame.render_widget(widget, rect);
+                (width, height, modal_title("prompts"), text)
             }
             Modal::Tasks { entries, selected } => {
                 let height = (entries.len() as u16 + 5).clamp(7, 21);
-                let width = 90.min(frame.area().width);
-                let rect = centered(width, height, modal_area);
-                modal_zone.set(Some(rect));
-                frame.render_widget(ratatui::widgets::Clear, rect);
-                let inner_w = width.saturating_sub(4) as usize;
+                let width = 90.min(fw);
                 let mut text = Vec::new();
                 if entries.is_empty() {
-                    text.push(TuiLine::styled(
-                        "(no background tasks or jobs)".to_string(),
-                        crate::palette::META,
-                    ));
+                    text.push(TuiLine::styled("(no background tasks or jobs)", meta));
                 }
                 let cap = (height as usize).saturating_sub(5);
-                let offset = (*selected)
-                    .saturating_sub(cap.saturating_sub(1))
-                    .min(entries.len().saturating_sub(cap));
+                let offset = window_of(*selected, entries.len(), cap);
                 for (i, (_, row)) in entries.iter().enumerate().skip(offset).take(cap) {
-                    if i == *selected {
-                        text.push(TuiLine::styled(
-                            pad_to_width(row.clone(), inner_w),
-                            selection_style(),
-                        ));
-                    } else {
-                        text.push(TuiLine::raw(row.clone()));
-                    }
+                    text.push(list_row(
+                        row.clone(),
+                        i == *selected,
+                        inner(width),
+                        Style::new(),
+                    ));
                 }
-                let widget = Paragraph::new(text)
-                    .block(modal_frame(format!(
-                        "{} tasks — ⏎ pages a task result",
-                        crate::icons::tool_icon("tasks")
-                    )))
-                    .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
-                    .wrap(Wrap { trim: false });
-                frame.render_widget(widget, rect);
+                let title = format!("{} tasks", crate::icons::tool_icon("tasks"));
+                (width, height, title, text)
             }
             Modal::TaskDetail { id, text, scroll } => {
                 let lines: Vec<&str> = text.lines().collect();
                 // clamp to the transcript pane: a taller box would bleed
-                // over the input box / status bar
+                // over the composer / status line
                 let height = (lines.len() as u16 + 5).clamp(7, 30).min(modal_area.height);
-                let width = 90.min(frame.area().width);
-                let rect = centered(width, height, modal_area);
-                modal_zone.set(Some(rect));
-                frame.render_widget(ratatui::widgets::Clear, rect);
+                let width = 90.min(fw);
                 let visible = (height as usize).saturating_sub(5);
-                let (start, _) = window_range(lines.len(), visible, *scroll);
-                let mut body = Vec::new();
-                for line in &lines[start..(start + visible).min(lines.len())] {
-                    body.push(TuiLine::raw((*line).to_string()));
-                }
-                let widget = Paragraph::new(body)
-                    .block(modal_frame(format!(
-                        "{} task t-{id}",
-                        crate::icons::tool_icon("tasks")
-                    )))
-                    .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
-                    .wrap(Wrap { trim: false });
-                frame.render_widget(widget, rect);
+                let (first, _) = window_range(lines.len(), visible, *scroll);
+                let body = lines[first..(first + visible).min(lines.len())]
+                    .iter()
+                    .map(|line| TuiLine::raw((*line).to_string()))
+                    .collect();
+                let title = format!("{} task t-{id}", crate::icons::tool_icon("tasks"));
+                (width, height, title, body)
             }
             Modal::Debug { rows, scroll } => {
                 // clamp to the transcript pane: a taller box would bleed
-                // over the input box / status bar
+                // over the composer / status line
                 let height = (rows.len() as u16 + 5).clamp(7, 30).min(modal_area.height);
-                let width = 90.min(frame.area().width);
-                let rect = centered(width, height, modal_area);
-                modal_zone.set(Some(rect));
-                frame.render_widget(ratatui::widgets::Clear, rect);
+                let width = 90.min(fw);
                 let visible = (height as usize).saturating_sub(5);
-                let (start, _) = window_range(rows.len(), visible, *scroll);
-                let mut body = Vec::new();
-                for row in &rows[start..(start + visible).min(rows.len())] {
-                    body.push(TuiLine::styled(row.clone(), crate::palette::META));
-                }
-                let widget = Paragraph::new(body)
-                    .block(modal_frame(format!(
-                        "{} debug sessions",
-                        crate::icons::tool_icon("debug")
-                    )))
-                    .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
-                    .wrap(Wrap { trim: false });
-                frame.render_widget(widget, rect);
+                let (first, _) = window_range(rows.len(), visible, *scroll);
+                let body = rows[first..(first + visible).min(rows.len())]
+                    .iter()
+                    .map(|row| TuiLine::styled(row.clone(), meta))
+                    .collect();
+                let title = format!("{} debug sessions", crate::icons::tool_icon("debug"));
+                (width, height, title, body)
             }
             Modal::Rewind { items, selected } => {
                 let height = (items.len() as u16 + 5).clamp(6, 22);
-                let width = 76.min(frame.area().width);
-                let rect = centered(width, height, modal_area);
-                modal_zone.set(Some(rect));
-                frame.render_widget(ratatui::widgets::Clear, rect);
-                let inner_w = width.saturating_sub(4) as usize;
+                let width = 76.min(fw);
                 let mut text = vec![TuiLine::styled(
-                    pad_to_width(
-                        "pick a message — ⏎/r rewind here · e edit & resend · esc close"
-                            .to_string(),
-                        inner_w,
-                    ),
-                    crate::palette::META,
+                    "pick a message — ⏎/r rewind here · e edit & resend · esc close",
+                    meta,
                 )];
                 let cap = (height as usize).saturating_sub(5);
                 for (i, (turns, prompt)) in items.iter().enumerate().take(cap.max(1)) {
-                    let mut row = format!("[−{turns}] {prompt}");
-                    if row.chars().count() > inner_w {
-                        row = row
-                            .chars()
-                            .take(inner_w.saturating_sub(1))
-                            .collect::<String>()
-                            + "…";
-                    }
-                    // the one selection idiom: the full-row pink bar
-                    let style = if i == *selected {
-                        selection_style()
-                    } else {
-                        ratatui::style::Style::new().fg(crate::palette::META)
-                    };
-                    text.push(TuiLine::styled(pad_to_width(row, inner_w), style));
+                    text.push(list_row(
+                        format!("[−{turns}] {prompt}"),
+                        i == *selected,
+                        inner(width),
+                        meta,
+                    ));
                 }
-                let widget = Paragraph::new(text)
-                    .block(modal_frame(modal_title("rewind")))
-                    .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
-                    .wrap(Wrap { trim: false });
-                frame.render_widget(widget, rect);
+                (width, height, modal_title("rewind"), text)
             }
             Modal::Memory {
                 rows,
@@ -10113,72 +10704,49 @@ fn render(
             } => {
                 let extra = if inbox.is_empty() { 0 } else { inbox.len() + 2 };
                 let height = (rows.len() as u16 + extra as u16 + 4).clamp(6, 24);
-                let width = 80.min(frame.area().width);
-                let rect = centered(width, height, modal_area);
-                modal_zone.set(Some(rect));
-                // wipe the covered cells first: the paragraph only paints
-                // its own text, and the transcript would bleed through
-                frame.render_widget(ratatui::widgets::Clear, rect);
-                let inner_w = width.saturating_sub(4) as usize;
+                let width = 80.min(fw);
                 let mut text = Vec::new();
-                let cap = (height as usize).saturating_sub(4);
-                let mut budget = cap;
+                let mut budget = (height as usize).saturating_sub(4);
                 for row in rows.iter() {
                     if budget == 0 {
                         break;
                     }
                     budget -= 1;
                     if row.starts_with('▸') {
-                        text.push(TuiLine::styled(
-                            pad_to_width(row.clone(), inner_w),
-                            crate::palette::META,
-                        ));
+                        text.push(TuiLine::styled(row.clone(), crate::palette::ACCENT_BOLD));
                     } else {
                         text.push(TuiLine::raw(row.clone()));
                     }
                 }
                 if !inbox.is_empty() && budget >= 2 {
                     budget -= 2;
-                    text.push(TuiLine::raw(String::new()));
+                    text.push(TuiLine::default());
                     text.push(TuiLine::styled(
-                        "staged memories — ⏎ accept→MEMORY.md · u→user · d discard".to_string(),
-                        crate::palette::META,
+                        "staged memories — ⏎ accept→MEMORY.md · u→user · d discard",
+                        meta,
                     ));
                     for (i, line) in inbox.iter().enumerate() {
                         if budget == 0 {
                             break;
                         }
                         budget -= 1;
-                        let style = if i == *selected {
-                            selection_style()
-                        } else {
-                            ratatui::style::Style::new().fg(crate::palette::META)
-                        };
-                        text.push(TuiLine::styled(pad_to_width(line.clone(), inner_w), style));
+                        text.push(list_row(line.clone(), i == *selected, inner(width), meta));
                     }
                 }
-                let widget = Paragraph::new(text)
-                    .block(modal_frame(modal_title("memory")))
-                    .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
-                    .wrap(Wrap { trim: false });
-                frame.render_widget(widget, rect);
+                (width, height, modal_title("memory"), text)
             }
             Modal::Features { entries, selected } => {
                 let height = (entries.len() as u16 + 4).clamp(6, 24);
-                let width = 76.min(frame.area().width);
-                let rect = centered(width, height, modal_area);
-                modal_zone.set(Some(rect));
-                frame.render_widget(ratatui::widgets::Clear, rect);
-                let inner_w = width.saturating_sub(4) as usize;
+                let width = 76.min(fw);
                 let cap = (height as usize).saturating_sub(4);
                 // keep the selection inside the window
-                let start = (*selected + 1).saturating_sub(cap);
+                let first = (*selected + 1).saturating_sub(cap);
                 let mut text = Vec::new();
-                for (i, row) in entries.iter().enumerate().skip(start).take(cap) {
+                for (i, row) in entries.iter().enumerate().skip(first).take(cap) {
                     if row.header {
                         text.push(TuiLine::styled(
-                            pad_to_width(row.label.clone(), inner_w),
-                            crate::palette::META,
+                            row.label.clone(),
+                            crate::palette::ACCENT_BOLD,
                         ));
                         continue;
                     }
@@ -10188,242 +10756,214 @@ fn render(
                     } else {
                         format!("{glyph} {} ({})", row.label, row.spec)
                     };
-                    let style = if i == *selected {
-                        selection_style()
-                    } else {
-                        ratatui::style::Style::new()
-                    };
-                    text.push(TuiLine::styled(pad_to_width(shown, inner_w), style));
+                    text.push(list_row(shown, i == *selected, inner(width), Style::new()));
                 }
-                let more = entries.len().saturating_sub(start + cap);
+                let more = entries.len().saturating_sub(first + cap);
                 if more > 0 {
-                    text.push(TuiLine::styled(
-                        format!("… +{more} more"),
-                        crate::palette::META,
-                    ));
+                    text.push(TuiLine::styled(format!("  … +{more} more"), meta));
                 }
-                let widget = Paragraph::new(text)
-                    .block(modal_frame(modal_title("features")))
-                    .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
-                    .wrap(Wrap { trim: false });
-                frame.render_widget(widget, rect);
+                (width, height, modal_title("features"), text)
             }
             Modal::Todos { rows } | Modal::Skills { rows } | Modal::Info { rows } => {
-                let (title, rows) = match open {
-                    Modal::Todos { rows } => ("todos", rows),
-                    Modal::Skills { rows } => ("skills · agents · mcp", rows),
-                    _ => ("info", rows),
+                let title = match open {
+                    Modal::Todos { .. } => "todos",
+                    Modal::Skills { .. } => "skills · agents · mcp",
+                    _ => "info",
                 };
                 let height = (rows.len() as u16 + 4).clamp(6, 24);
-                let width = 80.min(frame.area().width);
-                let rect = centered(width, height, modal_area);
-                modal_zone.set(Some(rect));
-                frame.render_widget(ratatui::widgets::Clear, rect);
-                let inner_w = width.saturating_sub(4) as usize;
-                let mut text = Vec::new();
+                let width = 80.min(fw);
                 let cap = (height as usize).saturating_sub(4);
+                let mut text = Vec::new();
                 for row in rows.iter().take(cap) {
                     let plain: String = row.spans.iter().map(|s| s.content.clone()).collect();
                     // section headers keep their accent; everything else
-                    // renders plain
+                    // renders as built
                     if plain == "skills" || plain == "agents" || plain == "mcp" {
-                        text.push(TuiLine::styled(
-                            pad_to_width(plain, inner_w),
-                            crate::palette::META,
-                        ));
+                        text.push(TuiLine::styled(plain, crate::palette::ACCENT_BOLD));
                     } else {
                         text.push(TuiLine::from(
                             row.spans
                                 .iter()
-                                .map(|s| Span::styled(s.content.clone(), s.style))
+                                .map(|s| Span::styled(s.content.clone().into_owned(), s.style))
                                 .collect::<Vec<_>>(),
                         ));
                     }
                 }
                 let more = rows.len().saturating_sub(cap);
                 if more > 0 {
-                    text.push(TuiLine::styled(
-                        format!("… +{more} more"),
-                        crate::palette::META,
-                    ));
+                    text.push(TuiLine::styled(format!("… +{more} more"), meta));
                 }
-                let widget = Paragraph::new(text)
-                    .block(modal_frame(modal_title(title)))
-                    .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
-                    .wrap(Wrap { trim: false });
-                frame.render_widget(widget, rect);
+                (width, height, modal_title(title), text)
             }
-            Modal::Usage { rows } => {
+            Modal::Usage { rows } | Modal::Context { rows } => {
+                let title = if matches!(open, Modal::Usage { .. }) {
+                    "usage"
+                } else {
+                    "context"
+                };
                 let height = (rows.len() as u16 + 4).clamp(6, 24);
-                let width = 80.min(frame.area().width);
-                let rect = centered(width, height, modal_area);
-                modal_zone.set(Some(rect));
-                // wipe the covered cells first: the paragraph only paints
-                // its own text, and the transcript would bleed through
-                frame.render_widget(ratatui::widgets::Clear, rect);
-                let inner_w = width.saturating_sub(4) as usize;
-                let mut text = Vec::new();
+                let width = 80.min(fw);
                 let cap = (height as usize).saturating_sub(4);
-                for row in rows.iter().take(cap) {
-                    if row.starts_with('▸') {
-                        text.push(TuiLine::styled(
-                            pad_to_width(row.clone(), inner_w),
-                            crate::palette::META,
-                        ));
-                    } else {
-                        text.push(TuiLine::raw(row.clone()));
-                    }
-                }
-                let widget = Paragraph::new(text)
-                    .block(modal_frame(modal_title("usage")))
-                    .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
-                    .wrap(Wrap { trim: false });
-                frame.render_widget(widget, rect);
-            }
-            Modal::Context { rows } => {
-                let height = (rows.len() as u16 + 4).clamp(6, 24);
-                let width = 80.min(frame.area().width);
-                let rect = centered(width, height, modal_area);
-                modal_zone.set(Some(rect));
-                // wipe the covered cells first: the paragraph only paints
-                // its own text, and the transcript would bleed through
-                frame.render_widget(ratatui::widgets::Clear, rect);
-                let inner_w = width.saturating_sub(4) as usize;
-                let mut text = Vec::new();
-                let cap = (height as usize).saturating_sub(4);
-                for row in rows.iter().take(cap) {
-                    if row.starts_with('▸') {
-                        text.push(TuiLine::styled(
-                            pad_to_width(row.clone(), inner_w),
-                            crate::palette::META,
-                        ));
-                    } else {
-                        text.push(TuiLine::raw(row.clone()));
-                    }
-                }
-                let widget = Paragraph::new(text)
-                    .block(modal_frame(modal_title("context")))
-                    .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
-                    .wrap(Wrap { trim: false });
-                frame.render_widget(widget, rect);
+                let text = rows
+                    .iter()
+                    .take(cap)
+                    .map(|row| {
+                        if row.starts_with('▸') {
+                            TuiLine::styled(row.clone(), crate::palette::ACCENT_BOLD)
+                        } else {
+                            TuiLine::raw(row.clone())
+                        }
+                    })
+                    .collect();
+                (width, height, modal_title(title), text)
             }
             Modal::Tree {
                 items,
-                targets: _,
+                actions,
                 selected,
             } => {
-                let height = (items.len() as u16 + 5).clamp(7, 21);
-                let width = 68.min(frame.area().width);
-                let rect = centered(width, height, modal_area);
-                modal_zone.set(Some(rect));
-                // wipe the covered cells first: the paragraph only paints
-                // its own text, and the transcript would bleed through
-                frame.render_widget(ratatui::widgets::Clear, rect);
-                let inner_w = width.saturating_sub(4) as usize;
+                let height = (items.len() as u16 + 5)
+                    .clamp(9, 34)
+                    .min(fh.saturating_sub(2).max(9));
+                let width = 110.min(fw);
                 let mut text = Vec::new();
                 if items.is_empty() {
-                    text.push(TuiLine::styled(
-                        "(no related sessions)",
-                        crate::palette::META,
-                    ));
+                    text.push(TuiLine::styled("(no related sessions)", meta));
                 }
                 let cap = (height as usize).saturating_sub(5);
                 // window the list so the selection always stays visible:
                 // long trees scroll instead of hiding the selected row
-                let offset = (*selected)
-                    .saturating_sub(cap.saturating_sub(1))
-                    .min(items.len().saturating_sub(cap));
+                let offset = window_of(*selected, items.len(), cap);
                 for (i, row) in items.iter().skip(offset).take(cap).enumerate() {
-                    // truncate at the ACTUAL inner width: a narrow
-                    // terminal renders a smaller box than the 64-col
+                    // list_row truncates at the ACTUAL inner width: a
+                    // narrow terminal renders a smaller box than the
                     // build assumption, and wrapping must not come back
-                    let row = pad_to_width(trunc_cols(row, inner_w), inner_w);
-                    if i + offset == *selected {
-                        text.push(TuiLine::styled(row, selection_style()));
+                    let style = if matches!(actions.get(i + offset), Some(TreeAction::Header)) {
+                        meta
                     } else {
-                        text.push(TuiLine::raw(row));
-                    }
+                        Style::new()
+                    };
+                    text.push(list_row(
+                        row.clone(),
+                        i + offset == *selected,
+                        inner(width),
+                        style,
+                    ));
                 }
-                let widget = Paragraph::new(text)
-                    .block(modal_frame(modal_title("tree")))
-                    .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
-                    .wrap(Wrap { trim: false });
-                frame.render_widget(widget, rect);
+                (width, height, modal_title("tree"), text)
             }
+        };
+        // the key prompt repaints the whole frame first: switching here
+        // from the model picker must leave no stale pixels outside it
+        if matches!(open, Modal::Key(_)) {
+            frame.render_widget(Block::new().style(crate::palette::CANVAS), full);
+        }
+        let rect = centered(width, height, modal_area);
+        modal_zone.set(Some(rect));
+        // wipe the covered cells first: the paragraph only paints its
+        // own text, and the transcript would bleed through
+        frame.render_widget(ratatui::widgets::Clear, rect);
+        frame.render_widget(
+            Paragraph::new(text)
+                .block(modal_frame(title))
+                .wrap(Wrap { trim: false }),
+            rect,
+        );
+        let buf = frame.buffer_mut();
+        drop_shadow(buf, rect);
+        if rect.height >= 2 {
+            paint_hints(
+                buf,
+                rect.x + 2,
+                rect.right().saturating_sub(2),
+                rect.bottom() - 1,
+                modal_hints(open),
+            );
         }
     }
 
     // ── permission ask: a real dialog, layered above everything ────
-    // the safety-critical surface gets the modal treatment: warned
-    // border, bold question, budgeted detail, numbered options on the
-    // pink selection bar. The input box renders normally underneath.
+    // the safety-critical surface: WARN frame and title, the question
+    // in strong gold, budgeted diff detail, numbered options with the
+    // selection pointer. No ✕ chip and no published zone — a click can
+    // never answer it.
     if let Some(ask) = ask {
-        let width = 80.min(frame.area().width);
-        let inner_w = width.saturating_sub(4) as usize;
-        let body = ask_modal_body(ask, inner_w);
+        let width = 80.min(full.width);
+        let body = ask_modal_body(ask, width.saturating_sub(4) as usize);
         let height = (body.len() as u16 + 4).clamp(5, modal_area.height.max(5));
         let rect = centered(width, height, modal_area);
-        // wipe the covered cells first: the paragraph only paints
-        // its own text, and the transcript would bleed through
         frame.render_widget(ratatui::widgets::Clear, rect);
-        let widget = Paragraph::new(body)
-            .block(
-                surface_frame("permission")
-                    .border_style(ratatui::style::Style::new().fg(crate::palette::WARN)),
-            )
-            .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
-            .wrap(Wrap { trim: false });
-        frame.render_widget(widget, rect);
+        let title = TuiLine::styled(
+            format!(" {} permission ", crate::icons::BRAND),
+            Style::new()
+                .fg(crate::palette::WARN)
+                .add_modifier(Modifier::BOLD),
+        );
+        frame.render_widget(
+            Paragraph::new(body)
+                .block(frame_block(title, crate::palette::WARN))
+                .wrap(Wrap { trim: false }),
+            rect,
+        );
+        let buf = frame.buffer_mut();
+        drop_shadow(buf, rect);
+        if rect.height >= 2 {
+            paint_hints(
+                buf,
+                rect.x + 2,
+                rect.right().saturating_sub(2),
+                rect.bottom() - 1,
+                ASK_HINTS,
+            );
+        }
     }
 
-    // ── toast: transient action feedback over the transcript tail ──
+    // ── toast: transient feedback pill, bottom-center of the pane ──
     if let Some(msg) = toast {
-        use unicode_width::UnicodeWidthStr;
-        let w = (msg.width() as u16 + 4)
-            .min(tx_area.width.saturating_sub(4))
-            .max(1);
-        let text = if msg.width() as u16 > w.saturating_sub(4) {
-            format!(" {}", trunc_cols(msg, w.saturating_sub(5) as usize))
-        } else {
-            format!(" {msg}")
-        };
-        let rect = ratatui::layout::Rect {
-            x: tx_area.x + (tx_area.width.saturating_sub(w)) / 2,
-            y: tx_area.y + tx_area.height.saturating_sub(1),
-            width: w,
-            height: 1,
-        };
-        frame.render_widget(ratatui::widgets::Clear, rect);
-        let bar = TuiLine::from(vec![Span::styled(
-            pad_to_width(text, w.saturating_sub(1) as usize),
-            ratatui::style::Style::new()
-                .fg(crate::palette::ACCENT)
-                .bg(crate::palette::BG_PANEL),
-        )]);
-        frame.render_widget(Paragraph::new(bar), rect);
+        let room = (tx_area.width as usize).saturating_sub(4);
+        if room >= 4 && tx_area.height > 0 {
+            let body = trunc_cols(msg, room - 3);
+            let pill = TuiLine::from(vec![
+                Span::styled(
+                    crate::icons::RAIL,
+                    Style::new()
+                        .fg(crate::palette::ACCENT)
+                        .bg(crate::palette::BG_SURFACE),
+                ),
+                Span::styled(
+                    format!(" {body} "),
+                    Style::new()
+                        .fg(crate::palette::STRONG)
+                        .bg(crate::palette::BG_SURFACE),
+                ),
+            ]);
+            let w = pill.width() as u16;
+            put_line(
+                frame.buffer_mut(),
+                tx_area.x + tx_area.width.saturating_sub(w) / 2,
+                tx_area.bottom() - 1,
+                &pill,
+            );
+        }
     }
 
-    // hover affordance (last, once every zone is published): lift
-    // whatever the pointer rests on — the hovered entry's rows take
-    // the warm hover band, chips/arrows/strip buttons/rail thumb glow
-    // gold. The selection patch above runs first, so a picked row
-    // keeps its stronger band.
+    // hover affordance (last, once every zone is published): the
+    // hovered entry's rows take the hover lift edge to edge across the
+    // content rect; chips/arrows/strip buttons/rail thumb glow gold.
+    // The selection patch above runs first and keeps its band.
     if let Some(h) = hover {
         let buf = frame.buffer_mut();
         match h {
             Hover::Entry(entry) => {
-                // lift only the cells that already carry a block tint —
-                // spacer rows and canvas margins keep the ground, so the
-                // hover reads as the block itself, not a painted stripe
                 if let Some((first, len)) = transcript.entry_row_span(entry) {
                     for trow in first.max(start)..first + len {
                         if trow >= start + content_rect.height as usize {
                             break;
                         }
                         let y = content_rect.y + (trow - start) as u16;
-                        for x in content_rect.x..content_rect.x + content_rect.width {
+                        for x in content_rect.x..content_rect.right() {
                             if let Some(cell) = buf.cell_mut((x, y))
-                                && hoverable_bg(cell.bg)
+                                && cell.bg != crate::palette::BG_SELECT
                             {
                                 cell.set_bg(crate::palette::BG_HOVER);
                             }
@@ -10436,7 +10976,7 @@ fn render(
                 if let Some(rect) = zone {
                     for x in rect.x + rect.width.saturating_sub(3)..rect.x + rect.width {
                         if let Some(cell) = buf.cell_mut((x, rect.y)) {
-                            cell.set_fg(crate::palette::GOLD_HI);
+                            cell.set_fg(crate::palette::STRONG);
                         }
                     }
                 }
@@ -10446,7 +10986,7 @@ fn render(
                     let r = if up { z.up } else { z.down };
                     for x in r.x..r.x + r.width {
                         if let Some(cell) = buf.cell_mut((x, r.y)) {
-                            cell.set_fg(crate::palette::GOLD_HI);
+                            cell.set_fg(crate::palette::STRONG);
                         }
                     }
                 }
@@ -10460,7 +11000,7 @@ fn render(
                     };
                     for x in r.x..r.x + r.width {
                         if let Some(cell) = buf.cell_mut((x, r.y)) {
-                            cell.set_fg(crate::palette::GOLD_HI);
+                            cell.set_fg(crate::palette::STRONG);
                         }
                     }
                 }
@@ -10470,7 +11010,7 @@ fn render(
                     for i in thumb_pos..thumb_pos + thumb_len {
                         for x in rect.x..rect.x + rect.width {
                             if let Some(cell) = buf.cell_mut((x, rect.y + i as u16)) {
-                                cell.set_fg(crate::palette::GOLD_HI);
+                                cell.set_fg(crate::palette::STRONG);
                             }
                         }
                     }
@@ -10480,120 +11020,52 @@ fn render(
     }
 }
 
-/// Merge a background into every span and pad each row to the full
-/// transcript width — the assistant "slab", a fill with no border glyphs.
-fn apply_output_surface(
-    rows: &mut [ratatui::text::Line<'static>],
-    width: u16,
-    bg: ratatui::style::Color,
-) {
-    use unicode_width::UnicodeWidthStr;
-    for row in rows.iter_mut() {
-        for s in row.spans.iter_mut() {
-            s.style = s.style.bg(bg);
-        }
-        let used: usize = row.spans.iter().map(|s| s.content.width()).sum();
-        let w = width as usize;
-        if w > used {
-            row.spans.push(ratatui::text::Span::styled(
-                " ".repeat(w - used),
-                ratatui::style::Style::new().bg(bg),
-            ));
-        }
-    }
-}
-
-/// An empty row carrying only the surface background. The bg must live on
-/// a SPAN: Paragraph ignores line-level styles when painting cells.
-fn surface_blank(width: u16, bg: ratatui::style::Color) -> ratatui::text::Line<'static> {
-    ratatui::text::Line::from(vec![ratatui::text::Span::styled(
-        " ".repeat(width as usize),
-        ratatui::style::Style::new().bg(bg),
-    )])
-}
-
-/// Horizontal inset (columns) between a message block's background
-/// edges and its text — the band reads as a block, characters never
-/// touch its borders.
-const CARD_MARGIN: usize = 2;
-
-/// Inset surface-filled rows by [`CARD_MARGIN`] columns on both sides:
-/// prepends and appends margin spans carrying the band background.
-/// Rows must already be surface-filled to exactly `width` columns
-/// (empty rows become full-width blanks).
-fn inset_rows(rows: &mut [ratatui::text::Line<'static>], width: u16, bg: ratatui::style::Color) {
-    let m = CARD_MARGIN.min(width as usize / 4);
-    if m == 0 {
-        return;
-    }
-    let style = ratatui::style::Style::new().bg(bg);
-    for row in rows.iter_mut() {
-        if row.spans.is_empty() {
-            *row = surface_blank(width, bg);
-            continue;
-        }
-        row.spans
-            .insert(0, ratatui::text::Span::styled(" ".repeat(m), style));
-        row.spans
-            .push(ratatui::text::Span::styled(" ".repeat(m), style));
-    }
-}
-/// Full-width band for user messages — the only edge-to-edge role
-/// (OMP userMsgBg: warm dark, amber prompt glyph, bold text).
+/// User turn: a full-width `BG_USER` band — the `▌` rail (`ACCENT`) in
+/// column 0, a space, then the text in bold `FG`, word-wrapped at W-2
+/// with a two-column hanging indent (every row rides the rail), each
+/// row padded to exactly W. No pad rows: the air around the band is
+/// [`separate_before`]'s job. An empty message still draws one rail
+/// row, so every user entry owns at least one row.
 fn push_block(out: &mut Vec<ratatui::text::Line<'static>>, text: &str, width: u16) {
-    use ratatui::text::Line as TuiLine;
-    use ratatui::text::Span;
-    // one blank band row above the text: the user card reads as a pad
-    // above AND below (the trailing blank below closes the card)
-    out.push(surface_blank(width, crate::palette::BG_USER));
-    let lead_style = ratatui::style::Style::new()
-        .fg(crate::palette::ACCENT)
-        .bg(crate::palette::BG_USER);
-    let body_style = ratatui::style::Style::new()
-        .bg(crate::palette::BG_USER)
-        .add_modifier(ratatui::style::Modifier::BOLD);
-    // horizontal margin: the band reads as a block, the text never
-    // touches its edges
-    let m = CARD_MARGIN.min(width as usize / 4);
-    let margin_span = Span::styled(" ".repeat(m), body_style);
-    let usable = width as usize - 2 * m;
-    for (li, raw) in text.lines().enumerate() {
-        // wrap long lines at the band width (char boundary)
-        let mut start = 0;
-        let chars: Vec<char> = raw.chars().collect();
-        loop {
-            // the prefix goes on the very first segment of the message;
-            // every later segment (wrapped or a new source line) indents
-            let first = li == 0 && start == 0;
-            let lead = if first { "❯ " } else { "  " };
-            // max(1) guarantees forward progress even at degenerate
-            // widths (0/1 columns) where the lead alone overflows
-            let room = usable.saturating_sub(2).max(1);
-            let end = (start + room).min(chars.len());
-            let segment: String = chars[start..end].iter().collect();
-            let pad = usable.saturating_sub(segment.chars().count() + 2);
+    use ratatui::style::{Modifier, Style};
+    use ratatui::text::{Line as TuiLine, Span};
+    use unicode_width::UnicodeWidthStr;
+    let w = width as usize;
+    let bg = crate::palette::BG_USER;
+    let rail = Style::new().fg(crate::palette::USER).bg(bg);
+    let body = Style::new()
+        .fg(crate::palette::FG)
+        .bg(bg)
+        .add_modifier(Modifier::BOLD);
+    let room = w.saturating_sub(2).max(1);
+    let lines: Vec<&str> = if text.is_empty() {
+        vec![""]
+    } else {
+        text.lines().collect()
+    };
+    for raw in lines {
+        for row in wrap_rows(raw, room) {
+            let seg = trunc_cols(&row.text, room);
+            let pad = w.saturating_sub(2 + seg.width());
             let mut spans = vec![
-                margin_span.clone(),
-                Span::styled(lead.to_string(), lead_style),
-                Span::styled(segment, body_style),
+                Span::styled(crate::icons::RAIL, rail),
+                Span::styled(" ", body),
+                Span::styled(seg, body),
             ];
             if pad > 0 {
-                spans.push(Span::styled(" ".repeat(pad), body_style));
+                spans.push(Span::styled(" ".repeat(pad), body));
             }
-            spans.push(margin_span.clone());
             out.push(TuiLine::from(spans));
-            if end >= chars.len() {
-                break;
-            }
-            start = end;
         }
     }
-    out.push(surface_blank(width, crate::palette::BG_USER)); // spacing after each block
 }
 
-/// Gutter-prefixed rows for ambient roles (thought/note/report): no
-/// background, no full-width padding, and no built-in spacing — air
-/// between blocks is [`separate_before`]'s job alone.
+/// Glyph-gutter rows for ambient roles (info/warn/err/report, the ask
+/// question): `{prefix}{text}` word-wrapped at the width, continuation
+/// rows hanging under the text by the prefix's display width. One
+/// line-level style tints glyph and text alike. No background, no
+/// full-width padding, no built-in spacing — air between blocks is
+/// [`separate_before`]'s job alone.
 fn push_gutter(
     out: &mut Vec<ratatui::text::Line<'static>>,
     text: &str,
@@ -10603,81 +11075,285 @@ fn push_gutter(
 ) {
     use ratatui::text::Line as TuiLine;
     use unicode_width::UnicodeWidthStr;
-
-    // continuation rows indent by the prefix's display width (an emoji
-    // lead like `🧠 ` is 3 columns, not 2 chars)
     let indent = " ".repeat(prefix.width());
-    let usable = width as usize;
-    for (li, raw) in text.lines().enumerate() {
-        // wrap long lines at the transcript width (char boundary)
-        let mut start = 0;
-        let chars: Vec<char> = raw.chars().collect();
-        loop {
-            let first = li == 0 && start == 0;
+    // max(1) guarantees forward progress even at degenerate widths
+    // (0/1 columns) where the lead alone overflows
+    let room = (width as usize).saturating_sub(prefix.width()).max(1);
+    let mut first = true;
+    for raw in text.lines() {
+        for row in wrap_rows(raw, room) {
             let lead = if first { prefix } else { indent.as_str() };
-            // max(1) guarantees forward progress even at degenerate
-            // widths (0/1 columns) where the lead alone overflows
-            let room = usable.saturating_sub(lead.width()).max(1);
-            let end = (start + room).min(chars.len());
-            let segment: String = chars[start..end].iter().collect();
-            out.push(TuiLine::styled(format!("{lead}{segment}"), style));
-            if end >= chars.len() {
-                break;
-            }
-            start = end;
+            first = false;
+            out.push(TuiLine::styled(format!("{lead}{}", row.text), style));
         }
     }
 }
 
-/// `/tree` modal rows: the current session's whole family (itself plus
-/// every descendant, found by walking `parent` links level by level).
-/// Rows come out parent-before-child, indented one step per depth, the
-/// current session marked `▸`, each truncated to `width` columns.
-/// Returns (rows, strand ids) in the same order.
-fn tree_modal_rows(
+/// `/tree` modal rows: the current session's family as a real branch
+/// tree — ancestors above, descendants below (children chronological,
+/// drawn with `├─`/`└─` connectors), the current session marked `▸` —
+/// with every fork edge labeled by the prompt it branched at. Below
+/// the tree, a branch section lists `history` (the session's user
+/// inputs, oldest first, annotated with the forks already growing
+/// there). `records_of` loads a strand's records by id (the fork point
+/// comes from the exact shared record prefix — fork copies keep the
+/// parent's record ids). Each row truncates to `width` columns.
+/// Returns (rows, actions) in the same order.
+fn tree_modal_rows<F>(
     all: &[ka_strand::StrandSummary],
     current: Option<&str>,
+    history: &[String],
     width: usize,
-) -> (Vec<String>, Vec<String>) {
-    let mut ids: Vec<String> = current.iter().map(|c| c.to_string()).collect();
-    let mut depths: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    if let Some(c) = current {
-        depths.insert(c.to_string(), 0);
+    records_of: F,
+) -> (Vec<String>, Vec<TreeAction>)
+where
+    F: Fn(&str) -> Vec<ka_strand::Record>,
+{
+    let parent_of: std::collections::HashMap<&str, &str> = all
+        .iter()
+        .filter_map(|s| s.parent.as_deref().map(|p| (s.id.as_str(), p)))
+        .collect();
+    // ancestor chain of `current`, collected upwards then flipped so
+    // the root leads (cycle-guarded against corrupt parent links)
+    let mut chain: Vec<String> = Vec::new();
+    let mut walk = current.map(|c| c.to_string());
+    while let Some(id) = walk {
+        if chain.contains(&id) {
+            break;
+        }
+        chain.push(id.clone());
+        walk = parent_of.get(id.as_str()).map(|p| p.to_string());
     }
-    let mut level = ids.clone();
-    let mut depth = 0;
+    chain.reverse();
+    // children of every family member (breadth-first from the chain),
+    // sorted chronological so branches grow downward
+    let mut children: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    // discovery starts empty: chain members must enter the map too,
+    // or the depth-first walk below cannot reach them
+    let mut seen: Vec<String> = Vec::new();
+    let mut level = chain.clone();
     while !level.is_empty() {
         let mut next = Vec::new();
         for s in all {
             if let Some(p) = &s.parent {
-                if level.contains(p) && !ids.contains(&s.id) {
-                    ids.push(s.id.clone());
-                    depths.insert(s.id.clone(), depth + 1);
+                if level.contains(p) && !seen.contains(&s.id) {
+                    seen.push(s.id.clone());
+                    children.entry(p.clone()).or_default().push(s.id.clone());
                     next.push(s.id.clone());
                 }
             }
         }
         level = next;
-        depth += 1;
     }
-    let mut items = Vec::with_capacity(ids.len());
-    let mut targets = Vec::with_capacity(ids.len());
+    for kids in children.values_mut() {
+        kids.sort_by_key(|id| {
+            all.iter()
+                .find(|s| &s.id == id)
+                .map_or(String::new(), |s| s.ts.clone())
+        });
+    }
+    // records cache: family edges read each strand at most once
+    let mut cache: std::collections::HashMap<String, Vec<ka_strand::Record>> =
+        std::collections::HashMap::new();
+    let mut records = |id: &str| -> Vec<ka_strand::Record> {
+        if let Some(r) = cache.get(id) {
+            return r.clone();
+        }
+        let r = records_of(id);
+        cache.insert(id.to_string(), r.clone());
+        r
+    };
+    // how many forks already branch at each of the current session's
+    // prompts — matches `history` entries by exact prompt text
+    let mut branch_points: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    if let Some(cur) = current {
+        if let Some(kids) = children.get(cur) {
+            let cur_records = records(cur);
+            for kid in kids {
+                if let Some(prompt) = dropped_prompt(&cur_records, &records(kid)) {
+                    if !prompt.is_empty() {
+                        *branch_points.entry(prompt).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+    }
+    // depth-first from the family root, children chronological: the
+    // classic tree reading order
+    let mut ids: Vec<String> = Vec::new();
+    if let Some(root) = chain.first() {
+        let mut stack = vec![root.clone()];
+        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+        while let Some(id) = stack.pop() {
+            if !visited.insert(id.clone()) {
+                continue;
+            }
+            ids.push(id.clone());
+            if let Some(kids) = children.get(&id) {
+                for kid in kids.iter().rev() {
+                    stack.push(kid.clone());
+                }
+            }
+        }
+    }
+    let mut items = Vec::with_capacity(ids.len() + history.len() + 1);
+    let mut actions = Vec::with_capacity(ids.len() + history.len() + 1);
+    // fork-edge labels read every family strand in full; past this
+    // family size the reads outweigh the labels, so edges go bare
+    const LABEL_FAMILY_CAP: usize = 24;
+    let label_edges = ids.len() <= LABEL_FAMILY_CAP;
     for id in &ids {
         let Some(s) = all.iter().find(|s| &s.id == id) else {
             continue;
         };
         let date = s.ts.get(..10).unwrap_or(&s.ts).to_string();
-        let indent = "  ".repeat(*depths.get(id).unwrap_or(&0));
         let marker = if Some(id.as_str()) == current {
             "▸ "
         } else {
             ""
         };
-        let row = format!("{indent}{marker}{} · {date} · {} msgs", s.title, s.messages);
+        let fork = if label_edges {
+            parent_of
+                .get(id.as_str())
+                .and_then(|p| fork_label(&records(p), &records(id), width))
+                .map(|l| format!("  {l}"))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let row = format!(
+            "{}{marker}{} · {date} · {} msgs{fork}",
+            tree_prefix(id, &parent_of, &children),
+            s.title,
+            s.messages
+        );
         items.push(trunc_cols(&row, width));
-        targets.push(id.clone());
+        actions.push(TreeAction::Attach(id.clone()));
     }
-    (items, targets)
+    if !history.is_empty() {
+        items.push("─ branch from a past input ─".to_string());
+        actions.push(TreeAction::Header);
+        // oldest first: a row's fork depth is its distance from the
+        // newest input (1 = the latest)
+        for (i, prompt) in history.iter().enumerate() {
+            let forks = branch_points.get(prompt).copied().unwrap_or(0);
+            let extra = if forks > 0 {
+                format!("  ↳ {forks} fork{}", if forks == 1 { "" } else { "s" })
+            } else {
+                String::new()
+            };
+            items.push(trunc_cols(
+                &format!("⑂ {}{extra}", first_line_of(prompt)),
+                width,
+            ));
+            actions.push(TreeAction::Fork {
+                turns: (history.len() - i) as u32,
+                prompt: prompt.clone(),
+            });
+        }
+    }
+    (items, actions)
+}
+
+/// First non-empty line of a possibly multi-line prompt, so a row
+/// never wraps.
+fn first_line_of(s: &str) -> &str {
+    s.lines().find(|l| !l.trim().is_empty()).unwrap_or("")
+}
+
+/// The `├─`/`└─` prefix for a family row: a vertical segment per
+/// ancestor (blank when that ancestor closed its branch) plus the
+/// node's own connector.
+fn tree_prefix(
+    id: &str,
+    parent_of: &std::collections::HashMap<&str, &str>,
+    children: &std::collections::HashMap<String, Vec<String>>,
+) -> String {
+    let is_last = |node: &str| -> bool {
+        parent_of
+            .get(node)
+            .and_then(|p| children.get(*p))
+            .is_none_or(|kids| kids.last().is_some_and(|k| k == node))
+    };
+    // path root → … → id
+    let mut path = vec![id];
+    while let Some(p) = parent_of.get(*path.last().unwrap_or(&id)) {
+        if path.contains(p) {
+            break;
+        }
+        path.push(p);
+    }
+    path.reverse();
+    let mut prefix = String::new();
+    for ancestor in path.iter().take(path.len().saturating_sub(1)) {
+        // the family root has no parent: nothing runs above it
+        if !parent_of.contains_key(*ancestor) {
+            continue;
+        }
+        prefix.push_str(if is_last(ancestor) { "   " } else { "│  " });
+    }
+    if path.len() > 1 {
+        prefix.push_str(if is_last(id) { "└─ " } else { "├─ " });
+    }
+    prefix
+}
+
+/// The prompt a child strand branched at: the first parent user
+/// message after the longest shared record prefix. `Some("")` = full
+/// copy (nothing dropped); None = parent unreadable. Headers key as a
+/// constant — every strand's own Header differs by design.
+fn dropped_prompt(parent: &[ka_strand::Record], child: &[ka_strand::Record]) -> Option<String> {
+    if parent.is_empty() || child.is_empty() {
+        return None;
+    }
+    let key = |r: &ka_strand::Record| match r.id() {
+        Some(id) => format!("{id:?}"),
+        None => "header".to_string(),
+    };
+    let mut k = 0usize;
+    while k < parent.len() && k < child.len() && key(&parent[k]) == key(&child[k]) {
+        k += 1;
+    }
+    if k >= parent.len() {
+        return Some(String::new());
+    }
+    parent[k..].iter().find_map(|r| match r {
+        ka_strand::Record::Message {
+            role: ka_strand::Role::User,
+            content,
+            ..
+        } => Some(content.clone()),
+        _ => None,
+    })
+}
+
+/// The row suffix labeling where a child forked off its parent.
+fn fork_label(
+    parent: &[ka_strand::Record],
+    child: &[ka_strand::Record],
+    width: usize,
+) -> Option<String> {
+    match dropped_prompt(parent, child) {
+        None => None,
+        Some(prompt) if prompt.is_empty() => {
+            let msgs = |rs: &[ka_strand::Record]| {
+                rs.iter()
+                    .filter(|r| matches!(r, ka_strand::Record::Message { .. }))
+                    .count()
+            };
+            Some(if msgs(child) > msgs(parent) {
+                "⑂ continued".to_string()
+            } else {
+                "⑂ copy".to_string()
+            })
+        }
+        Some(prompt) => {
+            let first = first_line_of(&prompt);
+            Some(trunc_cols(&format!("⑂ at \u{201c}{first}\u{201d}"), width))
+        }
+    }
 }
 
 /// Prefix a modal title with its icon from [`crate::icons::MODAL_ICONS`]
@@ -10695,11 +11371,12 @@ fn modal_title(title: &str) -> String {
     }
 }
 
-/// The one modal frame: rounded borders on the surface background with
-/// the muted padded title — every overlay speaks this dialect, so a
-/// corner never changes shape between popups. Carries the faint ✕ close
-/// chip at the right of the top border ([`surface_frame`] is the same
-/// frame without it).
+/// The one modal frame: rounded BORDER_FOCUS borders on the surface
+/// with the ` {icon} {title} ` ACCENT bold title — every overlay speaks
+/// this dialect, so a corner never changes shape between popups.
+/// Carries the FAINT ✕ close chip at the right of the top border
+/// (hover lights it GOLD_HI; [`surface_frame`] is the same frame
+/// without it). The chip's cells match [`modal_close_hit`].
 fn modal_frame(title: impl Into<String>) -> ratatui::widgets::Block<'static> {
     surface_frame(title).title(
         ratatui::text::Line::styled(
@@ -10710,42 +11387,65 @@ fn modal_frame(title: impl Into<String>) -> ratatui::widgets::Block<'static> {
     )
 }
 
-/// The modal frame dialect with no close chip — the permission ask's
-/// own frame: a stray ✕ must never invite dismissing (let alone
-/// denying) a permission decision.
+/// The modal frame dialect with no close chip.
 fn surface_frame(title: impl Into<String>) -> ratatui::widgets::Block<'static> {
+    frame_block(
+        ratatui::text::Line::styled(format!(" {} ", title.into()), crate::palette::ACCENT_BOLD),
+        crate::palette::BORDER_FOCUS,
+    )
+}
+
+/// The overlay frame body every surface shares: rounded `border`
+/// borders, `title` on the top border, one cell of padding all round,
+/// prose ink on the BG_SURFACE ground. The permission ask builds its
+/// WARN frame from this directly: a stray ✕ must never invite
+/// dismissing (let alone denying) a permission decision.
+fn frame_block(
+    title: ratatui::text::Line<'static>,
+    border: ratatui::style::Color,
+) -> ratatui::widgets::Block<'static> {
     ratatui::widgets::Block::default()
         .borders(ratatui::widgets::Borders::ALL)
         .border_type(ratatui::widgets::BorderType::Rounded)
-        .title(padded_title(title))
-        .border_style(crate::palette::BORDER_STYLE)
+        .title(title)
+        .border_style(ratatui::style::Style::new().fg(border))
         .padding(ratatui::widgets::Padding::new(1, 1, 1, 1))
-        .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
+        .style(
+            ratatui::style::Style::new()
+                .fg(crate::palette::FG)
+                .bg(crate::palette::BG_SURFACE),
+        )
 }
 
-/// Rows of the /help overlay: the full key table, then commands grouped
-/// by what they touch. `{key or /name:<14} {desc}` per row.
-fn help_modal_rows() -> Vec<ratatui::text::Line<'static>> {
+/// Rows of the /help overlay, `width` cols wide: the full key table,
+/// then commands grouped by what they touch. Section heads are ACCENT
+/// bold followed by a RULE line to the width; rows are a key column
+/// (GOLD_HI, as wide as the group's longest key plus two cols of air)
+/// and the description (META).
+fn help_modal_rows(width: usize) -> Vec<ratatui::text::Line<'static>> {
     use ratatui::text::{Line as TuiLine, Span};
-    let key_style = crate::palette::ACCENT_STYLE;
-    let dim = ratatui::style::Style::default().fg(crate::palette::META);
+    use unicode_width::UnicodeWidthStr;
+    let key_style = ratatui::style::Style::new().fg(crate::palette::STRONG);
+    let dim = ratatui::style::Style::new().fg(crate::palette::META);
     let mut text = Vec::new();
-    fn section(text: &mut Vec<TuiLine<'static>>, name: &str) {
-        text.push(TuiLine::styled(
-            format!("▸ {name}"),
-            crate::palette::ACCENT_BOLD,
-        ));
-    }
+    let section = |text: &mut Vec<TuiLine<'static>>, name: &str| {
+        let rule = width.saturating_sub(name.width() + 1);
+        text.push(TuiLine::from(vec![
+            Span::styled(name.to_string(), crate::palette::ACCENT_BOLD),
+            Span::styled(format!(" {}", "─".repeat(rule)), crate::palette::RULE_STYLE),
+        ]));
+    };
     fn rows(
         text: &mut Vec<TuiLine<'static>>,
         pairs: &[(&str, &str)],
         key_style: ratatui::style::Style,
     ) {
+        let col = pairs.iter().map(|(k, _)| k.width()).max().unwrap_or(0) + 2;
         for (k, v) in pairs {
             let desc: String = v.chars().take(44).collect();
             text.push(TuiLine::from(vec![
-                Span::styled(format!("{k:<14} "), key_style),
-                Span::styled(desc.to_string(), ratatui::style::Style::default()),
+                Span::styled(format!("{k}{}", " ".repeat(col - k.width())), key_style),
+                Span::styled(desc, crate::palette::META_STYLE),
             ]));
         }
     }
@@ -10785,7 +11485,7 @@ fn help_modal_rows() -> Vec<ratatui::text::Line<'static>> {
             ("/resume", "alias for /session"),
             ("/new", "start a fresh session"),
             ("/fork", "fork into a copy [turns to drop]"),
-            ("/tree", "current session's fork tree"),
+            ("/tree", "fork tree — branch from any input"),
             ("/rewind", "drop the last N exchanges"),
             ("/undo", "restore the last edited file"),
             ("/checkpoint", "snapshot the working tree (git)"),
@@ -10801,7 +11501,7 @@ fn help_modal_rows() -> Vec<ratatui::text::Line<'static>> {
     rows(
         &mut text,
         &[
-            ("/model", "pick a model"),
+            ("/model", "pick a model (/model <vendor> filters)"),
             ("/mode", "pick a permission mode"),
             ("/thinking", "pick the reasoning level"),
             (
@@ -10856,6 +11556,7 @@ fn help_modal_rows() -> Vec<ratatui::text::Line<'static>> {
             ("/agents", "list available agents"),
             ("/skill", "invoke a skill: /skill:<name>"),
             ("/quit", "exit"),
+            ("/update", "update ka, then resume here (idle)"),
         ],
         key_style,
     );
@@ -10901,6 +11602,7 @@ fn modal_close_hit(rect: ratatui::layout::Rect, x: u16, y: u16) -> bool {
 enum Click {
     Tool { entry: usize, call: usize },
     Thought { entry: usize },
+    Summary { entry: usize },
     JumpUp,
     JumpDown,
     Todos,
@@ -10938,24 +11640,11 @@ fn click_target(
         return match transcript.row_ref_at(row) {
             Some(RowRef::ToolCall(entry, call)) => Click::Tool { entry, call },
             Some(RowRef::Entry(entry)) => Click::Thought { entry },
+            Some(RowRef::Summary(entry)) => Click::Summary { entry },
             None => Click::None,
         };
     }
     Click::None
-}
-
-/// Backgrounds the hover lift may replace: the block tints cards and
-/// thinking bands paint. Canvas/panel cells (spacer rows, margins)
-/// never light up.
-fn hoverable_bg(bg: ratatui::style::Color) -> bool {
-    matches!(
-        bg,
-        crate::palette::BG_THINK_TINT
-            | crate::palette::BG_OK_TINT
-            | crate::palette::BG_ERR_TINT
-            | crate::palette::BG_TOOL
-            | crate::palette::BG_OUTPUT
-    )
 }
 
 /// What the pointer currently hovers — the visual affordance mirror of
@@ -10970,7 +11659,7 @@ enum Hover {
     Chip,
     /// One of the ▲▼ jump arrows (`true` = ▲).
     Arrow(bool),
-    /// One bottom-strip button.
+    /// One strip button on the composer's bottom border.
     Strip(StripButton),
     /// The scrollbar thumb.
     Rail,
@@ -11027,6 +11716,9 @@ fn hover_target(
     match click_target(strip, arrows, tx, transcript, col, row) {
         Click::Tool { entry, .. } => Some(Hover::Entry(entry)),
         Click::Thought { entry } => transcript.is_foldable(entry).then_some(Hover::Entry(entry)),
+        Click::Summary { entry } => transcript
+            .summary_foldable(entry)
+            .then_some(Hover::Entry(entry)),
         Click::JumpUp => Some(Hover::Arrow(true)),
         Click::JumpDown => Some(Hover::Arrow(false)),
         Click::Todos => Some(Hover::Strip(StripButton::Todos)),
@@ -11036,17 +11728,19 @@ fn hover_target(
     }
 }
 
-/// The transcript-row span a left drag picks, or `None` while the
-/// pointer is still within click tolerance of the press (≤1 cell in
-/// both axes — such a release is a click, not a drag). The anchor is
-/// the press row; the head clamps to the pane's first/last visible
-/// row, so drags past the edges keep extending to the end.
+/// The text span a left drag picks, or `None` while the pointer is
+/// still within click tolerance of the press (≤1 cell in both axes —
+/// such a release is a click, not a drag). Anchors are `(row, column)`
+/// in transcript space, columns relative to the content area's left
+/// edge and clamped into it, so drags past an edge keep extending to
+/// that edge. The pair comes back in reading order, so a vertical drag
+/// degrades to whole rows exactly as a row selection always did.
 fn drag_span(
     area: ratatui::layout::Rect,
     start: usize,
     press: (u16, u16),
     head: (u16, u16),
-) -> Option<(usize, usize)> {
+) -> Option<((usize, u16), (usize, u16))> {
     if head.0.abs_diff(press.0) < 2 && head.1.abs_diff(press.1) < 2 {
         return None;
     }
@@ -11056,10 +11750,64 @@ fn drag_span(
     }) {
         return None;
     }
-    let anchor = start + (press.1 - area.y) as usize;
-    let head_y = head.1.clamp(area.y, area.y + area.height.saturating_sub(1));
-    let head_row = start + (head_y - area.y) as usize;
-    Some((anchor.min(head_row), anchor.max(head_row)))
+    let right = area.x + area.width.saturating_sub(1);
+    let col = |x: u16| x.clamp(area.x, right) - area.x;
+    let bottom = area.y + area.height.saturating_sub(1);
+    let anchor = (start + (press.1 - area.y) as usize, col(press.0));
+    let head = (
+        start + (head.1.clamp(area.y, bottom) - area.y) as usize,
+        col(head.0),
+    );
+    Some(if anchor <= head {
+        (anchor, head)
+    } else {
+        (head, anchor)
+    })
+}
+
+/// The clipboard text of a drag selection: every picked row's visible
+/// text sliced to the selected display columns, right-trimmed, the
+/// rows joined by newlines.
+fn selection_text(t: &Transcript, sel: ((usize, u16), (usize, u16))) -> String {
+    let ((r0, c0), (r1, c1)) = sel;
+    let mut out = String::new();
+    for row in r0..=r1 {
+        if row > r0 {
+            out.push('\n');
+        }
+        if let Some(text) = t.row_text(row) {
+            let from = if row == r0 { c0 as usize } else { 0 };
+            let to = if row == r1 { c1 as usize } else { usize::MAX };
+            out.push_str(slice_cols(&text, from, to).trim_end());
+        }
+    }
+    out.trim_end().to_string()
+}
+
+/// The slice of a rendered row covering display columns `from..=to`
+/// (clamped to what the row has; a wide glyph is kept whole when its
+/// left column is in range, and combining marks follow their base
+/// glyph's decision).
+fn slice_cols(text: &str, from: usize, to: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+    let mut out = String::new();
+    let mut w = 0usize;
+    let mut keep = false;
+    for ch in text.chars() {
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if cw == 0 {
+            if keep {
+                out.push(ch);
+            }
+            continue;
+        }
+        keep = w >= from && w <= to;
+        if keep {
+            out.push(ch);
+        }
+        w += cw;
+    }
+    out
 }
 
 /// A block title with one column of air on each side, so titles never
@@ -11222,14 +11970,19 @@ mod tests {
 
     #[test]
     fn model_picker_filters_picks_and_falls_back_to_custom() {
+        // keyless locals: configured by definition
+        let keyless = |id: &str, context: u32| {
+            let mut m = model(id, context);
+            m.key_env = String::new();
+            m
+        };
         let picker = ModelPicker {
             models: vec![
-                model("ollama/qwen3-32b", 131_072),
-                model("openai/gpt-5.1", 400_000),
-                model("anthropic/claude-sonnet-5", 200_000),
+                keyless("ollama/qwen3-32b", 131_072),
+                keyless("openai/gpt-5.1", 400_000),
+                keyless("anthropic/claude-sonnet-5", 200_000),
             ],
             vendor: None,
-            configured_only: false,
             selected: 0,
             filter: String::new(),
         };
@@ -11263,37 +12016,31 @@ mod tests {
         second.selected = 0;
         assert_eq!(second.pick().as_deref(), Some("anthropic/claude-sonnet-5"));
 
-        // the unified list partitions: configured models lead, the rest
-        // follow; order is stable within both groups
+        // a keyed model without its key drops out of the list; typing
+        // its selector stays the reachability path
         let mut mixed = picker.clone();
-        mixed.models[1].key_set = true; // openai connected
+        mixed.models[1].key_env = "OPENAI_API_KEY".to_string();
         let ids: Vec<&str> = mixed.rows().iter().map(|m| m.id.as_str()).collect();
         assert_eq!(
             ids,
-            vec![
-                "openai/gpt-5.1",
-                "ollama/qwen3-32b",
-                "anthropic/claude-sonnet-5"
-            ],
-            "configured vendor's models lead"
+            vec!["ollama/qwen3-32b", "anthropic/claude-sonnet-5"],
+            "unconfigured providers are hidden"
         );
-        // the render's separator splits at the same predicate
+        mixed.filter = "openai/gpt-5.1".to_string();
+        assert!(mixed.rows().is_empty());
         assert_eq!(
-            mixed
-                .rows()
-                .iter()
-                .take_while(|m| ModelPicker::configured(m))
-                .count(),
-            1
+            mixed.pick().as_deref(),
+            Some("openai/gpt-5.1"),
+            "hidden models stay reachable as custom selectors"
         );
     }
 
     #[test]
-    fn model_picker_unified_partitions_configured_first() {
+    fn model_picker_lists_configured_providers_only() {
         let mut models = vec![
-            model("zai/glm-5.3", 200_000),      // keyed, no key → unconfigured
-            model("ollama/qwen3-32b", 131_072), // keyless → configured
-            model("openai/gpt-5.1", 400_000),   // keyed + key set → configured
+            model("zai/glm-5.3", 200_000),               // keyed, no key → hidden
+            model("ollama/qwen3-32b", 131_072),          // keyless → listed
+            model("openai/gpt-5.1", 400_000),            // keyed + key set → listed
             model("anthropic/claude-sonnet-5", 200_000), // keyed, no key
         ];
         models[0].key_env = "ZAI_API_KEY".to_string();
@@ -11302,31 +12049,28 @@ mod tests {
         let picker = ModelPicker {
             models,
             vendor: None,
-            configured_only: false,
             selected: 0,
             filter: String::new(),
         };
         let ids: Vec<&str> = picker.rows().iter().map(|m| m.id.as_str()).collect();
         assert_eq!(
             ids,
-            vec![
-                "ollama/qwen3-32b",
-                "openai/gpt-5.1",
-                "zai/glm-5.3",
-                "anthropic/claude-sonnet-5",
-            ],
-            "configured models lead (stable), unconfigured follow (stable)"
+            vec!["ollama/qwen3-32b", "openai/gpt-5.1"],
+            "keyed-unset vendors drop; keyless and keyed-set stay (stable order)"
         );
-        // the filter spans the whole pool, unconfigured group included
+        // a hidden vendor's model still applies through the custom
+        // selector fallback
         let mut f = picker.clone();
-        f.filter = "glm".to_string();
+        f.filter = "zai/glm-5.3".to_string();
+        assert!(f.rows().is_empty());
         assert_eq!(f.pick().as_deref(), Some("zai/glm-5.3"));
 
-        // the vendor-locked drill list never partitions
+        // the vendor lock composes: an unconfigured vendor's locked
+        // list is empty and Enter has nothing to apply
         let mut locked = picker.clone();
         locked.vendor = Some("zai".to_string());
-        let ids: Vec<&str> = locked.rows().iter().map(|m| m.id.as_str()).collect();
-        assert_eq!(ids, vec!["zai/glm-5.3"]);
+        assert!(locked.rows().is_empty());
+        assert_eq!(locked.pick(), None);
     }
 
     fn provider(name: &str, env_var: &str, key_set: bool) -> ProviderInfo {
@@ -11375,15 +12119,18 @@ mod tests {
 
     #[test]
     fn model_picker_vendor_lock_narrows_rows() {
-        let models = vec![
+        let mut models = vec![
             model("anthropic/claude-sonnet-5", 200_000),
             model("anthropic/claude-opus-4", 200_000),
             model("ollama/qwen3-32b", 131_072),
         ];
+        // anthropic keyed-in, ollama keyless: every row configured
+        models[0].key_set = true;
+        models[1].key_set = true;
+        models[2].key_env = String::new();
         let mut picker = ModelPicker {
             models,
             vendor: Some("anthropic".to_string()),
-            configured_only: false,
             selected: 0,
             filter: String::new(),
         };
@@ -11408,44 +12155,6 @@ mod tests {
     }
 
     #[test]
-    fn model_picker_configured_only_lists_connected_vendors() {
-        let mut models = vec![
-            model("openai/gpt-5.1", 400_000),
-            model("anthropic/claude-sonnet-5", 200_000),
-            model("ollama/qwen3-32b", 131_072),
-        ];
-        models[0].key_env = "OPENAI_API_KEY".to_string(); // keyed, no key
-        models[1].key_env = "ANTHROPIC_API_KEY".to_string();
-        models[1].key_set = true; // keyed and connected
-        models[2].key_env = String::new(); // keyless local
-
-        let mut picker = ModelPicker {
-            models,
-            vendor: None,
-            configured_only: true,
-            selected: 0,
-            filter: String::new(),
-        };
-        let ids: Vec<&str> = picker.rows().iter().map(|m| m.id.as_str()).collect();
-        assert_eq!(
-            ids,
-            vec!["anthropic/claude-sonnet-5", "ollama/qwen3-32b"],
-            "keyed-unset hidden; keyed-set and keyless shown"
-        );
-
-        // composes with the vendor lock: openai is unconfigured, so its
-        // locked list is empty and Enter has nothing to apply
-        picker.vendor = Some("openai".to_string());
-        assert!(picker.rows().is_empty());
-        assert_eq!(picker.pick(), None);
-
-        // the filter still applies within the configured set
-        picker.vendor = None;
-        picker.filter = "qwen".to_string();
-        assert_eq!(picker.pick().as_deref(), Some("ollama/qwen3-32b"));
-    }
-
-    #[test]
     fn mark_key_set_flips_only_matching_entries() {
         let mut models = vec![model("openai/gpt-5.1", 400_000)];
         models[0].key_env = "OPENAI_API_KEY".to_string();
@@ -11459,6 +12168,14 @@ mod tests {
         assert!(!providers[1].key_set, "other providers stay as they were");
     }
 
+    /// The picker's row budget: 68 wide minus borders, padding, and the
+    /// 2-col selection pointer.
+    const MODEL_ROW_BUDGET: usize = 62;
+
+    fn row_w(row: &str) -> usize {
+        unicode_width::UnicodeWidthStr::width(row)
+    }
+
     #[test]
     fn model_rows_stay_single_line() {
         let long = model(
@@ -11466,12 +12183,7 @@ mod tests {
             1_000_000,
         );
         let row = model_row(&long, "1000k", " ✗");
-        assert!(
-            row.chars().count() <= 66,
-            "row too wide: {} {}",
-            row.chars().count(),
-            row
-        );
+        assert!(row_w(&row) <= MODEL_ROW_BUDGET, "row too wide: {row}");
         let short = model("ollama/qwen3.5:9b", 262_144);
         let row = model_row(&short, "262k", "");
         assert!(row.contains("qwen3.5:9b"));
@@ -11479,21 +12191,25 @@ mod tests {
     }
 
     #[test]
-    fn model_rows_show_thinking_segment() {
-        // a reasoning model: the 🧠 segment rides last, the id column
-        // shrinks to keep the 66-col budget
+    fn model_rows_show_reasoning_battery() {
+        // a reasoning model: the ✻ battery rides last, one glyph per
+        // level, and the columns stay aligned with plain rows
         let mut m = model("anthropic/claude-opus-4.6", 200_000);
         m.efforts = ["low", "medium", "high"]
             .iter()
             .map(|s| s.to_string())
             .collect();
         let row = model_row(&m, "200k", "");
-        assert!(row.contains("🧠 low/med/high"), "{row}");
-        assert!(
-            row.chars().count() <= 66,
-            "row too wide: {} {}",
-            row.chars().count(),
-            row
+        assert!(row.ends_with(" ✻◔◑◕"), "{row}");
+        let plain = model("ollama/qwen3.5:9b", 262_144);
+        let plain_row = model_row(&plain, "262k", "");
+        assert!(!plain_row.contains('✻'), "{plain_row}");
+        assert_eq!(
+            row.find("200k").map(|i| row[..i].chars().count()),
+            plain_row
+                .find("262k")
+                .map(|i| plain_row[..i].chars().count()),
+            "ctx column aligned: {row} | {plain_row}"
         );
         // worst case: four levels, long wire, real prices — still fits
         let mut big = model("anthropic/claude-sonnet-5-opus-max", 200_000);
@@ -11507,16 +12223,16 @@ mod tests {
             .collect();
         let row = model_row(&big, "200k", " ✗");
         assert!(
-            row.chars().count() <= 66,
-            "four-level row too wide: {} {}",
-            row.chars().count(),
-            row
+            row_w(&row) <= MODEL_ROW_BUDGET,
+            "four-level row too wide: {row}"
         );
-        assert!(row.contains("🧠 low/med/high/max"), "{row}");
-        // a plain model carries no segment
-        let plain = model("ollama/qwen3.5:9b", 262_144);
-        let row = model_row(&plain, "262k", "");
-        assert!(!row.contains('🧠'), "{row}");
+        assert!(row.ends_with(" ✻◔◑◕●"), "{row}");
+        // a level without a battery glyph keeps its name
+        let mut odd = model("x/y", 8_000);
+        odd.efforts = vec!["low".into(), "xhigh".into()];
+        let row = model_row(&odd, "8k", "");
+        assert!(row.ends_with(" ✻◔ xhigh"), "{row}");
+        assert!(row_w(&row) <= MODEL_ROW_BUDGET, "{row}");
     }
 
     #[test]
@@ -11525,7 +12241,7 @@ mod tests {
             slash_command("/model"),
             Some(Slash {
                 note: None,
-                modal: Some(ModalKind::Model),
+                modal: Some(ModalKind::Model(None)),
                 event: None,
                 ..
             })
@@ -11537,6 +12253,33 @@ mod tests {
                 event: Some(Command::SetModel { selector }),
                 ..
             }) if selector == "groq/llama-3.3-70b"
+        ));
+        // a bare vendor opens the picker locked to it instead of
+        // poisoning the selector with a vendor-less string
+        assert!(matches!(
+            slash_command("/model opencode-go"),
+            Some(Slash {
+                note: None,
+                modal: Some(ModalKind::Model(v)),
+                event: None,
+                ..
+            }) if v.as_deref() == Some("opencode-go")
+        ));
+        // the effort suffix does not turn a vendor into a selector
+        assert!(matches!(
+            slash_command("/model opencode-go@high"),
+            Some(Slash {
+                modal: Some(ModalKind::Model(v)),
+                ..
+            }) if v.as_deref() == Some("opencode-go")
+        ));
+        // a selector with an effort suffix still sets directly
+        assert!(matches!(
+            slash_command("/model zai/glm-5.3@high"),
+            Some(Slash {
+                event: Some(Command::SetModel { selector }),
+                ..
+            }) if selector == "zai/glm-5.3@high"
         ));
         assert!(matches!(
             slash_command("/provider"),
@@ -11860,6 +12603,11 @@ mod tests {
         );
         assert!(flags.contains(F::DISAMBIGUATE_ESCAPE_CODES));
         assert!(flags.contains(F::REPORT_EVENT_TYPES));
+        assert!(
+            flags.contains(F::REPORT_ALTERNATE_KEYS),
+            "the shifted codepoint must ride the alternate-key field, or a \
+             layout's shifted symbols type as their un-shifted neighbours"
+        );
 
         // the CSI-u event the arm at the top of the key match receives:
         // (KeyCode::Enter, KeyModifiers::SHIFT) => input.newline()
@@ -12037,113 +12785,39 @@ mod tests {
         // degenerate track (thumb fills it): the tail stays pinned
         assert_eq!(rail_drag_anchor(3, 10, 10, 20, 10), None);
     }
-    #[test]
-    fn visible_rows_carves_out_chrome() {
-        // top margin + transcript top border + the blank row under it +
-        // input area + strip + footer
-        assert_eq!(visible_rows(24, 3), 16);
-        assert_eq!(visible_rows(5, 3), 0, "never underflows");
-        assert_eq!(visible_rows(0, 0), 0);
-        // growth of the input eats the viewport one row at a time
-        assert_eq!(visible_rows(24, 8), 11);
+    /// One frame and the zones `render` published for it.
+    struct PlainFrame {
+        terminal: ratatui::Terminal<ratatui::backend::TestBackend>,
+        strip: Option<StripZones>,
+        arrows: Option<TitleArrows>,
+        tx: Option<(ratatui::layout::Rect, usize)>,
     }
 
-    #[test]
-    fn thinking_tail_gets_spacer_above_input() {
+    /// Render one idle, captured-mouse frame at `w`×`h` over `t` with
+    /// the draft `input` (cursor at its end), an optional modal, and an
+    /// optional hover; hand back the terminal plus published zones.
+    fn plain_frame(
+        t: &mut Transcript,
+        (w, h): (u16, u16),
+        input: &str,
+        sidebar: &SidebarState,
+        modal: Option<&Modal>,
+        hover: Option<Hover>,
+    ) -> PlainFrame {
         use ratatui::backend::TestBackend;
         use ratatui::layout::Rect;
-        // 80x24: margin y0, transcript y1.., input 3 rows y19..21,
-        // strip y22, status y23. Without the spacer the transcript
-        // content runs to y18; with it, y18 is the blank spacer row.
-        let draw_row18 = |last_thought: bool| -> (bool, bool, bool) {
-            let mut terminal = ratatui::Terminal::new(TestBackend::new(80, 24)).unwrap();
-            terminal
-                .draw(|f| {
-                    let mut t = Transcript::default();
-                    for i in 0..20 {
-                        t.push(Line::Info(format!("filler row {i}")));
-                    }
-                    if last_thought {
-                        t.push(Line::Thought("ponder\ndeeply".into()));
-                    } else {
-                        t.push(Line::Info("tail info".into()));
-                    }
-                    super::render(
-                        f,
-                        &mut t,
-                        None,
-                        "",
-                        0,
-                        false,
-                        None,
-                        Instant::now(),
-                        0,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        &Meters::default(),
-                        &SidebarState::default(),
-                        false,
-                        true,
-                        "◆",
-                        &std::cell::Cell::new(None::<StripZones>),
-                        None,
-                        &std::cell::Cell::new(None::<TitleArrows>),
-                        &std::cell::Cell::new(None::<Rect>),
-                        &std::cell::Cell::new(None::<Rect>),
-                        &std::cell::Cell::new(None::<(Rect, usize)>),
-                        &std::cell::Cell::new(None::<(Rect, usize, usize, usize, usize)>),
-                        &std::cell::Cell::new(0u16),
-                        None,
-                        None,
-                    );
-                })
-                .unwrap();
-            let buf = terminal.backend().buffer();
-            let row18: String = (1..78u16).map(|x| buf[(x, 18)].symbol()).collect();
-            let row16: String = (1..79u16).map(|x| buf[(x, 16)].symbol()).collect();
-            // borderless band: the tail is the band's last text row
-            let band_tail = row16.contains("deeply");
-            let row19: String = (1..79u16).map(|x| buf[(x, 19)].symbol()).collect();
-            (row18.trim().is_empty(), band_tail, row19.contains('╭'))
-        };
-        // thought tail: spacer row blank, band tail pushed one row up,
-        // input box still opens at y19
-        let (blank18, band_tail17, input19) = draw_row18(true);
-        assert!(blank18, "spacer row y18 stays canvas-blank");
-        assert!(band_tail17, "the band tail rides above the spacers");
-        assert!(input19, "input box top border stays at y19");
-        // non-thought tail: no spacer — content paints y18
-        let (blank18, _, input19) = draw_row18(false);
-        assert!(!blank18, "no spacer without a thinking tail");
-        assert!(input19);
-    }
-
-    #[test]
-    fn hover_entry_paints_the_warm_band_over_its_rows() {
-        use ratatui::backend::TestBackend;
-        use ratatui::layout::Rect;
-        let tx_zone = std::cell::Cell::new(None::<(Rect, usize)>);
-        let mut terminal = ratatui::Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(w, h)).unwrap();
+        let strip = std::cell::Cell::new(None::<StripZones>);
+        let arrows = std::cell::Cell::new(None::<TitleArrows>);
+        let tx = std::cell::Cell::new(None::<(Rect, usize)>);
         terminal
             .draw(|f| {
-                let mut t = Transcript::default();
-                t.set_width(76);
-                for i in 0..18 {
-                    t.push(Line::Info(format!("filler row {i}")));
-                }
-                let thought = t.entries().len();
-                t.push(Line::Thought("ponder\ndeeply\nagain".into()));
                 super::render(
                     f,
-                    &mut t,
+                    t,
                     None,
-                    "",
-                    0,
+                    input,
+                    input.chars().count(),
                     false,
                     None,
                     Instant::now(),
@@ -12153,130 +12827,428 @@ mod tests {
                     None,
                     None,
                     None,
-                    None,
+                    modal,
                     None,
                     &Meters::default(),
-                    &SidebarState::default(),
+                    sidebar,
                     false,
                     true,
                     "◆",
-                    &std::cell::Cell::new(None::<StripZones>),
+                    &strip,
                     None,
-                    &std::cell::Cell::new(None::<TitleArrows>),
+                    &arrows,
                     &std::cell::Cell::new(None::<Rect>),
                     &std::cell::Cell::new(None::<Rect>),
-                    &tx_zone,
+                    &tx,
                     &std::cell::Cell::new(None::<(Rect, usize, usize, usize, usize)>),
                     &std::cell::Cell::new(0u16),
                     None,
-                    Some(Hover::Entry(thought)),
+                    hover,
                 );
             })
             .unwrap();
-        let buf = terminal.backend().buffer();
-        let hover_rows: Vec<u16> = (0..24u16)
-            .filter(|&y| (0..80u16).any(|x| buf[(x, y)].bg == crate::palette::BG_HOVER))
-            .collect();
-        // the hovered thought band is 4 rows (head + 3) and nothing
-        // else picks up the band
-        assert_eq!(hover_rows.len(), 6, "hover rows: {hover_rows:?}");
-        // the band spans the published content width; wide glyphs (the
-        // 🧠 head icon) leave one Reset placeholder cell the diff-driven
-        // test backend never paints — allow up to two
-        let y = hover_rows[1];
-        let (area, _) = tx_zone.get().expect("render published the content rect");
-        let banded = (area.x..area.x + area.width)
-            .filter(|&x| buf[(x, y)].bg == crate::palette::BG_HOVER)
-            .count();
-        assert!(
-            banded >= area.width.saturating_sub(2) as usize,
-            "row {y}: only {banded} of {} cells banded",
-            area.width
-        );
+        PlainFrame {
+            terminal,
+            strip: strip.get(),
+            arrows: arrows.get(),
+            tx: tx.get(),
+        }
+    }
+
+    /// One buffer row's symbols, concatenated.
+    fn buf_row(buf: &ratatui::buffer::Buffer, y: u16) -> String {
+        (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect()
     }
 
     #[test]
-    fn hover_entry_lifts_only_tinted_cells() {
-        use ratatui::backend::TestBackend;
-        use ratatui::layout::Rect;
-        // same transcript, hovered vs not: the hover may recolor ONLY
-        // cells that already carry a block tint — spacer rows and
-        // canvas margins keep the ground
-        let draw = |hover: Option<Hover>| -> ratatui::Terminal<TestBackend> {
-            let mut terminal = ratatui::Terminal::new(TestBackend::new(80, 24)).unwrap();
-            terminal
-                .draw(|f| {
-                    let mut t = Transcript::default();
-                    t.set_width(76);
-                    for i in 0..14 {
-                        t.push(Line::Info(format!("filler row {i}")));
-                    }
-                    let card = ToolCall {
-                        head: "bash · ls".into(),
-                        ok: true,
-                        note: "note".into(),
-                        excerpt: String::new(),
-                        spill: None,
-                        dur: None,
-                        expanded: false,
-                    };
-                    let entry = t.entries().len();
-                    t.push(Line::ToolBlock(vec![card]));
-                    super::render(
-                        f,
-                        &mut t,
-                        None,
-                        "",
-                        0,
-                        false,
-                        None,
-                        Instant::now(),
-                        0,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        &Meters::default(),
-                        &SidebarState::default(),
-                        false,
-                        true,
-                        "◆",
-                        &std::cell::Cell::new(None::<StripZones>),
-                        None,
-                        &std::cell::Cell::new(None::<TitleArrows>),
-                        &std::cell::Cell::new(None::<Rect>),
-                        &std::cell::Cell::new(None::<Rect>),
-                        &std::cell::Cell::new(None::<(Rect, usize)>),
-                        &std::cell::Cell::new(None::<(Rect, usize, usize, usize, usize)>),
-                        &std::cell::Cell::new(0u16),
-                        None,
-                        hover.map(|_| Hover::Entry(entry)),
-                    );
-                })
-                .unwrap();
-            terminal
+    fn visible_rows_carves_out_chrome() {
+        // header bar + its row of air + composer + a row of air + status
+        assert_eq!(visible_rows(24, 3), 17);
+        assert_eq!(visible_rows(5, 3), 0, "never underflows");
+        assert_eq!(visible_rows(0, 0), 0);
+        // growth of the composer eats the viewport one row at a time
+        assert_eq!(visible_rows(24, 8), 12);
+    }
+
+    #[test]
+    fn frame_layout_header_air_transcript_composer_status() {
+        let sidebar = SidebarState {
+            cwd: "/tmp/ka".to_string(),
+            branch: Some("main".to_string()),
+            ..Default::default()
         };
-        let plain = draw(None);
-        let hot = draw(Some(Hover::Entry(0)));
-        let (pb, hb) = (plain.backend().buffer(), hot.backend().buffer());
-        let mut lifted = 0usize;
-        let mut stray = 0usize;
+        let f = plain_frame(
+            &mut Transcript::default(),
+            (120, 40),
+            "",
+            &sidebar,
+            None,
+            None,
+        );
+        let buf = f.terminal.backend().buffer();
+        // row 0: the header bar spans the full width on the panel ground,
+        // brand left, cwd ⎇ branch right
+        for x in 0..120u16 {
+            assert_eq!(buf[(x, 0)].bg, crate::palette::BG_PANEL, "header col {x}");
+        }
+        let header = buf_row(buf, 0);
+        assert!(header.contains("◆ ka"), "{header}");
+        assert!(header.contains("new session"), "{header}");
+        let flat = header.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains(&format!("/tmp/ka {} main", crate::icons::BRANCH)),
+            "{flat}"
+        );
+        // row 1: a row of canvas air
+        for x in 0..120u16 {
+            assert_eq!(buf[(x, 1)].symbol(), " ", "row 1 col {x} must be blank");
+            assert_eq!(buf[(x, 1)].bg, crate::palette::BG, "row 1 rides the canvas");
+        }
+        // the transcript content starts right under it: no border row
+        let (area, start) = f.tx.expect("content rect published");
+        assert_eq!((area.y, start), (2, 0));
+        assert_eq!(area.height as usize, visible_rows(40, 3));
+        assert_eq!(area.width, transcript_width(120));
+        // the composer closes with rounded corners (rows 35..=37)
+        assert_eq!(buf[(1, 35)].symbol(), "╭");
+        assert_eq!(buf[(118, 35)].symbol(), "╮");
+        assert_eq!(buf[(1, 37)].symbol(), "╰");
+        assert_eq!(buf[(118, 37)].symbol(), "╯");
+        // a row of canvas air separates the composer from the status line
+        assert!(buf_row(buf, 38).trim().is_empty());
+        assert_eq!(buf[(0, 38)].bg, crate::palette::BG);
+        // the status line owns the last row, full width, cost on the right
+        assert!(buf_row(buf, 39).contains("$0.0000"));
+        assert_eq!(buf[(0, 39)].bg, crate::palette::BG_PANEL);
+        assert_eq!(buf[(119, 39)].bg, crate::palette::BG_PANEL);
+    }
+
+    #[test]
+    fn thinking_tail_keeps_its_spacer_above_the_composer() {
+        // 80x24: header y0, air y1, transcript y2..=18, composer
+        // y19..=21, air y22, status y23. A thinking block closes on its
+        // own canvas spacer row: the last transcript row stays blank and
+        // the band's text ends one row higher.
+        let draw = |last_thought: bool| -> (String, String, String) {
+            let mut t = Transcript::default();
+            for i in 0..20 {
+                t.push(Line::Info(format!("filler row {i}")));
+            }
+            if last_thought {
+                t.push(Line::Thought("ponder\ndeeply".into()));
+            } else {
+                t.push(Line::Info("tail info".into()));
+            }
+            let f = plain_frame(&mut t, (80, 24), "", &SidebarState::default(), None, None);
+            let buf = f.terminal.backend().buffer();
+            (buf_row(buf, 18), buf_row(buf, 17), buf_row(buf, 19))
+        };
+        let (last, above, composer) = draw(true);
+        // the rightmost column is the scrollbar rail, not content
+        let content = |row: &str| row.trim_end_matches(['│', '┃', ' ']).to_string();
+        assert!(
+            content(&last).is_empty(),
+            "spacer row stays blank: {last:?}"
+        );
+        assert!(above.contains("deeply"), "band tail rides above: {above:?}");
+        assert!(composer.contains('╭'), "composer opens at y19");
+        let (last, _, composer) = draw(false);
+        assert!(last.contains("tail info"), "no spacer otherwise: {last:?}");
+        assert!(composer.contains('╭'));
+    }
+
+    #[test]
+    fn hover_entry_lifts_every_content_cell_of_its_rows() {
+        // same transcript, hovered vs not: every content-rect cell of the
+        // entry's rows takes the hover lift; nothing else changes ground
+        let build = || {
+            let mut t = Transcript::default();
+            for i in 0..14 {
+                t.push(Line::Info(format!("filler row {i}")));
+            }
+            t.push(Line::ToolBlock(vec![ToolCall {
+                head: "bash · ls".into(),
+                note: "note".into(),
+                ..no_note_call()
+            }]));
+            t
+        };
+        let mut plain_t = build();
+        let entry = plain_t.entries().len() - 1;
+        let plain = plain_frame(
+            &mut plain_t,
+            (80, 24),
+            "",
+            &SidebarState::default(),
+            None,
+            None,
+        );
+        let mut hot_t = build();
+        let hot = plain_frame(
+            &mut hot_t,
+            (80, 24),
+            "",
+            &SidebarState::default(),
+            None,
+            Some(Hover::Entry(entry)),
+        );
+        let (area, start) = hot.tx.expect("content rect published");
+        let (first, len) = hot_t.entry_row_span(entry).expect("entry rows");
+        let rows: Vec<u16> = (first..first + len)
+            .filter(|r| *r >= start && *r < start + area.height as usize)
+            .map(|r| area.y + (r - start) as u16)
+            .collect();
+        assert!(!rows.is_empty(), "the card is on screen");
+        let (pb, hb) = (
+            plain.terminal.backend().buffer(),
+            hot.terminal.backend().buffer(),
+        );
         for y in 0..24u16 {
             for x in 0..80u16 {
-                let (p, h) = (&pb[(x, y)], &hb[(x, y)]);
-                if h.bg == crate::palette::BG_HOVER {
-                    lifted += 1;
-                    if !hoverable_bg(p.bg) {
-                        stray += 1;
-                    }
+                if rows.contains(&y) && x >= area.x && x < area.right() {
+                    assert_eq!(hb[(x, y)].bg, crate::palette::BG_HOVER, "({x},{y}) lifts");
+                } else {
+                    assert_eq!(hb[(x, y)].bg, pb[(x, y)].bg, "({x},{y}) keeps its ground");
                 }
             }
         }
-        assert!(lifted > 0, "the card must lift");
-        assert_eq!(stray, 0, "only tinted cells lift, spacers stay canvas");
+    }
+
+    #[test]
+    fn composer_cursor_accounts_for_the_prompt_lead() {
+        // 80x24, one draft row: composer y19..=21, x1..=78; the text
+        // starts after border + padding + the `❯ ` lead
+        let mut f = plain_frame(
+            &mut Transcript::default(),
+            (80, 24),
+            "hello",
+            &SidebarState::default(),
+            None,
+            None,
+        );
+        let buf = f.terminal.backend().buffer().clone();
+        assert_eq!(buf[(3, 20)].symbol(), crate::icons::PROMPT);
+        assert_eq!(buf[(5, 20)].symbol(), "h");
+        let pos = f.terminal.get_cursor_position().unwrap();
+        assert_eq!((pos.x, pos.y), (5 + 5, 20), "cursor sits after `hello`");
+        // continuation rows lead two blank cols, so text columns align
+        let mut f = plain_frame(
+            &mut Transcript::default(),
+            (80, 24),
+            "a\nbc",
+            &SidebarState::default(),
+            None,
+            None,
+        );
+        let buf = f.terminal.backend().buffer().clone();
+        // two rows grow the composer: y18..=21, content on y19 and y20
+        assert_eq!(buf[(3, 19)].symbol(), crate::icons::PROMPT);
+        assert_eq!(buf[(5, 19)].symbol(), "a");
+        assert_eq!(buf[(3, 20)].symbol(), " ");
+        assert_eq!(buf[(5, 20)].symbol(), "b");
+        let pos = f.terminal.get_cursor_position().unwrap();
+        assert_eq!((pos.x, pos.y), (5 + 2, 20));
+        // the wrap width is the box minus borders, padding, and lead
+        assert_eq!(input_inner_w(80), 72);
+        // an empty draft shows the placeholder after the lead
+        let f = plain_frame(
+            &mut Transcript::default(),
+            (120, 40),
+            "",
+            &SidebarState::default(),
+            None,
+            None,
+        );
+        let row = buf_row(f.terminal.backend().buffer(), 36);
+        assert!(row.contains("Ask anything"), "{row}");
+    }
+
+    #[test]
+    fn strip_zones_land_on_the_drawn_buttons() {
+        let f = plain_frame(
+            &mut Transcript::default(),
+            (120, 40),
+            "",
+            &SidebarState::default(),
+            None,
+            None,
+        );
+        let zones = f.strip.expect("strip zones published");
+        let buf = f.terminal.backend().buffer();
+        let cells = |r: ratatui::layout::Rect| -> String {
+            (r.x..r.right()).map(|x| buf[(x, r.y)].symbol()).collect()
+        };
+        for (rect, button, icon, label, key) in [
+            (
+                zones.todos,
+                StripButton::Todos,
+                crate::icons::STRIP_TODOS,
+                "todos",
+                "alt+o",
+            ),
+            (
+                zones.skills,
+                StripButton::Skills,
+                crate::icons::STRIP_SKILLS,
+                "skills",
+                "^t",
+            ),
+            (
+                zones.info,
+                StripButton::Info,
+                crate::icons::STRIP_INFO,
+                "info",
+                "alt+i",
+            ),
+        ] {
+            // the composer's bottom border row (35..=37 at 120x40)
+            assert_eq!(rect.y, 37, "{label}");
+            assert_eq!(cells(rect), format!(" {icon} {label} {key} "));
+            // icon ACCENT, label META, key FAINT
+            assert_eq!(buf[(rect.x + 1, 37)].fg, crate::palette::ACCENT);
+            assert_eq!(buf[(rect.x + 3, 37)].fg, crate::palette::META);
+            assert_eq!(buf[(rect.right() - 2, 37)].fg, crate::palette::FAINT);
+            // every drawn cell answers for its button
+            for x in rect.x..rect.right() {
+                assert_eq!(zones.hit(x, 37), Some(button));
+            }
+        }
+        // the buttons keep the border's corner and lead-in intact
+        assert_eq!(buf[(1, 37)].symbol(), "╰");
+        assert_eq!(buf[(2, 37)].symbol(), "─");
+        assert_eq!(zones.hit(2, 37), None);
+    }
+
+    #[test]
+    fn hints_ride_the_focused_surface_bottom_border() {
+        // idle: the composer's bottom border carries the send hints
+        let f = plain_frame(
+            &mut Transcript::default(),
+            (120, 40),
+            "",
+            &SidebarState::default(),
+            None,
+            None,
+        );
+        assert!(buf_row(f.terminal.backend().buffer(), 37).contains("⏎ send"));
+        // a modal takes them onto its own bottom border
+        let (terminal, modal_zone, _) =
+            draw_overlay(None, None, Some(&Modal::Todos { rows: vec![] }), None);
+        let rect = modal_zone.get().expect("modal rect published");
+        let buf = terminal.backend().buffer();
+        let bottom: String = (rect.x..rect.right())
+            .map(|x| buf[(x, rect.bottom() - 1)].symbol())
+            .collect();
+        assert!(bottom.contains("any close"), "{bottom}");
+        assert!(
+            !buf_row(buf, 37).contains("send"),
+            "composer cedes its hints"
+        );
+        assert!(buf_row(buf, 37).contains("todos"), "strip buttons stay");
+        // the ask carries its own keys
+        let ask = PendingAsk {
+            id: AskId("a1".into()),
+            question: "run it?".into(),
+            options: vec!["allow".into(), "deny".into()],
+            selected: 0,
+            detail: None,
+        };
+        let (terminal, _, _) = draw_overlay(Some(&ask), None, None, None);
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect();
+        assert!(text.contains("1-9 pick"), "ask hints drawn");
+    }
+
+    #[test]
+    fn hint_spans_drop_pairs_from_the_end_to_fit() {
+        let pairs = [("⏎", "send"), ("esc", "close")];
+        let text = |spans: &[ratatui::text::Span<'static>]| -> String {
+            spans.iter().map(|s| s.content.as_ref()).collect()
+        };
+        let all = hint_spans(&pairs, 80);
+        assert_eq!(text(&all), "⏎ send  esc close");
+        assert_eq!(all[0].style.fg, Some(crate::palette::ACCENT));
+        assert_eq!(all[1].style.fg, Some(crate::palette::FAINT));
+        assert_eq!(text(&hint_spans(&pairs, 10)), "⏎ send");
+        assert!(hint_spans(&pairs, 3).is_empty());
+    }
+
+    #[test]
+    fn overlay_shadow_hugs_the_frame_and_clips_to_the_buffer() {
+        let (terminal, modal_zone, _) =
+            draw_overlay(None, None, Some(&Modal::Todos { rows: vec![] }), None);
+        let rect = modal_zone.get().expect("modal rect published");
+        let buf = terminal.backend().buffer();
+        let shadow = crate::palette::SHADOW;
+        // one column right and one row down, offset by one cell
+        assert_eq!(buf[(rect.right(), rect.y + 1)].bg, shadow);
+        assert_eq!(buf[(rect.right(), rect.bottom())].bg, shadow);
+        assert_eq!(buf[(rect.x + 1, rect.bottom())].bg, shadow);
+        assert_ne!(buf[(rect.right(), rect.y)].bg, shadow);
+        assert_ne!(buf[(rect.x, rect.bottom())].bg, shadow);
+        // nothing inside the frame is shaded
+        assert_ne!(buf[(rect.x + 2, rect.y + 2)].bg, shadow);
+        // an overlay flush with the buffer edge clips instead of panicking
+        let area = ratatui::layout::Rect::new(0, 0, 10, 5);
+        let mut small = ratatui::buffer::Buffer::empty(area);
+        drop_shadow(&mut small, ratatui::layout::Rect::new(5, 2, 5, 3));
+        assert!(small.content.iter().all(|c| c.bg != shadow));
+    }
+
+    #[test]
+    fn modals_dim_the_transcript_backdrop() {
+        let draw = |modal: Option<&Modal>| -> ratatui::style::Color {
+            let mut t = Transcript::default();
+            t.push(Line::Info("backdrop line".into()));
+            let f = plain_frame(&mut t, (120, 40), "", &SidebarState::default(), modal, None);
+            let buf = f.terminal.backend().buffer();
+            let x = (0..120u16)
+                .find(|&x| buf[(x, 2)].symbol() == "b")
+                .expect("the info row is drawn");
+            buf[(x, 2)].fg
+        };
+        let plain = draw(None);
+        let dimmed = draw(Some(&Modal::Todos { rows: vec![] }));
+        assert_eq!(dimmed, crate::fx::lerp(plain, crate::palette::BG, 0.55));
+        assert_ne!(dimmed, plain);
+    }
+
+    #[test]
+    fn welcome_shows_the_logo_or_falls_back() {
+        let text = |rows: &[ratatui::text::Line<'static>]| -> String {
+            rows.iter()
+                .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+                .collect()
+        };
+        let meters = Meters {
+            model: "mock-5".into(),
+            mode: "plan".into(),
+            ..Default::default()
+        };
+        let sidebar = SidebarState {
+            cwd: "~/src/ka".into(),
+            branch: Some("main".into()),
+            ..Default::default()
+        };
+        let big = text(&welcome_rows(80, 30, "◆", &meters, &sidebar));
+        assert!(big.contains("██╗"), "the big logo: {big}");
+        assert!(big.contains("new conversation"));
+        assert!(big.contains("plan") && big.contains("mock-5"));
+        assert!(big.contains(&format!("~/src/ka {} main", crate::icons::BRANCH)));
+        for (key, desc) in WELCOME_TIPS {
+            assert!(big.contains(key) && big.contains(desc), "tip {key}");
+        }
+        // narrow or short panes fall back to the one-line mark
+        for (w, h) in [(43, 30), (80, 15)] {
+            let small = text(&welcome_rows(w, h, "◆", &meters, &sidebar));
+            assert!(!small.contains('█'), "{w}x{h}: no logo");
+            assert!(small.contains("◆ ka"), "{w}x{h}: {small}");
+        }
     }
 
     #[test]
@@ -12305,13 +13277,11 @@ mod tests {
 
     #[test]
     fn resume_hint_needs_a_session_and_activity() {
-        let (hint, cmd) = resume_hint("s19a4f2e1b0-3f9c2a81d4b7", 1, false, false).unwrap();
+        let hint = resume_hint("s19a4f2e1b0-3f9c2a81d4b7", 1, false, false).unwrap();
         assert!(hint.contains("ka -c"), "{hint}");
         assert!(hint.contains("ka --session 3f9c2a81"), "{hint}");
-        assert_eq!(
-            cmd, "ka --session 3f9c2a81",
-            "the command lands in $HISTFILE"
-        );
+        // text only: the terminal's history is never touched
+        assert!(!hint.contains("shell-integration"), "{hint}");
         // quitting mid-turn (turns == 0, still busy) still resumes
         assert!(resume_hint("s19a4f2e1b0-3f9c2a81d4b7", 0, true, false).is_some());
         // an older chat replayed at startup, closed with no new turn
@@ -12323,71 +13293,13 @@ mod tests {
     }
 
     #[test]
-    fn last_resume_file_carries_the_resume_command() {
-        let dir = std::env::temp_dir().join(format!("ka-last-resume-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).ok();
-        ka_strand::set_data_dir_for_tests(dir.clone());
-        write_last_resume("ka --session abc123");
-        let got = std::fs::read_to_string(dir.join("last-resume")).unwrap_or_default();
-        assert_eq!(got.trim_end(), "ka --session abc123");
-        // a later session replaces the file, never appends
-        write_last_resume("ka --session def456");
-        let got = std::fs::read_to_string(dir.join("last-resume")).unwrap_or_default();
-        assert_eq!(got.trim_end(), "ka --session def456");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn history_line_sniffs_zsh_extended_format() {
-        // zsh-style tail → matching extended shape
-        assert_eq!(
-            history_line(
-                Some(": 1700000000:5;cargo run"),
-                "ka --session abc",
-                1700000123
-            ),
-            ":1700000123:0;ka --session abc"
-        );
-        // plain tail (bash) → plain command
-        assert_eq!(
-            history_line(Some("cargo run"), "ka --session abc", 7),
-            "ka --session abc"
-        );
-        // empty file → plain
-        assert_eq!(
-            history_line(None, "ka --session abc", 7),
-            "ka --session abc"
-        );
-        // non-numeric timestamps are not the zsh shape
-        assert_eq!(history_line(Some(": start:5;ls"), "cmd", 9), "cmd");
-    }
-
-    #[test]
-    fn append_history_to_appends_and_never_creates() {
-        let dir = std::env::temp_dir().join(format!("ka-hist-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let hist = dir.join("hist");
-        // missing file: skipped, never created
-        append_history_to(&hist, "ka --session deadbeef", 1);
-        assert!(!hist.exists());
-        // zsh-style file: the extended line appends
-        std::fs::write(&hist, ": 1700000000:5;old cmd").unwrap(); // no trailing newline
-        append_history_to(&hist, "ka --session deadbeef", 1700000123);
-        let out = std::fs::read_to_string(&hist).unwrap();
-        assert!(
-            out.ends_with(":1700000123:0;ka --session deadbeef\n"),
-            "{out:?}"
-        );
-        // plain file: the bare command appends
-        std::fs::write(&hist, "old cmd\n").unwrap();
-        append_history_to(&hist, "ka --session deadbeef", 2);
-        assert!(
-            std::fs::read_to_string(&hist)
-                .unwrap()
-                .ends_with("ka --session deadbeef\n")
-        );
-        let _ = std::fs::remove_dir_all(&dir);
+    fn slash_update_is_an_idle_quit_variant() {
+        let cmd = slash_command("/update").unwrap();
+        assert!(cmd.quit, "update exits the loop");
+        assert!(cmd.event.is_none() && cmd.modal.is_none());
+        // while busy it must not ride the queue either
+        let refusal = queue_refusal("/update").unwrap_or_default();
+        assert!(refusal.contains("immediately"), "{refusal}");
     }
 
     #[test]
@@ -12545,7 +13457,7 @@ mod tests {
 
     #[test]
     fn help_lists_all_keys_and_groups() {
-        let text: String = help_modal_rows()
+        let text: String = help_modal_rows(76)
             .iter()
             .map(|l| {
                 l.spans
@@ -12580,21 +13492,27 @@ mod tests {
             "safety & plans",
             "meta",
         ] {
+            // a section head is the group name followed by its rule
             assert!(
-                text.contains(&format!("▸ {group}")),
+                text.contains(&format!("{group} ─")),
                 "help lacks group {group}"
             );
         }
-        // rows keep the `{name:<14} {desc}` shape: 15 cols before the text
-        let rows = help_modal_rows();
-        let line = rows
+        // within a group every description starts at one column, and no
+        // key (however long) touches its description
+        let rows = help_modal_rows(76);
+        let group: Vec<&ratatui::text::Line> = rows
             .iter()
-            .find(|l| {
-                let t: String = l.spans.iter().map(|s| s.content.to_string()).collect();
-                t.starts_with("/session")
-            })
-            .expect("/session row");
-        assert_eq!(line.spans[0].content.len(), 15, "{line:?}");
+            .skip(1)
+            .take_while(|l| l.spans.len() == 2 && !l.spans[1].content.starts_with(" ─"))
+            .collect();
+        assert!(group.len() > 10, "keys group rows: {}", group.len());
+        let col = unicode_width::UnicodeWidthStr::width(group[0].spans[0].content.as_ref());
+        for l in &group {
+            let key = l.spans[0].content.as_ref();
+            assert_eq!(unicode_width::UnicodeWidthStr::width(key), col, "{l:?}");
+            assert!(key.ends_with("  "), "key collides with its text: {l:?}");
+        }
 
         assert!(matches!(
             slash_command("/new"),
@@ -12849,10 +13767,10 @@ mod tests {
     fn spin_frame_cycles_braille_set() {
         let frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
         assert_eq!(spin_frame(0), '⠋');
-        assert_eq!(spin_frame(119), '⠋', "same frame within one tick");
-        assert_eq!(spin_frame(120), '⠙');
+        assert_eq!(spin_frame(79), '⠋', "same frame within one tick");
+        assert_eq!(spin_frame(80), '⠙');
         // wraps after the full set
-        assert_eq!(spin_frame(120 * frames.chars().count() as u128), '⠋');
+        assert_eq!(spin_frame(80 * frames.chars().count() as u128), '⠋');
         for ms in (0..3000).step_by(40) {
             assert!(frames.contains(spin_frame(ms)));
         }
@@ -12861,16 +13779,19 @@ mod tests {
     fn working_row_spins_then_waits_for_approval() {
         let t0 = Instant::now();
         let now = t0 + Duration::from_millis(1500);
-        // streaming: a spinner glyph leads, elapsed seconds trail
+        // streaming: a spinner glyph leads, the shimmering label, then
+        // elapsed seconds and the interrupt hint trail
         let row = working_row(None, Some(t0), now);
         let text: String = row.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text.ends_with("working · 1.5s"), "{text}");
+        assert!(
+            text.ends_with("Working · 1.5s · esc to interrupt"),
+            "{text}"
+        );
         assert!(
             "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏".contains(text.chars().next().unwrap()),
             "spinner glyph leads: {text}"
         );
-        assert_eq!(row.spans[0].style.fg, Some(crate::palette::META));
-        // permission ask up: static WARN line, no spinner glyph
+        // permission ask up: one static line, no spinner, no shimmer
         let ask = PendingAsk {
             id: ka_protocol::AskId("a".into()),
             question: "allow?".into(),
@@ -12880,12 +13801,70 @@ mod tests {
         };
         let row = working_row(Some(&ask), Some(t0), now);
         let text: String = row.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(text, "… waiting for approval · 1.5s");
-        assert_eq!(row.spans[0].style.fg, Some(crate::palette::WARN));
+        assert_eq!(text, "◆ waiting for approval · 1.5s");
+        assert_eq!(row.spans.len(), 1, "static: {row:?}");
         // a missing clock degrades to zero elapsed, never panics
         let row = working_row(None, None, now);
         let text: String = row.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text.ends_with("working · 0.0s"), "{text}");
+        assert!(
+            text.ends_with("Working · 0.0s · esc to interrupt"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn live_region_lands_where_the_flush_will() {
+        let text_of = |l: &ratatui::text::Line| -> String {
+            l.spans.iter().map(|s| s.content.to_string()).collect()
+        };
+        let t0 = Instant::now();
+        let now = t0 + Duration::from_millis(900);
+        let block = |thought: &str, md: &str| LiveBlock {
+            thought: thought.into(),
+            tool_header: String::new(),
+            live_tool: None,
+            md: if md.is_empty() {
+                Vec::new()
+            } else {
+                crate::markdown::render(md, assistant_md_width(40))
+            },
+        };
+        let no_double_air = |rows: &[ratatui::text::Line<'static>]| {
+            for pair in rows.windows(2) {
+                assert!(
+                    !(pair[0].spans.is_empty() && pair[1].spans.is_empty()),
+                    "air never doubles: {rows:?}"
+                );
+            }
+        };
+        // nothing streamed yet: the working row between air rows
+        let rows = live_region_rows(&block("", ""), None, Some(t0), now, 40);
+        assert_eq!(rows.len(), 3);
+        assert!(rows[0].spans.is_empty() && rows[2].spans.is_empty());
+        assert!(text_of(&rows[1]).contains("Working"));
+
+        // thinking: row-for-row the band the flush caches
+        let rows = live_region_rows(&block("a\nb\nc\nd", ""), None, Some(t0), now, 40);
+        let cached = thought_rows_tail("a\nb\nc\nd", 40, None);
+        let live: Vec<String> = rows[..cached.len()].iter().map(text_of).collect();
+        let flushed: Vec<String> = cached.iter().map(text_of).collect();
+        assert_eq!(live, flushed, "hand-off never jumps");
+        assert_eq!(rows.len(), cached.len() + 2, "band + working + air");
+        no_double_air(&rows);
+
+        // streaming text: the cursor rides the last row, and the row is
+        // the cached assistant row at the same width and indent
+        let rows = live_region_rows(&block("", "hello there"), None, Some(t0), now, 40);
+        let settled = render_line(&Line::Assistant("hello there".into()), 40, false);
+        assert!(rows[0].spans.is_empty(), "the separator's air leads");
+        assert_eq!(text_of(&rows[1]), format!("{}▌", text_of(&settled[0])));
+        assert!(text_of(&rows[1]).starts_with("  hello there"));
+        no_double_air(&rows);
+
+        // thinking then text: the band's trailing spacer is the air
+        let rows = live_region_rows(&block("why", "because"), None, Some(t0), now, 40);
+        no_double_air(&rows);
+        assert!(rows.iter().any(|r| text_of(r).starts_with("  because")));
     }
 
     #[test]
@@ -12898,7 +13877,7 @@ mod tests {
     }
 
     #[test]
-    fn status_right_joins_known_facts_and_always_shows_cost() {
+    fn status_line_splits_meters_and_always_shows_cost() {
         let m = Meters {
             model: "ollama/qwen3.5:9b".into(),
             mode: "full access".into(),
@@ -12910,19 +13889,35 @@ mod tests {
         let text = |spans: &[ratatui::text::Span<'static>]| {
             spans.iter().map(|s| s.content.as_ref()).collect::<String>()
         };
-        // 10% of the window: one green cell of the eight-cell gauge; the
-        // mode segment carries its icon before the word
+        // left: the model in INK_DIM (the mode pill lives at the far
+        // right now)
+        let left = status_left(&m);
+        assert_eq!(text(&left), "ollama/qwen3.5:9b");
+        assert_eq!(left[0].style.fg, Some(crate::palette::INK_DIM));
+        // right: 10% of the window fills one of ten gauge cells, then the
+        // percentage, the cost, and the mode pill last (dark chip ink on
+        // the mode's color)
+        let right = status_right(&m);
         assert_eq!(
-            text(&status_right(&m)),
+            text(&right),
             format!(
-                "ollama/qwen3.5:9b · {} full access · ctx █······· 10% · $0.0123",
+                "━━━━━━━━━━ 10%  $0.0123  {} full access ",
                 crate::icons::mode_icon(ka_protocol::Mode::Free)
             )
         );
-        assert_eq!(status_right(&m)[5].style.fg, Some(crate::palette::OK));
+        assert_eq!(right[0].content, "━");
+        assert_eq!(right[0].style.fg, Some(crate::palette::OK));
+        assert_eq!(right[1].style.fg, Some(crate::palette::RULE));
+        let pill = right.last().expect("pill closes the row");
+        assert_eq!(
+            pill.style.bg,
+            Some(crate::palette::mode_color(ka_protocol::Mode::Free))
+        );
+        assert_eq!(pill.style.fg, Some(crate::palette::CHIP_FG));
+        assert!(pill.content.ends_with("full access "), "{pill:?}");
         // effort rides its battery segment when the model supports
-        // reasoning; unsupported models hide it; an unknown level
-        // keeps the word and drops the glyph
+        // reasoning; unsupported models hide it; an unknown level keeps
+        // the word and drops the glyph
         let high = Meters {
             effort: "high".into(),
             effort_supported: true,
@@ -12930,17 +13925,18 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            text(&status_right(&high)),
-            format!("{} ◕ high · $0.5000", crate::icons::THOUGHT)
+            text(&status_left(&high)),
+            format!("{} ◕ high", crate::icons::THOUGHT)
         );
+        assert_eq!(text(&status_right(&high)), "$0.5000");
         let odd = Meters {
             effort: "turbo".into(),
             effort_supported: true,
             ..Default::default()
         };
         assert_eq!(
-            text(&status_right(&odd)),
-            format!("{} turbo · $0.0000", crate::icons::THOUGHT)
+            text(&status_left(&odd)),
+            format!("{} turbo", crate::icons::THOUGHT)
         );
         // a supported model with no level yet reads as off
         let unset = Meters {
@@ -12948,42 +13944,53 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            text(&status_right(&unset)),
-            format!("{} ○ off · $0.0000", crate::icons::THOUGHT)
+            text(&status_left(&unset)),
+            format!("{} ○ off", crate::icons::THOUGHT)
         );
         // unsupported: no segment even with a stale level string
         let unsupported = Meters {
             effort: "high".into(),
             ..Default::default()
         };
-        assert_eq!(text(&status_right(&unsupported)), "$0.0000");
-        // fresh session: unknown model/mode/window collapse away
+        assert!(status_left(&unsupported).is_empty());
+        // fresh session: unknown facts collapse to the cost alone
+        assert!(status_left(&Meters::default()).is_empty());
         assert_eq!(text(&status_right(&Meters::default())), "$0.0000");
+        // an unknown window still reports what was used
+        let estimate = Meters {
+            context: (1_500, 0),
+            ..Default::default()
+        };
+        assert!(text(&status_right(&estimate)).contains(" tok  $0.0000"));
     }
     #[test]
     fn ctx_gauge_cells_and_thresholds() {
+        // (filled cells, their color); the gauge is always ten cells
         let gauge = |used, window| {
             let m = Meters {
                 context: (used, window),
                 ..Default::default()
             };
             let spans = status_right(&m);
+            let cells: usize = spans.iter().map(|s| s.content.matches('━').count()).sum();
+            assert_eq!(cells, CTX_GAUGE_CELLS);
             spans
                 .iter()
-                .find(|s| s.content.contains('█'))
-                .map(|s| (s.content.trim_start().to_string(), s.style.fg))
-                .unwrap()
+                .find(|s| s.content.contains('━') && s.style.fg != Some(crate::palette::RULE))
+                .map_or((0, None), |s| (s.content.chars().count(), s.style.fg))
         };
-        // 12.5% per cell, thresholds at 80% (WARN) and 95% (ERR)
-        assert_eq!(gauge(25_000, 100_000).0, "██······");
-        assert_eq!(gauge(50_000, 100_000).0, "████····");
+        // 10% per cell, thresholds at 80% (WARN) and 95% (ERR)
+        assert_eq!(gauge(20_000, 100_000).0, 2);
+        assert_eq!(gauge(50_000, 100_000).0, 5);
         assert_eq!(gauge(79_000, 100_000).1, Some(crate::palette::OK));
         assert_eq!(gauge(80_000, 100_000).1, Some(crate::palette::WARN));
         assert_eq!(gauge(94_000, 100_000).1, Some(crate::palette::WARN));
         assert_eq!(gauge(95_000, 100_000).1, Some(crate::palette::ERR));
-        assert_eq!(gauge(100_000, 100_000).0, "████████");
-        // rounding at cell edges: 6.25% = half a cell rounds to one
-        assert_eq!(gauge(6_250, 100_000).0, "█·······");
+        assert_eq!(gauge(100_000, 100_000).0, 10);
+        // rounding at cell edges: 5% = half a cell rounds to one; less
+        // stays an empty track
+        assert_eq!(gauge(5_000, 100_000).0, 1);
+        assert_eq!(gauge(4_000, 100_000), (0, None));
     }
 
     #[test]
@@ -12994,118 +14001,144 @@ mod tests {
         fn row_width(line: &TuiLine) -> usize {
             line.spans.iter().map(|s| s.content.chars().count()).sum()
         }
+        let text =
+            |l: &TuiLine| -> String { l.spans.iter().map(|s| s.content.to_string()).collect() };
 
-        // user band: padded to exactly the width, wrapped rows included
+        // user band: padded to exactly the width, no pad rows
         let mut out: Vec<TuiLine> = Vec::new();
         push_block(&mut out, "short text", 40);
+        assert_eq!(out.len(), 1, "text rows only: air is the separator's job");
         assert_eq!(row_width(&out[0]), 40, "band must span exactly the width");
+        // wrapped rows: every row rides the rail, spans the width, and
+        // breaks between words (hanging indent 2)
         let mut out2: Vec<TuiLine> = Vec::new();
         push_block(&mut out2, &"word ".repeat(30), 40);
-        for (i, line) in out2.iter().take(4).enumerate() {
+        assert!(out2.len() > 2, "{out2:?}");
+        for (i, line) in out2.iter().enumerate() {
             assert_eq!(
                 row_width(line),
                 40,
                 "row {i} of wrapped band must span the width"
             );
+            assert!(
+                text(line).starts_with("▌ word"),
+                "row {i}: {:?}",
+                text(line)
+            );
+            assert!(
+                text(line).trim_end().ends_with("word"),
+                "word-wrapped: {:?}",
+                text(line)
+            );
         }
+        // an empty message still owns one rail row
+        let mut out3: Vec<TuiLine> = Vec::new();
+        push_block(&mut out3, "", 40);
+        assert_eq!(out3.len(), 1);
     }
 
     #[test]
     fn gutter_rows_wrap_without_padding() {
         use super::push_gutter;
         use ratatui::text::Line as TuiLine;
+        use unicode_width::UnicodeWidthStr;
 
         fn row_width(line: &TuiLine) -> usize {
             line.spans.iter().map(|s| s.content.chars().count()).sum()
         }
+        let text =
+            |l: &TuiLine| -> String { l.spans.iter().map(|s| s.content.to_string()).collect() };
 
         let mut out: Vec<TuiLine> = Vec::new();
         push_gutter(
             &mut out,
             "short text",
             40,
-            "⚙ ",
+            "• ",
             crate::palette::META.into(),
         );
         assert_eq!(out.len(), 1, "text rows only: air is the separator's job");
         assert!(row_width(&out[0]) <= 40, "gutter rows never pad to width");
 
-        // long text wraps at the width; the emoji lead is display-width
-        // aware and continuation rows indent by its width (3, not 2)
+        // an unbreakable token hard-wraps at the width; continuation
+        // rows hang under the text by the prefix's display width
+        let prefix = format!("{} ", crate::icons::THOUGHT);
+        let indent = " ".repeat(prefix.width());
         let mut out2: Vec<TuiLine> = Vec::new();
         push_gutter(
             &mut out2,
             &"x".repeat(100),
             40,
-            &format!("{} ", crate::icons::THOUGHT),
+            &prefix,
             crate::palette::THOUGHT,
         );
         assert!(out2.len() > 2);
-        use unicode_width::UnicodeWidthStr;
         for (i, line) in out2.iter().enumerate() {
-            let text: String = line.spans.iter().map(|s| s.content.to_string()).collect();
+            let text = text(line);
             assert!(text.width() <= 40, "row {i} overflows the width");
             if i > 0 {
                 assert!(
-                    text.starts_with("   x"),
+                    text.starts_with(&format!("{indent}x")),
                     "continuation indents by the prefix width: {text:?}"
                 );
             } else {
-                assert!(text.starts_with(&format!("{} ", crate::icons::THOUGHT)));
+                assert!(text.starts_with(&prefix));
             }
         }
-
-        // degenerate width still terminates
+        // prose breaks between words
         let mut out3: Vec<TuiLine> = Vec::new();
         push_gutter(
             &mut out3,
+            "alpha beta gamma",
+            14,
+            "• ",
+            crate::palette::META.into(),
+        );
+        let rows: Vec<String> = out3.iter().map(text).collect();
+        assert_eq!(rows, vec!["• alpha beta", "  gamma"]);
+
+        // degenerate width still terminates
+        let mut out4: Vec<TuiLine> = Vec::new();
+        push_gutter(
+            &mut out4,
             "abc",
             0,
-            "! ",
+            "✗ ",
             ratatui::style::Style::new().fg(crate::palette::ERR),
         );
-        assert!(!out3.is_empty());
+        assert!(!out4.is_empty());
     }
 
     #[test]
-    fn assistant_entry_fills_output_surface() {
-        // assistant rows carry the output background and fill the width;
-        // blank rows above and below carry the same fill, giving the
-        // card inner top/bottom air
-        let out = super::render_line(&Line::Assistant("**hi** there".into()), 40, false);
-        assert!(out.len() >= 3, "blank + content + blank, got {}", out.len());
-        let surface = crate::palette::BG_OUTPUT;
+    fn assistant_entry_sits_on_the_canvas_indented() {
+        // no slab: assistant rows carry no background and no padding
+        // rows; markdown folds at W-2 behind a two-column canvas indent
         let row_text = |l: &ratatui::text::Line<'static>| {
             l.spans
                 .iter()
                 .map(|s| s.content.to_string())
                 .collect::<String>()
         };
-        let cols = |l: &ratatui::text::Line<'static>| {
-            l.spans
-                .iter()
-                .map(|s| s.content.chars().count())
-                .sum::<usize>()
-        };
-        // the card opens and closes on a full-width surface blank
-        for edge in [out.first().unwrap(), out.last().unwrap()] {
-            assert!(
-                edge.spans.iter().all(|s| s.style.bg == Some(surface)),
-                "edge row filled at span level: {edge:?}"
-            );
-            assert_eq!(cols(edge), 40, "edge blank fills the width");
-            assert!(row_text(edge).trim().is_empty(), "edge row is blank");
+        let out = super::render_line(&Line::Assistant("**hi** there".into()), 40, false);
+        assert_eq!(out.len(), 1, "content only: {out:?}");
+        assert_eq!(row_text(&out[0]), "  hi there");
+        assert!(
+            out[0].spans.iter().all(|s| s.style.bg.is_none()),
+            "canvas, not a slab: {out:?}"
+        );
+        // long prose wraps inside the indent: every row fits W
+        use unicode_width::UnicodeWidthStr;
+        let long = super::render_line(&Line::Assistant("word ".repeat(40)), 40, false);
+        assert!(long.len() > 1);
+        for row in &long {
+            let t = row_text(row);
+            assert!(t.starts_with("  "), "{t:?}");
+            assert!(t.width() <= 40, "{t:?}");
         }
-        // the first content row keeps the surface fill
-        let content = &out[1];
-        assert_eq!(row_text(content).trim(), "hi there");
-        assert_eq!(cols(content), 40, "surface fills the width");
-        let slab = format!("{content:?}");
-        assert!(slab.contains(&format!("{surface:?}")), "output bg: {slab}");
     }
 
     #[test]
-    fn multiline_band_prefixes_only_first_row() {
+    fn multiline_band_rails_every_row() {
         use super::push_block;
         use ratatui::text::Line as TuiLine;
 
@@ -13117,21 +14150,21 @@ mod tests {
                 .map(|s| s.content.to_string())
                 .collect::<String>()
         };
-        // the card opens and closes on a BG_USER pad row
-        let user_bg = crate::palette::BG_USER;
-        for pad in [out.first().unwrap(), out.last().unwrap()] {
-            assert!(
-                pad.spans.iter().all(|s| s.style.bg == Some(user_bg)),
-                "pad rows carry BG_USER: {pad:?}"
-            );
-            assert!(text(pad).trim().is_empty(), "pad row is blank");
-        }
-        assert!(text(&out[1]).starts_with("  ❯ alpha"));
+        assert_eq!(out.len(), 2, "one row per source line, no pad rows");
+        assert!(text(&out[0]).starts_with("▌ alpha"));
         assert!(
-            text(&out[2]).starts_with("    beta"),
-            "second source line indents"
+            text(&out[1]).starts_with("▌ beta"),
+            "every row rides the rail"
         );
-        assert_eq!(out.len(), 4, "pad + two rows + pad");
+        for row in &out {
+            assert!(
+                row.spans
+                    .iter()
+                    .all(|s| s.style.bg == Some(crate::palette::BG_USER)),
+                "the band is BG_USER edge to edge: {row:?}"
+            );
+            assert_eq!(row.spans[0].style.fg, Some(crate::palette::USER));
+        }
     }
 
     #[test]
@@ -13264,7 +14297,7 @@ mod tests {
                 slash_command("/model"),
                 Some(Slash {
                     note: None,
-                    modal: Some(ModalKind::Model),
+                    modal: Some(ModalKind::Model(None)),
                     ..
                 })
             ),
@@ -13858,16 +14891,18 @@ mod tests {
             observe_preview(&mut window, &format!("line-{i}"));
         }
         assert_eq!(window, vec!["line-3", "line-4", "line-5"], "rolling 3");
-        // the card renders top border + at most the 3 newest dim rows +
-        // bottom border, rebuilt every frame
+        // the running call renders its timeline header + at most the 3
+        // newest faint rows on the thread, rebuilt every frame
+        let t0 = Instant::now();
+        let now = t0 + Duration::from_millis(2500);
         let lt = LiveTool {
             id: "c1".into(),
             preview: window.clone(),
             last: Some(("line-5".into(), false)),
-            started: Instant::now(),
+            started: t0,
         };
-        let rows = tool_live_rows("→ bash", Some(&lt), 40);
-        assert_eq!(rows.len(), 2 + PREVIEW_WINDOW);
+        let rows = tool_live_rows("→ bash", Some(&lt), 40, now);
+        assert_eq!(rows.len(), 1 + PREVIEW_WINDOW);
         use unicode_width::UnicodeWidthStr;
         let texts: Vec<String> = rows
             .iter()
@@ -13878,30 +14913,37 @@ mod tests {
                     .collect::<String>()
             })
             .collect();
-        // boxed top border: icon + tool left, spinner right
-        assert!(texts[0].starts_with("╭─ 🐚 bash"), "{texts:?}");
-        assert!(texts[0].ends_with(" ─╮"), "{texts:?}");
-        for (i, expect) in ["line-3", "line-4", "line-5"].iter().enumerate() {
-            assert!(
-                texts[1 + i].starts_with(&format!("│ {expect}")),
-                "{texts:?}"
-            );
-            assert!(texts[1 + i].ends_with(" │"), "{texts:?}");
-        }
-        assert!(texts[4].starts_with("╰"), "{texts:?}");
-        for text in &texts {
-            assert_eq!(text.width(), 40, "card rows fill the width: {text:?}");
-        }
+        // header: spinner instead of a verdict, icon + tool, the live
+        // elapsed right-aligned at the pane edge
+        assert!(
+            "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏".contains(texts[0].chars().next().unwrap()),
+            "{texts:?}"
+        );
+        assert!(texts[0][3..].starts_with(" $ bash"), "{texts:?}");
+        assert!(texts[0].ends_with("2.5s"), "{texts:?}");
+        assert_eq!(texts[0].width(), 40, "cluster rides the right edge");
+        assert_eq!(texts[1], "│ line-3");
+        assert_eq!(texts[2], "│ line-4");
+        assert_eq!(texts[3], "╰ line-5", "the last row turns the thread");
         for row in &rows {
-            // the whole card — borders included — rides BG_TOOL
             assert!(
-                row.spans
-                    .iter()
-                    .all(|s| s.style.bg == Some(crate::palette::BG_TOOL)),
-                "live card rides BG_TOOL: {row:?}"
+                row.spans.iter().all(|s| s.style.bg.is_none()),
+                "no box, no fill: {row:?}"
             );
         }
-        assert_eq!(tool_live_rows("→ bash", None, 40).len(), 0);
+        assert_eq!(tool_live_rows("→ bash", None, 40, now).len(), 0);
+
+        // nothing previewed yet: the header stands alone
+        let bare = LiveTool {
+            id: "c1".into(),
+            preview: Vec::new(),
+            last: None,
+            started: t0,
+        };
+        let rows = tool_live_rows("→ web_fetch · https://example.com", Some(&bare), 40, now);
+        assert_eq!(rows.len(), 1, "one line while there is nothing to show");
+        let text: String = rows[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("web_fetch  https://example.com"), "{text:?}");
     }
 
     #[test]
@@ -14026,7 +15068,10 @@ mod tests {
         assert!(matches!(entries[0], Line::Assistant(_)));
         // air opens between the card and the failure summary (family change)
         assert_eq!(&entries[1], &Line::Report(String::new()));
-        let Line::Summary { glyph, tone, text } = &entries[2] else {
+        let Line::Summary {
+            glyph, tone, text, ..
+        } = &entries[2]
+        else {
             panic!("third entry must be a failure Summary: {entries:?}");
         };
         assert_eq!(*glyph, '✗');
@@ -14696,7 +15741,7 @@ mod tests {
             toggles: sidebar.inventory.disabled.len(),
             ..Default::default()
         };
-        let right = status_right(&meters);
+        let right = status_left(&meters);
         let joined: String = right
             .iter()
             .map(|s| s.content.clone())
@@ -14830,6 +15875,8 @@ mod tests {
             glyph: '✓',
             tone: SummaryTone::Ok,
             text: "done · 0.0s".into(),
+            detail: None,
+            expanded: false,
         });
         t.push_separated(Line::Report("task row".into()));
         t.push_separated(Line::User("again".into()));
@@ -14978,14 +16025,14 @@ mod tests {
         // gutter rows carry their style on the line (push_gutter), so
         // Paragraph paints prefix and text alike
         let fg = |rows: &Vec<ratatui::text::Line<'static>>| rows[0].style.fg;
-        // info: `· ` muted
-        assert_eq!(text(&info), "· steering this turn");
+        // info: `• ` muted
+        assert_eq!(text(&info), "• steering this turn");
         assert_eq!(fg(&info), Some(crate::palette::META));
-        // warn: `⚠ ` salmon
-        assert_eq!(text(&warn), "⚠ turn running");
+        // warn: `▲ ` salmon
+        assert_eq!(text(&warn), "▲ turn running");
         assert_eq!(fg(&warn), Some(crate::palette::WARN));
-        // err: `! ` bold — the loudest system row
-        assert_eq!(text(&err), "! 429 too many requests");
+        // err: `✗ ` bold — the loudest system row
+        assert_eq!(text(&err), "✗ 429 too many requests");
         assert_eq!(fg(&err), Some(crate::palette::ERR));
         assert!(
             err[0]
@@ -15004,13 +16051,16 @@ mod tests {
     }
 
     #[test]
-    fn summary_rows_render_tone_glyph_and_muted_text() {
+    fn summary_rows_render_tone_glyph_faint_text_and_rule() {
+        use unicode_width::UnicodeWidthStr;
         let row = |glyph, tone| {
             super::render_line(
                 &Line::Summary {
                     glyph,
                     tone,
                     text: "done · 2.0s".into(),
+                    detail: None,
+                    expanded: false,
                 },
                 40,
                 false,
@@ -15024,7 +16074,15 @@ mod tests {
             let first = &rows[0].spans[0];
             assert_eq!(first.content.as_ref(), format!("{glyph} "));
             assert_eq!(first.style.fg, Some(fg));
-            assert_eq!(rows[0].spans[1].style.fg, Some(crate::palette::META));
+            assert_eq!(rows[0].spans[1].style.fg, Some(crate::palette::FAINT));
+            // a rule closes the turn, filling the row to the width
+            let text: String = rows[0].spans.iter().map(|s| s.content.as_ref()).collect();
+            assert!(
+                text.starts_with(&format!("{glyph} done · 2.0s ─")),
+                "{text}"
+            );
+            assert!(text.ends_with('─'), "{text}");
+            assert_eq!(text.width(), 40, "{text}");
         }
         // the error tone is bold so failures outweigh every other row
         let rows = row('✗', SummaryTone::Err);
@@ -15034,6 +16092,220 @@ mod tests {
                 .style
                 .add_modifier
                 .contains(ratatui::style::Modifier::BOLD)
+        );
+    }
+
+    #[test]
+    fn summary_chevron_tracks_detail_fold() {
+        let call = |expanded| {
+            super::render_line(
+                &Line::Summary {
+                    glyph: '✗',
+                    tone: SummaryTone::Err,
+                    text: "failed · HTTP 400: nope · /retry".into(),
+                    detail: Some("the full untruncated error".into()),
+                    expanded,
+                },
+                40,
+                false,
+            )
+        };
+        let text_of = |l: &ratatui::text::Line| -> String {
+            l.spans.iter().map(|s| s.content.as_ref()).collect()
+        };
+        let collapsed = call(false);
+        assert_eq!(collapsed.len(), 1, "collapsed shows the verdict only");
+        let head = text_of(&collapsed[0]);
+        assert!(
+            head.contains("/retry ▸ ─"),
+            "marker trails the verdict: {head}"
+        );
+        // a verdict longer than the row truncates its text, never the
+        // affordance
+        let long = super::render_line(
+            &Line::Summary {
+                glyph: '✗',
+                tone: SummaryTone::Err,
+                text: "failed · ".repeat(10),
+                detail: Some("all of it".into()),
+                expanded: false,
+            },
+            40,
+            false,
+        );
+        let head = text_of(&long[0]);
+        use unicode_width::UnicodeWidthStr;
+        assert!(head.width() <= 40, "{head}");
+        assert!(head.contains("… ▸"), "marker must survive clipping: {head}");
+        let open = call(true);
+        assert!(open.len() > 1, "expanded reveals wrapped detail");
+        assert!(text_of(&open[0]).contains("▾"), "open marker");
+        let body: String = open[1..].iter().map(text_of).collect();
+        assert!(body.contains("the full untruncated error"), "{body}");
+        // no hidden detail → no chevron (no dead indicator)
+        let plain = super::render_line(
+            &Line::Summary {
+                glyph: '✓',
+                tone: SummaryTone::Ok,
+                text: "done · 0.0s".into(),
+                detail: None,
+                expanded: false,
+            },
+            40,
+            false,
+        );
+        let s = text_of(&plain[0]);
+        assert!(!s.contains('▸') && !s.contains('▾'), "{s}");
+    }
+
+    #[test]
+    fn summary_fold_expands_full_detail_and_maps_clicks() {
+        let mut t = Transcript::default();
+        t.set_width(60);
+        t.push(Line::Summary {
+            glyph: '✗',
+            tone: SummaryTone::Err,
+            text: "failed · HTTP 400: {\"type\":\"err… · /retry · 0.9s".into(),
+            detail: Some(format!("HTTP 400: {}", "the gateway said no ".repeat(8))),
+            expanded: false,
+        });
+        assert_eq!(t.rendered_rows_of(0), 1, "collapsed keeps one row");
+        assert_eq!(t.row_ref_at(0), Some(RowRef::Summary(0)));
+        assert!(t.summary_foldable(0));
+        t.toggle_summary(0);
+        assert!(
+            matches!(t.lines.first(), Some(Line::Summary { expanded: true, .. })),
+            "toggle must flip the fold"
+        );
+        let rows = t.rendered_rows_of(0);
+        assert!(rows > 1, "wrapped detail adds rows: {rows}");
+        for r in 0..rows {
+            assert_eq!(t.row_ref_at(r), Some(RowRef::Summary(0)), "row {r}");
+        }
+        let body: String = (1..rows).filter_map(|r| t.row_text(r)).collect();
+        assert!(body.contains("the gateway said no"), "{body}");
+        t.toggle_summary(0);
+        assert_eq!(t.rendered_rows_of(0), 1, "collapse restores one row");
+        // nothing hidden → no fold, no click target, toggle no-ops
+        t.push(Line::Summary {
+            glyph: '✓',
+            tone: SummaryTone::Ok,
+            text: "done · 0.0s".into(),
+            detail: None,
+            expanded: false,
+        });
+        assert!(!t.summary_foldable(1));
+        assert_eq!(t.row_ref_at(1), Some(RowRef::Entry(1)));
+        t.toggle_summary(1);
+        assert_eq!(t.rendered_rows_of(1), 1);
+    }
+
+    #[test]
+    fn long_turn_error_keeps_full_text_for_the_fold() {
+        let mut lines = Transcript::default();
+        let mut busy = false;
+        let mut busy_since = None;
+        let mut meters = Meters::default();
+        let mut pending = None;
+        let mut turn_produced = false;
+        let mut usage = None;
+        let mut a = String::new();
+        let mut t = String::new();
+        let mut tool = String::new();
+        let mut live_tool: Option<LiveTool> = None;
+        let mut last_user: Option<String> = None;
+        let mut last_error: Option<String> = None;
+        let mut spills: Vec<String> = Vec::new();
+        let mut sidebar = SidebarState::default();
+
+        let _ = apply_event(
+            &Event::TurnStarted {
+                context: ka_protocol::ContextMeter {
+                    used: 100,
+                    window: 200,
+                },
+            },
+            &mut lines,
+            &mut busy,
+            &mut busy_since,
+            &mut meters,
+            &mut pending,
+            &mut turn_produced,
+            &mut usage,
+            &mut a,
+            &mut t,
+            &mut tool,
+            &mut live_tool,
+            &mut last_user,
+            &mut last_error,
+            &mut spills,
+            &mut sidebar,
+        );
+        let full = format!("HTTP 400: {}", "the gateway refused ".repeat(16));
+        let _ = apply_event(
+            &Event::Error {
+                class: ka_protocol::ErrorClass::Protocol,
+                retryable: false,
+                message: full.clone(),
+            },
+            &mut lines,
+            &mut busy,
+            &mut busy_since,
+            &mut meters,
+            &mut pending,
+            &mut turn_produced,
+            &mut usage,
+            &mut a,
+            &mut t,
+            &mut tool,
+            &mut live_tool,
+            &mut last_user,
+            &mut last_error,
+            &mut spills,
+            &mut sidebar,
+        );
+        let _ = apply_event(
+            &Event::TurnFinished {
+                stop: ka_protocol::Stop::Error,
+                usage: ka_protocol::Usage {
+                    input: 6,
+                    output: 0,
+                    cost: 0.0,
+                    ..Default::default()
+                },
+            },
+            &mut lines,
+            &mut busy,
+            &mut busy_since,
+            &mut meters,
+            &mut pending,
+            &mut turn_produced,
+            &mut usage,
+            &mut a,
+            &mut t,
+            &mut tool,
+            &mut live_tool,
+            &mut last_user,
+            &mut last_error,
+            &mut spills,
+            &mut sidebar,
+        );
+        let entries = lines.entries();
+        let Some(Line::Summary {
+            text,
+            detail,
+            expanded,
+            ..
+        }) = entries.last()
+        else {
+            panic!("last entry must be the failure summary: {entries:?}");
+        };
+        assert!(text.contains('…'), "preview stays truncated: {text}");
+        assert!(!*expanded, "rows start collapsed");
+        assert_eq!(
+            detail.as_deref(),
+            Some(full.as_str()),
+            "the untruncated error stays reachable through the fold"
         );
     }
 
@@ -15052,31 +16324,39 @@ mod tests {
             ..no_note_call()
         });
         t.toggle_tool_call(1, 1);
-        // the thought band owns its spacer rows (blank + tint + head + body
-        // + tint + blank); the card block starts right after it
+        // the thought owns its spacer rows (blank + head + body +
+        // blank); the call block starts right after it
         let air = t.rendered_rows_of(0);
+        assert_eq!(air, 5, "blank + head + 2 + blank");
         assert_eq!(t.row_ref_at(0), Some(RowRef::Entry(0)));
         assert_eq!(t.row_ref_at(air - 1), Some(RowRef::Entry(0)));
         // no separator between the families: the thought's trailing
-        // spacer row is the last thought row; the card starts right at it
+        // spacer row is the last thought row; the block starts right at it
         assert_eq!(t.row_ref_at(air), Some(RowRef::ToolCall(1, 0)));
-        // every row of a card — top border, body, bottom border — maps
-        // to that card's call
-        assert_eq!(t.row_ref_at(air + 1), Some(RowRef::ToolCall(1, 0)));
-        assert_eq!(t.row_ref_at(air + 2), Some(RowRef::ToolCall(1, 0)));
+        // a no-note call is its header alone; the next header follows
+        // directly (calls stack with no rule between them)
+        assert_eq!(t.row_ref_at(air + 1), Some(RowRef::ToolCall(1, 1)));
 
-        // the second card is expanded: 5 rows + the rule between makes
-        // the block 9 rows (3 + 1 + 5)
-        assert_eq!(t.rendered_rows_of(1), 9);
-        // offset 4 is the separator rule — it maps to the FOLLOWING
-        // call; 5..8 are the expanded card's rows
-        for off in [3usize, 4, 5, 6, 7, 8] {
+        // the second call is expanded: header + 2 output rows, so the
+        // block is 4 rows (1 + 3) — exactly the height authority's sum
+        assert_eq!(t.rendered_rows_of(1), 4);
+        let Some(Line::ToolBlock(calls)) = t.entries().get(1) else {
+            panic!("entry 1 is the tool block");
+        };
+        let heights: usize = calls.iter().map(|c| tool_card_height(c, 60)).sum();
+        assert_eq!(
+            heights,
+            t.rendered_rows_of(1),
+            "height authority = rendered rows"
+        );
+        for off in [2usize, 3] {
             assert_eq!(
                 t.row_ref_at(air + off),
                 Some(RowRef::ToolCall(1, 1)),
-                "row {off} of the expanded card"
+                "row {off} of the expanded call"
             );
         }
+        assert_eq!(t.row_ref_at(air + 4), None, "past the end");
         assert_eq!(
             t.tool_call(1, 1).map(|c| c.head.as_str()),
             Some("→ b"),
@@ -15099,45 +16379,45 @@ mod tests {
         let text_of = |l: &ratatui::text::Line| -> String {
             l.spans.iter().map(|s| s.content.to_string()).collect()
         };
-        // collapsed: top border, the note body row, bottom border
+        // collapsed: the header, then the note turning the thread
         let out = super::render_line(&Line::ToolBlock(vec![call.clone()]), 40, false);
-        assert_eq!(out.len(), 3, "collapsed card = top + note + bottom");
-        for row in &out {
-            assert_eq!(
-                text_of(row).width(),
-                40,
-                "{:?} fills the width",
-                text_of(row)
-            );
-        }
+        assert_eq!(out.len(), 2, "collapsed call = header + note");
         assert!(
-            text_of(&out[0]).starts_with("╭─ 🐚 bash ▸ · cargo build"),
+            text_of(&out[0]).starts_with("✓ $ bash  cargo build ▸"),
             "{out:?}"
         );
-        assert!(text_of(&out[0]).ends_with("1.2s ✓ ─╮"), "{out:?}");
-        assert!(text_of(&out[1]).starts_with("│ first line"), "{out:?}");
-        assert!(text_of(&out[2]).starts_with("╰"), "{out:?}");
-        // expanded: the note row stays, every excerpt line is added
-        // inside the box (blank line included), then the bottom border
+        assert!(text_of(&out[0]).ends_with("1.2s"), "{out:?}");
+        assert_eq!(text_of(&out[0]).width(), 40, "cluster rides the right edge");
+        assert_eq!(text_of(&out[1]), "╰ first line");
+        // expanded: the note row stays (now mid-thread), every excerpt
+        // line follows on the panel (blank line included)
         let expanded = ToolCall {
             expanded: true,
             ..call
         };
         let out = super::render_line(&Line::ToolBlock(vec![expanded]), 40, false);
-        assert_eq!(out.len(), 6, "top + note + 3 excerpt + bottom: {out:?}");
+        assert_eq!(out.len(), 5, "header + note + 3 output: {out:?}");
         let texts: Vec<String> = out.iter().map(text_of).collect();
-        assert!(
-            texts[0].starts_with("╭─ 🐚 bash ▾ · cargo build"),
-            "{texts:?}"
-        );
-        assert!(texts[0].ends_with("1.2s ✓ ─╮"), "{texts:?}");
-        assert!(texts[1].starts_with("│ first line"), "{texts:?}");
-        assert!(texts[2].starts_with("│ first line"), "{texts:?}");
-        assert_eq!(out[2].spans[2].style.fg, Some(crate::palette::INK_DIM));
-        assert!(texts[3].starts_with("│"), "{texts:?}");
-        assert!(texts[4].starts_with("│ third line"), "{texts:?}");
-        assert!(texts[5].starts_with("╰"), "{texts:?}");
-        // long lines hard-wrap and continue inside the box
+        assert!(texts[0].starts_with("✓ $ bash  cargo build ▾"), "{texts:?}");
+        assert_eq!(texts[1], "│ first line");
+        assert!(texts[2].starts_with("│  first line"), "{texts:?}");
+        assert_eq!(out[2].spans[3].style.fg, Some(crate::palette::INK_DIM));
+        assert!(texts[3].starts_with("│ "), "{texts:?}");
+        assert!(texts[4].starts_with("╰  third line"), "{texts:?}");
+        for (row, text) in out[2..].iter().zip(&texts[2..]) {
+            assert_eq!(text.width(), 40, "the panel runs to the edge: {text:?}");
+            assert!(
+                row.spans[2..]
+                    .iter()
+                    .all(|s| s.style.bg == Some(crate::palette::BG_TOOL)),
+                "ok output rides BG_TOOL from column 2: {row:?}"
+            );
+            assert_eq!(
+                row.spans[0].style.bg, None,
+                "the thread stays on the canvas"
+            );
+        }
+        // long lines hard-wrap and continue on the thread
         let long = ToolCall {
             excerpt: "x".repeat(100),
             expanded: true,
@@ -15147,7 +16427,9 @@ mod tests {
         assert!(out.len() > 4, "wrapped into continuation rows: {out:?}");
         for row in &out[1..out.len() - 1] {
             assert_eq!(row.spans[0].content.as_ref(), "│", "railed: {row:?}");
+            assert_eq!(text_of(row).width(), 20);
         }
+        assert_eq!(out[out.len() - 1].spans[0].content.as_ref(), "╰");
     }
 
     #[test]
@@ -15160,17 +16442,16 @@ mod tests {
             ..no_note_call()
         };
         let out = super::render_line(&Line::ToolBlock(vec![call]), 60, false);
-        // the spill pointer is the last content row, just above the
-        // card's bottom border
-        let spill = &out[out.len() - 2];
+        // the spill pointer is the last body row, turning the thread
+        let spill = out.last().unwrap();
         let text: String = spill.spans.iter().map(|s| s.content.to_string()).collect();
         assert!(
             text.contains("spill file") && text.contains("/spills"),
             "{text:?}"
         );
         // the trailer rides the muted tier, not the content tier
-        assert_eq!(spill.spans[2].style.fg, Some(crate::palette::META));
-        assert!(out.last().unwrap().spans[0].content.starts_with('╰'));
+        assert_eq!(spill.spans[3].style.fg, Some(crate::palette::META));
+        assert_eq!(spill.spans[0].content.as_ref(), "╰");
     }
 
     #[test]
@@ -15184,12 +16465,15 @@ mod tests {
             ..no_note_call()
         });
         let (entry, call) = t.last_tool_ref().expect("ref for the fresh block");
-        assert_eq!(t.rendered_rows_of(entry), 3, "collapsed: one card");
-        // expand: top + empty note + two excerpt rows + bottom, the flag
-        // lives on the call
+        assert_eq!(
+            t.rendered_rows_of(entry),
+            1,
+            "collapsed: the header alone (no note to show)"
+        );
+        // expand: header + two output rows, the flag lives on the call
         t.toggle_tool_call(entry, call);
         assert!(t.tool_call(entry, call).unwrap().expanded, "flag flipped");
-        assert_eq!(t.rendered_rows_of(entry), 5, "top + note + 2 + bottom");
+        assert_eq!(t.rendered_rows_of(entry), 3, "header + 2 output rows");
         let row_text = |r: usize| -> String {
             t.row(r)
                 .unwrap()
@@ -15198,20 +16482,16 @@ mod tests {
                 .map(|s| s.content.to_string())
                 .collect()
         };
-        assert!(row_text(2).starts_with("│ line one"), "{:?}", row_text(2));
-        assert!(row_text(3).starts_with("│ line two"), "{:?}", row_text(3));
-        assert!(
-            row_text(1).starts_with("│"),
-            "empty note row: {:?}",
-            row_text(1)
-        );
-        // collapse again: back to the one-card shape
+        // the note-less call opens straight onto its output
+        assert!(row_text(1).starts_with("│  line one"), "{:?}", row_text(1));
+        assert!(row_text(2).starts_with("╰  line two"), "{:?}", row_text(2));
+        // collapse again: back to the one-line shape
         t.toggle_tool_call(entry, call);
         assert!(!t.tool_call(entry, call).unwrap().expanded);
-        assert_eq!(t.rendered_rows_of(entry), 3);
+        assert_eq!(t.rendered_rows_of(entry), 1);
         // stale indices (rewound past the block) no-op instead of panicking
         t.toggle_tool_call(99, 0);
-        assert_eq!(t.rendered_rows_of(entry), 3);
+        assert_eq!(t.rendered_rows_of(entry), 1);
         // a call with nothing to reveal never expands
         t.push_tool_call(ToolCall {
             head: "→ read".into(),
@@ -15300,13 +16580,13 @@ mod tests {
             update: Some("v0.2.10".into()),
             ..Default::default()
         };
-        let text: String = status_right(&meters)
+        let text: String = status_left(&meters)
             .iter()
             .map(|s| s.content.to_string())
             .collect();
         assert!(text.contains("\u{2934} v0.2.10"), "badge renders: {text}");
         meters.update = None;
-        let text: String = status_right(&meters)
+        let text: String = status_left(&meters)
             .iter()
             .map(|s| s.content.to_string())
             .collect();
@@ -15318,9 +16598,10 @@ mod tests {
 
     #[test]
     fn busy_title_carries_only_the_queue_hint() {
-        // action hints moved to the status bar; the title keeps state only
-        assert_eq!(busy_input_title(0), "input");
-        assert_eq!(busy_input_title(2), "input · 2 queued");
+        // action hints ride the composer's bottom border; the title
+        // only appears for a waiting queue
+        assert_eq!(busy_input_title(0), None);
+        assert_eq!(busy_input_title(2).as_deref(), Some("2 queued"));
     }
 
     #[test]
@@ -15358,19 +16639,23 @@ mod tests {
                 .map(|s| s.content.to_string())
                 .collect::<String>()
         };
-        // bold question, then the budgeted detail, then numbered options
+        // bold gold question, then the budgeted detail, then options
         assert_eq!(text(&rows[0]), "allow write to modify files?");
+        assert_eq!(rows[0].spans[0].style.fg, Some(crate::palette::STRONG));
         assert_eq!(text(&rows[1]), "+a");
-        // the selected option wears the full-row pink bar
-        assert_eq!(text(&rows[2]), pad_to_width("1 allow".to_string(), 40));
-        assert_eq!(text(&rows[3]), "2 deny");
-        assert_eq!(rows[2].spans[0].style, selection_style());
-        assert_ne!(rows[3].spans[0].style, selection_style());
-        // the bar follows the selection
+        // the selected option leads with the ▌ pointer, its FAINT key
+        // cap, then the label in the selection style padded to the width
+        assert_eq!(text(&rows[2]), pad_to_width("▌ 1 allow".to_string(), 40));
+        assert_eq!(rows[2].spans[1].style.fg, Some(crate::palette::FAINT));
+        assert_eq!(rows[2].spans[2].style, selection_style());
+        // unselected rows lead two blank cols so the caps align
+        assert_eq!(text(&rows[3]), "  2 deny");
+        assert_ne!(rows[3].spans[2].style, selection_style());
+        // the pointer follows the selection
         let ask = PendingAsk { selected: 1, ..ask };
         let rows = ask_modal_body(&ask, 40);
-        assert_eq!(rows[3].spans[0].style, selection_style());
-        assert_ne!(rows[2].spans[0].style, selection_style());
+        assert_eq!(rows[3].spans[2].style, selection_style());
+        assert_ne!(rows[2].spans[2].style, selection_style());
     }
 
     #[test]
@@ -15806,85 +17091,73 @@ mod tests {
 
     #[test]
     fn thinking_blocks_collapse_to_band_and_expand() {
+        use unicode_width::UnicodeWidthStr;
         let thought = Line::Thought("l1\nl2\nl3\nl4\nl5".into());
         let text_of = |l: &ratatui::text::Line| -> String {
             l.spans.iter().map(|s| s.content.to_string()).collect()
         };
 
-        // collapsed (default): head + at most three body rows
+        // collapsed (default): spacer + head + at most three body rows
+        // + the "more" row while anything is hidden + spacer
         let collapsed = super::render_line(&thought, 60, false);
         assert_eq!(
             collapsed.len(),
-            8,
-            "blank + tint + head + 3 of 5 lines + tint + blank: {collapsed:?}"
+            7,
+            "blank + head + 3 of 5 lines + more + blank: {collapsed:?}"
         );
-        let head = text_of(&collapsed[2]);
-        assert!(head.contains(crate::icons::THOUGHT), "brain lead: {head}");
+        assert!(collapsed[0].spans.is_empty() && collapsed[6].spans.is_empty());
+        let head = text_of(&collapsed[1]);
         assert!(
-            head.contains("Thinking"),
-            "label, not a content title: {head}"
+            head.starts_with(&format!("{} Thinking ▸", crate::icons::THOUGHT)),
+            "{head}"
         );
-        assert!(head.contains('▸'), "collapsed marker: {head}");
-        assert!(head.contains("5 lines"), "count in the head: {head}");
+        assert!(head.ends_with("5 lines"), "right-aligned count: {head}");
+        assert_eq!(head.width(), 60, "{head}");
         let all: String = collapsed.iter().map(text_of).collect();
         assert!(all.contains("l1") && all.contains("l3"), "{all}");
         assert!(
             !all.contains("l4") && !all.contains("l5"),
             "max 3 rows visible: {all}"
         );
-        assert!(
-            !all.contains('╭') && !all.contains('╰'),
-            "borderless band: {all}"
-        );
-        for row in collapsed.iter().filter(|r| !r.spans.is_empty()) {
-            assert_eq!(row.width(), 60, "{:?}", text_of(row));
-        }
+        assert_eq!(text_of(&collapsed[2]), "│ l1");
+        assert_eq!(text_of(&collapsed[5]), "│ ⋯ +2 more");
+        assert!(!all.contains('▾'), "collapsed: no open cue: {all}");
 
-        // open: head + every line
+        // open: head + every line, and the more row and count are gone
         let open = super::render_line(&thought, 60, true);
-        assert_eq!(
-            open.len(),
-            10,
-            "blank + tint + head + 5 lines + tint + blank: {open:?}"
-        );
+        assert_eq!(open.len(), 8, "blank + head + 5 lines + blank: {open:?}");
         let text: String = open.iter().map(text_of).collect();
         assert!(text.contains("l1") && text.contains("l5"), "{text}");
-        assert!(text.contains('▾'), "open fold marker: {text}");
-        for row in open.iter().filter(|r| !r.spans.is_empty()) {
-            assert_eq!(row.width(), 60, "{:?}", text_of(row));
-        }
+        assert!(text_of(&open[1]).ends_with('▾'), "open fold marker: {text}");
+        assert!(!text.contains("more"), "{text}");
+        assert!(!text.contains("lines"), "no count when open: {text}");
 
         // single-line thoughts: head without chevron or count + the
         // one body row — nothing to fold is visible at a glance
         let one = super::render_line(&Line::Thought("just one".into()), 60, false);
+        assert_eq!(one.len(), 4, "blank + head + the line + blank");
         assert_eq!(
-            one.len(),
-            6,
-            "blank + tint + head + the line + tint + blank"
+            text_of(&one[1]),
+            format!("{} Thinking", crate::icons::THOUGHT),
+            "no fold cue, no count"
         );
-        let one_head = text_of(&one[2]);
-        assert!(
-            !one_head.contains('▾') && !one_head.contains('▸') && !one_head.contains("lines"),
-            "no fold cue, no count: {one_head}"
-        );
-        assert!(one_head.contains(crate::icons::THOUGHT), "{one_head}");
-        assert!(text_of(&one[3]).contains("just one"));
+        assert_eq!(text_of(&one[2]), "│ just one");
 
         // the toggle rebuilds the cache: row counts follow the flag
         let mut t = Transcript::default();
         t.set_width(60);
         t.push(thought);
-        assert_eq!(t.total_rows(), 8, "collapsed band + its spacers");
+        assert_eq!(t.total_rows(), 7, "collapsed band + more row + spacers");
         t.set_thoughts_open(true);
-        assert_eq!(t.total_rows(), 10, "expanded after the toggle");
+        assert_eq!(t.total_rows(), 8, "expanded after the toggle");
         t.set_thoughts_open(false);
-        assert_eq!(t.total_rows(), 8, "collapsed again");
+        assert_eq!(t.total_rows(), 7, "collapsed again");
     }
 
     #[test]
-    fn thought_box_carries_single_icon() {
-        // one 🧠 per block: the icon rides the head only; body rows
-        // carry no gutter icon, and every body cell sits on the tint
+    fn thought_block_rails_its_body_on_the_canvas() {
+        // one ✻ per block: the glyph rides the head only; body rows are
+        // `│ ` rails (RULE) + THOUGHT prose, and nothing carries a fill
         let open = super::render_line(&Line::Thought("l1\nl2\nl3\nl4\nl5".into()), 60, true);
         let icon_rows = open
             .iter()
@@ -15894,38 +17167,72 @@ mod tests {
                     .any(|s| s.content.contains(crate::icons::THOUGHT))
             })
             .count();
-        assert_eq!(icon_rows, 1, "exactly one 🧠 row (the head)");
-        for l in open.iter().skip(3).take(open.len() - 5) {
-            for s in &l.spans {
-                assert!(
-                    !s.content.contains(crate::icons::THOUGHT),
-                    "body rows carry no icon: {}",
-                    s.content
-                );
-            }
+        assert_eq!(icon_rows, 1, "exactly one ✻ row (the head)");
+        assert_eq!(open[1].spans[0].style.fg, Some(crate::palette::THINK));
+        for l in &open[2..open.len() - 1] {
+            assert_eq!(l.spans[0].content.as_ref(), "│ ");
+            assert_eq!(l.spans[0].style.fg, Some(crate::palette::RULE));
+            assert_eq!(l.spans[1].style, crate::palette::THOUGHT);
         }
-        for l in &open[1..open.len() - 1] {
+        for l in &open {
             assert!(
-                l.spans
-                    .iter()
-                    .all(|s| s.style.bg == Some(crate::palette::BG_THINK_TINT)),
-                "body cells sit on the pink tint"
+                l.spans.iter().all(|s| s.style.bg.is_none()),
+                "no tint: {l:?}"
             );
         }
-        // collapsed keeps the single icon too
-        let collapsed = super::render_line(&Line::Thought("l1\nl2\nl3\nl4\nl5".into()), 60, false);
-        let icon_rows = collapsed
-            .iter()
-            .filter(|l| {
-                l.spans
-                    .iter()
-                    .any(|s| s.content.contains(crate::icons::THOUGHT))
-            })
-            .count();
-        assert_eq!(icon_rows, 1, "collapsed band keeps one 🧠");
+        // long lines wrap at W-2 under the rail
+        let long = super::render_line(&Line::Thought("word ".repeat(30)), 40, true);
+        assert!(long.len() > 4, "{long:?}");
+        for l in &long[2..long.len() - 1] {
+            assert_eq!(l.spans[0].content.as_ref(), "│ ");
+            assert!(l.width() <= 40, "{l:?}");
+        }
     }
+
+    /// A call that produced nothing readable is its header alone: no
+    /// thread, no empty interior.
     #[test]
-    fn tool_card_verdict_rows_fill_and_tint_by_state() {
+    fn empty_output_calls_render_one_header_row() {
+        let text_of = |l: &ratatui::text::Line| -> String {
+            l.spans.iter().map(|s| s.content.to_string()).collect()
+        };
+        let out = super::render_line(&Line::ToolBlock(vec![no_note_call()]), 40, false);
+        assert_eq!(out.len(), 1, "the header alone: {out:?}");
+        assert!(text_of(&out[0]).starts_with('✓'), "{out:?}");
+        // the shape in the wild: a failed call that produced nothing
+        // (blocked/refused)
+        let refused = ToolCall {
+            ok: false,
+            ..no_note_call()
+        };
+        let out = super::render_line(&Line::ToolBlock(vec![refused]), 44, false);
+        assert_eq!(out.len(), 1, "failed, nothing to say: {out:?}");
+        assert!(
+            text_of(&out[0]).starts_with('✗'),
+            "status leads the row: {out:?}"
+        );
+        // the height authority (click mapping rides it) agrees
+        assert_eq!(super::tool_card_height(&no_note_call(), 40), 1);
+        // expanded output still opens the body, note or not
+        let with_output = ToolCall {
+            excerpt: "one\ntwo".into(),
+            expanded: true,
+            ..no_note_call()
+        };
+        assert_eq!(
+            super::tool_card_height(&with_output, 40),
+            3,
+            "header + two output rows"
+        );
+        assert_eq!(
+            super::render_line(&Line::ToolBlock(vec![with_output]), 40, false).len(),
+            3,
+            "rendered rows match the height authority"
+        );
+    }
+
+    #[test]
+    fn tool_header_styles_and_state_panel() {
         use unicode_width::UnicodeWidthStr;
         let call = ToolCall {
             head: "→ bash · cargo build".into(),
@@ -15937,55 +17244,52 @@ mod tests {
             expanded: false,
         };
         let out = super::render_line(&Line::ToolBlock(vec![call]), 40, false);
-        assert_eq!(out.len(), 3, "one collapsed card: top + note + bottom");
+        assert_eq!(out.len(), 2, "collapsed call: header + note");
         let text_of = |l: &ratatui::text::Line| -> String {
             l.spans.iter().map(|s| s.content.to_string()).collect()
         };
         let top = &out[0];
         let text = text_of(top);
-        // icon + fold chevron + tool left, duration + verdict right,
-        // exact fill
-        assert!(text.starts_with("╭─ 🐚 bash ▸ · cargo build"), "{text:?}");
-        assert!(text.ends_with("✓ ─╮"), "{text:?}");
-        assert_eq!(text.width(), 40, "the top border fills exactly the width");
-        // the verdict is OK-colored; the duration right before it is
-        // faint; the border suffix ` ─╮` closes the row
-        assert_eq!(top.spans.last().unwrap().content.as_ref(), " ─╮");
-        let verdict = &top.spans[top.spans.len() - 2];
-        assert_eq!(verdict.content.as_ref(), "✓");
-        assert_eq!(verdict.style.fg, Some(crate::palette::OK));
-        let dur = &top.spans[top.spans.len() - 3];
-        assert_eq!(dur.content.as_ref(), "1.2s ");
+        // status, icon + tool, detail, chevron left; duration right
+        assert!(text.starts_with("✓ $ bash  cargo build ▸"), "{text:?}");
+        assert!(text.ends_with("1.2s"), "{text:?}");
+        assert_eq!(text.width(), 40, "the cluster rides the right edge");
+        assert_eq!(top.spans[0].style.fg, Some(crate::palette::OK));
+        assert_eq!(top.spans[2].style.fg, Some(crate::palette::TOOL));
+        assert_eq!(top.spans[4].content.as_ref(), "bash");
+        assert!(
+            top.spans[4]
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
+        assert_eq!(top.spans[6].style.fg, Some(crate::palette::INK_DIM));
+        let dur = top.spans.last().unwrap();
+        assert_eq!(dur.content.as_ref(), "1.2s");
         assert_eq!(dur.style.fg, Some(crate::palette::FAINT));
-        // head text stays the tool tier; the ok card tints sage
-        assert_eq!(top.spans[1].style.fg, Some(crate::palette::TOOL));
-        for row in &out {
-            assert_eq!(text_of(row).width(), 40, "fills the width: {row:?}");
-            assert!(
-                row.spans
-                    .iter()
-                    .all(|s| s.style.bg == Some(crate::palette::BG_OK_TINT)),
-                "ok card tints sage: {row:?}"
-            );
-        }
-        assert!(text_of(&out[1]).starts_with("│ done"), "{out:?}");
-        // a failed call flips the verdict to the red ✗ on the coral tint
+        assert!(
+            top.spans.iter().all(|s| s.style.bg.is_none()),
+            "no header tint: {top:?}"
+        );
+        assert_eq!(text_of(&out[1]), "╰ done");
+        // a failed call flips the status to the red ✗ and its output
+        // panel to the error tint
         let fail = ToolCall {
             ok: false,
+            excerpt: "boom".into(),
+            expanded: true,
             ..no_note_call()
         };
         let out = super::render_line(&Line::ToolBlock(vec![fail]), 20, false);
-        let verdict = &out[0].spans[out[0].spans.len() - 2];
-        assert_eq!(verdict.content.as_ref(), "✗");
-        assert_eq!(verdict.style.fg, Some(crate::palette::ERR));
-        for row in &out {
-            assert!(
-                row.spans
-                    .iter()
-                    .all(|s| s.style.bg == Some(crate::palette::BG_ERR_TINT)),
-                "failed card tints coral: {row:?}"
-            );
-        }
+        assert_eq!(out[0].spans[0].content.as_ref(), "✗");
+        assert_eq!(out[0].spans[0].style.fg, Some(crate::palette::ERR));
+        assert!(
+            out[1].spans[2..]
+                .iter()
+                .all(|s| s.style.bg == Some(crate::palette::BG_ERR_TINT)),
+            "failed output rides the error tint: {:?}",
+            out[1]
+        );
         // sub-tenth durations and replayed calls omit the duration
         let quiet = ToolCall {
             head: "→ x".into(),
@@ -15995,6 +17299,17 @@ mod tests {
         let out = super::render_line(&Line::ToolBlock(vec![quiet]), 20, false);
         let text = text_of(&out[0]);
         assert!(!text.contains("0.0s"), "{text:?}");
+        // a long detail truncates; the chevron survives at the edge
+        let long = ToolCall {
+            head: format!("→ read · {}", "src/".repeat(20)),
+            excerpt: "x".into(),
+            ..no_note_call()
+        };
+        let out = super::render_line(&Line::ToolBlock(vec![long]), 30, false);
+        let text = text_of(&out[0]);
+        assert!(text.width() <= 30, "{text:?}");
+        assert!(text.ends_with("… ▸"), "{text:?}");
+        assert_eq!(text.width(), 30, "{text:?}");
     }
 
     #[test]
@@ -16021,14 +17336,21 @@ mod tests {
             note: "(exit 1)".into(),
             ..no_note_call()
         };
-        let out = super::render_line(&Line::ToolBlock(vec![fail]), 44, false);
+        let out = super::render_line(&Line::ToolBlock(vec![fail.clone()]), 44, false);
         let text: String = out[0].spans.iter().map(|s| s.content.to_string()).collect();
-        assert!(text.contains("⏎ exit 1"), "{text:?}");
-        assert!(text.ends_with("✗ ─╮"), "{text:?}");
+        assert!(text.ends_with("⏎ exit 1"), "{text:?}");
         assert!(!text.contains("0.0s"), "replay-fast call: no duration");
-        // the exit note carries the error tier (… exit, verdict, ` ─╮`)
-        let exit_span = &out[0].spans[out[0].spans.len() - 3];
+        // the exit note carries the error tier
+        let exit_span = out[0].spans.last().unwrap();
         assert_eq!(exit_span.style.fg, Some(crate::palette::ERR));
+        // with a measured duration the cluster reads `⏎ exit N  {dur}`
+        let timed = ToolCall {
+            dur: Some(2.0),
+            ..fail
+        };
+        let out = super::render_line(&Line::ToolBlock(vec![timed]), 44, false);
+        let text: String = out[0].spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(text.ends_with("⏎ exit 1  2.0s"), "{text:?}");
         // a successful call never shows an exit note, even when its
         // note happens to carry one
         let ok = ToolCall {
@@ -16043,7 +17365,7 @@ mod tests {
     }
 
     #[test]
-    fn consecutive_cards_get_separator_rule() {
+    fn consecutive_calls_stack_without_rules() {
         let a = ToolCall {
             head: "→ read · lib.rs".into(),
             ..no_note_call()
@@ -16054,29 +17376,16 @@ mod tests {
             ..no_note_call()
         };
         let out = super::render_line(&Line::ToolBlock(vec![a, b]), 40, false);
-        assert_eq!(out.len(), 7, "two collapsed cards + the rule between");
+        assert_eq!(out.len(), 3, "1 (no note) + header + note, nothing between");
         let text_of = |l: &ratatui::text::Line| -> String {
             l.spans.iter().map(|s| s.content.to_string()).collect()
         };
+        assert!(text_of(&out[0]).starts_with("✓ ≡ read  lib.rs"), "{out:?}");
         assert!(
-            text_of(&out[0]).starts_with("╭─ 📖"),
-            "{:?}",
-            text_of(&out[0])
+            text_of(&out[1]).starts_with("✓ $ bash  cargo build"),
+            "call two follows directly: {out:?}"
         );
-        assert!(
-            text_of(&out[2]).starts_with("╰"),
-            "card one closes at row 2"
-        );
-        // the separator: a full-width quiet rule between the cards
-        let rule = text_of(&out[3]);
-        assert!(rule.chars().all(|c| c == '╌'), "rule row: {rule:?}");
-        assert_eq!(rule.chars().count(), 40, "rule fills the width");
-        assert_eq!(out[3].spans[0].style.fg, Some(crate::palette::BORDER));
-        assert!(
-            text_of(&out[4]).starts_with("╭─ 🐚"),
-            "card two opens after the rule"
-        );
-        assert!(text_of(&out[6]).starts_with("╰"), "card two closes");
+        assert_eq!(text_of(&out[2]), "╰ ok");
     }
 
     /// Every overlay speaks one dialect: rounded corners. Opens each
@@ -16139,7 +17448,6 @@ mod tests {
             Modal::Model(ModelPicker {
                 models: vec![],
                 vendor: None,
-                configured_only: false,
                 selected: 0,
                 filter: String::new(),
             }),
@@ -16178,7 +17486,7 @@ mod tests {
             Modal::Context { rows: vec![] },
             Modal::Tree {
                 items: vec![],
-                targets: vec![],
+                actions: vec![],
                 selected: 0,
             },
             Modal::Tasks {
@@ -16198,27 +17506,29 @@ mod tests {
             Modal::Skills { rows: vec![] },
             Modal::Info { rows: vec![] },
         ];
-        // every pinned title: icon prefix + literal (model picker is
-        // vendor-derived and stays unprefixed)
+        // every pinned title: monochrome icon prefix + literal (model
+        // picker is vendor-derived and stays unprefixed; the task views
+        // wear their tool glyph)
+        let tasks = crate::icons::tool_icon("tasks");
         let titles = vec![
-            "📜 sessions",
-            "❓ help",
-            "model",
-            "📡 providers",
-            "🔑 api key",
-            "💧 spills",
-            "🧾 prompts",
-            "⏪ rewind",
-            "💾 memory",
-            "📊 usage",
-            "🗺️ context",
-            "🌳 tree",
-            "🧵 tasks — ⏎ pages a task result",
-            "🧵 task t-1",
-            "🐛 debug sessions",
-            "📋 todos",
-            "⚡ skills · agents · mcp",
-            "💡 info",
+            modal_title("sessions"),
+            modal_title("help"),
+            "model".to_string(),
+            modal_title("providers"),
+            modal_title("api key"),
+            modal_title("spills"),
+            modal_title("prompts"),
+            modal_title("rewind"),
+            modal_title("memory"),
+            modal_title("usage"),
+            modal_title("context"),
+            modal_title("tree"),
+            format!("{tasks} tasks"),
+            format!("{tasks} task t-1"),
+            format!("{} debug sessions", crate::icons::tool_icon("debug")),
+            modal_title("todos"),
+            modal_title("skills · agents · mcp"),
+            modal_title("info"),
         ];
         assert_eq!(modals.len(), titles.len(), "title pin per modal");
         for (m, want) in modals.into_iter().zip(titles) {
@@ -16234,7 +17544,7 @@ mod tests {
             let text: String = buf.content.iter().map(|c| c.symbol().to_string()).collect();
             let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
             assert!(
-                flat.contains(want),
+                flat.contains(want.as_str()),
                 "{m:?} title must read `{want}`: {flat}"
             );
             // every modal frame carries the ✕ close chip (the
@@ -16247,132 +17557,27 @@ mod tests {
     }
 
     #[test]
-    fn title_row_shows_session_title() {
-        use ratatui::backend::TestBackend;
-        let frame_title = |sidebar: &SidebarState| -> String {
-            let mut terminal = ratatui::Terminal::new(TestBackend::new(120, 40)).unwrap();
-            terminal
-                .draw(|f| {
-                    let mut t = Transcript::default();
-                    super::render(
-                        f,
-                        &mut t,
-                        None,
-                        "",
-                        0,
-                        false,
-                        None,
-                        Instant::now(),
-                        0,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        &Meters::default(),
-                        sidebar,
-                        true,
-                        true,
-                        "◆",
-                        &std::cell::Cell::new(None::<StripZones>),
-                        None,
-                        &std::cell::Cell::new(None::<TitleArrows>),
-                        &std::cell::Cell::new(None::<ratatui::layout::Rect>),
-                        &std::cell::Cell::new(None::<ratatui::layout::Rect>),
-                        &std::cell::Cell::new(None::<(ratatui::layout::Rect, usize)>),
-                        &std::cell::Cell::new(
-                            None::<(ratatui::layout::Rect, usize, usize, usize, usize)>,
-                        ),
-                        &std::cell::Cell::new(0u16),
-                        None,
-                        None,
-                    )
-                })
-                .unwrap();
-            (1..100u16)
-                .map(|x| terminal.backend().buffer()[(x, 1)].symbol())
-                .collect()
+    fn header_bar_shows_brand_title_and_place() {
+        let mut sidebar = SidebarState {
+            cwd: "~/src/ka".into(),
+            branch: Some("main".into()),
+            ..Default::default()
         };
-        let mut sidebar = SidebarState::default();
-        assert!(
-            frame_title(&sidebar).contains('◆'),
-            "bare glyph with no title"
-        );
+        let header = |sidebar: &SidebarState, w: u16| -> String {
+            let f = plain_frame(&mut Transcript::default(), (w, 24), "", sidebar, None, None);
+            buf_row(f.terminal.backend().buffer(), 0)
+        };
+        let row = header(&sidebar, 120);
+        assert!(row.contains("◆ ka"), "brand glyph + name: {row}");
+        assert!(row.contains("new session"), "untitled placeholder: {row}");
         sidebar.title = Some("refactor the login flow".into());
-        let row = frame_title(&sidebar);
-        assert!(row.contains("◆ refactor the login flow"), "{row}");
-    }
-
-    #[test]
-    fn strip_buttons_bright_label_faint_key() {
-        use ratatui::backend::TestBackend;
-        let mut terminal = ratatui::Terminal::new(TestBackend::new(120, 40)).unwrap();
-        terminal
-            .draw(|f| {
-                let mut t = Transcript::default();
-                super::render(
-                    f,
-                    &mut t,
-                    None,
-                    "",
-                    0,
-                    false,
-                    None,
-                    Instant::now(),
-                    0,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    &Meters::default(),
-                    &SidebarState::default(),
-                    true,
-                    true,
-                    "◆",
-                    &std::cell::Cell::new(None::<StripZones>),
-                    None,
-                    &std::cell::Cell::new(None::<TitleArrows>),
-                    &std::cell::Cell::new(None::<ratatui::layout::Rect>),
-                    &std::cell::Cell::new(None::<ratatui::layout::Rect>),
-                    &std::cell::Cell::new(None::<(ratatui::layout::Rect, usize)>),
-                    &std::cell::Cell::new(
-                        None::<(ratatui::layout::Rect, usize, usize, usize, usize)>,
-                    ),
-                    &std::cell::Cell::new(0u16),
-                    None,
-                    None,
-                )
-            })
-            .unwrap();
-        let buf = terminal.backend().buffer();
-        // widen the slice: emoji buttons push the row well past 30 cols
-        let strip: String = (0..60u16).map(|x| buf[(x, 38)].symbol()).collect();
-        assert!(strip.contains("todos"), "{strip}");
-        // each button leads with its glyph
-        assert!(strip.contains(crate::icons::STRIP_TODOS), "{strip}");
-        assert!(strip.contains(crate::icons::STRIP_SKILLS), "{strip}");
-        assert!(strip.contains(crate::icons::STRIP_INFO), "{strip}");
-        // locate the label vs its key hint, compare fg tones. `find`
-        // yields byte offsets and the emoji is 4 bytes — map to cell
-        // coordinates (one symbol per cell) before indexing the buffer.
-        let cell_of = |needle: &str| {
-            let byte = strip.find(needle).expect("needle in strip");
-            strip[..byte].chars().count() as u16
-        };
-        let todos_x = cell_of("t");
-        let alt_x = cell_of("alt");
-        let sep_x = cell_of("│");
-        let label_fg = buf[(todos_x, 38)].fg;
-        let hint_fg = buf[(alt_x, 38)].fg;
-        assert_eq!(label_fg, crate::palette::FG_STRONG);
-        assert_eq!(hint_fg, crate::palette::FAINT);
-        // the separator rides the quiet border tone
-        assert_eq!(buf[(sep_x, 38)].fg, crate::palette::BORDER_QUIET);
+        let row = header(&sidebar, 120);
+        assert!(row.contains("› refactor the login flow"), "{row}");
+        assert!(row.contains("main"), "the place rides the right: {row}");
+        // narrow: the place drops before the title truncates
+        let row = header(&sidebar, 40);
+        assert!(!row.contains("main"), "{row}");
+        assert!(row.contains("refactor the login flow"), "{row}");
     }
 
     #[test]
@@ -16533,95 +17738,6 @@ mod tests {
     }
 
     #[test]
-    fn frame_has_top_margin_glyph_title_and_rounded_input() {
-        use ratatui::backend::TestBackend;
-        let mut terminal = ratatui::Terminal::new(TestBackend::new(120, 40)).unwrap();
-        terminal
-            .draw(|f| {
-                let mut t = Transcript::default();
-                super::render(
-                    f,
-                    &mut t,
-                    None,
-                    "",
-                    0,
-                    false,
-                    None,
-                    Instant::now(),
-                    0,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    &Meters::default(),
-                    &SidebarState::default(),
-                    true,
-                    true,
-                    "◆",
-                    &std::cell::Cell::new(None::<StripZones>),
-                    None,
-                    &std::cell::Cell::new(None::<TitleArrows>),
-                    &std::cell::Cell::new(None::<ratatui::layout::Rect>),
-                    &std::cell::Cell::new(None::<ratatui::layout::Rect>),
-                    &std::cell::Cell::new(None::<(ratatui::layout::Rect, usize)>),
-                    &std::cell::Cell::new(
-                        None::<(ratatui::layout::Rect, usize, usize, usize, usize)>,
-                    ),
-                    &std::cell::Cell::new(0u16),
-                    None,
-                    None,
-                )
-            })
-            .unwrap();
-        let buf = terminal.backend().buffer();
-        // (a) the first UI row is empty canvas
-        for x in 0..120u16 {
-            let cell = &buf[(x, 0)];
-            assert_eq!(cell.symbol(), " ", "row 0 col {x} must be blank");
-            assert_eq!(cell.bg, crate::palette::BG, "row 0 rides the canvas");
-        }
-        // the transcript title row carries the header glyph (◆ default)
-        let title_row: String = (1..93u16).map(|x| buf[(x, 1)].symbol()).collect();
-        assert!(title_row.contains('◆'), "glyph title: {title_row}");
-        // the top border is the dim-gold horizon line, not the quiet violet
-        assert_eq!(buf[(110, 1)].symbol(), "─");
-        assert_eq!(buf[(110, 1)].fg, crate::palette::BORDER_HORIZON);
-        // one blank row of air separates the horizon border from the
-        // transcript content, which begins on row 3
-        for x in 0..120u16 {
-            let cell = &buf[(x, 2)];
-            assert_eq!(cell.symbol(), " ", "row 2 col {x} must be blank");
-            assert_eq!(cell.bg, crate::palette::BG, "row 2 rides the canvas");
-        }
-        let content_head: String = (1..118u16).map(|x| buf[(x, 3)].symbol()).collect();
-        assert!(
-            !content_head.trim().is_empty(),
-            "content starts one row under the blank row: {content_head:?}"
-        );
-        // the chat owns the full width (no sidebar column): the title
-        // row runs to the right margin
-        let tx_end: String = (110..119u16).map(|x| buf[(x, 1)].symbol()).collect();
-        assert!(tx_end.contains('─') || tx_end.contains('◆'), "{tx_end}");
-        // the input box closes with rounded corners (rows 35..38)
-        assert_eq!(buf[(1, 35)].symbol(), "╭");
-        assert_eq!(buf[(118, 35)].symbol(), "╮");
-        assert_eq!(buf[(1, 37)].symbol(), "╰");
-        assert_eq!(buf[(118, 37)].symbol(), "╯");
-        // the strip row carries the popup buttons
-        let strip: String = (0..120u16).map(|x| buf[(x, 38)].symbol()).collect();
-        assert!(
-            strip.contains("todos") && strip.contains("skills") && strip.contains("info"),
-            "{strip}"
-        );
-        // the status bar still owns the last row (no bottom margin)
-        let last_row: String = (0..120u16).map(|x| buf[(x, 39)].symbol()).collect();
-        assert!(last_row.contains("enter"), "status hints on the last row");
-    }
-
-    #[test]
     fn empty_idle_transcript_shows_the_welcome() {
         use ratatui::backend::TestBackend;
         let frame_text = |transcript: &mut Transcript, busy: bool, fresh: bool| -> String {
@@ -16675,7 +17791,8 @@ mod tests {
         };
         let frame = frame_text(&mut Transcript::default(), false, true);
         assert!(frame.contains("new conversation"), "welcome on fresh chat");
-        assert!(frame.contains("/help keys"), "hint row present");
+        assert!(frame.contains("██╗"), "the big logo at 120x40");
+        assert!(frame.contains("keys & commands"), "tips grid present");
         // busy, carrying entries, or an older chat still replaying: the
         // welcome steps aside
         assert!(
@@ -16699,9 +17816,7 @@ mod tests {
     fn idle_hints_teach_the_active_mouse_mode() {
         use ratatui::backend::TestBackend;
         let draw = |captured: bool| -> String {
-            // the info section renders `cwd:branch`; with a default
-            // (empty) SidebarState every section is skipped, so seed the
-            // cwd to make the sidebar visible at all
+            // seed the place so the header bar renders `cwd ⎇ branch`
             let sidebar = SidebarState {
                 cwd: "/tmp/ka".to_string(),
                 branch: Some("main".to_string()),
@@ -16778,9 +17893,9 @@ mod tests {
             !native.contains("⇧drag"),
             "no shift bypass advertised without capture"
         );
-        // the bottom strip renders in both modes; `cwd 🌿 branch` rides
-        // the right side (seeded on the state above). Wide glyphs leave
-        // a gap cell in the buffer, so compare whitespace-collapsed text.
+        // the composer's strip buttons render in both modes; `cwd ⎇
+        // branch` rides the header bar's right side. Compare
+        // whitespace-collapsed text.
         let flat = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(
             native.contains("todos alt+o")
@@ -16790,7 +17905,7 @@ mod tests {
         );
         assert!(
             flat(&native).contains(&format!("/tmp/ka {} main", crate::icons::BRANCH)),
-            "strip carries cwd 🌿 branch: {native}"
+            "header carries cwd ⎇ branch: {native}"
         );
         assert!(
             draw(true).contains("todos alt+o"),
@@ -16908,67 +18023,39 @@ mod tests {
 
     #[test]
     fn title_arrows_render_and_record_click_zones() {
-        use ratatui::backend::TestBackend;
         let mut t = Transcript::default();
-        t.set_width(80);
         t.push(Line::User("hello".into()));
-        let mut terminal = ratatui::Terminal::new(TestBackend::new(120, 40)).unwrap();
-        let strip_zone: std::cell::Cell<Option<StripZones>> = std::cell::Cell::new(None);
-        let title_arrows: std::cell::Cell<Option<TitleArrows>> = std::cell::Cell::new(None);
-        terminal
-            .draw(|f| {
-                super::render(
-                    f,
-                    &mut t,
-                    None,
-                    "",
-                    0,
-                    false,
-                    None,
-                    Instant::now(),
-                    0,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    &Meters::default(),
-                    &SidebarState::default(),
-                    true,
-                    true,
-                    "◆",
-                    &strip_zone,
-                    None,
-                    &title_arrows,
-                    &std::cell::Cell::new(None::<ratatui::layout::Rect>),
-                    &std::cell::Cell::new(None::<ratatui::layout::Rect>),
-                    &std::cell::Cell::new(None::<(ratatui::layout::Rect, usize)>),
-                    &std::cell::Cell::new(
-                        None::<(ratatui::layout::Rect, usize, usize, usize, usize)>,
-                    ),
-                    &std::cell::Cell::new(0u16),
-                    None,
-                    None,
-                )
-            })
-            .unwrap();
-        let row: String = (0..120u16)
-            .map(|x| terminal.backend().buffer()[(x, 1)].symbol())
-            .collect();
-        assert!(row.contains('▲') && row.contains('▼'), "{row}");
-        assert!(title_arrows.get().is_some(), "click zones recorded");
+        let f = plain_frame(&mut t, (120, 40), "", &SidebarState::default(), None, None);
+        let buf = f.terminal.backend().buffer();
+        let arrows = f.arrows.expect("click zones recorded");
+        // the header bar's right end: each zone covers ` ▲` / ` ▼`
+        assert_eq!((arrows.up.y, arrows.down.y), (0, 0));
+        assert_eq!(buf[(arrows.up.x + 1, 0)].symbol(), "▲");
+        assert_eq!(buf[(arrows.down.x + 1, 0)].symbol(), "▼");
+        assert_eq!(buf[(arrows.up.x + 1, 0)].fg, crate::palette::ACCENT);
+        assert!(arrows.down.right() < 120, "a col of air closes the bar");
+        assert_eq!(arrows.hit(arrows.up.x + 1, 0), Some(true));
+        assert_eq!(arrows.hit(arrows.down.x + 1, 0), Some(false));
+        // no user message yet: no arrows, no zones
+        let f = plain_frame(
+            &mut Transcript::default(),
+            (120, 40),
+            "",
+            &SidebarState::default(),
+            None,
+            None,
+        );
+        assert!(f.arrows.is_none());
+        assert!(!buf_row(f.terminal.backend().buffer(), 0).contains('▲'));
     }
 
     #[test]
-    fn live_band_stays_inside_the_transcript_across_resizes() {
+    fn live_region_stays_inside_the_transcript_across_resizes() {
         use ratatui::backend::TestBackend;
         // a cached tool row plus a live block streaming wide chars and a
-        // 200-col token, while the terminal drags across the sidebar
-        // threshold: the band must fold at each frame's own width (no
-        // wrap-driven row drift, no band/surface bg outside the
-        // transcript pane)
+        // 200-col token, while the terminal width drags: the live region
+        // folds at each frame's own width and no transcript surface
+        // bleeds into the header, composer, or status line
         let mut t = Transcript::default();
         t.push_tool_call(ToolCall {
             head: "→ bash · cargo build".into(),
@@ -16988,9 +18075,15 @@ mod tests {
             }),
             md: crate::markdown::render("# heading\ntext", 60),
         };
+        let surfaces = [
+            crate::palette::BG_TOOL,
+            crate::palette::BG_CODE,
+            crate::palette::BG_USER,
+            crate::palette::BG_ERR_TINT,
+        ];
         for width in [99u16, 100, 101] {
             let mut terminal = ratatui::Terminal::new(TestBackend::new(width, 24)).unwrap();
-            let sb_zone = std::cell::Cell::new(None::<StripZones>);
+            let tx_width = std::cell::Cell::new(0u16);
             terminal
                 .draw(|f| {
                     super::render(
@@ -17015,7 +18108,7 @@ mod tests {
                         false,
                         true,
                         "◆",
-                        &sb_zone,
+                        &std::cell::Cell::new(None::<StripZones>),
                         None,
                         &std::cell::Cell::new(None::<TitleArrows>),
                         &std::cell::Cell::new(None::<ratatui::layout::Rect>),
@@ -17024,43 +18117,21 @@ mod tests {
                         &std::cell::Cell::new(
                             None::<(ratatui::layout::Rect, usize, usize, usize, usize)>,
                         ),
-                        &std::cell::Cell::new(0u16),
+                        &tx_width,
                         None,
                         None,
                     )
                 })
                 .unwrap();
+            assert_eq!(tx_width.get(), transcript_width(width), "w{width}");
             let buf = terminal.backend().buffer();
             let area = buf.area;
-            // the live card owns BG_TOOL now: top border + its preview
-            // rows + bottom border (the cached cards tint by state)
-            let band_rows = (0..area.height)
-                .filter(|&y| (0..area.width).any(|x| buf[(x, y)].bg == crate::palette::BG_TOOL))
-                .count();
-            assert_eq!(
-                band_rows,
-                2 + live
-                    .live_tool
-                    .as_ref()
-                    .map(|lt| lt.preview.len().min(super::PREVIEW_WINDOW))
-                    .unwrap_or(0),
-                "band rows at width {width}"
-            );
-            // nothing band- or output-colored bleeds past the input box's
-            // top edge (the strip and status rows stay chrome-clean)
-            for y in (area.height - 2)..area.height {
+            // header (row 0) + composer (3 rows) + status line (last row)
+            let chrome = std::iter::once(0).chain((area.height - 4)..area.height);
+            for y in chrome {
                 for x in 0..area.width {
-                    let cell = &buf[(x, y)];
-                    assert_ne!(
-                        cell.bg,
-                        crate::palette::BG_TOOL,
-                        "tool bleed at {x},{y} w{width}"
-                    );
-                    assert_ne!(
-                        cell.bg,
-                        crate::palette::BG_OUTPUT,
-                        "output bleed at {x},{y} w{width}"
-                    );
+                    let bg = buf[(x, y)].bg;
+                    assert!(!surfaces.contains(&bg), "surface bleed at {x},{y} w{width}");
                 }
             }
         }
@@ -17374,8 +18445,9 @@ mod tests {
     }
 
     /// A drag only becomes a selection past the click tolerance; the
-    /// anchor is the press row, the head clamps to the pane edges, and
-    /// upward drags order the span.
+    /// anchor is the press cell, the head clamps to the pane edges, the
+    /// pair comes back in reading order, and columns are relative to
+    /// the content area, clamped into it.
     #[test]
     fn drag_span_needs_motion_clamps_and_orders() {
         let area = ratatui::layout::Rect {
@@ -17387,16 +18459,71 @@ mod tests {
         // unmoved / one-cell jitter: still a click
         assert_eq!(drag_span(area, 0, (10, 5), (10, 5)), None);
         assert_eq!(drag_span(area, 0, (10, 5), (11, 5)), None);
-        // two cells down from screen row 5 (start row 2): rows 2..=4
-        assert_eq!(drag_span(area, 0, (10, 5), (12, 7)), Some((2, 4)));
-        // upward drag orders the span around the anchor
-        assert_eq!(drag_span(area, 0, (10, 7), (12, 5)), Some((2, 4)));
+        // two cells down from screen row 5 (start row 2): rows 2..=4,
+        // columns measured from the area's left edge (x = 1)
+        assert_eq!(
+            drag_span(area, 0, (10, 5), (12, 7)),
+            Some(((2, 9), (4, 11)))
+        );
+        // upward drag orders the pair around the anchor (reading order)
+        assert_eq!(
+            drag_span(area, 0, (10, 7), (12, 5)),
+            Some(((2, 11), (4, 9)))
+        );
+        // same row dragged left: the columns order, the row is shared
+        assert_eq!(
+            drag_span(area, 0, (30, 5), (10, 5)),
+            Some(((2, 9), (2, 29)))
+        );
         // a press outside the transcript never selects
         assert_eq!(drag_span(area, 0, (0, 0), (30, 6)), None);
-        // dragging above the pane clamps the head to the first visible
-        // row; below, to the last
-        assert_eq!(drag_span(area, 7, (10, 5), (10, 0)), Some((7, 9)));
-        assert_eq!(drag_span(area, 7, (10, 5), (40, 30)), Some((9, 11)));
+        // dragging above/below clamps the head row; past either side
+        // clamps its column
+        assert_eq!(drag_span(area, 7, (10, 5), (10, 0)), Some(((7, 9), (9, 9))));
+        assert_eq!(
+            drag_span(area, 7, (10, 5), (40, 30)),
+            Some(((9, 9), (11, 39)))
+        );
+        assert_eq!(
+            drag_span(area, 0, (10, 5), (500, 5)),
+            Some(((2, 9), (2, 49)))
+        );
+        assert_eq!(drag_span(area, 0, (10, 5), (0, 5)), Some(((2, 0), (2, 9))));
+    }
+
+    /// Column slicing is display-width aware: wide glyphs count their
+    /// full width and stay whole, combining marks ride their base.
+    #[test]
+    fn slice_cols_counts_display_width() {
+        assert_eq!(super::slice_cols("hello world", 0, 4), "hello");
+        assert_eq!(super::slice_cols("hello world", 6, 10), "world");
+        assert_eq!(super::slice_cols("hello", 3, 99), "lo");
+        assert_eq!(super::slice_cols("hello", 0, usize::MAX), "hello");
+        // 世 and 界 are two columns each
+        assert_eq!(super::slice_cols("世界!", 0, 1), "世");
+        assert_eq!(super::slice_cols("世界!", 2, 3), "界");
+        // e + combining acute: the mark follows its base's decision
+        assert_eq!(super::slice_cols("e\u{301}x", 0, 0), "e\u{301}");
+        assert_eq!(super::slice_cols("e\u{301}x", 1, 1), "x");
+    }
+
+    /// A selection copies the picked columns of every row it spans,
+    /// joining them with newlines and dropping trailing blanks.
+    #[test]
+    fn selection_text_slices_rows_and_trims() {
+        let mut t = Transcript::default();
+        t.set_width(40);
+        t.push(Line::Shell("alpha beta".into()));
+        t.push(Line::Shell("gamma delta".into()));
+        // full rows: the whole text, no padding
+        assert_eq!(
+            super::selection_text(&t, ((0, 0), (1, 39))),
+            "alpha beta\ngamma delta"
+        );
+        // a column range slices every row it spans
+        assert_eq!(super::selection_text(&t, ((0, 6), (1, 4))), "beta\ngamma");
+        // a range past the end of a single row is empty
+        assert_eq!(super::selection_text(&t, ((0, 11), (0, 30))), "");
     }
 
     /// `row_text` returns the rendered row's spans concatenated — the
@@ -17420,63 +18547,64 @@ mod tests {
     #[test]
     fn selection_highlights_picked_rows_while_active() {
         use ratatui::backend::TestBackend;
-        let draw = |sel: Option<(usize, usize)>| -> Vec<ratatui::style::Color> {
-            let mut t = Transcript::default();
-            t.set_width(80);
-            t.push(Line::User("first".into()));
-            t.push(Line::Assistant("second".into()));
-            let mut terminal = ratatui::Terminal::new(TestBackend::new(100, 30)).unwrap();
-            terminal
-                .draw(|f| {
-                    super::render(
-                        f,
-                        &mut t,
-                        None,
-                        "",
-                        0,
-                        false,
-                        None,
-                        Instant::now(),
-                        0,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        &Meters::default(),
-                        &SidebarState::default(),
-                        false,
-                        true,
-                        "◆",
-                        &std::cell::Cell::new(None::<StripZones>),
-                        None,
-                        &std::cell::Cell::new(None::<TitleArrows>),
-                        &std::cell::Cell::new(None::<ratatui::layout::Rect>),
-                        &std::cell::Cell::new(None::<ratatui::layout::Rect>),
-                        &std::cell::Cell::new(None::<(ratatui::layout::Rect, usize)>),
-                        &std::cell::Cell::new(
-                            None::<(ratatui::layout::Rect, usize, usize, usize, usize)>,
-                        ),
-                        &std::cell::Cell::new(0u16),
-                        sel,
-                        None,
-                    )
-                })
-                .unwrap();
-            // content starts at y=3 (title border 1, blank margin 2),
-            // x=1; sample one cell per content row
-            (3..12)
-                .map(|y| terminal.backend().buffer()[(5, y)].bg)
-                .collect()
-        };
-        let plain = draw(None);
+        let draw =
+            |sel: Option<((usize, u16), (usize, u16))>, x: u16| -> Vec<ratatui::style::Color> {
+                let mut t = Transcript::default();
+                t.set_width(80);
+                t.push(Line::User("first".into()));
+                t.push(Line::Assistant("second".into()));
+                let mut terminal = ratatui::Terminal::new(TestBackend::new(100, 30)).unwrap();
+                terminal
+                    .draw(|f| {
+                        super::render(
+                            f,
+                            &mut t,
+                            None,
+                            "",
+                            0,
+                            false,
+                            None,
+                            Instant::now(),
+                            0,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            &Meters::default(),
+                            &SidebarState::default(),
+                            false,
+                            true,
+                            "◆",
+                            &std::cell::Cell::new(None::<StripZones>),
+                            None,
+                            &std::cell::Cell::new(None::<TitleArrows>),
+                            &std::cell::Cell::new(None::<ratatui::layout::Rect>),
+                            &std::cell::Cell::new(None::<ratatui::layout::Rect>),
+                            &std::cell::Cell::new(None::<(ratatui::layout::Rect, usize)>),
+                            &std::cell::Cell::new(
+                                None::<(ratatui::layout::Rect, usize, usize, usize, usize)>,
+                            ),
+                            &std::cell::Cell::new(0u16),
+                            sel,
+                            None,
+                        )
+                    })
+                    .unwrap();
+                // content starts at y=2 (header bar 0, air 1), x=2;
+                // sample one cell per content row
+                (2..11)
+                    .map(|y| terminal.backend().buffer()[(x, y)].bg)
+                    .collect()
+            };
+        let plain = draw(None, 5);
         assert!(
             plain.iter().all(|bg| *bg != crate::palette::BG_SELECT),
             "no selection, no highlight: {plain:?}"
         );
-        let picked = draw(Some((0, 1)));
+        let picked = draw(Some(((0, 0), (1, 95))), 5);
         assert_eq!(picked[0], crate::palette::BG_SELECT, "row 0 highlighted");
         assert_eq!(picked[1], crate::palette::BG_SELECT, "row 1 highlighted");
         assert_ne!(
@@ -17484,13 +18612,30 @@ mod tests {
             crate::palette::BG_SELECT,
             "row 2 is outside the span"
         );
+        // a partial row highlights only its picked columns
+        assert_ne!(
+            draw(Some(((0, 10), (0, 20))), 5)[0],
+            crate::palette::BG_SELECT,
+            "left of the selection stays plain"
+        );
+        assert_eq!(
+            draw(Some(((0, 10), (0, 20))), 15)[0],
+            crate::palette::BG_SELECT,
+            "inside the selection is picked"
+        );
+        // only the drag's own rows are cut: a middle row paints edge to
+        // edge, so a column left of the anchor is still picked there
+        assert_eq!(
+            draw(Some(((0, 10), (2, 20))), 5)[1],
+            crate::palette::BG_SELECT,
+            "middle rows paint the full width"
+        );
     }
 
-    /// Expandable cards carry the thinking-block fold vocabulary on
-    /// their top border, left-aligned in the head like every other
-    /// block's marker: `🐚 bash ▸ · cmd` collapsed, `🐚 bash ▾ · cmd`
-    /// expanded. A call with nothing to reveal shows no chevron at
-    /// all — no dead indicator.
+    /// Expandable calls carry the thinking-block fold vocabulary in
+    /// their header, trailing the detail: `$ bash  cmd ▸` collapsed,
+    /// `$ bash  cmd ▾` expanded. A call with nothing to reveal shows
+    /// no chevron at all — no dead indicator.
     #[test]
     fn tool_card_chevron_tracks_expand_state() {
         let text_of = |l: &ratatui::text::Line| -> String {
@@ -17507,8 +18652,8 @@ mod tests {
         };
         let collapsed = super::render_line(&Line::ToolBlock(vec![expandable.clone()]), 40, false);
         assert!(
-            text_of(&collapsed[0]).contains("bash ▸ ·"),
-            "collapsed shows the left chevron: {:?}",
+            text_of(&collapsed[0]).ends_with("cargo build ▸"),
+            "collapsed shows the closed chevron after the detail: {:?}",
             text_of(&collapsed[0])
         );
         let expanded = super::render_line(
@@ -17520,12 +18665,12 @@ mod tests {
             false,
         );
         assert!(
-            text_of(&expanded[0]).contains("bash ▾ ·"),
+            text_of(&expanded[0]).ends_with("cargo build ▾"),
             "expanded shows the open chevron: {:?}",
             text_of(&expanded[0])
         );
         assert!(
-            !text_of(&expanded[0]).contains("bash ▸"),
+            !text_of(&expanded[0]).contains('▸'),
             "{:?}",
             text_of(&expanded[0])
         );
@@ -17987,37 +19132,190 @@ mod tests {
                 tokens: 0,
             },
         ];
-        let (rows, targets) = tree_modal_rows(&all, Some("root"), 60);
+        let no_records = |_: &str| vec![];
+        let history = vec!["first prompt".to_string(), "second prompt".to_string()];
+        let (rows, actions) = tree_modal_rows(&all, Some("root"), &history, 60, no_records);
         assert_eq!(
-            targets,
+            actions,
             vec![
-                "root".to_string(),
-                "kid".to_string(),
-                "grandkid".to_string()
+                TreeAction::Attach("root".to_string()),
+                TreeAction::Attach("kid".to_string()),
+                TreeAction::Attach("grandkid".to_string()),
+                TreeAction::Header,
+                TreeAction::Fork {
+                    turns: 2,
+                    prompt: "first prompt".to_string()
+                },
+                TreeAction::Fork {
+                    turns: 1,
+                    prompt: "second prompt".to_string()
+                },
             ]
         );
-        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.len(), 6);
         assert!(
             rows[0].starts_with("\u{25b8} "),
             "current is marked: {:?}",
             rows[0]
         );
-        assert!(rows[1].starts_with("  "), "child indented: {:?}", rows[1]);
         assert!(
-            rows[2].starts_with("    "),
-            "grandchild double-indented: {:?}",
+            rows[1].starts_with("└─ "),
+            "only child closes the branch: {:?}",
+            rows[1]
+        );
+        assert!(
+            rows[2].starts_with("   └─ "),
+            "grandchild nests one level in: {:?}",
             rows[2]
         );
+        assert!(rows[4].starts_with("⑂ "), "fork row marked: {:?}", rows[4]);
         assert!(!rows.iter().any(|r| r.contains("not family")));
-        // the walk is descendants-only: from the grandkid the closure is
-        // just itself (fork history stays out, matching the old build)
-        let (rows2, targets2) = tree_modal_rows(&all, Some("grandkid"), 60);
-        assert_eq!(targets2, vec!["grandkid".to_string()]);
-        assert!(rows2[0].starts_with("\u{25b8} "), "{:?}", rows2[0]);
-        // a strand with no family renders alone, unindented
-        let (rows3, targets3) = tree_modal_rows(&all, Some("unrelated"), 60);
-        assert_eq!(targets3, vec!["unrelated".to_string()]);
+
+        // from the grandkid the whole family stays reachable: the
+        // ancestor chain leads, the fork section still closes the list
+        let (rows2, actions2) = tree_modal_rows(&all, Some("grandkid"), &history, 60, no_records);
+        assert_eq!(actions2.len(), 6);
+        assert!(
+            !rows2[0].starts_with(' '),
+            "root unindented: {:?}",
+            rows2[0]
+        );
+        assert!(rows2[2].starts_with("   └─ \u{25b8} "), "{:?}", rows2[2]);
+
+        // a strand with no family renders alone, unindented; without
+        // user inputs there is no fork section at all
+        let (rows3, actions3) = tree_modal_rows(&all, Some("unrelated"), &[], 60, no_records);
+        assert_eq!(actions3, vec![TreeAction::Attach("unrelated".to_string())]);
         assert!(!rows3[0].starts_with(' '));
+    }
+
+    #[test]
+    fn tree_rows_label_fork_points_and_count_branches() {
+        let msg = |id: &str, role: ka_strand::Role, content: &str| ka_strand::Record::Message {
+            id: ka_protocol::RecordId(id.to_string()),
+            role,
+            content: content.to_string(),
+            calls: Vec::new(),
+            results: Vec::new(),
+            thinking: None,
+        };
+        let header = || ka_strand::Record::Header {
+            id: ka_protocol::StrandId("s".into()),
+            ts: String::new(),
+            cwd: String::new(),
+            version: 1,
+            repo: None,
+            parent: None,
+        };
+        // root: p1 answered, p2 answered; one child forked before p2,
+        // another is a full copy
+        let root = vec![
+            header(),
+            msg("r1", ka_strand::Role::User, "fix the parser"),
+            msg("r2", ka_strand::Role::Assistant, "done"),
+            msg("r3", ka_strand::Role::User, "second prompt"),
+            msg("r4", ka_strand::Role::Assistant, "ok"),
+        ];
+        let forked = vec![
+            header(),
+            msg("r1", ka_strand::Role::User, "fix the parser"),
+            msg("r2", ka_strand::Role::Assistant, "done"),
+        ];
+        let copied = root.clone();
+        let all = vec![
+            ka_strand::StrandSummary {
+                path: std::path::PathBuf::new(),
+                id: "root".into(),
+                ts: "2026-01-02T10:00:00Z".into(),
+                title: "the root".into(),
+                messages: 4,
+                cost: 0.0,
+                parent: None,
+                name: None,
+                tokens: 0,
+            },
+            ka_strand::StrandSummary {
+                path: std::path::PathBuf::new(),
+                id: "forked".into(),
+                ts: "2026-01-03T10:00:00Z".into(),
+                title: "fork at p2".into(),
+                messages: 2,
+                cost: 0.0,
+                parent: Some("root".into()),
+                name: None,
+                tokens: 0,
+            },
+            ka_strand::StrandSummary {
+                path: std::path::PathBuf::new(),
+                id: "copied".into(),
+                ts: "2026-01-04T10:00:00Z".into(),
+                title: "a copy".into(),
+                messages: 4,
+                cost: 0.0,
+                parent: Some("root".into()),
+                name: None,
+                tokens: 0,
+            },
+        ];
+        let records = |id: &str| match id {
+            "root" => root.clone(),
+            "forked" => forked.clone(),
+            "copied" => copied.clone(),
+            _ => vec![],
+        };
+        let history = vec!["fix the parser".to_string(), "second prompt".to_string()];
+        let (rows, _actions) = tree_modal_rows(&all, Some("root"), &history, 80, records);
+        // forked branched where "second prompt" was dropped; copied
+        // kept everything
+        assert!(
+            rows[1].contains("⑂ at \u{201c}second prompt\u{201d}"),
+            "fork edge carries its branch point: {:?}",
+            rows[1]
+        );
+        assert!(
+            rows[2].contains("⑂ copy"),
+            "full copy labeled: {:?}",
+            rows[2]
+        );
+        // the branch section counts the fork already growing at
+        // "second prompt" but leaves the untouched prompt plain
+        assert!(
+            rows[4].contains("fix the parser") && !rows[4].contains("↳"),
+            "no-branch prompt stays plain: {:?}",
+            rows[4]
+        );
+        assert!(
+            rows[5].contains("second prompt") && rows[5].contains("↳ 1 fork"),
+            "branch count rides the prompt: {:?}",
+            rows[5]
+        );
+    }
+
+    #[test]
+    fn tree_fork_depth_counts_from_the_newest_input() {
+        let history: Vec<String> = (1..=25).map(|n| format!("prompt {n}")).collect();
+        let (_rows, actions) = tree_modal_rows(&[], Some("s1"), &history, 60, |_: &str| vec![]);
+        let forks: Vec<&TreeAction> = actions
+            .iter()
+            .skip_while(|a| !matches!(a, TreeAction::Fork { .. }))
+            .collect();
+        assert_eq!(forks.len(), 25);
+        assert!(
+            matches!(
+                forks.first(),
+                Some(TreeAction::Fork { turns: 25, prompt }) if prompt == "prompt 1"
+            ),
+            "oldest input forks the whole history back: {:?}",
+            forks.first()
+        );
+        assert!(
+            matches!(
+                forks.last(),
+                Some(TreeAction::Fork { turns: 1, prompt }) if prompt == "prompt 25"
+            ),
+            "newest input forks one turn: {:?}",
+            forks.last()
+        );
     }
 
     #[test]
@@ -18144,7 +19442,7 @@ mod tests {
         let mut t = Transcript::default();
         t.set_width(60);
         t.push(Line::User("q".into()));
-        t.push(Line::Thought("a\nb\nc\nd".into()));
+        t.push(Line::Thought("a\nb\nc\nd\ne\nf".into()));
         t.push(Line::Thought("solo".into()));
         t.push(Line::Assistant("ans".into()));
         // collapsed by default: entry 1 renders 1 row, solo entry 2 = 1 row
@@ -18179,24 +19477,39 @@ mod tests {
         t.set_thoughts_open(true);
         let open_rows = t.rendered_rows_of(1);
         assert!(open_rows == after, "global open respects no overrides");
+
+        // a block at the collapsed height carries no fold at all —
+        // neither a chevron nor a click target (three lines used to
+        // show a chevron that did nothing)
+        t.push(Line::Thought("x\ny\nz".into()));
+        let three = t.entries().len() - 1;
+        assert!(!t.is_foldable(three), "3 lines fit the collapsed band");
+        let (first, count) = t.entry_row_span(three).unwrap();
+        let band: String = (first..first + count)
+            .filter_map(|r| t.row_text(r))
+            .collect();
+        assert!(!band.contains("lines"), "the head carries no count: {band}");
+        assert!(
+            !band.contains('▸') && !band.contains('▾'),
+            "no dead chevron and no more-below row: {band}"
+        );
+        let before = t.rendered_rows_of(three);
+        t.toggle_thought(three);
+        assert_eq!(t.rendered_rows_of(three), before, "toggle is a no-op");
     }
 
     #[test]
     fn streamed_thought_flushes_tail_then_settles_above_viewport() {
         let mut t = Transcript::default();
         t.set_width(60);
-        // the flush caches the live tail band: head + the last three
-        // lines, the same height as the collapsed band — no jump
+        // the flush caches the live tail band: spacer + head + the last
+        // three lines + spacer, row-for-row the live rows — no jump
         t.push_thought_streamed("l1\nl2\nl3\nl4\nl5".into());
-        assert_eq!(
-            t.rendered_rows_of(0),
-            8,
-            "blank + tint + head + 3 tail + tint + blank"
-        );
+        assert_eq!(t.rendered_rows_of(0), 6, "blank + head + 3 tail + blank");
 
         // still visible: nothing collapses
         t.collapse_streamed_above(0);
-        assert_eq!(t.rendered_rows_of(0), 8, "in view, keeps its tail band");
+        assert_eq!(t.rendered_rows_of(0), 6, "in view, keeps its tail band");
 
         // push enough entries to push the thought above a viewport
         // whose first visible row sits past its span
@@ -18207,18 +19520,15 @@ mod tests {
         t.collapse_streamed_above(thought_end);
         assert_eq!(
             t.rendered_rows_of(0),
-            8,
-            "settles to the ordinary collapsed band once fully above the window"
+            7,
+            "settles to the collapsed band + the more row"
         );
 
         // a streamed block that is still visible stays open
         t.push_thought_streamed("fresh\nstream".into());
         let fresh = t.entries().len() - 1;
         let fresh_open = t.rendered_rows_of(fresh);
-        assert_eq!(
-            fresh_open, 7,
-            "blank + tint + head + 2 + tint + blank at the flush"
-        );
+        assert_eq!(fresh_open, 5, "blank + head + 2 + blank at the flush");
         t.collapse_streamed_above(thought_end);
         assert_eq!(
             t.rendered_rows_of(fresh),
@@ -18228,35 +19538,29 @@ mod tests {
 
         // the collapsed block still toggles open like any other
         t.toggle_thought(0);
-        assert_eq!(t.rendered_rows_of(0), 10, "Alt+T/click toggle still works");
+        assert_eq!(t.rendered_rows_of(0), 8, "Alt+T/click toggle still works");
     }
 
     #[test]
-    fn tail_band_shows_last_three_with_whole_count() {
+    fn tail_band_shows_last_three_rows() {
         let text_of = |l: &ratatui::text::Line| -> String {
             l.spans.iter().map(|s| s.content.to_string()).collect()
         };
-        let band = super::thought_rows_tail("l1\nl2\nl3\nl4\nl5", 60);
-        assert_eq!(
-            band.len(),
-            8,
-            "blank + tint + head + 3 lines + tint + blank"
-        );
-        let head = text_of(&band[2]);
-        assert!(
-            head.contains("5 lines"),
-            "count covers the whole block: {head}"
-        );
+        let band = super::thought_rows_tail("l1\nl2\nl3\nl4\nl5", 60, None);
+        assert_eq!(band.len(), 6, "blank + head + 3 lines + blank");
+        assert!(band[0].spans.is_empty() && band[5].spans.is_empty());
+        let head = text_of(&band[1]);
+        assert!(!head.contains("lines"), "the head carries no count: {head}");
+        assert!(head.contains("Thinking"), "label: {head}");
         assert!(head.contains('▾'), "the tail band reads as open: {head}");
-        let body: String = band[3..6].iter().map(text_of).collect();
-        assert!(
-            body.contains("l3") && body.contains("l5"),
-            "the tail, not the head of the block: {body}"
-        );
-        assert!(!body.contains("l1"), "{body}");
-        for row in band.iter().filter(|r| !r.spans.is_empty()) {
-            assert_eq!(row.width(), 60, "{:?}", text_of(row));
-        }
+        let body: Vec<String> = band[2..5].iter().map(text_of).collect();
+        assert_eq!(body, vec!["│ l3", "│ l4", "│ l5"], "the tail, not the head");
+        // the live head shimmers; the text (and so the height) is the
+        // flushed band's exactly
+        let live = super::thought_rows_tail("l1\nl2\nl3\nl4\nl5", 60, Some(1234));
+        let flat: Vec<String> = band.iter().map(text_of).collect();
+        let lit: Vec<String> = live.iter().map(text_of).collect();
+        assert_eq!(flat, lit);
     }
 
     #[test]
@@ -18269,20 +19573,20 @@ mod tests {
         t.set_width(60);
         t.push(Line::User("q".into()));
         t.push_thought_streamed("a\nb\nc".into());
-        assert_eq!(t.rendered_rows_of(1), 8, "streamed band stays open");
+        assert_eq!(t.rendered_rows_of(1), 6, "streamed band stays open");
         t.rewind_user(1);
         t.push_thought_streamed("fresh\nlines".into());
         let idx = t.entries().len() - 1;
         assert_eq!(
             t.rendered_rows_of(idx),
-            7,
-            "the recycled index must not inherit the stale override (7 = blank+tint+head+2+tint+blank)"
+            5,
+            "the recycled index must not inherit the stale override (5 = blank+head+2+blank)"
         );
         // clear() wipes everything for the session switch
         t.clear();
         t.push_thought_streamed("x\ny".into());
         let idx = t.entries().len() - 1;
-        assert_eq!(t.rendered_rows_of(idx), 7, "clear leaves no stale state");
+        assert_eq!(t.rendered_rows_of(idx), 5, "clear leaves no stale state");
     }
 
     #[test]
@@ -18291,21 +19595,13 @@ mod tests {
         t.set_width(60);
         t.push_thought_streamed("a\nb\nc".into());
         t.push_thought_streamed("still\nopen".into());
-        assert_eq!(
-            t.rendered_rows_of(0),
-            8,
-            "blank + tint + head + 3 + tint + blank"
-        );
-        assert_eq!(
-            t.rendered_rows_of(1),
-            7,
-            "blank + tint + head + 2 + tint + blank"
-        );
+        assert_eq!(t.rendered_rows_of(0), 6, "blank + head + 3 + blank");
+        assert_eq!(t.rendered_rows_of(1), 5, "blank + head + 2 + blank");
         // the TurnStarted backstop collapses every streamed-open entry
         // even though nothing scrolled
         t.collapse_streamed_all();
-        assert_eq!(t.rendered_rows_of(0), 8);
-        assert_eq!(t.rendered_rows_of(1), 7);
+        assert_eq!(t.rendered_rows_of(0), 6);
+        assert_eq!(t.rendered_rows_of(1), 5);
 
         // under a globally-open flag the streamed blocks also land
         // collapsed at the boundary
@@ -18315,16 +19611,16 @@ mod tests {
         t.push_thought_streamed("x\ny".into());
         assert_eq!(
             t.rendered_rows_of(0),
-            7,
+            5,
             "expanded at flush under global-open"
         );
         t.collapse_streamed_all();
-        assert_eq!(t.rendered_rows_of(0), 7, "boundary closes it");
+        assert_eq!(t.rendered_rows_of(0), 5, "boundary closes it");
         // the global flag itself is untouched — other blocks stay open
         t.push(Line::Thought("plain\ncached".into()));
         assert_eq!(
             t.rendered_rows_of(1),
-            7,
+            5,
             "non-streamed block follows the global flag"
         );
     }

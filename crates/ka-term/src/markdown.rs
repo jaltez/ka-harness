@@ -1,7 +1,11 @@
-//! Markdown renderer for the TUI transcript. One accent color for
-//! headings, faint fence lines around syntax-colored code, quiet gutters
-//! for quotes, and bright-tinted bold/italic emphasis (strike stays a
-//! pure modifier) — all tuned to the sunset palette in [`crate::palette`]. The only
+//! Markdown renderer for the TUI transcript, tuned to the Nocturne
+//! palette in [`crate::palette`]. Assistant prose sits directly on the
+//! canvas (no parent surface), so structure comes from type weight,
+//! rails and rules: an h1 in gold over a `─` rule, `▍` marked h2s, accent
+//! h3s, quiet h4+; gold bold, dim italic (strike stays a pure modifier);
+//! inline code as a chip on the code surface; fenced code as a full-width
+//! `BG_CODE` panel with a language tag row; `│` railed quotes; rounded
+//! rule-colored tables. Every row fits the given width. The only
 //! dependency beyond ratatui is unicode-width, already in the tree via
 //! ratatui.
 
@@ -10,22 +14,73 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line as TuiLine, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-fn header_style() -> Style {
-    Style::default()
-        .fg(palette::HEADING)
-        .add_modifier(Modifier::BOLD)
-}
+/// List bullets by nesting depth (cycling past the third level).
+const BULLETS: [&str; 3] = ["•", "◦", "▪"];
 
-/// Blank line after a heading unless the source already has one.
-fn push_heading_gap(out: &mut Vec<TuiLine<'static>>, lines: &[&str], i: usize) {
+/// Blank row after a block (heading, code panel, table) unless the
+/// source already has one there or the block ends the text — air is
+/// never doubled and never trails the message.
+fn push_gap(out: &mut Vec<TuiLine<'static>>, lines: &[&str], i: usize) {
     if lines.get(i + 1).is_some_and(|n| !n.trim_start().is_empty()) {
         out.push(TuiLine::default());
     }
 }
 
+/// Push a heading's rows: h1 = gold bold over a `─` rule as wide as the
+/// text, h2 = `▍ ` marker + accent bold, h3 = accent bold, h4+ = meta
+/// bold.
+fn push_heading(out: &mut Vec<TuiLine<'static>>, level: usize, text: &str, width: u16) {
+    let text = text.to_string();
+    match level {
+        1 => {
+            let rule = text.width().min(width as usize);
+            out.push(TuiLine::from(Span::styled(
+                text,
+                Style::new()
+                    .fg(palette::STRONG)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            if rule > 0 {
+                out.push(TuiLine::from(Span::styled(
+                    "─".repeat(rule),
+                    palette::RULE_STYLE,
+                )));
+            }
+        }
+        2 => out.push(TuiLine::from(vec![
+            Span::styled("▍ ", Style::new().fg(palette::HEADING)),
+            Span::styled(text, header_style()),
+        ])),
+        3 => out.push(TuiLine::from(Span::styled(text, header_style()))),
+        _ => out.push(TuiLine::from(Span::styled(
+            text,
+            Style::new().fg(palette::META).add_modifier(Modifier::BOLD),
+        ))),
+    }
+}
+
+fn header_style() -> Style {
+    Style::new()
+        .fg(palette::HEADING)
+        .add_modifier(Modifier::BOLD)
+}
+
+/// ATX heading: one to six `#` then a space. Returns `(level, text)`
+/// with any closing `#` run stripped.
+fn atx_heading(trimmed: &str) -> Option<(usize, &str)> {
+    let level = trimmed.bytes().take_while(|&b| b == b'#').count();
+    if !(1..=6).contains(&level) {
+        return None;
+    }
+    let rest = trimmed[level..].strip_prefix(' ')?;
+    Some((level, strip_atx_closer(rest)))
+}
+
 /// Render markdown text into styled terminal lines at `width` (the
-/// transcript's inner width). Tables size themselves to fit; anything that
-/// cannot fit degrades to plain rows so nothing is lost or clipped.
+/// assistant content width; the caller adds the canvas indent). Every
+/// returned row fits `width` columns: prose soft-wraps, code panels
+/// truncate, tables size themselves to fit, and anything that cannot fit
+/// degrades to plain rows so nothing is lost or clipped.
 pub fn render(text: &str, width: u16) -> Vec<TuiLine<'static>> {
     let mut out: Vec<TuiLine<'static>> = Vec::new();
     let mut in_code = false;
@@ -38,7 +93,12 @@ pub fn render(text: &str, width: u16) -> Vec<TuiLine<'static>> {
         let trimmed = line.trim_start();
         if let Some(fence) = trimmed.strip_prefix("```") {
             if in_code {
-                push_code_block(&mut out, &code_lines, &code_lang, width);
+                // an empty fence renders no rows, so it earns no gap
+                // either (air only ever separates real blocks)
+                if !code_lines.is_empty() {
+                    push_code_block(&mut out, &code_lines, &code_lang, width);
+                    push_gap(&mut out, &lines, i);
+                }
                 code_lines.clear();
                 code_lang.clear();
                 in_code = false;
@@ -69,9 +129,9 @@ pub fn render(text: &str, width: u16) -> Vec<TuiLine<'static>> {
                     for r in &block {
                         out.push(TuiLine::from(inline_spans(r)));
                     }
-                    out.push(TuiLine::default());
                 }
             }
+            push_gap(&mut out, &lines, i);
             i += 1;
             continue;
         }
@@ -80,49 +140,37 @@ pub fn render(text: &str, width: u16) -> Vec<TuiLine<'static>> {
             i += 1;
             continue;
         }
-        if let Some(h) = trimmed.strip_prefix("#### ") {
-            out.push(TuiLine::styled(
-                strip_atx_closer(h).to_string(),
-                header_style(),
-            ));
-            push_heading_gap(&mut out, &lines, i);
-        } else if let Some(h) = trimmed.strip_prefix("### ") {
-            out.push(TuiLine::styled(
-                strip_atx_closer(h).to_string(),
-                header_style(),
-            ));
-            push_heading_gap(&mut out, &lines, i);
-        } else if let Some(h) = trimmed.strip_prefix("## ") {
-            out.push(TuiLine::styled(
-                strip_atx_closer(h).to_string(),
-                header_style(),
-            ));
-            push_heading_gap(&mut out, &lines, i);
-        } else if let Some(h) = trimmed.strip_prefix("# ") {
-            // h1 is the only level that also underlines
-            let style = header_style().add_modifier(Modifier::UNDERLINED);
-            out.push(TuiLine::styled(strip_atx_closer(h).to_string(), style));
-            push_heading_gap(&mut out, &lines, i);
-        } else if trimmed.starts_with(">") {
+        if let Some((level, h)) = atx_heading(trimmed) {
+            push_heading(&mut out, level, h, width);
+            push_gap(&mut out, &lines, i);
+        } else if trimmed.starts_with('>') {
             let q = trimmed.trim_start_matches('>').trim();
             out.push(TuiLine::from(vec![
-                Span::styled("▏ ", palette::BORDER_STYLE),
+                Span::styled("│ ", palette::RULE_STYLE),
                 Span::styled(q.to_string(), palette::QUOTE),
             ]));
         } else if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
-            let indent = list_indent(line, trimmed);
+            let depth = list_depth(line, trimmed);
             let rest = &trimmed[2..];
-            let mut spans = vec![Span::styled(format!("{indent}• "), palette::ACCENT_STYLE)];
+            let mut spans = vec![Span::styled(
+                format!("{}{} ", "  ".repeat(depth), BULLETS[depth % BULLETS.len()]),
+                palette::ACCENT_STYLE,
+            )];
             match task_marker(rest) {
-                Some((marker, remainder)) => {
+                Some((marker, remainder, done)) => {
                     spans.push(marker);
-                    spans.extend(inline_spans(remainder));
+                    spans.extend(inline_spans(remainder).into_iter().map(|mut s| {
+                        if done {
+                            s.style = s.style.fg(palette::FAINT);
+                        }
+                        s
+                    }));
                 }
                 None => spans.extend(inline_spans(rest)),
             }
             out.push(TuiLine::from(spans));
         } else if is_numbered_item(trimmed) {
-            let indent = list_indent(line, trimmed);
+            let indent = "  ".repeat(list_depth(line, trimmed));
             let (num, rest) = trimmed.split_once(". ").unwrap_or(("1", trimmed));
             let mut spans = vec![Span::styled(
                 format!("{indent}{num}. "),
@@ -131,16 +179,15 @@ pub fn render(text: &str, width: u16) -> Vec<TuiLine<'static>> {
             spans.extend(inline_spans(rest));
             out.push(TuiLine::from(spans));
         } else if trimmed == "---" || trimmed == "***" {
-            out.push(TuiLine::styled(
-                "─".repeat(width.min(80) as usize),
-                palette::BORDER_STYLE,
-            ));
+            out.push(TuiLine::from(Span::styled(
+                "─".repeat(width as usize),
+                palette::RULE_STYLE,
+            )));
         } else if lines.get(i + 1).and_then(|n| setext_level(n)).is_some() {
-            // setext `====` h1 (underlined, like ATX h1)
-            let style = header_style().add_modifier(Modifier::UNDERLINED);
-            out.push(TuiLine::styled(trimmed.to_string(), style));
+            // setext `====` h1 (same shape as ATX h1)
+            push_heading(&mut out, 1, trimmed.trim_end(), width);
             i += 1; // consume the underline
-            push_heading_gap(&mut out, &lines, i);
+            push_gap(&mut out, &lines, i);
         } else {
             out.push(TuiLine::from(inline_spans(line)));
         }
@@ -230,22 +277,30 @@ fn spans_from_chars(chars: Vec<(char, Style)>) -> Vec<Span<'static>> {
     spans
 }
 
-/// Two indent spaces per two leading whitespace characters, capped at four
-/// levels so deep nesting stays inside the transcript.
-fn list_indent(line: &str, trimmed: &str) -> String {
+/// Nesting depth of a list item: one level per two leading whitespace
+/// characters, capped at four so deep nesting stays inside the
+/// transcript. The caller indents two columns per level and picks the
+/// bullet glyph by depth.
+fn list_depth(line: &str, trimmed: &str) -> usize {
     let lead = line.chars().count().saturating_sub(trimmed.chars().count());
-    "  ".repeat((lead / 2).min(4))
+    (lead / 2).min(4)
 }
 
-/// `- [ ]` / `- [x]` task boxes.
-fn task_marker(rest: &str) -> Option<(Span<'static>, &str)> {
+/// `- [ ]` / `- [x]` task boxes: `☐` faint when open, `☑` in the ok
+/// color when done. Returns `(box, item text, done)`; the caller fades a
+/// done item's text.
+fn task_marker(rest: &str) -> Option<(Span<'static>, &str, bool)> {
     if let Some(r) = rest.strip_prefix("[ ] ") {
-        Some((Span::styled("☐ ", Style::new().fg(palette::META)), r))
+        Some((
+            Span::styled("☐ ", Style::new().fg(palette::FAINT)),
+            r,
+            false,
+        ))
     } else if let Some(r) = rest
         .strip_prefix("[x] ")
         .or_else(|| rest.strip_prefix("[X] "))
     {
-        Some((Span::styled("☑ ", palette::OK), r))
+        Some((Span::styled("☑ ", Style::new().fg(palette::OK)), r, true))
     } else {
         None
     }
@@ -330,10 +385,10 @@ fn parse_table(rows: &[&str]) -> Option<(Vec<String>, Vec<Vec<String>>)> {
     Some((header, body))
 }
 
-/// Render a parsed table as a sharp box-drawn grid (OMP `table` symbols)
-/// fitted to `width`. Bars/rules sit in the dim border color; the header
-/// is bold in the accent color. Cells clip with `…`, never overflow.
-/// Inner rules separate every body row.
+/// Render a parsed table as a rounded box-drawn grid (`╭╮╰╯` corners)
+/// fitted to `width`. Every bar and rule sits in the quiet rule color;
+/// header cells are accent bold. Cells clip with `…`, never overflow.
+/// Inner rules separate every body row. The caller owns the air after.
 fn render_table(
     header: &[String],
     body: &[Vec<String>],
@@ -370,29 +425,27 @@ fn render_table(
     }
 
     let mut lines: Vec<TuiLine<'static>> = Vec::new();
-    let edge = Span::styled("│", palette::BORDER_STYLE);
+    let edge = Span::styled("│", palette::RULE_STYLE);
     let hrule = |l: char, m: char, r: char| {
         let mut line = String::from(l);
         for (c, w) in widths.iter().enumerate() {
             line.push_str(&"─".repeat(w + 2));
             line.push(if c + 1 == cols { r } else { m });
         }
-        TuiLine::styled(line, palette::BORDER_STYLE)
+        TuiLine::from(Span::styled(line, palette::RULE_STYLE))
     };
 
     // top rule
-    lines.push(hrule('┌', '┬', '┐'));
+    lines.push(hrule('╭', '┬', '╮'));
 
-    // header row: gold bold
+    // header row: accent bold
     let mut spans = vec![edge.clone()];
     for (c, h) in header.iter().enumerate() {
         spans.push(Span::styled(" ", Style::default()));
         let fitted: Vec<Span<'static>> = fit_spans(inline_spans(h), widths[c])
             .into_iter()
             .map(|mut s| {
-                s.style = Style::default()
-                    .fg(palette::ACCENT)
-                    .add_modifier(Modifier::BOLD);
+                s.style = palette::ACCENT_BOLD;
                 s
             })
             .collect();
@@ -401,14 +454,12 @@ fn render_table(
         if widths[c] > used {
             spans.push(Span::styled(
                 " ".repeat(widths[c] - used),
-                Style::default()
-                    .fg(palette::ACCENT)
-                    .add_modifier(Modifier::BOLD),
+                palette::ACCENT_BOLD,
             ));
         }
         spans.push(Span::styled(" ", Style::default()));
         if c + 1 < cols {
-            spans.push(Span::styled("│", palette::BORDER_STYLE));
+            spans.push(Span::styled("│", palette::RULE_STYLE));
         }
     }
     spans.push(edge.clone());
@@ -432,7 +483,7 @@ fn render_table(
             }
             spans.push(Span::styled(" ", Style::default()));
             if c + 1 < cols {
-                spans.push(Span::styled("│", palette::BORDER_STYLE));
+                spans.push(Span::styled("│", palette::RULE_STYLE));
             }
         }
         spans.push(edge.clone());
@@ -442,8 +493,7 @@ fn render_table(
         }
     }
     // bottom rule
-    lines.push(hrule('└', '┴', '┘'));
-    lines.push(TuiLine::default());
+    lines.push(hrule('╰', '┴', '╯'));
     Some(lines)
 }
 
@@ -493,8 +543,10 @@ fn is_numbered_item(s: &str) -> bool {
 }
 
 /// Inline markdown: `**bold**`, `*italic*`, `` `code` ``, `~~strike~~`,
-/// `[text](url)` links, `![alt](url)` images, `\`-escapes. Bold/italic
-/// runs tint with the strong foreground; strike stays a pure modifier.
+/// `[text](url)` links, `![alt](url)` images, `\`-escapes. Bold is gold
+/// bold, italic is dim-ink italic, inline code is a chip (code-inline ink
+/// on the code surface, backticks dropped), links are underlined in the
+/// tool color with the url faint; strike stays a pure modifier.
 pub fn inline_spans(s: &str) -> Vec<Span<'static>> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut plain = String::new();
@@ -518,7 +570,7 @@ pub fn inline_spans(s: &str) -> Vec<Span<'static>> {
             if let Some((alt, url, next_i)) = parse_link(&chars, i + 1) {
                 flush(&mut plain, &mut spans);
                 spans.push(Span::styled(
-                    format!("🖼 {alt}"),
+                    format!("▣ {alt}"),
                     Style::new().fg(palette::FAINT),
                 ));
                 spans.push(Span::styled(
@@ -536,7 +588,7 @@ pub fn inline_spans(s: &str) -> Vec<Span<'static>> {
                 spans.push(Span::styled(
                     text,
                     Style::new()
-                        .fg(palette::TOOL)
+                        .fg(palette::LINK)
                         .add_modifier(Modifier::UNDERLINED),
                 ));
                 spans.push(Span::styled(
@@ -575,7 +627,10 @@ pub fn inline_spans(s: &str) -> Vec<Span<'static>> {
                     .trim()
                     .to_string();
                 if !code.is_empty() {
-                    spans.push(Span::styled(code, Style::new().fg(palette::CODE_INLINE)));
+                    spans.push(Span::styled(
+                        code,
+                        Style::new().fg(palette::CODE_INLINE).bg(palette::BG_CODE),
+                    ));
                 }
                 i += end + 2;
                 continue;
@@ -593,7 +648,7 @@ pub fn inline_spans(s: &str) -> Vec<Span<'static>> {
                     spans.push(Span::styled(
                         bold,
                         Style::default()
-                            .fg(palette::FG_STRONG)
+                            .fg(palette::STRONG)
                             .add_modifier(Modifier::BOLD),
                     ));
                 }
@@ -613,7 +668,7 @@ pub fn inline_spans(s: &str) -> Vec<Span<'static>> {
                     spans.push(Span::styled(
                         italic,
                         Style::default()
-                            .fg(palette::FG_STRONG)
+                            .fg(palette::INK_DIM)
                             .add_modifier(Modifier::ITALIC),
                     ));
                 }
@@ -663,10 +718,12 @@ fn parse_link(chars: &[char], start: usize) -> Option<(String, String, usize)> {
     Some((text, url, close_url + 1))
 }
 
-/// Code block: the ` ``` ` marker rows vanish; every code line carries a
-/// quiet `▎ ` rail (borrowing the transcript's tool-row language) and
-/// rides the assistant card surface (BG_OUTPUT). Content truncates two
-/// columns early so the rail never pushes a row past the wrap width.
+/// Code block: the ` ``` ` marker rows vanish and the code becomes a
+/// panel on `BG_CODE` padded to the full `width`: a head row carrying
+/// the language tag (` {lang}` faint italic; blank when untagged), one
+/// ` {code}` row per source line, and a blank bottom row. Rows truncate
+/// (cut marked `…`), never wrap or overflow; tabs expand to four spaces
+/// so the panel's padding stays exact.
 ///
 /// Fences tagged with a known language go through [`CodeHighlighter`],
 /// which tracks block comments across lines within this block; every
@@ -674,25 +731,54 @@ fn parse_link(chars: &[char], start: usize) -> Option<(String, String, usize)> {
 /// both paths come from the palette's syntax ramp (consistent across all
 /// code surfaces): comments → SYNTAX_COMMENT, strings → SYNTAX_STRING,
 /// keywords → SYNTAX_KEYWORD, numbers → SYNTAX_NUMBER, everything else
-/// stays CODE_BLOCK.
+/// stays CODE_BLOCK; every span rides the panel's `BG_CODE`.
 fn push_code_block(out: &mut Vec<TuiLine<'static>>, lines: &[String], lang: &str, width: u16) {
     if lines.is_empty() {
         return;
     }
-    // the two-column rail budget: `▎ ` before every code row
-    let rail = Style::new().fg(palette::BORDER_QUIET);
-    let inner = width.saturating_sub(2) as usize;
+    let w = width as usize;
+    let head = if lang.is_empty() {
+        Vec::new()
+    } else {
+        vec![Span::styled(
+            format!(" {lang}"),
+            Style::new()
+                .fg(palette::FAINT)
+                .add_modifier(Modifier::ITALIC),
+        )]
+    };
+    out.push(code_row(head, w));
     let mut hl = code_lang(lang).map(CodeHighlighter::new);
     for line in lines {
-        let spans = match &mut hl {
-            Some(h) => h.line(line),
-            None => highlight(line),
-        };
-        let mut row = vec![Span::styled("▎ ", rail)];
-        row.extend(fit_spans(spans, inner));
-        out.push(TuiLine::from(row));
+        let line = line.replace('\t', "    ");
+        let mut spans = vec![Span::raw(" ")];
+        spans.extend(match &mut hl {
+            Some(h) => h.line(&line),
+            None => highlight(&line),
+        });
+        out.push(code_row(spans, w));
     }
-    out.push(TuiLine::default());
+    out.push(code_row(Vec::new(), w));
+}
+
+/// One code-panel row: `spans` truncated to `w` columns, every span on
+/// `BG_CODE`, then `BG_CODE` padding out to exactly `w`.
+fn code_row(spans: Vec<Span<'static>>, w: usize) -> TuiLine<'static> {
+    let mut row: Vec<Span<'static>> = fit_spans(spans, w)
+        .into_iter()
+        .map(|mut s| {
+            s.style = s.style.bg(palette::BG_CODE);
+            s
+        })
+        .collect();
+    let used = spans_width(&row);
+    if w > used {
+        row.push(Span::styled(
+            " ".repeat(w - used),
+            Style::new().bg(palette::BG_CODE),
+        ));
+    }
+    TuiLine::from(row)
 }
 
 const KEYWORDS: &[&str] = &[
@@ -1063,28 +1149,53 @@ mod tests {
     fn renders_headers_and_lists() {
         let md = "# Title\n\n- item one\n- **bold** item\n\n1. first\n2. second\n";
         let lines = render(md, 80);
-        assert_eq!(lines.len(), 7);
+        // Title, its rule, the source blank, two bullets, blank, two items
+        assert_eq!(lines.len(), 8);
         assert!(format!("{:?}", lines[0]).contains("Title"));
     }
 
     #[test]
-    fn headings_share_one_accent() {
+    fn heading_levels_step_down_in_weight() {
         let lines = render("# Top\n## Mid\n### Deep\n#### Deepest\n", 80);
-        assert!(
-            format!("{:?}", lines[0]).contains("underlined()"),
-            "h1 underlined"
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        assert_eq!(texts.len(), 8, "{texts:?}");
+        // h1: gold bold over a rule exactly as wide as the text
+        assert_eq!(texts[0], "Top");
+        assert_eq!(lines[0].spans[0].style.fg, Some(palette::STRONG));
+        assert!(format!("{:?}", lines[0]).contains("bold()"));
+        assert_eq!(texts[1], "───");
+        assert_eq!(lines[1].spans[0].style.fg, Some(palette::RULE));
+        assert!(lines[2].spans.is_empty(), "gap after h1");
+        // h2: accent marker + accent bold text
+        assert_eq!(texts[3], "▍ Mid");
+        assert_eq!(lines[3].spans[0].style.fg, Some(palette::ACCENT));
+        assert_eq!(lines[3].spans[1].style, palette::ACCENT_BOLD);
+        assert!(lines[4].spans.is_empty(), "gap after h2");
+        // h3: accent bold, no marker
+        assert_eq!(texts[5], "Deep", "h3 strips its hashes");
+        assert_eq!(lines[5].spans[0].style, palette::ACCENT_BOLD);
+        assert!(lines[6].spans.is_empty(), "gap after h3");
+        // h4+: meta bold
+        assert_eq!(texts[7], "Deepest", "h4 strips its hashes");
+        assert_eq!(lines[7].spans[0].style.fg, Some(palette::META));
+        let h6 = render("###### Six\n", 80);
+        assert_eq!(line_text(&h6[0]), "Six");
+        assert_eq!(h6[0].spans[0].style.fg, Some(palette::META));
+        assert_eq!(
+            line_text(&render("#tag\n", 80)[0]),
+            "#tag",
+            "no space: prose"
         );
-        assert!(lines[1].spans.is_empty(), "gap after h1");
-        assert_eq!(line_text(&lines[2]), "Mid", "h2 has no marker");
-        assert!(lines[3].spans.is_empty(), "gap after h2");
-        assert_eq!(line_text(&lines[4]), "Deep", "h3 strips its hashes");
-        assert!(lines[5].spans.is_empty(), "gap after h3");
-        assert_eq!(line_text(&lines[6]), "Deepest", "h4 strips its hashes");
-        let joined = format!("{:?}", lines);
-        assert!(!joined.contains('═'), "no rules: {joined}");
-        assert!(!joined.contains('▍'), "no markers: {joined}");
-        // single heading color everywhere
-        assert!(joined.contains(&format!("{:?}", palette::ACCENT)));
+    }
+
+    #[test]
+    fn h1_rule_never_outgrows_the_width() {
+        let lines = render("# a heading wider than the pane\n", 12);
+        let rule = lines
+            .iter()
+            .find(|l| line_text(l).starts_with('─'))
+            .expect("h1 rule");
+        assert_eq!(line_text(rule), "─".repeat(12));
     }
 
     #[test]
@@ -1113,20 +1224,26 @@ mod tests {
     }
 
     #[test]
-    fn fences_hidden_rail_prefix() {
+    fn fences_render_as_code_panel() {
         let md = "```rust\nfn main() { let x = \"hi\"; } // done\n```\n";
         let lines = render(md, 80);
-        // the fence markers vanish; one railed row for the code line and
-        // the trailing blank
-        assert_eq!(lines.len(), 2, "no fence marker rows: {lines:?}");
-        let first = &lines[0];
-        let spans: Vec<&Span> = first.spans.iter().collect();
-        assert_eq!(spans[0].content.as_ref(), "▎ ", "quiet rail prefix");
-        assert_eq!(
-            spans[0].style.fg,
-            Some(palette::BORDER_QUIET),
-            "rail uses the quiet border tone"
-        );
+        // the fence markers vanish: tag row, one code row, bottom row
+        assert_eq!(lines.len(), 3, "no fence marker rows: {lines:?}");
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        assert_eq!(texts[0].trim_end(), " rust", "language tag row");
+        assert_eq!(lines[0].spans[0].style.fg, Some(palette::FAINT));
+        assert!(format!("{:?}", lines[0]).contains("italic()"));
+        assert!(texts[1].starts_with(" fn main()"), "{:?}", texts[1]);
+        assert!(texts[2].trim().is_empty(), "blank bottom row");
+        for (row, text) in lines.iter().zip(&texts) {
+            assert_eq!(text.width(), 80, "panel padded to width: {text:?}");
+            assert!(
+                row.spans
+                    .iter()
+                    .all(|s| s.style.bg == Some(palette::BG_CODE)),
+                "every cell on the code surface: {row:?}"
+            );
+        }
         let rendered = format!("{:?}", lines);
         assert!(!rendered.contains("```"), "no literal fence glyphs");
         assert!(
@@ -1138,9 +1255,26 @@ mod tests {
             "keyword: {rendered}"
         );
         assert!(
-            rendered.contains(&format!("{:?}", palette::META)),
+            rendered.contains(&format!("{:?}", palette::SYNTAX_COMMENT)),
             "comment: {rendered}"
         );
+    }
+
+    #[test]
+    fn untagged_fence_has_blank_head_and_truncates() {
+        let md = "```\nshort\nthis line is far too long for the narrow panel\n```\nafter\n";
+        let lines = render(md, 20);
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        assert_eq!(texts[0], " ".repeat(20), "blank head row: {texts:?}");
+        assert_eq!(texts[1].trim_end(), " short");
+        assert!(texts[2].ends_with('…'), "cut marked: {:?}", texts[2]);
+        for t in &texts[..4] {
+            assert_eq!(t.width(), 20, "{t:?}");
+        }
+        // one blank row of air before the following prose, never doubled
+        assert!(lines[4].spans.is_empty(), "{texts:?}");
+        assert_eq!(texts[5], "after");
+        assert_eq!(texts.len(), 6, "{texts:?}");
     }
 
     #[test]
@@ -1148,15 +1282,18 @@ mod tests {
         let spans = inline_spans("run `cargo build` for **release** builds");
         let joined = format!("{spans:?}");
         assert!(joined.contains("cargo build"), "{joined}");
-        assert!(
-            joined.contains(&format!("{:?}", palette::CODE_INLINE)),
-            "inline code tint: {joined}"
-        );
+        assert!(!joined.contains('`'), "no backticks: {joined}");
+        let chip = spans
+            .iter()
+            .find(|s| s.content == "cargo build")
+            .expect("code chip");
+        assert_eq!(chip.style.fg, Some(palette::CODE_INLINE));
+        assert_eq!(chip.style.bg, Some(palette::BG_CODE), "chip surface");
         assert!(joined.contains("bold()"), "{joined}");
     }
 
-    /// Bold and italic read as bright warm-white (weight + slant over
-    /// the soft gray prose); strike-through stays a pure modifier.
+    /// Bold reads gold, italic slants in dim ink; strike-through stays a
+    /// pure modifier.
     #[test]
     fn emphasis_is_bright_and_strike_is_plain() {
         let spans = inline_spans("**loud** and *soft* and ~~gone~~");
@@ -1166,10 +1303,10 @@ mod tests {
         assert!(joined.contains("crossed_out()"), "{joined}");
         let loud_is_tinted = spans
             .iter()
-            .any(|s| s.content == "loud" && s.style.fg == Some(palette::FG_STRONG));
+            .any(|s| s.content == "loud" && s.style.fg == Some(palette::STRONG));
         let soft_is_tinted = spans
             .iter()
-            .any(|s| s.content == "soft" && s.style.fg == Some(palette::FG_STRONG));
+            .any(|s| s.content == "soft" && s.style.fg == Some(palette::INK_DIM));
         let gone_is_plain = spans
             .iter()
             .any(|s| s.content == "gone" && s.style.fg.is_none());
@@ -1192,11 +1329,11 @@ mod tests {
             "keyword: {joined}"
         );
         assert!(
-            joined.contains(&format!("{:?}", palette::WARN)),
+            joined.contains(&format!("{:?}", palette::SYNTAX_NUMBER)),
             "number: {joined}"
         );
         assert!(
-            joined.contains(&format!("{:?}", palette::META)),
+            joined.contains(&format!("{:?}", palette::SYNTAX_COMMENT)),
             "comment: {joined}"
         );
     }
@@ -1234,9 +1371,24 @@ mod tests {
             "{:?}",
             texts[1]
         );
-        assert!(texts[0].starts_with('┌') && texts[0].ends_with('┐') && texts[0].contains('┬'));
+        assert!(texts[0].starts_with('╭') && texts[0].ends_with('╮') && texts[0].contains('┬'));
         assert!(texts[2].contains('┼') && texts[2].contains('├') && texts[2].contains('┤'));
-        assert!(texts[6].starts_with('└') && texts[6].ends_with('┘'));
+        assert!(texts[6].starts_with('╰') && texts[6].ends_with('╯'));
+        // every line of the grid sits in the rule color; header cells are
+        // accent bold
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .all(|s| s.style.fg == Some(palette::RULE))
+        );
+        assert_eq!(lines[1].spans[0].style.fg, Some(palette::RULE), "edge");
+        let name = lines[1]
+            .spans
+            .iter()
+            .find(|s| s.content == "Name")
+            .expect("header cell");
+        assert_eq!(name.style, palette::ACCENT_BOLD);
         // every body row is separated by an inner rule
         assert!(texts[4].starts_with('├') && texts[4].contains('┼'));
         assert!(texts.iter().any(|t| t.contains("alpha")));
@@ -1276,13 +1428,16 @@ mod tests {
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
             .collect();
-        assert_eq!(texts.len(), 6, "{texts:?}");
-        assert_eq!(texts[0], "┌───┬───┐");
+        assert_eq!(texts.len(), 5, "no trailing blank at the end: {texts:?}");
+        assert_eq!(texts[0], "╭───┬───╮");
         assert_eq!(texts[1], "│ a │ b │");
         assert_eq!(texts[2], "├───┼───┤");
         assert_eq!(texts[3], "│ 1 │ 2 │");
-        assert_eq!(texts[4], "└───┴───┘");
-        assert_eq!(texts[5], "");
+        assert_eq!(texts[4], "╰───┴───╯");
+        // followed by prose: exactly one blank row of air
+        let lines = render(&format!("{md}after\n"), 40);
+        assert!(lines[5].spans.is_empty(), "{lines:?}");
+        assert_eq!(line_text(&lines[6]), "after");
     }
 
     #[test]
@@ -1325,8 +1480,8 @@ mod tests {
         assert!(joined.contains("http://x.io"), "{joined}");
         assert!(joined.contains("underlined()"), "{joined}");
         assert!(
-            joined.contains(&format!("{:?}", palette::TOOL)),
-            "link steel: {joined}"
+            joined.contains(&format!("{:?}", palette::LINK)),
+            "link color: {joined}"
         );
     }
 
@@ -1334,7 +1489,7 @@ mod tests {
     fn images_render_alt_and_url() {
         let spans = inline_spans("![logo](http://x.io/l.png)");
         let joined = format!("{spans:?}");
-        assert!(joined.contains("🖼 logo"), "{joined}");
+        assert!(joined.contains("▣ logo"), "{joined}");
         assert!(joined.contains("http://x.io/l.png"), "{joined}");
     }
 
@@ -1360,8 +1515,9 @@ mod tests {
     #[test]
     fn setext_equals_makes_header_dash_stays_rule() {
         let h1 = render("Title\n=====\n", 80);
-        let joined = format!("{h1:?}");
-        assert!(joined.contains("underlined()"), "{joined}");
+        assert_eq!(line_text(&h1[0]), "Title");
+        assert_eq!(h1[0].spans[0].style.fg, Some(palette::STRONG));
+        assert_eq!(line_text(&h1[1]), "─────", "h1 rule under the text");
         let out = render("Sub\n---\n", 80);
         let joined = format!("{out:?}");
         assert!(joined.contains("Sub"), "{joined}");
@@ -1380,30 +1536,41 @@ mod tests {
     #[test]
     fn task_lists_render_boxes() {
         let lines = render("- [ ] todo\n- [x] done\n", 80);
-        let joined = format!("{lines:?}");
-        assert!(joined.contains('☐'), "{joined}");
-        assert!(joined.contains('☑'), "{joined}");
-    }
-
-    #[test]
-    fn indented_lists_nest() {
-        let lines = render("- a\n  - b\n    - c\n", 80);
-        let texts: Vec<String> = lines
+        let open = lines[0]
+            .spans
             .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
-            .collect();
-        assert!(texts[0].starts_with("• "), "{texts:?}");
-        assert!(texts[1].starts_with("  • "), "{texts:?}");
-        assert!(texts[2].starts_with("    • "), "{texts:?}");
+            .find(|s| s.content == "☐ ")
+            .expect("open box");
+        assert_eq!(open.style.fg, Some(palette::FAINT));
+        let done = lines[1]
+            .spans
+            .iter()
+            .find(|s| s.content == "☑ ")
+            .expect("done box");
+        assert_eq!(done.style.fg, Some(palette::OK));
+        let done_text = lines[1].spans.last().unwrap();
+        assert_eq!(done_text.content, "done");
+        assert_eq!(done_text.style.fg, Some(palette::FAINT), "done item fades");
+        let todo_text = lines[0].spans.last().unwrap();
+        assert_eq!(todo_text.style.fg, None, "open item keeps prose ink");
     }
 
     #[test]
-    fn bullets_use_accent_butter() {
-        let lines = render("- item\n", 80);
-        assert!(
-            format!("{lines:?}").contains(&format!("{:?}", palette::ACCENT)),
-            "butter bullet"
-        );
+    fn indented_lists_nest_with_depth_bullets() {
+        let lines = render("- a\n  - b\n    - c\n      - d\n", 80);
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        assert!(texts[0].starts_with("• "), "{texts:?}");
+        assert!(texts[1].starts_with("  ◦ "), "{texts:?}");
+        assert!(texts[2].starts_with("    ▪ "), "{texts:?}");
+        assert!(texts[3].starts_with("      • "), "cycles: {texts:?}");
+    }
+
+    #[test]
+    fn list_markers_use_accent() {
+        let lines = render("- item\n1. first\n", 80);
+        assert_eq!(lines[0].spans[0].style.fg, Some(palette::ACCENT));
+        assert_eq!(line_text(&lines[1]), "1. first");
+        assert_eq!(lines[1].spans[0].style.fg, Some(palette::ACCENT));
     }
 
     #[test]
@@ -1440,15 +1607,47 @@ mod tests {
     }
 
     #[test]
-    fn quote_uses_quiet_gutter() {
+    fn quote_uses_rule_rail() {
         let lines = render("> deep thought\n", 60);
         let text = line_text(&lines[0]);
-        assert!(text.starts_with("▏ "), "{text}");
-        assert!(format!("{:?}", lines[0]).contains("italic()"));
-        assert!(
-            format!("{:?}", lines[0]).contains(&format!("{:?}", palette::META)),
-            "muted gray"
-        );
+        assert!(text.starts_with("│ "), "{text}");
+        assert_eq!(lines[0].spans[0].style.fg, Some(palette::RULE), "rail");
+        assert_eq!(lines[0].spans[1].style, palette::QUOTE, "quote text");
+    }
+
+    #[test]
+    fn horizontal_rule_spans_the_full_width() {
+        let lines = render("above\n\n---\n", 90);
+        let rule = lines.last().unwrap();
+        assert_eq!(line_text(rule), "─".repeat(90));
+        assert_eq!(rule.spans[0].style.fg, Some(palette::RULE));
+    }
+
+    /// Every rendered row fits the width, whatever the block: long
+    /// headings, code lines, tables, quotes, lists, rules.
+    #[test]
+    fn every_block_fits_the_width() {
+        let md = "# A heading long enough to wrap at narrow widths for sure\n\
+                  ## Second level heading with words\n\
+                  text with `inline code` and **bold** and *italic* and [link](http://example.com/a/b)\n\
+                  > a quoted line that keeps going and going past the edge\n\
+                  - [x] a done task item that is also rather long indeed\n\
+                  \x20   - nested bullet with several words in it\n\
+                  12. numbered item with a few words\n\
+                  ---\n\
+                  ```rust\n\
+                  fn main() { let a_very_long_identifier_name = \"a long string literal\"; }\n\
+                  \tindented();\n\
+                  ```\n\
+                  | Column one | Column two |\n\
+                  |---|---|\n\
+                  | a fairly long cell value | another long one |\n";
+        for width in [4u16, 10, 17, 24, 40, 80] {
+            for row in render(md, width) {
+                let used: usize = row.spans.iter().map(|s| s.content.width()).sum();
+                assert!(used <= width as usize, "w={width} overflow: {row:?}");
+            }
+        }
     }
     #[test]
     fn rust_fence_uses_the_language_tokenizer() {
@@ -1465,11 +1664,11 @@ mod tests {
             "keyword: {joined}"
         );
         assert!(
-            joined.contains(&format!("{:?}", palette::WARN)),
+            joined.contains(&format!("{:?}", palette::SYNTAX_NUMBER)),
             "number: {joined}"
         );
         assert!(
-            joined.contains(&format!("{:?}", palette::META)),
+            joined.contains(&format!("{:?}", palette::SYNTAX_COMMENT)),
             "comment: {joined}"
         );
     }
@@ -1493,7 +1692,7 @@ mod tests {
             "true keyword: {joined}"
         );
         assert!(
-            joined.contains(&format!("{:?}", palette::WARN)),
+            joined.contains(&format!("{:?}", palette::SYNTAX_NUMBER)),
             "json number: {joined}"
         );
 
@@ -1501,11 +1700,11 @@ mod tests {
         push_code_block(&mut out, &["rate = 0.5 # capped".to_string()], "toml", 80);
         let joined = format!("{out:?}");
         assert!(
-            joined.contains(&format!("{:?}", palette::WARN)),
+            joined.contains(&format!("{:?}", palette::SYNTAX_NUMBER)),
             "toml number: {joined}"
         );
         assert!(
-            joined.contains(&format!("{:?}", palette::META)),
+            joined.contains(&format!("{:?}", palette::SYNTAX_COMMENT)),
             "toml comment: {joined}"
         );
 
@@ -1540,11 +1739,12 @@ mod tests {
             "rust",
             80,
         );
-        // fences no longer emit marker rows: out[1] is the second code
-        // row, carrying the `▎ ` rail
-        let second = &out[1];
+        // out[0] is the panel's tag row; out[2] is the second code row,
+        // led by the one-column pad and padded to the panel width
+        let second = &out[2];
         let text: String = second.spans.iter().map(|s| s.content.to_string()).collect();
-        assert_eq!(text, "▎ still comment */ let x = 1;");
+        assert_eq!(text.trim_end(), " still comment */ let x = 1;");
+        assert_eq!(text.width(), 80, "panel row padded to width");
         assert!(
             format!("{second:?}").contains(&format!("{:?}", palette::SYNTAX_KEYWORD)),
             "let styled after the close: {second:?}"
@@ -1559,9 +1759,9 @@ mod tests {
             80,
         );
         assert!(
-            format!("{:?}", out[1]).contains(&format!("{:?}", palette::SYNTAX_KEYWORD)),
+            format!("{:?}", out[2]).contains(&format!("{:?}", palette::SYNTAX_KEYWORD)),
             "next line keywords styled: {:?}",
-            out[1]
+            out[2]
         );
 
         // unterminated block comment swallows the rest of the block, no panic
@@ -1573,9 +1773,9 @@ mod tests {
             80,
         );
         assert!(
-            format!("{:?}", out[1]).contains(&format!("{:?}", palette::META)),
+            format!("{:?}", out[2]).contains(&format!("{:?}", palette::SYNTAX_COMMENT)),
             "rest of the fence stays comment: {:?}",
-            out[1]
+            out[2]
         );
     }
 

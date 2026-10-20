@@ -6,6 +6,7 @@ use std::io;
 
 use crossterm::event::{Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
+pub mod fx;
 pub mod icons;
 pub mod markdown;
 pub mod observer;

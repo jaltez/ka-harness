@@ -90,7 +90,11 @@ pub fn apply_event(state: &mut ObserverState, evt: &Event) {
                         }
                         for call in &m.calls {
                             state.push(
-                                format!("  {} {}", tool_glyph(&call.tool), call.detail),
+                                format!(
+                                    "  {} {}",
+                                    crate::icons::tool_icon(&call.tool),
+                                    call.detail
+                                ),
                                 true,
                                 if call.is_error {
                                     Some(Color::Red)
@@ -123,7 +127,11 @@ pub fn apply_event(state: &mut ObserverState, evt: &Event) {
         } => state.pending.push_str(t),
         Event::CallStarted { tool, detail, .. } => {
             state.flush_pending();
-            state.push(format!("{} {}", tool_glyph(tool), detail), true, None);
+            state.push(
+                format!("{} {}", crate::icons::tool_icon(tool), detail),
+                true,
+                None,
+            );
         }
         Event::CallOutput {
             excerpt, is_error, ..
@@ -180,18 +188,6 @@ fn cap_width(line: &str) -> String {
         format!("{capped}…")
     } else {
         capped
-    }
-}
-
-fn tool_glyph(tool: &str) -> char {
-    match tool {
-        "bash" => '🐚',
-        "read" => '📖',
-        "edit" | "write" => '✎',
-        "grep" => '🔍',
-        "glob" => '🌐',
-        "web_fetch" | "web_search" => '🛰',
-        _ => '🔧',
     }
 }
 
@@ -345,7 +341,11 @@ fn draw(
 
             // footer: presence chips + hints
             let busy = if state.busy { "busy" } else { "idle" };
-            let mut footer = format!(" ◉ {busy} · 👁 {} attached", state.attached);
+            let mut footer = format!(
+                " ◉ {busy} · {} {} attached",
+                crate::icons::AGENTS,
+                state.attached
+            );
             if !state.model.is_empty() {
                 footer.push_str(&format!(" · {}", state.model));
             }
