@@ -1569,6 +1569,8 @@ async fn mcp_cache_registers_tools_without_waiting_on_the_server() {
         url: None,
         headers: Vec::new(),
     };
+    // legacy-shape cache: a dotted name written before sanitization —
+    // load must re-derive `demo__fetch`.
     ka_engine::mcp_cache::store_tools(
         &server,
         &[ka_engine::mcp::McpTool {
@@ -1609,7 +1611,7 @@ async fn mcp_cache_registers_tools_without_waiting_on_the_server() {
             e,
             Event::Inventory { mcp, tools, .. }
                 if mcp.iter().any(|s| s.name == "demo" && s.ok && s.tools == 1)
-                    && tools.iter().any(|t| t == "demo.fetch")
+                    && tools.iter().any(|t| t == "demo__fetch")
         )),
         "cached tools must register without the server: {events:?}"
     );

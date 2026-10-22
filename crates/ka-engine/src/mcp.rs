@@ -65,7 +65,7 @@ impl McpServerConfig {
 /// One tool advertised by a server.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct McpTool {
-    /// Prefixed tool name (`server.tool`).
+    /// Wire-facing tool name (`server__tool`, `[a-zA-Z0-9_-]` only).
     pub name: String,
     /// Raw tool name on the server.
     pub raw_name: String,
@@ -854,13 +854,31 @@ fn parse_tools(result: &Value, server_name: &str) -> Result<Vec<McpTool>, String
                 .cloned()
                 .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
             Some(McpTool {
-                name: format!("{server_name}.{raw_name}"),
+                name: wire_name(server_name, &raw_name),
                 raw_name,
                 description,
                 schema,
             })
         })
         .collect())
+}
+/// The name the model sees: `{server}__{raw}` with every character
+/// outside `[a-zA-Z0-9_-]` collapsed to `_`. Providers reject function
+/// names off that pattern (`tools[n].function.name`), so a dotted
+/// `server.tool` namespace never reaches the wire.
+pub(crate) fn wire_name(server: &str, raw: &str) -> String {
+    let clean = |s: &str| {
+        s.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>()
+    };
+    format!("{}__{}", clean(server), clean(raw))
 }
 
 /// Concatenate a tool result's text content parts.
@@ -1342,7 +1360,7 @@ for line in sys.stdin:
         }
         let (mut client, tools) = McpClient::spawn_connect(&cfg()).await.unwrap();
         assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].name, "fake.echo");
+        assert_eq!(tools[0].name, "fake__echo");
         assert!(tools[0].description.contains("echo"));
         let out = client
             .call_tool("echo", json!({"text": "hello"}))
@@ -1538,7 +1556,7 @@ for line in sys.stdin:
         };
         let (mut client, tools) = McpClient::spawn_connect(&cfg).await.unwrap();
         assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].name, "http.echo");
+        assert_eq!(tools[0].name, "http__echo");
         // session id from the initialize response is echoed on later calls
         assert!(client.alive().await, "ping round-trip must succeed");
     }
@@ -1650,7 +1668,7 @@ for line in sys.stdin:
         };
         let (_client, tools) = McpClient::spawn_connect(&cfg).await.unwrap();
         assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].name, "sse.ping_tool");
+        assert_eq!(tools[0].name, "sse__ping_tool");
     }
 
     #[tokio::test]
