@@ -69,7 +69,15 @@ pub fn load_tools(cfg: &McpServerConfig) -> Option<Vec<McpTool>> {
     let text = std::fs::read_to_string(cache_file()).ok()?;
     let cache: Cache = serde_json::from_str(&text).ok()?;
     let entry = cache.servers.get(&cfg.name)?;
-    (entry.hash == config_hash(cfg) && !entry.tools.is_empty()).then(|| entry.tools.clone())
+    (entry.hash == config_hash(cfg) && !entry.tools.is_empty()).then(|| {
+        let mut tools = entry.tools.clone();
+        // Caches written before wire names were sanitized carry dotted
+        // `server.tool` names; re-derive so they never reach the wire.
+        for t in &mut tools {
+            t.name = crate::mcp::wire_name(&cfg.name, &t.raw_name);
+        }
+        tools
+    })
 }
 
 /// Remember `tools` under `cfg`'s hash — best-effort, read-modify-write
@@ -167,7 +175,7 @@ mod tests {
 
     fn tool(name: &str) -> McpTool {
         McpTool {
-            name: format!("demo.{name}"),
+            name: format!("demo__{name}"),
             raw_name: name.into(),
             description: "a tool".into(),
             schema: serde_json::json!({"type": "object"}),
@@ -181,13 +189,25 @@ mod tests {
         store_tools(&c, &[tool("fetch"), tool("probe")]);
         let back = load_tools(&c).unwrap();
         assert_eq!(back.len(), 2);
-        assert_eq!(back[0].name, "demo.fetch");
+        assert_eq!(back[0].name, "demo__fetch");
         // any config change is a miss: different args → different hash
         let mut changed = cfg("demo", "server-bin");
         changed.args.push("--verbose".into());
         assert!(load_tools(&changed).is_none());
         // a different server name is a miss
         assert!(load_tools(&cfg("other", "server-bin")).is_none());
+    }
+
+    #[test]
+    fn legacy_dotted_names_are_rederived_on_load() {
+        let _g = test_support::cache_guard();
+        let c = cfg("demo", "server-bin");
+        let mut legacy = tool("fetch");
+        legacy.name = "demo.fetch".into(); // written before wire-name sanitization
+        store_tools(&c, &[legacy]);
+        let back = load_tools(&c).unwrap();
+        assert_eq!(back[0].name, "demo__fetch");
+        assert_eq!(back[0].raw_name, "fetch");
     }
 
     #[test]
