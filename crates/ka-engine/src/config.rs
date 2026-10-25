@@ -300,6 +300,11 @@ pub struct Tui {
     /// at runtime either way. kitty has no alternate-scroll — keep
     /// `"capture"` there for the wheel.
     pub mouse: Option<String>,
+    /// Report this agent's state (`idle`/`working`/`blocked`), resume
+    /// command, and exit to the Herdr pane hosting it (opt-in; requires
+    /// `HERDR_ENV=1` and its pane variables, so it is inert outside
+    /// Herdr). Default off.
+    pub herdr: Option<bool>,
 }
 
 impl Sandbox {
@@ -326,6 +331,16 @@ pub struct Lsp {
     /// Act through the server, not just read: adds the `lsp_rename` and
     /// `lsp_actions` hands (Write tier). Default false.
     pub write_through: Option<bool>,
+}
+
+/// Prompt assembly ([prompt]).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct PromptSettings {
+    /// A file whose text replaces ka's built-in identity sentence in
+    /// the system prompt (free-form instructions; re-read every turn,
+    /// capped at 8 KiB). Ignored in safe mode.
+    pub identity_file: Option<String>,
 }
 
 /// DAP debugging probe ([debug]): off by default — spawning debug
@@ -487,6 +502,9 @@ pub struct Config {
     /// Runtime feature toggles ([features]).
     #[serde(default)]
     pub features: Features,
+    /// Prompt assembly ([prompt]).
+    #[serde(default)]
+    pub prompt: PromptSettings,
 }
 
 impl Config {
@@ -581,6 +599,9 @@ impl Config {
         if other.tui.mouse.is_some() {
             self.tui.mouse = other.tui.mouse;
         }
+        if other.tui.herdr.is_some() {
+            self.tui.herdr = other.tui.herdr;
+        }
         if other.tools.mcp.discovery.is_some() {
             self.tools.mcp.discovery = other.tools.mcp.discovery;
         }
@@ -607,6 +628,9 @@ impl Config {
         }
         if !other.features.disable.is_empty() {
             self.features.disable = other.features.disable;
+        }
+        if other.prompt.identity_file.is_some() {
+            self.prompt.identity_file = other.prompt.identity_file;
         }
     }
     /// Effective step cap (default 20).
@@ -1173,7 +1197,7 @@ mod tests {
         let mut cfg = Config::default();
         cfg.overlay(
             Config::parse_layer(
-                "[guards]\nspend_usd = 2.5\ncontext_pct = 80\n\n[[search]]\nprovider = \"tavily\"\napi_key_env = \"TAVILY_KEY\"\n\n[tools.web]\nallow_private_hosts = true\n\n[tools.mcp]\ndiscovery = \"lazy\"\n\n[tui]\nheader_glyph = \"*\"\nbell = false\nnotify = \"notify-send ka done\"\n\n[verify]\ntest = \"cargo test\"\n\n[[verify.lints]]\npattern = \"*.rs\"\ncommand = \"rustfmt --check {file}\"\n\n[features]\ndisable = [\"agents\", \"mcp:github\"]\n",
+                "[guards]\nspend_usd = 2.5\ncontext_pct = 80\n\n[[search]]\nprovider = \"tavily\"\napi_key_env = \"TAVILY_KEY\"\n\n[tools.web]\nallow_private_hosts = true\n\n[tools.mcp]\ndiscovery = \"lazy\"\n\n[tui]\nheader_glyph = \"*\"\nbell = false\nnotify = \"notify-send ka done\"\nherdr = true\n\n[verify]\ntest = \"cargo test\"\n\n[[verify.lints]]\npattern = \"*.rs\"\ncommand = \"rustfmt --check {file}\"\n\n[features]\ndisable = [\"agents\", \"mcp:github\"]\n\n[prompt]\nidentity_file = \"/tmp/IDENTITY.md\"\n",
                 "project",
             )
             .unwrap(),
@@ -1194,6 +1218,12 @@ mod tests {
             cfg.tui.notify.as_deref(),
             Some("notify-send ka done"),
             "[tui] notify survives"
+        );
+        assert_eq!(cfg.tui.herdr, Some(true), "[tui] herdr survives");
+        assert_eq!(
+            cfg.prompt.identity_file.as_deref(),
+            Some("/tmp/IDENTITY.md"),
+            "[prompt] identity_file survives"
         );
         assert_eq!(
             cfg.verify.test.as_deref(),

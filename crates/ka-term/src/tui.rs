@@ -2788,6 +2788,93 @@ pub static SKILLS: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::
 /// stdin — `notify-send ka "done"` is the canonical use.
 pub static NOTIFY: std::sync::OnceLock<NotifySettings> = std::sync::OnceLock::new();
 
+/// What an opt-in integration (Herdr) gets to see: the TUI's activity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentActivity {
+    /// Ready for input.
+    Idle,
+    /// A turn is streaming.
+    Working,
+    /// A permission ask holds the turn.
+    Blocked,
+}
+
+/// One activity report: the state plus the active strand id (empty while
+/// the engine has not named one yet).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivityReport {
+    /// The state to surface.
+    pub activity: AgentActivity,
+    /// Active strand id — the integration's resume handle.
+    pub session: String,
+}
+
+/// One message for an [`ActivitySink`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentReport {
+    /// A state (and session) change.
+    Report(ActivityReport),
+    /// The agent is quitting: clear the pane's agent.
+    Release,
+    /// Stop the consumer (sent after a release; used by tests too).
+    Stop,
+}
+
+/// Latest-wins hand-off between the TUI loop and an out-of-process
+/// integration: publishing replaces any unconsumed report, so a slow
+/// reporter can never replay stale states (and never grows a queue).
+#[derive(Debug, Default)]
+pub struct ActivitySink {
+    slot: std::sync::Mutex<Option<AgentReport>>,
+    ready: std::sync::Condvar,
+}
+
+impl ActivitySink {
+    /// A fresh, empty sink.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Replace the pending report and wake the consumer.
+    pub fn publish(&self, report: AgentReport) {
+        if let Ok(mut slot) = self.slot.lock() {
+            *slot = Some(report);
+        }
+        self.ready.notify_one();
+    }
+
+    /// Block until a report is published, then take it.
+    pub fn wait(&self) -> Option<AgentReport> {
+        let mut slot = self.slot.lock().ok()?;
+        loop {
+            if let Some(report) = slot.take() {
+                return Some(report);
+            }
+            slot = self.ready.wait(slot).ok()?;
+        }
+    }
+}
+
+/// Installed once by the CLI when the integration is enabled.
+static ACTIVITY: std::sync::OnceLock<std::sync::Arc<ActivitySink>> = std::sync::OnceLock::new();
+
+/// Install the sink the TUI publishes activity to. No-op after the first
+/// call, and the TUI runs unchanged when nothing is installed.
+pub fn set_activity_sink(sink: std::sync::Arc<ActivitySink>) {
+    let _ = ACTIVITY.set(sink);
+}
+
+/// The state a turn holds: a permission ask outranks a running turn.
+fn activity_of(busy: bool, blocked: bool) -> AgentActivity {
+    if blocked {
+        AgentActivity::Blocked
+    } else if busy {
+        AgentActivity::Working
+    } else {
+        AgentActivity::Idle
+    }
+}
+
 /// What the CLI resolves from `[tui]` config before `run`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NotifySettings {
@@ -3962,6 +4049,8 @@ async fn app(
     // what the pointer currently hovers (capture mode; motion events)
     let mut hover: Option<Hover> = None;
     let mut was_overlay_open = false;
+    // last (activity, session) published to an opt-in sink
+    let mut reported: Option<(AgentActivity, String)> = None;
 
     while exit.is_none() {
         // Hybrid mouse: base native leaves the mouse to the terminal
@@ -3993,6 +4082,19 @@ async fn app(
         }
         let busy_now = busy;
         let ask = pending.clone();
+        // opt-in integrations (Herdr) see one report per state/session
+        // change; with no sink installed this is a no-op
+        let activity = activity_of(busy_now, ask.is_some());
+        let session_now = meters.session.clone();
+        if reported.as_ref() != Some(&(activity, session_now.clone())) {
+            if let Some(sink) = ACTIVITY.get() {
+                sink.publish(AgentReport::Report(ActivityReport {
+                    activity,
+                    session: session_now.clone(),
+                }));
+            }
+            reported = Some((activity, session_now));
+        }
         let input_snapshot = input.text.clone();
         let rsearch = input.search_title();
         let (term_w, term_h) = match terminal.size() {
@@ -10960,6 +11062,16 @@ fn render(
                         if trow >= start + content_rect.height as usize {
                             break;
                         }
+                        // a thinking block's canvas spacers (the blank
+                        // rows before and after it) belong to the entry
+                        // for click mapping, but lifting them would
+                        // highlight air: only rows with content glow
+                        let Some(row) = transcript.row(trow) else {
+                            continue;
+                        };
+                        if row.spans.is_empty() {
+                            continue;
+                        }
                         let y = content_rect.y + (trow - start) as u16;
                         for x in content_rect.x..content_rect.right() {
                             if let Some(cell) = buf.cell_mut((x, y))
@@ -13015,6 +13127,76 @@ mod tests {
     }
 
     #[test]
+    fn hover_skips_a_thinking_blocks_canvas_spacers() {
+        // a thinking block owns the blank rows before and after it (its
+        // click target), but the hover lift must light only the head and
+        // body rows — never the air around them
+        let build = || {
+            let mut t = Transcript::default();
+            for i in 0..12 {
+                t.push(Line::Info(format!("filler row {i}")));
+            }
+            t.push(Line::Thought("one\ntwo\nthree\nfour".into()));
+            t
+        };
+        let mut plain_t = build();
+        let entry = plain_t.entries().len() - 1;
+        let plain = plain_frame(
+            &mut plain_t,
+            (80, 24),
+            "",
+            &SidebarState::default(),
+            None,
+            None,
+        );
+        let mut hot_t = build();
+        let hot = plain_frame(
+            &mut hot_t,
+            (80, 24),
+            "",
+            &SidebarState::default(),
+            None,
+            Some(Hover::Entry(entry)),
+        );
+        let (area, start) = hot.tx.expect("content rect published");
+        let (first, len) = hot_t.entry_row_span(entry).expect("entry rows");
+        let (pb, hb) = (
+            plain.terminal.backend().buffer(),
+            hot.terminal.backend().buffer(),
+        );
+        let mut lifted = 0;
+        let mut grounded = 0;
+        for r in first..first + len {
+            let blank = hot_t.row(r).is_none_or(|row| row.spans.is_empty());
+            let y = area.y + (r.saturating_sub(start)) as u16;
+            if r < start || r >= start + area.height as usize || y >= area.bottom() {
+                continue;
+            }
+            for x in area.x..area.right() {
+                if blank {
+                    assert_eq!(
+                        hb[(x, y)].bg,
+                        pb[(x, y)].bg,
+                        "spacer row ({x},{y}) keeps its ground"
+                    );
+                } else {
+                    assert_eq!(hb[(x, y)].bg, crate::palette::BG_HOVER, "({x},{y}) lifts");
+                }
+            }
+            if blank {
+                grounded += 1;
+            } else {
+                lifted += 1;
+            }
+        }
+        assert!(lifted >= 2, "head + body rows lift: {lifted}");
+        assert!(
+            grounded >= 2,
+            "leading + trailing spacers stay put: {grounded}"
+        );
+    }
+
+    #[test]
     fn composer_cursor_accounts_for_the_prompt_lead() {
         // 80x24, one draft row: composer y19..=21, x1..=78; the text
         // starts after border + padding + the `❯ ` lead
@@ -13874,6 +14056,34 @@ mod tests {
         assert!(!live_stale(t0, t0 + Duration::from_millis(79)));
         assert!(live_stale(t0, t0 + Duration::from_millis(80)));
         assert!(live_stale(t0, t0 + Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn activity_reports_blocked_over_working_and_coalesces() {
+        use AgentActivity::{Blocked, Idle, Working};
+        assert_eq!(activity_of(false, false), Idle);
+        assert_eq!(activity_of(true, false), Working);
+        assert_eq!(activity_of(true, true), Blocked, "an ask outranks the turn");
+        assert_eq!(activity_of(false, true), Blocked);
+        // latest-wins: a slow consumer never replays a stale state
+        let sink = ActivitySink::new();
+        sink.publish(AgentReport::Report(ActivityReport {
+            activity: Working,
+            session: "s1".into(),
+        }));
+        sink.publish(AgentReport::Report(ActivityReport {
+            activity: Idle,
+            session: "s1".into(),
+        }));
+        assert_eq!(
+            sink.wait(),
+            Some(AgentReport::Report(ActivityReport {
+                activity: Idle,
+                session: "s1".into()
+            }))
+        );
+        sink.publish(AgentReport::Release);
+        assert_eq!(sink.wait(), Some(AgentReport::Release));
     }
 
     #[test]

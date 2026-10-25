@@ -1775,3 +1775,102 @@ async fn hill_climb_rates_only_plan_mode() {
     assert_eq!(speaker.requests.lock().len(), 2);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Live steering (gap G14): a `Steer` sent while a tool runs rides the
+/// history at the tool-batch boundary — the next model request ends
+/// with the tool result followed by the steer as a user message, a
+/// `steer delivered` note surfaces, and nothing converts into a queued
+/// follow-on turn (exactly one TurnFinished + one Idle).
+#[tokio::test]
+async fn steer_during_tool_batch_rides_the_next_request() {
+    let dir = tmp_dir("steer-live");
+    let cfg = ka_engine::Config {
+        cwd: Some(dir.to_string_lossy().into_owned()),
+        model: Some("test/m".into()),
+        mode: Some(ka_protocol::Mode::Free),
+        ..Default::default()
+    };
+    let speaker = Scripted::new(vec![("bash", serde_json::json!({"command": "sleep 0.25"}))]);
+    let mut handle = ka_engine::spawn_with_speaker(
+        cfg,
+        test_catalog(),
+        ka_engine::StrandChoice::New,
+        ka_dialect::Wire::OpenaiChat,
+        speaker.clone(),
+    );
+
+    handle
+        .commands
+        .send(Command::Prompt {
+            allowed_tools: None,
+            model: None,
+            text: "go".into(),
+            schema: None,
+            images: Vec::new(),
+            skills: Vec::new(),
+        })
+        .await
+        .expect("engine alive");
+    let mut events = Vec::new();
+    loop {
+        let e = tokio::time::timeout(Duration::from_secs(15), handle.events.recv())
+            .await
+            .expect("event within 15s")
+            .expect("engine alive");
+        let idle = matches!(e, Event::Idle);
+        if matches!(e, Event::CallStarted { .. }) {
+            // the tool sleeps 250 ms: the steer lands mid-batch
+            handle
+                .commands
+                .send(Command::Steer {
+                    text: "use metric units".into(),
+                })
+                .await
+                .expect("engine alive");
+        }
+        events.push(e);
+        if idle {
+            break;
+        }
+    }
+    // quiet drain
+    while let Ok(Some(e)) =
+        tokio::time::timeout(Duration::from_millis(300), handle.events.recv()).await
+    {
+        events.push(e);
+    }
+
+    assert!(
+        events.iter().any(|e| matches!(e, Event::Note { message }
+            if message == "steer delivered: use metric units")),
+        "the delivery note surfaces: {events:?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, Event::TurnFinished { .. }))
+            .count(),
+        1,
+        "no queued follow-on turn: {events:?}"
+    );
+    let requests = speaker.requests.lock();
+    assert_eq!(requests.len(), 2, "call round + final round");
+    let second = requests.last().unwrap();
+    let steer_msg = second
+        .iter()
+        .rev()
+        .find(|m| m.role == TurnRole::User && m.content.contains("use metric units"))
+        .expect("the steer rides the second request as a user message");
+    assert!(
+        steer_msg
+            .content
+            .starts_with("[operator, while you were working]"),
+        "the steer is framed as operator input: {}",
+        steer_msg.content
+    );
+    assert!(
+        second.iter().any(|m| m.role == TurnRole::Tool),
+        "the tool result precedes the steer: {second:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -9,6 +9,7 @@ use crossterm::event::{Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyM
 pub mod fx;
 pub mod icons;
 pub mod markdown;
+pub mod mermaid;
 pub mod observer;
 pub mod palette;
 pub mod tui;

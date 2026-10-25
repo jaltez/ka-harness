@@ -736,6 +736,15 @@ fn push_code_block(out: &mut Vec<TuiLine<'static>>, lines: &[String], lang: &str
     if lines.is_empty() {
         return;
     }
+    // a mermaid fence draws as a diagram instead of a source panel;
+    // anything the subset renderer cannot lay out at this width keeps
+    // the panel below
+    if lang.eq_ignore_ascii_case("mermaid")
+        && let Some(rows) = crate::mermaid::render(&lines.join("\n"), width)
+    {
+        out.extend(rows);
+        return;
+    }
     let w = width as usize;
     let head = if lang.is_empty() {
         Vec::new()

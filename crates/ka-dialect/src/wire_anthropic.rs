@@ -49,6 +49,32 @@ impl Speaker for AnthropicMessages {
     }
 }
 
+/// Push one `user` message, merging into the previous one when it is
+/// also `user` — the Messages API requires strict alternation, and a
+/// live steer appended after tool results produces exactly that shape.
+/// String content becomes a `{"type":"text"}` block on merge.
+fn push_user(messages: &mut Vec<Value>, content: Value) {
+    if let Some(last) = messages.last_mut() {
+        if last.get("role").and_then(Value::as_str) == Some("user") {
+            let mut blocks = match last.get_mut("content") {
+                Some(Value::Array(blocks)) => std::mem::take(blocks),
+                Some(Value::String(text)) => {
+                    vec![json!({"type": "text", "text": std::mem::take(text)})]
+                }
+                _ => Vec::new(),
+            };
+            match content {
+                Value::Array(mut new_blocks) => blocks.append(&mut new_blocks),
+                Value::String(text) => blocks.push(json!({"type": "text", "text": text})),
+                other => blocks.push(other),
+            }
+            last["content"] = Value::Array(blocks);
+            return;
+        }
+    }
+    messages.push(json!({"role": "user", "content": content}));
+}
+
 async fn speak_anthropic(
     client: &reqwest::Client,
     req: &SpeakRequest,
@@ -166,10 +192,10 @@ async fn speak_anthropic(
             crate::speaker::TurnRole::User if !m.images.is_empty() => {
                 let mut blocks = image_blocks(&m.images);
                 blocks.push(json!({"type": "text", "text": m.content}));
-                messages.push(json!({"role": "user", "content": blocks}));
+                push_user(&mut messages, Value::Array(blocks));
             }
             crate::speaker::TurnRole::User => {
-                messages.push(json!({"role": "user", "content": m.content}));
+                push_user(&mut messages, Value::String(m.content.clone()));
             }
             crate::speaker::TurnRole::Assistant if !m.calls.is_empty() || !m.results.is_empty() => {
                 let mut blocks = Vec::new();
@@ -214,7 +240,7 @@ async fn speak_anthropic(
                         }
                     })
                     .collect();
-                messages.push(json!({"role": "user", "content": blocks}));
+                push_user(&mut messages, Value::Array(blocks));
             }
         }
     }
@@ -242,6 +268,7 @@ async fn speak_anthropic(
     let mut stream = resp.bytes_stream();
     let mut usage = ka_protocol::Usage::default();
     let mut stop = Stop::Done;
+    let mut saw_terminal = false;
     let mut blocks: Vec<Block> = Vec::new();
 
     loop {
@@ -387,6 +414,7 @@ async fn speak_anthropic(
                 }
                 "message_delta" => {
                     if let Some(reason) = v.pointer("/delta/stop_reason").and_then(Value::as_str) {
+                        saw_terminal = true;
                         stop = match reason {
                             "max_tokens" => Stop::Length,
                             // server tools (web search) can pause the
@@ -403,7 +431,7 @@ async fn speak_anthropic(
                             .unwrap_or(usage.output);
                     }
                 }
-                "message_stop" => {}
+                "message_stop" => saw_terminal = true,
                 "error" => {
                     let message = v
                         .pointer("/error/message")
@@ -427,20 +455,32 @@ async fn speak_anthropic(
         let Ok(v) = serde_json::from_str::<Value>(&evt.data) else {
             continue;
         };
-        if v.get("type").and_then(Value::as_str) == Some("message_delta") {
-            if let Some(reason) = v.pointer("/delta/stop_reason").and_then(Value::as_str) {
-                stop = match reason {
-                    "max_tokens" | "pause_turn" => Stop::Length,
-                    _ => Stop::Done,
-                };
+        match v.get("type").and_then(Value::as_str).unwrap_or("") {
+            "message_stop" => saw_terminal = true,
+            "message_delta" => {
+                if let Some(reason) = v.pointer("/delta/stop_reason").and_then(Value::as_str) {
+                    saw_terminal = true;
+                    stop = match reason {
+                        "max_tokens" | "pause_turn" => Stop::Length,
+                        _ => Stop::Done,
+                    };
+                }
+                if let Some(u) = v.pointer("/usage") {
+                    usage.output = u
+                        .get("output_tokens")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(usage.output);
+                }
             }
-            if let Some(u) = v.pointer("/usage") {
-                usage.output = u
-                    .get("output_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(usage.output);
-            }
+            _ => {}
         }
+    }
+    // A clean EOF is not a completed turn: without message_stop (or a
+    // stop_reason) the provider may have cut the stream mid-answer.
+    if !saw_terminal {
+        return Err(WireError::network(
+            "stream ended without message_stop or stop_reason",
+        ));
     }
     // mixed server+client tool calls: the provider defers the search
     // (it runs only if the assistant message is resent with the

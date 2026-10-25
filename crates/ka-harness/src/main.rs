@@ -345,10 +345,67 @@ pub enum InstallCmd {
 mod acp;
 mod attach;
 mod doctor;
+mod herdr;
 mod import;
 mod serve;
 mod skills;
 mod update;
+
+/// One startup flag that shapes a session but is never written to the
+/// strand (only in-session changes are). The `/update` re-exec and the
+/// Herdr resume command both replay these so a resumed session keeps its
+/// model and posture; keeping each flag with its value lets a consumer
+/// drop an unusable pair whole (Herdr rejects apostrophes and control
+/// characters).
+fn startup_args(cli: &Cli) -> Vec<(&'static str, Option<std::ffi::OsString>)> {
+    let mut out: Vec<(&'static str, Option<std::ffi::OsString>)> = Vec::new();
+    if let Some(model) = &cli.model {
+        out.push(("--model", Some(model.into())));
+    }
+    if let Some(mode) = &cli.mode {
+        out.push(("--mode", Some(mode.into())));
+    }
+    if let Some(sandbox) = &cli.sandbox {
+        out.push(("--sandbox", Some(sandbox.into())));
+    }
+    for spec in &cli.disable {
+        out.push(("--disable", Some(spec.to_string().into())));
+    }
+    for spec in &cli.enable {
+        out.push(("--enable", Some(spec.to_string().into())));
+    }
+    for path in &cli.configs {
+        out.push(("--config", Some(path.clone().into_os_string())));
+    }
+    for path in &cli.dialects {
+        out.push(("--dialects", Some(path.clone().into_os_string())));
+    }
+    if cli.no_discovery {
+        out.push(("--no-discovery", None));
+    }
+    if cli.safe_mode {
+        out.push(("--safe-mode", None));
+    }
+    if cli.trust {
+        out.push(("--trust", None));
+    }
+    out
+}
+
+/// [`startup_args`] as Herdr resume groups: one group per flag, and a
+/// non-UTF-8 value drops its group (the argv contract is text-only).
+fn herdr_startup(cli: &Cli) -> Vec<Vec<String>> {
+    startup_args(cli)
+        .into_iter()
+        .filter_map(|(flag, value)| {
+            let mut group = vec![flag.to_string()];
+            if let Some(value) = value {
+                group.push(value.into_string().ok()?);
+            }
+            Some(group)
+        })
+        .collect()
+}
 
 /// The strands storage root (`<data>/strands`). Delegates to
 /// `ka_strand::data_dir()` so the index scans the same tree the writer
@@ -748,121 +805,18 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             }
         },
         #[cfg(target_os = "linux")]
-        Some(CliCommand::KaSandboxExec { policy, argv }) => run_sandbox_exec(&policy, &argv),
+        Some(CliCommand::KaSandboxExec { policy, argv }) => {
+            match ka_sandbox::trampoline::exec_trampoline(&policy, &argv) {
+                Ok(infallible) => match infallible {},
+                Err(e) => Err(e),
+            }
+        }
         None => {
             Cli::command()
                 .print_help()
                 .map_err(|e| format!("help: {e}"))?;
             Ok(ExitCode::SUCCESS)
         }
-    }
-}
-
-/// Hidden `ka-sandbox-exec <policy-json> -- <argv…>`: apply the landlock
-/// ruleset to this process, then exec the real command (restrictions
-/// survive execve). Fails closed: any landlock error refuses to run.
-/// The policy JSON is `{"writable":[…], "net":bool, "env":[…]}` — the
-/// net/env fields carry sandbox-expansion grants.
-#[cfg(target_os = "linux")]
-fn run_sandbox_exec(policy: &str, argv: &[String]) -> Result<ExitCode, String> {
-    use std::os::unix::process::CommandExt;
-
-    // parse the policy JSON by hand (serde_json::Value): ka-harness does
-    // not depend on serde derive directly, and this shape is tiny
-    let parsed: serde_json::Value =
-        serde_json::from_str(policy).map_err(|e| format!("sandbox policy: {e}"))?;
-    let writable: Vec<PathBuf> = parsed
-        .get("writable")
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|x| x.as_str().map(PathBuf::from))
-                .collect()
-        })
-        .unwrap_or_default();
-    let allow_net = parsed.get("net").and_then(|v| v.as_bool()).unwrap_or(false);
-    let env_names: Vec<String> = parsed
-        .get("env")
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|x| x.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
-    let (program, args) = argv
-        .split_first()
-        .ok_or_else(|| "sandbox-exec: no command after --".to_string())?;
-    apply_landlock(&writable, allow_net)?;
-    // parity with bwrap --clearenv: the sandboxed command must not see
-    // the parent's environment (provider API keys live there). PATH is
-    // re-set to the bare minimum so plain commands still resolve; env
-    // grants re-set their variables from this process's environment
-    // (the trampoline still sees the parent's values).
-    let passed: Vec<(String, String)> = env_names
-        .iter()
-        .filter_map(|name| std::env::var(name).ok().map(|value| (name.clone(), value)))
-        .collect();
-    let mut cmd = std::process::Command::new(program);
-    cmd.args(args);
-    cmd.env_clear();
-    cmd.env("PATH", "/usr/local/bin:/usr/bin:/bin");
-    for (name, value) in passed {
-        cmd.env(name, value);
-    }
-    let err = cmd.exec();
-    // exec() only returns on failure
-    Err(format!("sandbox-exec: {program}: {err}"))
-}
-
-/// Landlock policy: read everything beneath `/`; write only beneath the
-/// allowlist; network (bind/connect) denied when the kernel ABI ≥ 4 and
-/// the policy does not grant it (older kernels degrade silently —
-/// filesystem enforcement stays). Mirrors what bwrap's `--unshare-all`
-/// gives the fs tier.
-#[cfg(target_os = "linux")]
-fn apply_landlock(writable: &[PathBuf], allow_net: bool) -> Result<(), String> {
-    use landlock::{
-        ABI, Access, AccessFs, AccessNet, Compatible, LandlockStatus, Ruleset, RulesetAttr,
-        RulesetCreatedAttr, path_beneath_rules,
-    };
-
-    // newest ABI the crate knows: IoctlDev (V5) and later rights get
-    // denied by default too; BestEffort at restrict_self degrades
-    // gracefully on older kernels (they simply don't have the rights)
-    let abi = ABI::V9;
-    let ruleset = Ruleset::default()
-        .handle_access(AccessFs::from_all(abi))
-        .map_err(|e| format!("sandbox: ruleset: {e}"))?;
-    // handled-but-ungranted network access = denied on ABI ≥ 4;
-    // BestEffort makes these no-ops where the kernel lacks it. An
-    // expansion grant skips the handling entirely: unhandled = allowed.
-    let ruleset = if allow_net {
-        ruleset
-    } else {
-        ruleset
-            .handle_access(AccessNet::BindTcp)
-            .map_err(|e| format!("sandbox: ruleset (net bind): {e}"))?
-            .handle_access(AccessNet::ConnectTcp)
-            .map_err(|e| format!("sandbox: ruleset (net connect): {e}"))?
-    };
-    let created = ruleset
-        .create()
-        .map_err(|e| format!("sandbox: ruleset create: {e}"))?
-        .add_rules(path_beneath_rules(["/"], AccessFs::from_read(abi)))
-        .map_err(|e| format!("sandbox: read rules: {e}"))?
-        .add_rules(path_beneath_rules(writable.iter(), AccessFs::from_all(abi)))
-        .map_err(|e| format!("sandbox: write rules: {e}"))?;
-    let status = created
-        .set_compatibility(landlock::CompatLevel::BestEffort)
-        .restrict_self()
-        .map_err(|e| format!("sandbox: landlock enforce: {e}"))?;
-    match status.landlock {
-        LandlockStatus::Available { .. } => Ok(()),
-        LandlockStatus::NotEnabled | LandlockStatus::NotImplemented => Err(
-            "sandbox: kernel landlock not enabled on this host — refusing to run unsandboxed"
-                .to_string(),
-        ),
     }
 }
 /// The `/review` preset as a headless prompt (focus: a base ref or a
@@ -1333,7 +1287,7 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
             .map(|a| (a.name, a.description))
             .collect()
     };
-    let (cfg_tui_header_glyph, tui_notify, tui_mouse_capture) = {
+    let (cfg_tui_header_glyph, tui_notify, tui_mouse_capture, tui_herdr) = {
         let trust = trust_for_cwd(false);
         load_config(
             &cli.configs,
@@ -1350,6 +1304,7 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
                     command: c.tui.notify.clone(),
                 },
                 c.effective_mouse_capture(),
+                c.tui.herdr.unwrap_or(false),
             )
         })
         .unwrap_or_else(|_| {
@@ -1360,9 +1315,16 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
                     command: None,
                 },
                 true,
+                false,
             )
         })
     };
+    // opt-in Herdr integration: inert unless [tui] herdr = true AND the
+    // process runs inside a Herdr pane
+    let mut herdr = herdr::init(tui_herdr, herdr_startup(&cli));
+    if let Some(reporter) = &herdr {
+        ka_term::tui::set_activity_sink(reporter.sink());
+    }
     let exit = ka_term::tui::run(
         commands,
         events,
@@ -1379,6 +1341,11 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
     )
     .await
     .map_err(|e| format!("tui: {e}"))?;
+    // the agent stops owning the pane the moment the TUI returns; the
+    // reporter flushes a release (bounded by one report deadline)
+    if let Some(mut reporter) = herdr.take() {
+        reporter.finish();
+    }
     match exit {
         ka_term::tui::Exit::Quit | ka_term::tui::Exit::EngineEnded => Ok(ExitCode::SUCCESS),
         ka_term::tui::Exit::Update { session } => {
@@ -1409,38 +1376,11 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
             // in-session changes are), so the re-exec must carry them
             // or the resumed session silently changes model and
             // sandbox posture
-            if let Some(model) = &cli.model {
-                relaunch.arg("--model").arg(model);
-            }
-            if let Some(mode) = &cli.mode {
-                relaunch.arg("--mode").arg(mode);
-            }
-            if let Some(sandbox) = &cli.sandbox {
-                relaunch.arg("--sandbox").arg(sandbox);
-            }
-            for spec in &cli.disable {
-                relaunch.arg("--disable").arg(spec.to_string());
-            }
-            for spec in &cli.enable {
-                relaunch.arg("--enable").arg(spec.to_string());
-            }
-            // startup flags are never written to the strand, so the
-            // re-exec must carry them or the resumed session silently
-            // changes model and sandbox posture
-            for path in &cli.configs {
-                relaunch.arg("--config").arg(path);
-            }
-            for path in &cli.dialects {
-                relaunch.arg("--dialects").arg(path);
-            }
-            if cli.no_discovery {
-                relaunch.arg("--no-discovery");
-            }
-            if cli.safe_mode {
-                relaunch.arg("--safe-mode");
-            }
-            if cli.trust {
-                relaunch.arg("--trust");
+            for (flag, value) in startup_args(&cli) {
+                relaunch.arg(flag);
+                if let Some(value) = value {
+                    relaunch.arg(value);
+                }
             }
             println!("⟳ resuming session…");
             use std::os::unix::process::CommandExt;

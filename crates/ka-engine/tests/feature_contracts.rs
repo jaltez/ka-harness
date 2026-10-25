@@ -197,6 +197,28 @@ fn tmp_dir(tag: &str) -> std::path::PathBuf {
     dir
 }
 
+/// An fs policy the way production builds one: the bash hand streams
+/// every command's output through the state dir (`Spill::new`), so
+/// `allowlist_for` always keeps it writable — a policy without it
+/// cannot even start a command under bubblewrap/firejail. The test
+/// adds only that dir (not /tmp or the cache) so out-of-allowlist
+/// writes under the temp dir still earn a grant ask.
+fn fs_policy_for(allow: &[std::path::PathBuf]) -> ka_sandbox::Policy {
+    let state = std::env::var("XDG_STATE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|_| {
+            std::env::var("HOME").map(|h| std::path::PathBuf::from(h).join(".local/state"))
+        })
+        .ok();
+    let mut dirs = allow.to_vec();
+    if let Some(s) = state {
+        if !dirs.contains(&s) {
+            dirs.push(s);
+        }
+    }
+    ka_sandbox::Policy::fs(dirs)
+}
+
 // ---------------------------------------------------------------- registry
 
 /// The documented built-in tool set: names, clearance tiers, read-only
@@ -1318,7 +1340,7 @@ async fn sandbox_expansion_grant_ask_allow_deny_always() {
             ka_dialect::Wire::OpenaiChat,
             Scripted::calls(vec![("bash", serde_json::json!({"command": command}))]),
         );
-    voice.set_sandbox(ka_sandbox::Policy::fs(vec![inside.clone()]));
+    voice.set_sandbox(fs_policy_for(std::slice::from_ref(&inside)));
     let events = run_turn(&mut voice, "go", Some(0)).await;
     let asks = asks_of(&events);
     assert_eq!(asks.len(), 1, "grant-only ask fires once in free mode");
@@ -1338,6 +1360,9 @@ async fn sandbox_expansion_grant_ask_allow_deny_always() {
         let text = std::fs::read_to_string(&target).unwrap_or_default();
         assert!(text.contains("granted"), "allow must run the granted write");
     }
+    // the granted write landed (or never ran) — clear it so the deny
+    // case below starts from a clean slate
+    let _ = std::fs::remove_file(&target);
     // a command inside the allowlist never asks
     let mut voice = Voice::new(test_catalog(), inside.clone(), ka_protocol::Mode::Free, 5)
         .with_speaker(
@@ -1347,7 +1372,7 @@ async fn sandbox_expansion_grant_ask_allow_deny_always() {
                 serde_json::json!({"command": format!("echo ok > {}", inside.join("in.txt").display())}),
             )]),
         );
-    voice.set_sandbox(ka_sandbox::Policy::fs(vec![inside.clone()]));
+    voice.set_sandbox(fs_policy_for(std::slice::from_ref(&inside)));
     let events = run_turn(&mut voice, "go", Some(0)).await;
     assert!(
         asks_of(&events).is_empty(),
@@ -1360,7 +1385,7 @@ async fn sandbox_expansion_grant_ask_allow_deny_always() {
             ka_dialect::Wire::OpenaiChat,
             Scripted::calls(vec![("bash", serde_json::json!({"command": command}))]),
         );
-    voice.set_sandbox(ka_sandbox::Policy::fs(vec![inside.clone()]));
+    voice.set_sandbox(fs_policy_for(std::slice::from_ref(&inside)));
     let events = run_turn(&mut voice, "go", Some(2)).await;
     assert_eq!(asks_of(&events).len(), 1);
     assert!(
@@ -1374,7 +1399,7 @@ async fn sandbox_expansion_grant_ask_allow_deny_always() {
             ka_dialect::Wire::OpenaiChat,
             Scripted::calls(vec![("bash", serde_json::json!({"command": command}))]),
         );
-    voice.set_sandbox(ka_sandbox::Policy::fs(vec![inside.clone()]));
+    voice.set_sandbox(fs_policy_for(std::slice::from_ref(&inside)));
     let events = run_turn(&mut voice, "go", Some(1)).await;
     assert_eq!(asks_of(&events).len(), 1);
     let saved = std::fs::read_to_string(inside.join(".ka/ka.toml")).unwrap_or_default();

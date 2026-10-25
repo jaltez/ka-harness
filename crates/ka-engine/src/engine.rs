@@ -521,6 +521,13 @@ async fn run(
     voice.set_feature_slot(features.clone());
     voice.set_rules(rules);
     voice.set_verify(config.verify.clone());
+    // [prompt] identity_file: same trust class as convention discovery
+    // (a user-authored local file) — inert in safe mode
+    voice.set_identity_file(if crate::conventions::bare_mode() {
+        None
+    } else {
+        config.prompt.identity_file.clone()
+    });
     voice.set_allowed_tools(allowed_tools);
     voice.set_hooks(hooks);
     voice.set_bash_background_ms(config.effective_bash_background_after_ms());

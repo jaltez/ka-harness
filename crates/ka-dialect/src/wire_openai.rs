@@ -243,6 +243,7 @@ async fn speak_openai(
     // complete Call events at stream end (or index switch).
     let mut calls: Vec<PendingCall> = Vec::new();
     let mut finished = false;
+    let mut saw_finish_reason = false;
 
     loop {
         let item =
@@ -291,6 +292,7 @@ async fn speak_openai(
                 continue;
             };
             if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+                saw_finish_reason = true;
                 stop = match reason {
                     "length" => Stop::Length,
                     _ => Stop::Done,
@@ -323,8 +325,19 @@ async fn speak_openai(
     }
     for evt in parser.finish() {
         // trailing frame without [DONE]: treat identically
+        if evt.data.trim() == "[DONE]" {
+            finished = true;
+            continue;
+        }
         if let Ok(v) = serde_json::from_str::<Value>(&evt.data) {
             if let Some(choice) = v.pointer("/choices/0") {
+                if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+                    saw_finish_reason = true;
+                    stop = match reason {
+                        "length" => Stop::Length,
+                        _ => Stop::Done,
+                    };
+                }
                 if let Some(delta) = choice.get("delta") {
                     if let Some(text) = delta.get("content").and_then(Value::as_str) {
                         out.send(StreamEvent::Text(text.to_string())).await.ok();
@@ -332,6 +345,16 @@ async fn speak_openai(
                 }
             }
         }
+    }
+
+    // A clean EOF is not a completed turn: without [DONE] or a
+    // finish_reason the provider may have cut the stream mid-answer.
+    // Fail retryably before emitting calls so a truncated tool call is
+    // never executed.
+    if !finished && !saw_finish_reason {
+        return Err(WireError::network(
+            "stream ended without [DONE] or finish_reason",
+        ));
     }
 
     // Emit complete calls.
@@ -347,7 +370,6 @@ async fn speak_openai(
         .await
         .ok();
     }
-    let _ = finished;
     out.send(StreamEvent::Finished { stop, usage }).await.ok();
     Ok(())
 }

@@ -28,7 +28,8 @@ ka run "summarize the build error"  # one headless turn, NDJSON events on stdout
 
 Essential keys: `Enter` send or steer mid-turn · `⇧Enter` newline (`Ctrl+J` fallback) · `Esc`/`Ctrl-C` abort · `/help` for the rest.
 
-Full key map, slash commands, mouse, and modes of use: [TUI](https://ka-harness.dev/docs/interfaces/tui/) · [headless](https://ka-harness.dev/docs/interfaces/headless/) · [CLI reference](https://ka-harness.dev/docs/getting-started/cli/).
+
+Markdown answers render with shaded code panels, tables, and mermaid diagrams drawn as box-drawing flowcharts, sequence and state diagrams, quadrant planes; anything the renderer does not cover keeps its source panel.
 
 ## Models
 
@@ -83,7 +84,7 @@ Also: `ka sessions` · `ka export` (markdown/HTML) · `ka rewind` · `ka attach`
 - **Hooks** — lifecycle hooks that block, patch, or steer a turn ([docs](https://ka-harness.dev/docs/extending/hooks/))
 - **MCP servers** — stdio and HTTP; tools appear as `<server>.<tool>` hands ([docs](https://ka-harness.dev/docs/extending/mcp/))
 
-Opt-in integrations, all config tables: **LSP** (diagnostics, navigation, rename/format), **DAP debugging**, the **verify loop** (auto-lint / auto-test after edits), and **runtime feature toggles** (`ka --disable agents,mcp:github,tool:bash` — fail-closed). See the [config reference](https://ka-harness.dev/docs/reference/config/).
+Opt-in integrations, all config tables: **LSP** (diagnostics, navigation, rename/format), **DAP debugging**, the **verify loop** (auto-lint / auto-test after edits), **runtime feature toggles** (`ka --disable agents,mcp:github,tool:bash` — fail-closed), and **Herdr** (`[tui] herdr = true` — reports the agent's `idle`/`working`/`blocked` state, its resume command, and exit to the pane that hosts it; inert outside Herdr). See the [config reference](https://ka-harness.dev/docs/reference/config/).
 
 ka reads the ecosystem automatically: `AGENTS.md` (`CLAUDE.md` compatible) and `.agents/` / `.claude/` directories. Every session is an append-only JSONL [strand](https://ka-harness.dev/docs/concepts/strands/) — rewind, fork, export, replay. `/tree` shows the session's fork tree and branches from any past input: picking one forks the strand there (original stays intact) and the chat continues from that point. The [harness loop](https://ka-harness.dev/docs/concepts/harness/) reads the model's own todo list back and pushes on claims that don't hold up.
 

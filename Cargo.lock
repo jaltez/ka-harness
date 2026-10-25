@@ -988,7 +988,7 @@ dependencies = [
 
 [[package]]
 name = "ka-dialect"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "futures-util",
  "ka-protocol",
@@ -1003,7 +1003,7 @@ dependencies = [
 
 [[package]]
 name = "ka-engine"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "ignore",
  "ka-dialect",
@@ -1022,7 +1022,7 @@ dependencies = [
 
 [[package]]
 name = "ka-harness"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "clap",
  "ed25519-dalek",
@@ -1044,7 +1044,7 @@ dependencies = [
 
 [[package]]
 name = "ka-index"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "ka-strand",
  "rusqlite",
@@ -1053,7 +1053,7 @@ dependencies = [
 
 [[package]]
 name = "ka-protocol"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "schemars",
  "serde",
@@ -1062,7 +1062,7 @@ dependencies = [
 
 [[package]]
 name = "ka-sandbox"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "landlock",
  "serde",
@@ -1071,7 +1071,7 @@ dependencies = [
 
 [[package]]
 name = "ka-strand"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "ka-protocol",
  "serde",
@@ -1080,7 +1080,7 @@ dependencies = [
 
 [[package]]
 name = "ka-term"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "crossterm",
  "futures-util",
@@ -2545,7 +2545,7 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 
 [[package]]
 name = "xtask"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "ed25519-dalek",
  "serde",

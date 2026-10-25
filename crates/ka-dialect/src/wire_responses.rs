@@ -218,6 +218,7 @@ async fn speak_responses(
     // function calls accumulate across argument deltas, keyed by item_id
     let mut calls: Vec<PendingItem> = Vec::new();
     let mut saw_any_event = false;
+    let mut saw_terminal = false;
 
     loop {
         let item =
@@ -235,6 +236,7 @@ async fn speak_responses(
         let chunk = chunk.map_err(|e| WireError::network(e.to_string()))?;
         for evt in parser.feed(&chunk) {
             if evt.data.trim() == "[DONE]" {
+                saw_terminal = true;
                 continue;
             }
             let Ok(v) = serde_json::from_str::<Value>(&evt.data) else {
@@ -337,6 +339,7 @@ async fn speak_responses(
                     }
                 }
                 "response.completed" | "response.incomplete" => {
+                    saw_terminal = true;
                     let response = &v["response"];
                     if evt_type == "response.incomplete" {
                         stop = Stop::Length;
@@ -386,7 +389,18 @@ async fn speak_responses(
         }
     }
     for evt in parser.finish() {
-        let _ = evt; // responses terminates with response.completed; nothing to drain
+        // trailing frame without a final blank line: the only event
+        // worth draining is the terminal marker itself
+        if evt.data.trim() == "[DONE]" {
+            saw_terminal = true;
+        } else if let Ok(v) = serde_json::from_str::<Value>(&evt.data) {
+            if matches!(
+                v.get("type").and_then(Value::as_str),
+                Some("response.completed" | "response.incomplete")
+            ) {
+                saw_terminal = true;
+            }
+        }
     }
 
     if !saw_any_event {
@@ -395,6 +409,14 @@ async fn speak_responses(
             retryable: false,
             message: "empty stream".to_string(),
         });
+    }
+    // A clean EOF is not a completed turn: without response.completed,
+    // response.incomplete, or [DONE], the provider may have cut the
+    // stream mid-answer.
+    if !saw_terminal {
+        return Err(WireError::network(
+            "stream ended without response.completed/incomplete or [DONE]",
+        ));
     }
 
     // Emit complete calls (deduped by call_id, arguments repaired).

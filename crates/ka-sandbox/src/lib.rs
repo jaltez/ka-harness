@@ -24,6 +24,10 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+pub mod trampoline;
+
+pub use trampoline::TRAMPOLINE_ARG;
+
 /// Sandbox mode (`[sandbox] mode`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -521,7 +525,7 @@ pub fn wrap_command(policy: &Policy, command: &str, cwd: &Path) -> Result<Vec<St
                 let exe = EXE.as_ref().map_err(Clone::clone)?;
                 Ok(vec![
                     exe.to_string_lossy().into_owned(),
-                    "ka-sandbox-exec".into(),
+                    TRAMPOLINE_ARG.into(),
                     policy,
                     "--".into(),
                     "sh".into(),

@@ -57,6 +57,20 @@ data: [DONE]
 
 "#;
 
+// A clean EOF without [DONE]/finish_reason: the connection died while
+// the model was still reasoning (the v0.4.0 silent-"(no text)" failure).
+const OPENAI_TRUNCATED: &str = r#"
+data: {"choices":[{"delta":{"reasoning_content":"still planning"}}]}
+
+"#;
+
+// Truncated after complete tool-call fragments but before completion:
+// the wire must not surface the call (a retry will re-drive it).
+const OPENAI_TRUNCATED_TOOL: &str = r#"
+data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"read","arguments":"{\"path\":\"src/x.rs\"}"}}]}}]}
+
+"#;
+
 const ANTHROPIC_BASIC: &str = r#"
 event: message_start
 data: {"type":"message_start","message":{"usage":{"input_tokens":25,"cache_read_input_tokens":10,"cache_creation_input_tokens":5}}}
@@ -98,6 +112,15 @@ data: {"type":"content_block_stop","index":1}
 data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":30}}
 
 data: {"type":"message_stop"}
+
+"#;
+
+const ANTHROPIC_TRUNCATED: &str = r#"
+data: {"type":"message_start","message":{"usage":{"input_tokens":10}}}
+
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}
 
 "#;
 
@@ -315,6 +338,53 @@ async fn openai_malformed_chunk_is_dropped_not_fatal() {
     assert_eq!(text, "good after");
 }
 
+#[tokio::test]
+async fn openai_truncated_stream_is_retryable_error() {
+    let (addr, _cap) = serve_sse(OPENAI_TRUNCATED).await;
+    let dialect = dialect_for("openai_chat", addr, "");
+    let events = collect(&OpenaiChat::new(), request(dialect, "")).await;
+
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::Thought(t) if t == "still planning"))
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::Finished { .. })),
+        "a cut stream must never report Finished: {events:?}"
+    );
+    match events.last() {
+        Some(StreamEvent::Failed {
+            class: ka_protocol::ErrorClass::Network,
+            retryable: true,
+            message,
+        }) => assert!(message.contains("without"), "{message}"),
+        other => panic!("expected retryable network failure, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn openai_truncated_tool_call_is_not_emitted() {
+    let (addr, _cap) = serve_sse(OPENAI_TRUNCATED_TOOL).await;
+    let dialect = dialect_for("openai_chat", addr, "");
+    let events = collect(&OpenaiChat::new(), request(dialect, "")).await;
+
+    assert!(
+        !events.iter().any(|e| matches!(e, StreamEvent::Call(_))),
+        "truncated call must not reach the engine: {events:?}"
+    );
+    assert!(matches!(
+        events.last(),
+        Some(StreamEvent::Failed {
+            class: ka_protocol::ErrorClass::Network,
+            retryable: true,
+            ..
+        })
+    ));
+}
+
 // ---------------------------------------------------------------- anthropic
 
 #[tokio::test]
@@ -353,6 +423,82 @@ async fn anthropic_basic_stream_blocks_and_usage() {
     assert!(
         raw.contains("\"max_tokens\":"),
         "anthropic requires max_tokens:\n{raw}"
+    );
+}
+
+#[tokio::test]
+async fn anthropic_tool_results_then_ster_merge_into_one_user_message() {
+    use ka_dialect::speaker::{ToolCall, ToolResult};
+
+    let (addr, captured) = serve_sse(ANTHROPIC_BASIC).await;
+    let dialect = dialect_for("anthropic_messages", addr, "");
+    let mut req = request(dialect, "sys");
+    req.messages = vec![
+        TurnMessage {
+            role: TurnRole::User,
+            content: "go".into(),
+            thinking: None,
+            calls: Vec::new(),
+            results: Vec::new(),
+            images: Vec::new(),
+        },
+        TurnMessage {
+            role: TurnRole::Assistant,
+            content: String::new(),
+            thinking: None,
+            calls: vec![ToolCall {
+                id: "c1".into(),
+                tool: "bash".into(),
+                arguments: serde_json::json!({"command": "make"}),
+            }],
+            results: Vec::new(),
+            images: Vec::new(),
+        },
+        TurnMessage {
+            role: TurnRole::Tool,
+            content: String::new(),
+            thinking: None,
+            calls: Vec::new(),
+            results: vec![ToolResult {
+                call_id: "c1".into(),
+                content: "built".into(),
+                is_error: false,
+                images: Vec::new(),
+            }],
+            images: Vec::new(),
+        },
+        TurnMessage {
+            role: TurnRole::User,
+            content: "[operator, while you were working]\nuse metric units".into(),
+            thinking: None,
+            calls: Vec::new(),
+            results: Vec::new(),
+            images: Vec::new(),
+        },
+    ];
+    let _ = collect(&AnthropicMessages::new(), req).await;
+
+    let raw = captured.lock().clone().unwrap();
+    let body_start = raw.find("\r\n\r\n").unwrap() + 4;
+    let body: serde_json::Value = serde_json::from_str(raw[body_start..].trim_end()).unwrap();
+    let messages = body["messages"].as_array().unwrap();
+    assert_eq!(
+        messages.len(),
+        3,
+        "tool results + steer must merge into one user message: {messages:?}"
+    );
+    assert_eq!(messages[0]["content"], serde_json::json!("go"));
+    assert_eq!(messages[1]["role"], "assistant");
+    let last = &messages[2];
+    assert_eq!(last["role"], "user");
+    let blocks = last["content"].as_array().unwrap();
+    assert_eq!(blocks.len(), 2, "{blocks:?}");
+    assert_eq!(blocks[0]["type"], "tool_result");
+    assert_eq!(blocks[0]["tool_use_id"], "c1");
+    assert_eq!(blocks[1]["type"], "text");
+    assert_eq!(
+        blocks[1]["text"],
+        "[operator, while you were working]\nuse metric units"
     );
 }
 
@@ -406,6 +552,33 @@ async fn anthropic_length_stop_maps_to_length() {
     ));
 }
 
+#[tokio::test]
+async fn anthropic_truncated_stream_is_retryable_error() {
+    let (addr, _cap) = serve_sse(ANTHROPIC_TRUNCATED).await;
+    let dialect = dialect_for("anthropic_messages", addr, "");
+    let events = collect(&AnthropicMessages::new(), request(dialect, "")).await;
+
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::Text(t) if t == "partial"))
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::Finished { .. })),
+        "a cut stream must never report Finished: {events:?}"
+    );
+    match events.last() {
+        Some(StreamEvent::Failed {
+            class: ka_protocol::ErrorClass::Network,
+            retryable: true,
+            message,
+        }) => assert!(message.contains("without"), "{message}"),
+        other => panic!("expected retryable network failure, got {other:?}"),
+    }
+}
+
 // ---------------------------------------------------------------- responses
 
 const RESPONSES_BASIC: &str = r#"
@@ -447,6 +620,15 @@ data: {"type":"response.incomplete","response":{"status":"incomplete","usage":{"
 
 const RESPONSES_FAILED: &str = r#"
 data: {"type":"response.failed","response":{"error":{"code":"server_error","message":"model overloaded"}}}
+
+"#;
+
+const RESPONSES_TRUNCATED: &str = r#"
+data: {"type":"response.output_text.delta","delta":"partial"}
+
+data: {"type":"response.output_item.added","item":{"type":"function_call","id":"fc_1","call_id":"call_9","name":"read","arguments":""}}
+
+data: {"type":"response.function_call_arguments.delta","item_id":"fc_1","delta":"{\"path\":\"src/x.rs\"}"}
 
 "#;
 
@@ -561,6 +743,37 @@ async fn responses_failed_event_is_an_error() {
             ..
         })
     ));
+}
+
+#[tokio::test]
+async fn responses_truncated_stream_is_retryable_error() {
+    let (addr, _cap) = serve_sse(RESPONSES_TRUNCATED).await;
+    let dialect = dialect_for("openai_responses", addr, "");
+    let events = collect(&OpenaiResponses::new(), request(dialect, "")).await;
+
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::Text(t) if t == "partial"))
+    );
+    assert!(
+        !events.iter().any(|e| matches!(e, StreamEvent::Call(_))),
+        "truncated call must not reach the engine: {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::Finished { .. })),
+        "a cut stream must never report Finished: {events:?}"
+    );
+    match events.last() {
+        Some(StreamEvent::Failed {
+            class: ka_protocol::ErrorClass::Network,
+            retryable: true,
+            message,
+        }) => assert!(message.contains("without"), "{message}"),
+        other => panic!("expected retryable network failure, got {other:?}"),
+    }
 }
 
 // ------------------------------------------------------- structured output

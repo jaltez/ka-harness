@@ -242,6 +242,11 @@ pub struct Voice {
     /// Fallback model chain ([fallback] models; tried in order on
     /// provider/auth failure, max 2 hops per turn).
     fallbacks: Vec<String>,
+    /// `[prompt] identity_file`: a file whose text replaces the
+    /// built-in identity sentence (re-read every turn; None = default).
+    identity_file: Option<String>,
+    /// One unreadable-identity Note per session (not one per turn).
+    identity_warned: bool,
     /// Auto-promote to a bigger-context sibling on overflow
     /// ([context] promote, default true).
     context_promote: bool,
@@ -333,6 +338,8 @@ impl Voice {
             digest_revision: 0,
             last_digest: None,
             fallbacks: Vec::new(),
+            identity_file: None,
+            identity_warned: false,
             context_promote: true,
             promoted: false,
             pending_promotion: None,
@@ -532,6 +539,8 @@ impl Voice {
             digest_revision: 0,
             last_digest: None,
             fallbacks: Vec::new(),
+            identity_file: None,
+            identity_warned: false,
             context_promote: true,
             promoted: false,
             pending_promotion: None,
@@ -740,6 +749,52 @@ impl Voice {
     /// Set the bash sandbox policy (engine bootstrap).
     pub fn set_sandbox(&mut self, policy: ka_sandbox::Policy) {
         self.hand_ctx.sandbox = policy;
+    }
+
+    /// Set `[prompt] identity_file` (engine bootstrap; None = default
+    /// identity). The file is re-read on every prompt assembly so
+    /// edits apply without a restart.
+    pub fn set_identity_file(&mut self, path: Option<String>) {
+        self.identity_file = path;
+        self.identity_warned = false;
+    }
+
+    /// Read the identity file for this turn's prompt: `None` keeps the
+    /// built-in identity (no file configured, safe mode, unreadable —
+    /// with one Note per session for the failure — or empty file).
+    /// Content over 8 KiB is cut on a char boundary and marked.
+    async fn load_identity(&mut self, events: &mpsc::Sender<Event>) -> Option<String> {
+        if crate::conventions::bare_mode() {
+            return None;
+        }
+        let path = self.identity_file.as_deref()?;
+        match std::fs::read_to_string(path) {
+            Ok(text) => {
+                const CAP: usize = 8192;
+                if text.len() <= CAP {
+                    return Some(text);
+                }
+                let mut cut = CAP;
+                while cut > 0 && !text.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                Some(format!("{}\n[identity truncated at 8 KiB]", &text[..cut]))
+            }
+            Err(err) => {
+                if !self.identity_warned {
+                    self.identity_warned = true;
+                    events
+                        .send(Event::Note {
+                            message: format!(
+                                "identity file {path}: {err} — using ka's default identity"
+                            ),
+                        })
+                        .await
+                        .ok();
+                }
+                None
+            }
+        }
     }
 
     /// Set the LSP diagnostics manager (engine bootstrap).
@@ -1743,10 +1798,12 @@ impl Voice {
                 }
             }
         }
+        let identity = self.load_identity(events).await;
         system.push_str(&core_instructions(
             &snap.summary(),
             self.mode,
             &self.hand_ctx.cwd,
+            identity.as_deref(),
         ));
         if let Some(d) = &self.digest {
             system.push_str(&format!(
@@ -2362,6 +2419,24 @@ impl Voice {
                     .ok();
                 self.stop_hooks(events, "aborted").await;
                 return Usage::default();
+            }
+            // Live steering at the batch boundary: steers that arrived
+            // while the tools ran ride the history right after the
+            // results, so the next model request sees them in order.
+            // Leftovers (steer after the last batch, or a Length break)
+            // still convert to queued turns at settle time.
+            for text in steers.drain(..) {
+                self.history.push(TurnMessage::user(format!(
+                    "[operator, while you were working]\n{text}"
+                )));
+                let first_line = text.lines().next().unwrap_or("").to_string();
+                let head: String = first_line.chars().take(80).collect();
+                events
+                    .send(Event::Note {
+                        message: format!("steer delivered: {head}"),
+                    })
+                    .await
+                    .ok();
             }
             if final_stop == Stop::Length {
                 break 'outer;
@@ -3195,12 +3270,21 @@ use /build to switch to implementation",
 /// memory, scoped rules, skills, and the digest summary are session
 /// data layered around it, outside the budget. Contract-capped by
 /// `system_prompt_core_stays_within_budget` so it cannot creep.
-fn core_instructions(snap_summary: &str, mode: ka_protocol::Mode, cwd: &std::path::Path) -> String {
+fn core_instructions(
+    snap_summary: &str,
+    mode: ka_protocol::Mode,
+    cwd: &std::path::Path,
+    identity: Option<&str>,
+) -> String {
     let mut s = String::new();
-    s.push_str(&format!(
-        "\nYou are ka, a precise coding agent. {}. Use the provided tools to inspect and modify the repository; prefer read before edit.",
-        snap_summary
-    ));
+    match identity.map(str::trim).filter(|i| !i.is_empty()) {
+        Some(identity) => s.push_str(&format!(
+            "\n{identity}\nWorkspace: {snap_summary}."
+        )),
+        None => s.push_str(&format!(
+            "\nYou are ka, a precise coding agent. {snap_summary}. Use the provided tools to inspect and modify the repository; prefer read before edit.",
+        )),
+    }
     s.push_str(
         "\nMaintain your plan with the todo tool: on multi-step tasks keep the todo list \
 current — one item per step, mark items done as you finish them (each call replaces the \
@@ -3827,14 +3911,225 @@ mod tests {
             ka_protocol::Mode::Plan,
         ];
         for mode in modes {
-            let core =
-                super::core_instructions("(git: main, clean)", mode, std::path::Path::new("/tmp"));
+            let core = super::core_instructions(
+                "(git: main, clean)",
+                mode,
+                std::path::Path::new("/tmp"),
+                None,
+            );
             let n = core.chars().count();
             assert!(
                 n <= BUDGET,
                 "static system-prompt core for {mode:?} is {n} chars (budget {BUDGET}) — trim it"
             );
         }
+    }
+
+    #[test]
+    fn identity_replaces_default_sentence_keeps_todo_line() {
+        let identity = "You are Ka, the resident personal assistant of one person.";
+        let with = super::core_instructions(
+            "(git: main, clean)",
+            ka_protocol::Mode::Guarded,
+            std::path::Path::new("/tmp"),
+            Some(identity),
+        );
+        assert!(with.contains(identity), "identity text rides the core");
+        assert!(
+            with.contains("Workspace: (git: main, clean)."),
+            "the workspace summary stays: {with}"
+        );
+        assert!(
+            !with.contains("precise coding agent"),
+            "the default identity sentence must be replaced: {with}"
+        );
+        assert!(
+            with.contains("Maintain your plan with the todo tool"),
+            "the todo-discipline line is unchanged"
+        );
+        // unset: byte-identical to the pre-identity default
+        let without = super::core_instructions(
+            "(git: main, clean)",
+            ka_protocol::Mode::Guarded,
+            std::path::Path::new("/tmp"),
+            None,
+        );
+        assert!(without.contains("You are ka, a precise coding agent."));
+        assert!(
+            !without.contains("Workspace:"),
+            "the default keeps its own phrasing: {without}"
+        );
+        // whitespace-only identity falls back to the default
+        let blank = super::core_instructions(
+            "(git: main, clean)",
+            ka_protocol::Mode::Guarded,
+            std::path::Path::new("/tmp"),
+            Some("  \n"),
+        );
+        assert_eq!(blank, without, "empty identity = default identity");
+    }
+
+    /// A speaker that records the system prompt of its one and only
+    /// request, then finishes with text.
+    struct SystemSpeaker {
+        systems: std::sync::Arc<parking_lot::Mutex<Vec<String>>>,
+    }
+
+    impl Speaker for SystemSpeaker {
+        fn speak<'a>(
+            &'a self,
+            req: SpeakRequest,
+            out: tokio::sync::mpsc::Sender<StreamEvent>,
+        ) -> SpeakFuture<'a> {
+            let systems = &self.systems;
+            Box::pin(async move {
+                systems.lock().push(req.system.clone());
+                out.send(StreamEvent::Text("ok".into())).await.ok();
+                out.send(StreamEvent::Finished {
+                    stop: ka_protocol::Stop::Done,
+                    usage: ka_protocol::Usage {
+                        input: 1,
+                        output: 1,
+                        ..Default::default()
+                    },
+                })
+                .await
+                .ok();
+            })
+        }
+    }
+
+    /// Run one turn on `voice`; returns its events plus the system
+    /// prompts the speaker saw. The turn future is polled inline (the
+    /// existing test pattern) so borrows of `voice` stay local.
+    async fn run_identity_turn(voice: &mut Voice) -> (Vec<ka_protocol::Event>, Vec<String>) {
+        use tokio::sync::mpsc;
+        let (_cmd_tx, mut cmd_rx) = mpsc::channel(16);
+        let (evt_tx, mut evt_rx) = mpsc::channel(256);
+        let mut steers = Vec::new();
+        let mut queue = std::collections::VecDeque::new();
+        let mut guards = GuardRuntime::default();
+        let mut events = Vec::new();
+        let turn = voice.turn(
+            "test/m",
+            "hi".into(),
+            &mut cmd_rx,
+            &evt_tx,
+            &mut steers,
+            &mut queue,
+            &mut guards,
+            None,
+            Vec::new(),
+        );
+        tokio::pin!(turn);
+        loop {
+            tokio::select! {
+                evt = evt_rx.recv() => match evt {
+                    Some(e) => {
+                        let done = matches!(e, ka_protocol::Event::TurnFinished { .. });
+                        events.push(e);
+                        if done {
+                            break;
+                        }
+                    }
+                    None => break,
+                },
+                _ = turn.as_mut() => break,
+            }
+        }
+        // the turn may complete while events are still buffered: drain
+        while let Ok(evt) = evt_rx.try_recv() {
+            events.push(evt);
+        }
+        (events, Vec::new())
+    }
+
+    #[tokio::test]
+    async fn identity_file_replaces_default_and_warns_once_on_error() {
+        let dir = std::env::temp_dir().join(format!("ka-voice-id-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let catalog = Catalog::parse(
+            "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000\n",
+        )
+        .unwrap();
+
+        // good identity file: its text rides the system prompt, the
+        // default sentence does not
+        let id_path = dir.join("IDENTITY.md");
+        std::fs::write(
+            &id_path,
+            "You are Ka, the resident personal assistant of one person.",
+        )
+        .unwrap();
+        let seen = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let mut voice = Voice::new(catalog.clone(), dir.clone(), ka_protocol::Mode::Guarded, 5)
+            .with_speaker(
+                Wire::OpenaiChat,
+                std::sync::Arc::new(SystemSpeaker {
+                    systems: seen.clone(),
+                }),
+            );
+        voice.set_identity_file(Some(id_path.display().to_string()));
+        let (events, _) = run_identity_turn(&mut voice).await;
+        assert!(
+            events
+                .iter()
+                .all(|e| !matches!(e, ka_protocol::Event::Note { .. })),
+            "a readable identity file emits no note: {events:?}"
+        );
+        let systems = seen.lock().clone();
+        assert_eq!(systems.len(), 1);
+        assert!(
+            systems[0].contains("You are Ka, the resident personal assistant"),
+            "identity text rides the system prompt: {}",
+            systems[0]
+        );
+        assert!(
+            !systems[0].contains("precise coding agent"),
+            "the default identity sentence is gone: {}",
+            systems[0]
+        );
+
+        // unreadable path: default identity + exactly one Note, then
+        // a second turn stays silent about it
+        let seen = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let mut voice = Voice::new(catalog, dir.clone(), ka_protocol::Mode::Guarded, 5)
+            .with_speaker(
+                Wire::OpenaiChat,
+                std::sync::Arc::new(SystemSpeaker {
+                    systems: seen.clone(),
+                }),
+            );
+        voice.set_identity_file(Some(dir.join("missing.md").display().to_string()));
+        let (events, _) = run_identity_turn(&mut voice).await;
+        let notes = events
+            .iter()
+            .filter(|e| matches!(e, ka_protocol::Event::Note { .. }))
+            .count();
+        assert_eq!(notes, 1, "exactly one identity note: {events:?}");
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                ka_protocol::Event::Note { message }
+                    if message.contains("identity file") && message.contains("default identity")
+            )),
+            "the note names the file and the fallback: {events:?}"
+        );
+        let systems = seen.lock().clone();
+        assert!(
+            systems[0].contains("You are ka, a precise coding agent."),
+            "unreadable identity falls back to the default: {}",
+            systems[0]
+        );
+        let (events2, _) = run_identity_turn(&mut voice).await;
+        assert!(
+            events2
+                .iter()
+                .all(|e| !matches!(e, ka_protocol::Event::Note { .. })),
+            "the warning fires once per session: {events2:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

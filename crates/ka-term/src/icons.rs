@@ -20,12 +20,14 @@ pub const PROMPT: &str = "\u{276f}";
 /// ▌ rails: user turns, the selection pointer
 pub const RAIL: &str = "\u{258c}";
 
-/// ☰ todos button
-pub const STRIP_TODOS: &str = "\u{2630}";
+/// ≣ todos button — a stacked-line glyph whose column width is stable
+/// across Unicode tables (☰ is 1 col under unicode-width 0.2.0 and 2
+/// under 0.2.2+, so it silently shifted every row it rode on).
+pub const STRIP_TODOS: &str = "\u{2263}";
 /// ✦ skills button
 pub const STRIP_SKILLS: &str = "\u{2726}";
-/// ⓘ info button
-pub const STRIP_INFO: &str = "\u{24d8}";
+/// ? info button — ASCII, so no terminal can disagree about its width
+pub const STRIP_INFO: &str = "?";
 
 pub fn mode_icon(mode: Mode) -> &'static str {
     match mode {
@@ -73,7 +75,7 @@ pub fn tool_icon(tool: &str) -> &'static str {
             "write" => "\u{271a}",    // ✚
             "web" => "\u{25cd}",      // ◍
             "delegate" => "\u{21c4}", // ⇄
-            "todo" => "\u{2630}",     // ☰
+            "todo" => "\u{2263}",     // ≣
             "remember" => "\u{2691}", // ⚑
             "tasks" => "\u{22ee}",    // ⋮
             "debug" => "\u{29bf}",    // ⦿
@@ -97,9 +99,9 @@ pub const MODAL_ICONS: &[(&str, &str)] = &[
     ("usage", "\u{25a6}"),     // ▦
     ("context", "\u{25f0}"),   // ◰
     ("tree", "\u{2387}"),      // ⎇
-    ("todos", "\u{2630}"),     // ☰
+    ("todos", "\u{2263}"),     // ≣
     ("skills", "\u{2726}"),    // ✦
-    ("info", "\u{24d8}"),      // ⓘ
+    ("info", "?"),
     ("help", "?"),
 ];
 
@@ -113,6 +115,21 @@ mod tests {
 
     /// Layout math everywhere assumes one column per glyph: a
     /// double-width icon would shift every row it rides on.
+    #[test]
+    fn strip_icons_hold_one_column_in_every_width_table() {
+        // the strip's click zones and alignment are computed from these
+        // widths; an East-Asian-Ambiguous glyph (☰, ⓘ) renders 1 col in
+        // one table/terminal and 2 in another, shifting the whole row
+        for g in [STRIP_TODOS, STRIP_SKILLS, STRIP_INFO] {
+            assert_eq!(UnicodeWidthStr::width(g), 1, "strip glyph {g:?}");
+            assert_eq!(
+                UnicodeWidthStr::width_cjk(g),
+                1,
+                "strip glyph {g:?} is ambiguous-width"
+            );
+        }
+    }
+
     #[test]
     fn every_glyph_is_one_column() {
         let mut all: Vec<&str> = vec![
