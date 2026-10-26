@@ -1033,7 +1033,6 @@ dependencies = [
  "ka-sandbox",
  "ka-strand",
  "ka-term",
- "landlock",
  "reqwest",
  "serde",
  "serde_json",

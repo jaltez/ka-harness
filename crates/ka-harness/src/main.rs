@@ -1339,13 +1339,15 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
         session_cwd,
         update_rx,
     )
-    .await
-    .map_err(|e| format!("tui: {e}"))?;
-    // the agent stops owning the pane the moment the TUI returns; the
-    // reporter flushes a release (bounded by one report deadline)
+    .await;
+    // the agent stops owning the pane the moment the TUI returns — on a
+    // clean exit *and* on an error, so a failed TUI never leaves Herdr
+    // reporting this pane as working. The reporter flushes a release
+    // (bounded by one report deadline).
     if let Some(mut reporter) = herdr.take() {
         reporter.finish();
     }
+    let exit = exit.map_err(|e| format!("tui: {e}"))?;
     match exit {
         ka_term::tui::Exit::Quit | ka_term::tui::Exit::EngineEnded => Ok(ExitCode::SUCCESS),
         ka_term::tui::Exit::Update { session } => {

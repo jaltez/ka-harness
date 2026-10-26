@@ -1874,3 +1874,210 @@ async fn steer_during_tool_batch_rides_the_next_request() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A speaker that streams its answer and then waits for the test to
+/// release it before finishing — the window where a steer lands after
+/// the model has already produced the closing (zero-tool-call) round.
+struct GatedAnswer {
+    gate: tokio::sync::Semaphore,
+    first: std::sync::atomic::AtomicBool,
+    requests: parking_lot::Mutex<Vec<Vec<TurnMessage>>>,
+}
+
+impl GatedAnswer {
+    fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            gate: tokio::sync::Semaphore::new(0),
+            first: std::sync::atomic::AtomicBool::new(true),
+            requests: parking_lot::Mutex::new(Vec::new()),
+        })
+    }
+}
+
+impl Speaker for GatedAnswer {
+    fn speak<'a>(
+        &'a self,
+        req: SpeakRequest,
+        out: tokio::sync::mpsc::Sender<StreamEvent>,
+    ) -> SpeakFuture<'a> {
+        Box::pin(async move {
+            self.requests.lock().push(req.messages.clone());
+            let first = self.first.swap(false, std::sync::atomic::Ordering::SeqCst);
+            out.send(StreamEvent::Text("the answer".into())).await.ok();
+            if first {
+                // hold the closing round open until the test steered:
+                // the steer arrives after the model answered
+                let _ = self.gate.acquire().await;
+            }
+            out.send(StreamEvent::Finished {
+                stop: Stop::Done,
+                usage: ka_protocol::Usage {
+                    input: 1,
+                    output: 1,
+                    ..Default::default()
+                },
+            })
+            .await
+            .ok();
+        })
+    }
+}
+
+/// A steer that arrives during the closing zero-tool-call round has no
+/// batch boundary left to ride: the engine must settle it as a queued
+/// follow-on turn on the same strand — never leave it in `state.steers`
+/// to be replayed into a later turn as if it had been seen live.
+#[tokio::test]
+async fn steer_during_final_answer_becomes_a_queued_turn() {
+    let dir = tmp_dir("steer-late");
+    let cfg = ka_engine::Config {
+        cwd: Some(dir.to_string_lossy().into_owned()),
+        model: Some("test/m".into()),
+        mode: Some(ka_protocol::Mode::Free),
+        ..Default::default()
+    };
+    let speaker = GatedAnswer::new();
+    let mut handle = ka_engine::spawn_with_speaker(
+        cfg,
+        test_catalog(),
+        ka_engine::StrandChoice::New,
+        ka_dialect::Wire::OpenaiChat,
+        speaker.clone(),
+    );
+    handle
+        .commands
+        .send(Command::Prompt {
+            allowed_tools: None,
+            model: None,
+            text: "go".into(),
+            schema: None,
+            images: Vec::new(),
+            skills: Vec::new(),
+        })
+        .await
+        .expect("engine alive");
+    let mut events = Vec::new();
+    loop {
+        let e = tokio::time::timeout(Duration::from_secs(15), handle.events.recv())
+            .await
+            .expect("event within 15s")
+            .expect("engine alive");
+        // the answer delta means the closing round is streaming: steer
+        // now, then let the model finish
+        if matches!(e, Event::Delta { .. }) {
+            handle
+                .commands
+                .send(Command::Steer {
+                    text: "use metric units".into(),
+                })
+                .await
+                .expect("engine alive");
+            speaker.gate.add_permits(1);
+        }
+        let idle = matches!(e, Event::Idle);
+        events.push(e);
+        if idle {
+            break;
+        }
+    }
+    while let Ok(Some(e)) =
+        tokio::time::timeout(Duration::from_millis(300), handle.events.recv()).await
+    {
+        events.push(e);
+    }
+
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, Event::TurnFinished { .. }))
+            .count(),
+        2,
+        "the late steer must run as a queued follow-on turn: {events:?}"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(e, Event::Note { message }
+                if message.starts_with("steer delivered"))),
+        "a steer with no batch left is not delivered live: {events:?}"
+    );
+    let requests = speaker.requests.lock();
+    assert_eq!(
+        requests.len(),
+        2,
+        "answer round + queued follow-on: {requests:?}"
+    );
+    let steer_msg = requests
+        .last()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|m| m.role == TurnRole::User)
+        .expect("the follow-on turn carries the steer as its prompt");
+    assert_eq!(
+        steer_msg.content, "use metric units",
+        "the steer runs as a plain queued prompt, not live-operator framing"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A steer sent while the engine is idle targets the turn it arrived
+/// around; attaching another strand must drop it instead of replaying
+/// it into that strand's next tool batch.
+#[tokio::test]
+async fn steer_left_over_at_strand_attach_is_not_reinjected() {
+    let dir = tmp_dir("steer-attach");
+    let cfg = ka_engine::Config {
+        cwd: Some(dir.to_string_lossy().into_owned()),
+        model: Some("test/m".into()),
+        mode: Some(ka_protocol::Mode::Free),
+        ..Default::default()
+    };
+    let speaker = Scripted::new(vec![("bash", serde_json::json!({"command": "true"}))]);
+    let mut handle = ka_engine::spawn_with_speaker(
+        cfg,
+        test_catalog(),
+        ka_engine::StrandChoice::New,
+        ka_dialect::Wire::OpenaiChat,
+        speaker.clone(),
+    );
+    handle
+        .commands
+        .send(Command::Steer {
+            text: "stale steer".into(),
+        })
+        .await
+        .expect("engine alive");
+    let _ = settle(
+        &mut handle,
+        Command::SwitchStrand { id: "new".into() },
+        |e| matches!(e, Event::SessionInfo { .. } | Event::Error { .. }),
+    )
+    .await;
+    let events = settle(
+        &mut handle,
+        Command::Prompt {
+            allowed_tools: None,
+            model: None,
+            text: "go".into(),
+            schema: None,
+            images: Vec::new(),
+            skills: Vec::new(),
+        },
+        on_idle,
+    )
+    .await;
+
+    let requests = speaker.requests.lock();
+    assert!(
+        requests
+            .iter()
+            .all(|round| round.iter().all(|m| !m.content.contains("stale steer"))),
+        "a pre-switch steer must not ride the new strand's batch boundary: {requests:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, Event::Note { message } if message.contains("stale steer"))),
+        "no delivery note for a dropped steer: {events:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

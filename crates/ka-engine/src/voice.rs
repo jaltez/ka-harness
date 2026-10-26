@@ -2424,7 +2424,9 @@ impl Voice {
             // while the tools ran ride the history right after the
             // results, so the next model request sees them in order.
             // Leftovers (steer after the last batch, or a Length break)
-            // still convert to queued turns at settle time.
+            // are settled by the engine: a live turn returns with them
+            // still pending and the engine converts them into queued
+            // follow-on turns.
             for text in steers.drain(..) {
                 self.history.push(TurnMessage::user(format!(
                     "[operator, while you were working]\n{text}"

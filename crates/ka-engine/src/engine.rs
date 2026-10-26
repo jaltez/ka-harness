@@ -2402,6 +2402,10 @@ async fn attach_strand(
     // checkpoints and guard latches are session-scoped; re-arm them from
     // the strand we just attached to
     state.checkpoints.clear();
+    // a steer is scoped to the strand it arrived in: replaying it into
+    // the strand we are attaching to would present old operator input as
+    // if it had been sent during that strand's next tool batch
+    state.steers.clear();
     let session_spend = strand
         .records()
         .iter()
@@ -3054,6 +3058,18 @@ async fn dispatch_turn(
             }
         }
     }
+    settle_steers(state);
+}
+
+/// Settle steers that no tool-batch boundary consumed. A live steer can
+/// arrive after the last batch or during the closing zero-tool-call
+/// round; converting it to queued input keeps the operator text (queued
+/// follow-on turns run on this strand) instead of replaying it into a
+/// later turn or another strand as if it had been seen live.
+fn settle_steers(state: &mut EngineState) {
+    for steer in state.steers.drain(..) {
+        state.queue.push_back(steer);
+    }
 }
 
 /// Last `cap` characters of `text` (test output is tail-relevant).
@@ -3459,10 +3475,6 @@ async fn turn_canned(
         return (Usage::default(), Stop::Aborted);
     }
 
-    // Settling: unhandled steers become queued input so they are not lost.
-    for steer in state.steers.drain(..) {
-        state.queue.push_back(steer);
-    }
     let est_out: u64 = chunks
         .iter()
         .map(|c: &String| c.len() as u64)
