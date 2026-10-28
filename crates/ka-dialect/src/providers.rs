@@ -5,7 +5,7 @@
 //! catalog row.
 //!
 //! Curation (v2): official providers first and FEW — Anthropic, OpenAI,
-//! Google, z.ai (API), z.ai (Coding Plan) — then community/alternative
+//! Google, z.ai (API), z.ai (Coding Readonly) — then community/alternative
 //! vendors, then local runtimes last. The z.ai family is merged: legacy
 //! `zhipu`/`zhipuai` selectors resolve to the z.ai provider (see
 //! [`find`]). The final display order for both providers and catalog
@@ -69,7 +69,7 @@ pub const PROVIDERS: &[Provider] = &[
         wire: Wire::OpenaiChat,
         base_url: "https://api.z.ai/api/coding/paas/v4",
         key_env: Some("ZHIPU_API_KEY"),
-        note: "z.ai Coding Plan subscription endpoint",
+        note: "z.ai Coding Readonly subscription endpoint",
     },
     // ── community / alternative ─────────────────────────────────
     Provider {

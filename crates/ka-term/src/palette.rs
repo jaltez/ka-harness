@@ -97,10 +97,10 @@ pub const BRAND: [Color; 3] = [ACCENT, THINK, USER];
 /// that runs without asking.
 pub fn mode_color(mode: Mode) -> Color {
     match mode {
-        Mode::Guarded => OK,
+        Mode::Ask => OK,
         Mode::AcceptEdits => TOOL,
-        Mode::Free => USER,
-        Mode::Plan => ACCENT,
+        Mode::Allow => USER,
+        Mode::Readonly => ACCENT,
     }
 }
 
@@ -204,7 +204,7 @@ mod tests {
 
     #[test]
     fn chip_ink_reads_on_every_mode_color() {
-        for mode in [Mode::Guarded, Mode::AcceptEdits, Mode::Free, Mode::Plan] {
+        for mode in [Mode::Ask, Mode::AcceptEdits, Mode::Allow, Mode::Readonly] {
             let c = contrast(CHIP_FG, mode_color(mode));
             assert!(c >= 6.0, "{mode:?} chip: {c:.2}");
         }

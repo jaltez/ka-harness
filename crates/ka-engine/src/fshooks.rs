@@ -89,10 +89,10 @@ pub(crate) fn parse_steering(stdout: &str) -> Steering {
         .get("mode")
         .and_then(|m| m.as_str())
         .and_then(|s| match s {
-            "guarded" => Some(ka_protocol::Mode::Guarded),
-            "accept-edits" | "accept_edits" => Some(ka_protocol::Mode::AcceptEdits),
-            "free" => Some(ka_protocol::Mode::Free),
-            "plan" => Some(ka_protocol::Mode::Plan),
+            "ask" | "guarded" => Some(ka_protocol::Mode::Ask),
+            "accept_edits" | "accept-edits" => Some(ka_protocol::Mode::AcceptEdits),
+            "allow" | "free" => Some(ka_protocol::Mode::Allow),
+            "readonly" | "plan" => Some(ka_protocol::Mode::Readonly),
             _ => None,
         });
     let note = v
@@ -294,12 +294,25 @@ mod tests {
     #[test]
     fn steering_parses_mode_and_note() {
         let s = parse_steering(r#"  {"mode":"plan","note":"switching"}  "#);
-        assert_eq!(s.mode, Some(ka_protocol::Mode::Plan));
+        assert_eq!(s.mode, Some(ka_protocol::Mode::Readonly));
         assert_eq!(s.note.as_deref(), Some("switching"));
-        assert_eq!(
-            parse_steering(r#"{"mode":"accept-edits"}"#).mode,
-            Some(ka_protocol::Mode::AcceptEdits)
-        );
+        // both vocabularies parse: the new words first, older spellings kept
+        for (word, want) in [
+            ("ask", ka_protocol::Mode::Ask),
+            ("guarded", ka_protocol::Mode::Ask),
+            ("accept_edits", ka_protocol::Mode::AcceptEdits),
+            ("accept-edits", ka_protocol::Mode::AcceptEdits),
+            ("allow", ka_protocol::Mode::Allow),
+            ("free", ka_protocol::Mode::Allow),
+            ("readonly", ka_protocol::Mode::Readonly),
+            ("plan", ka_protocol::Mode::Readonly),
+        ] {
+            assert_eq!(
+                parse_steering(&format!(r#"{{"mode":"{word}"}}"#)).mode,
+                Some(want),
+                "{word}"
+            );
+        }
         assert_eq!(parse_steering(r#"{"mode":"yolo"}"#).mode, None);
         assert_eq!(parse_steering("not json"), Steering::default());
         assert_eq!(parse_steering(r#"["array"]"#), Steering::default());

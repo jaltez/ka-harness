@@ -437,8 +437,9 @@ pub struct Config {
     pub model: Option<String>,
     /// Default reasoning effort.
     pub effort: Option<Effort>,
-    /// Permission mode: `guarded` | `accept_edits` | `free` | `plan`
-    /// (defaults to free when absent everywhere).
+    /// Permission mode: `ask` | `accept_edits` | `allow` | `readonly`
+    /// (defaults to allow when absent everywhere; the pre-v0.5 names
+    /// `guarded`/`free`/`plan` still parse as aliases).
     pub mode: Option<Mode>,
     /// Role mappings.
     pub roles: Roles,
@@ -699,7 +700,7 @@ impl Config {
 
     /// The effective permission mode (free unless set in a layer).
     pub fn effective_mode(&self) -> Mode {
-        self.mode.unwrap_or(Mode::Free)
+        self.mode.unwrap_or(Mode::Allow)
     }
 
     /// Effective auto-poke rounds per user prompt (default 3; 0
@@ -943,7 +944,7 @@ mod tests {
             &path,
             Some("groq/llama-3.3-70b"),
             Some(Effort::High),
-            Some(Mode::Free),
+            Some(Mode::Allow),
             None,
             None,
         )
@@ -952,7 +953,7 @@ mod tests {
         let layer = Config::parse_layer(&text, "saved").unwrap();
         assert_eq!(layer.model.as_deref(), Some("groq/llama-3.3-70b"));
         assert_eq!(layer.effort, Some(Effort::High));
-        assert_eq!(layer.mode, Some(Mode::Free));
+        assert_eq!(layer.mode, Some(Mode::Allow));
         assert_eq!(layer.max_steps, Some(7), "unrelated keys preserved");
         assert_eq!(layer.tui.mouse, None, "mouse left alone when None");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1033,28 +1034,28 @@ mod tests {
     #[test]
     fn defaults_are_empty() {
         let c = Config::default();
-        assert_eq!(c.effective_mode(), Mode::Free);
+        assert_eq!(c.effective_mode(), Mode::Allow);
         assert!(c.model.is_none());
         assert!(c.effective_mouse_capture(), "capture is the default mode");
     }
 
     #[test]
-    fn mode_defaults_to_free_but_explicit_still_wins() {
-        assert_eq!(Config::default().effective_mode(), Mode::Free);
-        let guarded = Config::parse_layer("mode = \"guarded\"\n", "user").unwrap();
-        assert_eq!(guarded.effective_mode(), Mode::Guarded);
-        let accept = Config::parse_layer("mode = \"accept_edits\"\n", "user").unwrap();
-        assert_eq!(accept.effective_mode(), Mode::AcceptEdits);
+    fn mode_defaults_to_allow_but_explicit_still_wins() {
+        assert_eq!(Config::default().effective_mode(), Mode::Allow);
+        let ask = Config::parse_layer("mode = \"ask\"\n", "user").unwrap();
+        assert_eq!(ask.effective_mode(), Mode::Ask);
+        // pre-v0.5 spelling keeps parsing (old configs, old strands)
+        let legacy = Config::parse_layer("mode = \"guarded\"\n", "user").unwrap();
+        assert_eq!(legacy.effective_mode(), Mode::Ask);
     }
 
     #[test]
     fn layer_overlay_set_fields_win() {
-        let mut base =
-            Config::parse_layer("model = \"a/x\"\nmode = \"guarded\"\n", "base").unwrap();
-        let over = Config::parse_layer("mode = \"free\"\n", "over").unwrap();
+        let mut base = Config::parse_layer("model = \"a/x\"\nmode = \"ask\"\n", "base").unwrap();
+        let over = Config::parse_layer("mode = \"allow\"\n", "over").unwrap();
         base.overlay(over);
         assert_eq!(base.model.as_deref(), Some("a/x"));
-        assert_eq!(base.effective_mode(), Mode::Free);
+        assert_eq!(base.effective_mode(), Mode::Allow);
     }
 
     #[test]
@@ -1110,9 +1111,9 @@ mod tests {
     fn env_shaped_layer_parses() {
         // what the CLI builds from KA_MODEL/KA_MODE before overlaying
         let c =
-            Config::parse_layer("model = \"openai/gpt-5.1\"\nmode = \"free\"\n", "env").unwrap();
+            Config::parse_layer("model = \"openai/gpt-5.1\"\nmode = \"allow\"\n", "env").unwrap();
         assert_eq!(c.model.as_deref(), Some("openai/gpt-5.1"));
-        assert_eq!(c.effective_mode(), Mode::Free);
+        assert_eq!(c.effective_mode(), Mode::Allow);
     }
 
     #[test]

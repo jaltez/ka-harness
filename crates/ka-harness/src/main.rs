@@ -30,7 +30,7 @@ struct Cli {
     /// Model selector override (vendor/model@effort)
     #[arg(long)]
     model: Option<String>,
-    /// Permission mode override (guarded|free)
+    /// Permission mode override (ask|accept_edits|allow|readonly)
     #[arg(long)]
     mode: Option<String>,
     /// Disable features at startup, comma-separated or repeatable:
@@ -77,7 +77,7 @@ enum CliCommand {
         /// Model selector override (vendor/model:effort)
         #[arg(long)]
         model: Option<String>,
-        /// Permission mode override (guarded|free)
+        /// Permission mode override (ask|accept_edits|allow|readonly)
         #[arg(long)]
         mode: Option<String>,
         /// Disable features for this run, comma-separated or repeatable
@@ -525,13 +525,13 @@ fn load_config(
 
 fn parse_mode(s: &str) -> Result<ka_protocol::Mode, String> {
     match s {
-        "guarded" | "needs-approval" | "needs_approval" => Ok(ka_protocol::Mode::Guarded),
-        "accept-edits" | "accept_edits" => Ok(ka_protocol::Mode::AcceptEdits),
-        "free" | "full-access" | "full_access" => Ok(ka_protocol::Mode::Free),
-        "plan" => Ok(ka_protocol::Mode::Plan),
+        "ask" | "guarded" | "needs-approval" | "needs_approval" => Ok(ka_protocol::Mode::Ask),
+        "accept-edits" | "accept_edits" | "accept edits" => Ok(ka_protocol::Mode::AcceptEdits),
+        "allow" | "free" | "full-access" | "full_access" => Ok(ka_protocol::Mode::Allow),
+        "readonly" | "read-only" | "read_only" | "plan" => Ok(ka_protocol::Mode::Readonly),
         other => Err(format!(
             "unknown mode {other:?} (expected \
-guarded|needs-approval|accept-edits|free|full-access|plan)"
+ask|accept_edits|allow|readonly — guarded/free/plan still parse as aliases)"
         )),
     }
 }
@@ -643,7 +643,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
                 prompt
             };
             let mode = if review && mode.is_none() {
-                Some("plan".to_string())
+                Some("readonly".to_string())
             } else {
                 mode
             };
@@ -1974,6 +1974,34 @@ mod feature_flag_tests {
             }
             _ => panic!("expected run subcommand"),
         }
+    }
+
+    #[test]
+    fn parse_mode_accepts_new_and_old_vocabularies() {
+        // the new canonical words
+        for (word, want) in [
+            ("ask", ka_protocol::Mode::Ask),
+            ("accept_edits", ka_protocol::Mode::AcceptEdits),
+            ("allow", ka_protocol::Mode::Allow),
+            ("readonly", ka_protocol::Mode::Readonly),
+        ] {
+            assert_eq!(parse_mode(word), Ok(want), "{word}");
+        }
+        // every older spelling keeps parsing to the same tier
+        for (word, want) in [
+            ("guarded", ka_protocol::Mode::Ask),
+            ("needs-approval", ka_protocol::Mode::Ask),
+            ("needs_approval", ka_protocol::Mode::Ask),
+            ("accept-edits", ka_protocol::Mode::AcceptEdits),
+            ("accept edits", ka_protocol::Mode::AcceptEdits),
+            ("free", ka_protocol::Mode::Allow),
+            ("full-access", ka_protocol::Mode::Allow),
+            ("full_access", ka_protocol::Mode::Allow),
+            ("plan", ka_protocol::Mode::Readonly),
+        ] {
+            assert_eq!(parse_mode(word), Ok(want), "{word}");
+        }
+        assert!(parse_mode("yolo").is_err());
     }
 }
 

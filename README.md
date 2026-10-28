@@ -45,7 +45,7 @@ Strict TOML, layered: defaults → `~/.config/ka/ka.toml` → `.ka/ka.toml` (pro
 
 ```toml
 model = "ollama/qwen3.5:9b"
-mode = "accept_edits"       # guarded | accept_edits | free | plan
+mode = "accept_edits"       # ask | accept_edits | allow | readonly
 
 [[rules]]                   # first match wins, before mode logic
 tool = "bash"
@@ -57,8 +57,8 @@ Every key with its default: [ka.toml reference](https://ka-harness.dev/docs/refe
 
 ## Safety
 
-- **Clearances** (read / write / exec) and four permission modes, `guarded` → `free`.
-- **Unbypassable hardstops** — root rm, fork bombs, fetch-and-execute: they ask even in free mode; headless denies.
+- **Clearances** (read / write / exec) and four permission modes, `ask` → `allow` (`guarded`/`free`/`plan` still parse as pre-v0.5 aliases).
+- **Unbypassable hardstops** — root rm, fork bombs, fetch-and-execute: they ask even in allow mode; headless denies.
 - **Read ledger** — edits refuse files the model has not read, or that changed since.
 - **Secret redaction**, one-way, in every tool result.
 - **Optional fs sandbox** for bash children (bwrap / firejail / landlock), fail-closed.

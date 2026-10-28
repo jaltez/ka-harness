@@ -3201,8 +3201,8 @@ impl SettingsPanel {
 /// (mode, label, one-line description).
 const MODE_CHOICES: [(ka_protocol::Mode, &str, &str); 4] = [
     (
-        ka_protocol::Mode::Guarded,
-        "guarded",
+        ka_protocol::Mode::Ask,
+        "ask",
         "ask before every edit and command",
     ),
     (
@@ -3210,16 +3210,16 @@ const MODE_CHOICES: [(ka_protocol::Mode, &str, &str); 4] = [
         "accept edits",
         "auto-apply file edits, ask for commands",
     ),
-    (ka_protocol::Mode::Free, "full access", "no prompts"),
+    (ka_protocol::Mode::Allow, "allow", "no prompts"),
     (
-        ka_protocol::Mode::Plan,
-        "plan",
+        ka_protocol::Mode::Readonly,
+        "readonly",
         "read-only planning (build with /build)",
     ),
 ];
 
-/// Footer label for a mode — the friendly lowercase word (`guarded`,
-/// `accept edits`, `full access`, `plan`).
+/// Footer label for a mode — the canonical lowercase word (`ask`,
+/// `accept_edits`, `allow`, `readonly`).
 fn mode_label(mode: ka_protocol::Mode) -> &'static str {
     crate::icons::mode_word(mode)
 }
@@ -3228,11 +3228,13 @@ fn mode_label(mode: ka_protocol::Mode) -> &'static str {
 /// friendly words are canonical; the older slugs keep parsing.
 fn mode_from_label(label: &str) -> ka_protocol::Mode {
     match label {
-        "guarded" | "needs-approval" | "needs_approval" => ka_protocol::Mode::Guarded,
+        "ask" | "guarded" | "needs-approval" | "needs_approval" => ka_protocol::Mode::Ask,
         "accept edits" | "accept-edits" | "accept_edits" => ka_protocol::Mode::AcceptEdits,
-        "full access" | "full-access" | "full_access" | "free" => ka_protocol::Mode::Free,
-        "plan" => ka_protocol::Mode::Plan,
-        _ => ka_protocol::Mode::Guarded,
+        "allow" | "full access" | "full-access" | "full_access" | "free" => {
+            ka_protocol::Mode::Allow
+        }
+        "readonly" | "read-only" | "read_only" | "plan" => ka_protocol::Mode::Readonly,
+        _ => ka_protocol::Mode::Ask,
     }
 }
 
@@ -3950,9 +3952,9 @@ async fn app(
     let mut input = InputBuffer::default();
     let mut meters = Meters {
         model: initial_model.to_string(),
-        // default mode is Free (yolo default); the bootstrap
+        // default mode is Allow (yolo default); the bootstrap
         // ModeChanged event re-renders this with the true state
-        mode: mode_label(ka_protocol::Mode::Free).to_string(),
+        mode: mode_label(ka_protocol::Mode::Allow).to_string(),
         ..Default::default()
     };
     // the reasoning segment must be visible from the first frame: the
@@ -5564,7 +5566,7 @@ async fn app(
                                 if matches!(
                                     cmd.event,
                                     Some(Command::SetMode {
-                                        mode: ka_protocol::Mode::Plan,
+                                        mode: ka_protocol::Mode::Readonly,
                                     })
                                 ) {
                                     plan_started = Some(std::time::SystemTime::now());
@@ -6750,7 +6752,7 @@ async fn app(
                                             if matches!(
                                                 event,
                                                 Command::SetMode {
-                                                    mode: ka_protocol::Mode::Plan
+                                                    mode: ka_protocol::Mode::Readonly
                                                 }
                                             ) {
                                                 plan_started =
@@ -6786,7 +6788,7 @@ async fn app(
                             }
                         }
                         if matches!(evt, Event::TurnFinished { .. })
-                            && meters.mode == mode_label(ka_protocol::Mode::Plan)
+                            && meters.mode == mode_label(ka_protocol::Mode::Readonly)
                             && plan_drafted(plan_started, &plan_file_path())
                         {
                             plan_started = None;
@@ -7721,7 +7723,10 @@ fn builtin_slash_commands() -> Vec<(String, String)> {
             "/provider".to_string(),
             "connect a provider (api key)".to_string(),
         ),
-        ("/mode".to_string(), "pick a permission mode".to_string()),
+        (
+            "/mode".to_string(),
+            "permission mode (ask|accept_edits|allow|readonly)".to_string(),
+        ),
         (
             "/features".to_string(),
             "toggle features, tools, skills, MCP (on|off spec)".to_string(),
@@ -8553,7 +8558,7 @@ pub fn slash_command(text: &str) -> Option<Slash> {
             Some(Slash {
                 note: None,
                 event: Some(Command::SetMode {
-                    mode: ka_protocol::Mode::Plan,
+                    mode: ka_protocol::Mode::Readonly,
                 }),
                 quit: false,
                 followup: None,
@@ -8571,7 +8576,7 @@ then write a concrete numbered implementation plan to {}. Task: {task}",
         "/build" => Some(Slash {
             note: None,
             event: Some(Command::SetMode {
-                mode: ka_protocol::Mode::Guarded,
+                mode: ka_protocol::Mode::Ask,
             }),
             quit: false,
             modal: None,
@@ -8588,7 +8593,7 @@ then write a concrete numbered implementation plan to {}. Task: {task}",
             Some(Slash {
                 note: None,
                 event: Some(Command::SetMode {
-                    mode: ka_protocol::Mode::Plan,
+                    mode: ka_protocol::Mode::Readonly,
                 }),
                 quit: false,
                 modal: None,
@@ -8605,7 +8610,7 @@ blocker > major > minor > nit, each as `file:line — issue — concrete fix`, \
         "/approve" => Some(Slash {
             note: None,
             event: Some(Command::SetMode {
-                mode: ka_protocol::Mode::Guarded,
+                mode: ka_protocol::Mode::Ask,
             }),
             quit: false,
             modal: None,
@@ -8895,14 +8900,16 @@ blocker > major > minor > nit, each as `file:line — issue — concrete fix`, \
             }),
             Some(name) => {
                 let mode = match name {
-                    "guarded" | "needs-approval" | "needs_approval" => ka_protocol::Mode::Guarded,
+                    "ask" | "guarded" | "needs-approval" | "needs_approval" => {
+                        ka_protocol::Mode::Ask
+                    }
                     "accept edits" | "accept-edits" | "accept_edits" => {
                         ka_protocol::Mode::AcceptEdits
                     }
-                    "free" | "full access" | "full-access" | "full_access" => {
-                        ka_protocol::Mode::Free
+                    "allow" | "free" | "full access" | "full-access" | "full_access" => {
+                        ka_protocol::Mode::Allow
                     }
-                    "plan" => ka_protocol::Mode::Plan,
+                    "readonly" | "read-only" | "read_only" | "plan" => ka_protocol::Mode::Readonly,
                     other => {
                         return Some(Slash {
                             note: Some(format!("unknown mode {other:?} — pick one below")),
@@ -11614,7 +11621,7 @@ fn help_modal_rows(width: usize) -> Vec<ratatui::text::Line<'static>> {
         &mut text,
         &[
             ("/model", "pick a model (/model <vendor> filters)"),
-            ("/mode", "pick a permission mode"),
+            ("/mode", "permission mode (ask|accept_edits|allow|readonly)"),
             ("/thinking", "pick the reasoning level"),
             (
                 "/features",
@@ -13409,7 +13416,7 @@ mod tests {
         };
         let meters = Meters {
             model: "mock-5".into(),
-            mode: "plan".into(),
+            mode: "readonly".into(),
             ..Default::default()
         };
         let sidebar = SidebarState {
@@ -13420,7 +13427,7 @@ mod tests {
         let big = text(&welcome_rows(80, 30, "◆", &meters, &sidebar));
         assert!(big.contains("██╗"), "the big logo: {big}");
         assert!(big.contains("new conversation"));
-        assert!(big.contains("plan") && big.contains("mock-5"));
+        assert!(big.contains("readonly") && big.contains("mock-5"));
         assert!(big.contains(&format!("~/src/ka {} main", crate::icons::BRANCH)));
         for (key, desc) in WELCOME_TIPS {
             assert!(big.contains(key) && big.contains(desc), "tip {key}");
@@ -13571,7 +13578,7 @@ mod tests {
         use ka_protocol::Effort;
         let mut panel = SettingsPanel {
             model: "x/y".to_string(),
-            mode: ka_protocol::Mode::Guarded,
+            mode: ka_protocol::Mode::Ask,
             effort: None,
             selected: 0,
             edit: None,
@@ -13787,7 +13794,7 @@ mod tests {
             matches!(
                 sl.event,
                 Some(Command::SetMode {
-                    mode: ka_protocol::Mode::Guarded,
+                    mode: ka_protocol::Mode::Ask,
                 })
             )
         };
@@ -14090,8 +14097,8 @@ mod tests {
     fn status_line_splits_meters_and_always_shows_cost() {
         let m = Meters {
             model: "ollama/qwen3.5:9b".into(),
-            mode: "full access".into(),
-            mode_icon: crate::icons::mode_icon(ka_protocol::Mode::Free).into(),
+            mode: "allow".into(),
+            mode_icon: crate::icons::mode_icon(ka_protocol::Mode::Allow).into(),
             context: (10_000, 100_000),
             cost: 0.0123,
             ..Default::default()
@@ -14111,8 +14118,8 @@ mod tests {
         assert_eq!(
             text(&right),
             format!(
-                "━━━━━━━━━━ 10%  $0.0123  {} full access ",
-                crate::icons::mode_icon(ka_protocol::Mode::Free)
+                "━━━━━━━━━━ 10%  $0.0123  {} allow ",
+                crate::icons::mode_icon(ka_protocol::Mode::Allow)
             )
         );
         assert_eq!(right[0].content, "━");
@@ -14121,10 +14128,10 @@ mod tests {
         let pill = right.last().expect("pill closes the row");
         assert_eq!(
             pill.style.bg,
-            Some(crate::palette::mode_color(ka_protocol::Mode::Free))
+            Some(crate::palette::mode_color(ka_protocol::Mode::Allow))
         );
         assert_eq!(pill.style.fg, Some(crate::palette::CHIP_FG));
-        assert!(pill.content.ends_with("full access "), "{pill:?}");
+        assert!(pill.content.ends_with("allow "), "{pill:?}");
         // effort rides its battery segment when the model supports
         // reasoning; unsupported models hide it; an unknown level keeps
         // the word and drops the glyph
@@ -14457,19 +14464,19 @@ mod tests {
         let m = slash_command("/model openai/gpt-5.1").unwrap();
         assert!(!m.quit);
         assert!(matches!(m.event, Some(Command::SetModel { .. })));
-        let md = slash_command("/mode free").unwrap();
+        let md = slash_command("/mode allow").unwrap();
         assert!(matches!(
             md.event,
             Some(Command::SetMode {
-                mode: ka_protocol::Mode::Free
+                mode: ka_protocol::Mode::Allow
             })
         ));
         // the friendly words parse to the same tiers
         for (word, want) in [
-            ("guarded", ka_protocol::Mode::Guarded),
-            ("accept edits", ka_protocol::Mode::AcceptEdits),
-            ("full access", ka_protocol::Mode::Free),
-            ("plan", ka_protocol::Mode::Plan),
+            ("ask", ka_protocol::Mode::Ask),
+            ("accept_edits", ka_protocol::Mode::AcceptEdits),
+            ("allow", ka_protocol::Mode::Allow),
+            ("readonly", ka_protocol::Mode::Readonly),
         ] {
             let s = slash_command(&format!("/mode {word}")).unwrap();
             assert!(
@@ -14479,12 +14486,15 @@ mod tests {
         }
         // every legacy slug keeps parsing
         for (slug, want) in [
-            ("needs-approval", ka_protocol::Mode::Guarded),
-            ("needs_approval", ka_protocol::Mode::Guarded),
+            ("guarded", ka_protocol::Mode::Ask),
+            ("free", ka_protocol::Mode::Allow),
+            ("plan", ka_protocol::Mode::Readonly),
+            ("needs-approval", ka_protocol::Mode::Ask),
+            ("needs_approval", ka_protocol::Mode::Ask),
+            ("accept edits", ka_protocol::Mode::AcceptEdits),
             ("accept-edits", ka_protocol::Mode::AcceptEdits),
-            ("accept_edits", ka_protocol::Mode::AcceptEdits),
-            ("full-access", ka_protocol::Mode::Free),
-            ("full_access", ka_protocol::Mode::Free),
+            ("full-access", ka_protocol::Mode::Allow),
+            ("full_access", ka_protocol::Mode::Allow),
         ] {
             let s = slash_command(&format!("/mode {slug}")).unwrap();
             assert!(
@@ -14494,10 +14504,10 @@ mod tests {
         }
         // footer labels round-trip through the parser (settings bootstrap)
         for mode in [
-            ka_protocol::Mode::Guarded,
+            ka_protocol::Mode::Ask,
             ka_protocol::Mode::AcceptEdits,
-            ka_protocol::Mode::Free,
-            ka_protocol::Mode::Plan,
+            ka_protocol::Mode::Allow,
+            ka_protocol::Mode::Readonly,
         ] {
             assert_eq!(mode_from_label(mode_label(mode)), mode, "{mode:?}");
         }
@@ -15837,7 +15847,7 @@ mod tests {
                 path: std::path::PathBuf::from("/tmp/f.jsonl"),
                 id: "s1-dddd4444".into(),
                 ts: "2026-09-02T10:00:00Z".into(),
-                title: "free".into(),
+                title: "no-cost chat".into(),
                 messages: 2,
                 cost: 0.004,
                 tokens: 0,
@@ -16824,7 +16834,7 @@ mod tests {
         assert_eq!(
             input_area_rows(
                 Some(&InputPicker::Mode(ModePicker::for_mode(
-                    ka_protocol::Mode::Free
+                    ka_protocol::Mode::Allow
                 ))),
                 "x",
                 40
@@ -16935,7 +16945,7 @@ mod tests {
     fn meters_sample() -> Meters {
         Meters {
             model: "mockco/mock".into(),
-            mode: "free".into(),
+            mode: "allow".into(),
             effort: String::new(),
             session: "s19a4f2e1b0-3f9c2a81d4b7".into(),
             context: (12_000, 200_000),
@@ -18929,7 +18939,7 @@ mod tests {
     fn outside_click_closes_settings_without_applying_the_edit() {
         let panel = SettingsPanel {
             model: "mock-5".into(),
-            mode: ka_protocol::Mode::Guarded,
+            mode: ka_protocol::Mode::Ask,
             effort: None,
             selected: 0,
             edit: Some("half-typed model".into()),

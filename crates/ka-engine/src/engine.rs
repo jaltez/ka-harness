@@ -1459,7 +1459,7 @@ async fn handle_command(
                     ctx.state.poke_pending = None;
                 }
                 if ctx.state.pokes_used >= ctx.state.poke_max
-                    || ctx.voice.mode() == Mode::Plan
+                    || ctx.voice.mode() == Mode::Readonly
                     || ctx.voice.last_stop() != Stop::Done
                 {
                     break;
@@ -2577,7 +2577,7 @@ async fn maybe_rate_hill_climb(
     state: &EngineState,
     events: &mpsc::Sender<Event>,
 ) {
-    if voice.mode() != ka_protocol::Mode::Plan || voice.last_stop() != Stop::Done {
+    if voice.mode() != ka_protocol::Mode::Readonly || voice.last_stop() != Stop::Done {
         return;
     }
     let Some(fast) = state.roles.fast.clone() else {

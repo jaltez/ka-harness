@@ -92,8 +92,12 @@ impl Hand for PathfinderHand {
                 return ToolOutput::err("pathfinder: no model configured for the parent session");
             };
 
-            let mut voice =
-                Voice::new_readonly(source.catalog, ctx.cwd.clone(), ka_protocol::Mode::Free, 12);
+            let mut voice = Voice::new_readonly(
+                source.catalog,
+                ctx.cwd.clone(),
+                ka_protocol::Mode::Allow,
+                12,
+            );
             voice.set_model_selector(&model, 4.0);
             voice.set_session_id(source.session_id.clone());
             // system rides via the voice's git line; inject the subagent

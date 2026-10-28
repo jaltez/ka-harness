@@ -467,7 +467,7 @@ async fn run_agent_once(
     if def.isolate {
         if !matches!(
             parent_mode,
-            ka_protocol::Mode::AcceptEdits | ka_protocol::Mode::Free
+            ka_protocol::Mode::AcceptEdits | ka_protocol::Mode::Allow
         ) {
             return (
                 Err(
@@ -508,14 +508,14 @@ async fn run_agent_once(
             Voice::new(
                 source.catalog,
                 agent_cwd,
-                ka_protocol::Mode::Free,
+                ka_protocol::Mode::Allow,
                 max_steps,
             )
         } else {
             Voice::new_readonly(
                 source.catalog,
                 agent_cwd,
-                ka_protocol::Mode::Free,
+                ka_protocol::Mode::Allow,
                 max_steps,
             )
         };
@@ -728,7 +728,7 @@ mod tests {
         DelegateHand::new(
             agents,
             std::sync::Arc::new(parking_lot::RwLock::new(PathfinderSource::default())),
-            ka_protocol::Mode::Free,
+            ka_protocol::Mode::Allow,
             crate::hands::tasks::AgentTaskTable::new(),
             events,
             crate::features::FeatureToggles::slot(Vec::new()),

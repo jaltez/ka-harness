@@ -33,7 +33,10 @@ pub enum Effort {
     Max,
 }
 
-/// Permission mode for the engine.
+/// Permission mode for the engine. The names read as permission
+/// language — ask before acting, allow everything — and each variant
+/// keeps its pre-v0.5 spelling as a deserialization alias so existing
+/// configs and strand records keep parsing.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
 )]
@@ -41,13 +44,17 @@ pub enum Effort {
 pub enum Mode {
     /// Confirm exec-tier actions and non-allowlisted writes.
     #[default]
-    Guarded,
+    #[serde(alias = "guarded")]
+    Ask,
     /// Auto-apply file edits; commands still confirm.
+    #[serde(alias = "accept-edits", alias = "accept edits")]
     AcceptEdits,
     /// Auto-approve everything except hardstops.
-    Free,
+    #[serde(alias = "free")]
+    Allow,
     /// Research mode: read-only except the plans directory.
-    Plan,
+    #[serde(alias = "plan")]
+    Readonly,
 }
 
 /// A feature-toggle selector — the one grammar shared by the
@@ -859,7 +866,7 @@ mod tests {
             selector: "anthropic/claude-sonnet-5:high".into(),
         });
         roundtrip_command(Command::SetEffort { level: Effort::Max });
-        roundtrip_command(Command::SetMode { mode: Mode::Free });
+        roundtrip_command(Command::SetMode { mode: Mode::Allow });
         roundtrip_command(Command::Compact {
             focus: Some("keep API notes".into()),
         });
@@ -1038,9 +1045,7 @@ mod tests {
         roundtrip_event(Event::DigestFinished {
             kept: RecordId("r4".into()),
         });
-        roundtrip_event(Event::ModeChanged {
-            mode: Mode::Guarded,
-        });
+        roundtrip_event(Event::ModeChanged { mode: Mode::Ask });
         roundtrip_event(Event::ModelChanged {
             selector: "openai/gpt-5.1".into(),
         });

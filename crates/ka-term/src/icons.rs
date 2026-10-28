@@ -31,19 +31,19 @@ pub const STRIP_INFO: &str = "?";
 
 pub fn mode_icon(mode: Mode) -> &'static str {
     match mode {
-        Mode::Guarded => "\u{25c8}",     // ◈
+        Mode::Ask => "\u{25c8}",         // ◈
         Mode::AcceptEdits => "\u{270e}", // ✎
-        Mode::Free => "\u{21af}",        // ↯
-        Mode::Plan => "\u{25ce}",        // ◎
+        Mode::Allow => "\u{21af}",       // ↯
+        Mode::Readonly => "\u{25ce}",    // ◎
     }
 }
 
 pub fn mode_word(mode: Mode) -> &'static str {
     match mode {
-        Mode::Guarded => "guarded",
-        Mode::AcceptEdits => "accept edits",
-        Mode::Free => "full access",
-        Mode::Plan => "plan",
+        Mode::Ask => "ask",
+        Mode::AcceptEdits => "accept_edits",
+        Mode::Allow => "allow",
+        Mode::Readonly => "readonly",
     }
 }
 
@@ -144,7 +144,7 @@ mod tests {
             STRIP_INFO,
             AGENTS,
         ];
-        for m in [Mode::Guarded, Mode::AcceptEdits, Mode::Free, Mode::Plan] {
+        for m in [Mode::Ask, Mode::AcceptEdits, Mode::Allow, Mode::Readonly] {
             all.push(mode_icon(m));
         }
         for t in [

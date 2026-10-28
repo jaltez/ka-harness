@@ -1132,7 +1132,7 @@ mod tests {
                 id: new_record_id(),
                 model: Some("openai/gpt-5.1@high".into()),
                 effort: Some(Effort::High),
-                mode: Some(Mode::Free),
+                mode: Some(Mode::Allow),
                 features: None,
                 sandbox: None,
             })
@@ -1142,7 +1142,7 @@ mod tests {
         assert_eq!(reopened.records().len(), 5);
         let settings = reopened.settings();
         assert_eq!(settings.model.as_deref(), Some("openai/gpt-5.1@high"));
-        assert_eq!(settings.mode, Some(Mode::Free));
+        assert_eq!(settings.mode, Some(Mode::Allow));
         assert!(!settings.dangling);
         let _ = std::fs::remove_dir_all(&data);
     }

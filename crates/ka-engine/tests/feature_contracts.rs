@@ -487,7 +487,7 @@ fn conditional_hands_contract() {
         Arc::new(parking_lot::RwLock::new(
             hands::pathfinder::PathfinderSource::default(),
         )),
-        ka_protocol::Mode::Free,
+        ka_protocol::Mode::Allow,
         hands::tasks::AgentTaskTable::new(),
         evt_tx,
         ka_engine::features::FeatureToggles::slot(Vec::new()),
@@ -662,11 +662,11 @@ fn web_domain_rule_semantics() {
 
 // ------------------------------------------------------------ gate matrix
 
-/// free mode: writes run without an ask (the documented default tier).
+/// allow mode: writes run without an ask (the documented default tier).
 #[tokio::test]
 async fn free_mode_writes_without_ask() {
     let dir = tmp_dir("free-write");
-    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Free, 5)
+    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Allow, 5)
         .with_speaker(
             ka_dialect::Wire::OpenaiChat,
             Scripted::calls(vec![(
@@ -677,7 +677,7 @@ async fn free_mode_writes_without_ask() {
     let events = run_turn(&mut voice, "make a file", None).await;
     assert!(
         asks_of(&events).is_empty(),
-        "free mode must not ask for writes: {events:?}"
+        "allow mode must not ask for writes: {events:?}"
     );
     assert_eq!(errored_outputs(&events, "write").len(), 0, "{events:?}");
     assert!(
@@ -687,12 +687,12 @@ async fn free_mode_writes_without_ask() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// guarded mode: writes ask; a deny answer blocks the call without
+/// ask mode: writes ask; a deny answer blocks the call without
 /// executing it.
 #[tokio::test]
-async fn guarded_write_asks_and_deny_blocks() {
-    let dir = tmp_dir("guarded-write");
-    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Guarded, 5)
+async fn ask_mode_write_asks_and_deny_blocks() {
+    let dir = tmp_dir("ask-mode-write");
+    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Ask, 5)
         .with_speaker(
             ka_dialect::Wire::OpenaiChat,
             Scripted::calls(vec![(
@@ -702,7 +702,7 @@ async fn guarded_write_asks_and_deny_blocks() {
         );
     let events = run_turn(&mut voice, "make a file", Some(2)).await;
     let asks = asks_of(&events);
-    assert_eq!(asks.len(), 1, "guarded write must ask once: {events:?}");
+    assert_eq!(asks.len(), 1, "ask-mode write must ask once: {events:?}");
     assert!(asks[0].text.contains("modify files"), "{}", asks[0].text);
     let errs = errored_outputs(&events, "write");
     assert!(
@@ -716,19 +716,19 @@ async fn guarded_write_asks_and_deny_blocks() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Hardstops are unbypassable-by-mode: they ask even in free mode, and
+/// Hardstops are unbypassable-by-mode: they ask even in allow mode, and
 /// a deny answer keeps the catastrophic command from ever running.
 #[tokio::test]
 async fn hardstop_asks_even_in_free() {
     let dir = tmp_dir("hardstop");
-    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Free, 5)
+    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Allow, 5)
         .with_speaker(
             ka_dialect::Wire::OpenaiChat,
             Scripted::calls(vec![("bash", serde_json::json!({"command": "rm -rf /"}))]),
         );
     let events = run_turn(&mut voice, "clean the disk", Some(2)).await;
     let asks = asks_of(&events);
-    assert_eq!(asks.len(), 1, "hardstop must ask in free mode: {events:?}");
+    assert_eq!(asks.len(), 1, "hardstop must ask in allow mode: {events:?}");
     assert!(asks[0].text.contains("HARDSTOP"), "{}", asks[0].text);
     assert!(
         asks[0].text.contains("recursive delete"),
@@ -743,12 +743,12 @@ async fn hardstop_asks_even_in_free() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Protected paths ask even in free mode, even with an allow rule and
+/// Protected paths ask even in allow mode, even with an allow rule and
 /// a session allowlist — the injected-prompt defense.
 #[tokio::test]
 async fn protected_path_asks_even_with_allow_rule() {
     let dir = tmp_dir("protected-ask");
-    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Free, 5)
+    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Allow, 5)
         .with_speaker(
             ka_dialect::Wire::OpenaiChat,
             Scripted::calls(vec![(
@@ -774,7 +774,7 @@ async fn protected_path_asks_even_with_allow_rule() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Plan mode matrix: writes inside .ka/plans/ run; everything else
+/// Readonly mode matrix: writes inside .ka/plans/ run; everything else
 /// denies with the documented message; exec asks.
 #[tokio::test]
 async fn plan_mode_matrix() {
@@ -782,7 +782,7 @@ async fn plan_mode_matrix() {
     std::fs::create_dir_all(dir.join(".ka/plans")).unwrap();
 
     // allowed: the plans directory
-    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Plan, 5)
+    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Readonly, 5)
         .with_speaker(
             ka_dialect::Wire::OpenaiChat,
             Scripted::calls(vec![(
@@ -797,7 +797,7 @@ async fn plan_mode_matrix() {
     drop(voice);
 
     // denied: anything outside the plans directory
-    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Plan, 5)
+    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Readonly, 5)
         .with_speaker(
             ka_dialect::Wire::OpenaiChat,
             Scripted::calls(vec![(
@@ -815,7 +815,7 @@ async fn plan_mode_matrix() {
     drop(voice);
 
     // exec: read-only commands auto-allow (research), everything else asks
-    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Plan, 5)
+    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Readonly, 5)
         .with_speaker(
             ka_dialect::Wire::OpenaiChat,
             Scripted::calls(vec![("bash", serde_json::json!({"command": "ls"}))]),
@@ -826,7 +826,7 @@ async fn plan_mode_matrix() {
         "read-only exec must auto-allow in plan mode: {events:?}"
     );
     drop(voice);
-    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Plan, 5)
+    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Readonly, 5)
         .with_speaker(
             ka_dialect::Wire::OpenaiChat,
             Scripted::calls(vec![(
@@ -849,8 +849,8 @@ async fn plan_mode_matrix() {
 #[tokio::test]
 async fn rules_first_match_allow_ask_deny() {
     let dir = tmp_dir("rules");
-    // allow rule: `echo *` runs ungated even in guarded mode
-    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Guarded, 5)
+    // allow rule: `echo *` runs ungated even in ask mode
+    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Ask, 5)
         .with_speaker(
             ka_dialect::Wire::OpenaiChat,
             Scripted::calls(vec![(
@@ -877,7 +877,7 @@ async fn rules_first_match_allow_ask_deny() {
     drop(voice);
 
     // deny rule: `git *` refuses without asking
-    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Guarded, 5)
+    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Ask, 5)
         .with_speaker(
             ka_dialect::Wire::OpenaiChat,
             Scripted::calls(vec![("bash", serde_json::json!({"command": "git status"}))]),
@@ -903,7 +903,7 @@ async fn rules_first_match_allow_ask_deny() {
 #[tokio::test]
 async fn session_always_allow_skips_later_asks() {
     let dir = tmp_dir("always-allow");
-    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Guarded, 5)
+    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Ask, 5)
         .with_speaker(
             ka_dialect::Wire::OpenaiChat,
             Scripted::calls(vec![
@@ -940,7 +940,7 @@ async fn read_ledger_contract() {
     std::fs::write(dir.join("f.txt"), "alpha beta").unwrap();
 
     // unread edit refuses
-    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Free, 5)
+    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Allow, 5)
         .with_speaker(
             ka_dialect::Wire::OpenaiChat,
             Scripted::calls(vec![(
@@ -962,7 +962,7 @@ async fn read_ledger_contract() {
     drop(voice);
 
     // read-then-edit succeeds
-    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Free, 5)
+    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Allow, 5)
         .with_speaker(
             ka_dialect::Wire::OpenaiChat,
             Scripted::calls(vec![
@@ -982,14 +982,14 @@ async fn read_ledger_contract() {
 
     // changed-since-read refuses: the mutation lands between turns, the
     // ledger keeps the old stamp, and the next-turn edit is refused
-    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Free, 5)
+    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Allow, 5)
         .with_speaker(
             ka_dialect::Wire::OpenaiChat,
             Scripted::calls(vec![("read", serde_json::json!({"path": "f.txt"}))]),
         );
     let _ = run_turn(&mut voice, "read it", None).await;
     std::fs::write(dir.join("f.txt"), "CHANGED behind the read").unwrap();
-    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Free, 5)
+    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Allow, 5)
         .with_speaker(
             ka_dialect::Wire::OpenaiChat,
             Scripted::calls(vec![(
@@ -1014,7 +1014,7 @@ async fn read_ledger_contract() {
 #[tokio::test]
 async fn hook_exit2_blocks_pre_tool_use() {
     let dir = tmp_dir("hook-block");
-    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Free, 5)
+    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Allow, 5)
         .with_speaker(
             ka_dialect::Wire::OpenaiChat,
             Scripted::calls(vec![("bash", serde_json::json!({"command": "echo hi"}))]),
@@ -1035,11 +1035,11 @@ async fn hook_exit2_blocks_pre_tool_use() {
 }
 
 /// Hook steering: a clean-exit pre_tool_use hook emitting
-/// `{"mode":"plan","note":"…"}` switches the permission mode mid-turn.
+/// `{"mode":"readonly","note":"…"}` switches the permission mode mid-turn.
 #[tokio::test]
 async fn hook_stdout_steers_mode() {
     let dir = tmp_dir("hook-steer");
-    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Free, 5)
+    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Allow, 5)
         .with_speaker(
             ka_dialect::Wire::OpenaiChat,
             Scripted::calls(vec![("bash", serde_json::json!({"command": "echo hi"}))]),
@@ -1047,14 +1047,14 @@ async fn hook_stdout_steers_mode() {
     voice.set_hooks(vec![ka_engine::config::Hook {
         event: ka_engine::config::HookEvent::PreToolUse,
         tool: None,
-        command: "printf '{\"mode\":\"plan\",\"note\":\"steered\"}'".into(),
+        command: "printf '{\"mode\":\"readonly\",\"note\":\"steered\"}'".into(),
     }]);
     let events = run_turn(&mut voice, "run it", None).await;
     assert!(
         events.iter().any(|e| matches!(
             e,
             Event::ModeChanged {
-                mode: ka_protocol::Mode::Plan
+                mode: ka_protocol::Mode::Readonly
             }
         )),
         "steering must switch the mode: {events:?}"
@@ -1074,7 +1074,7 @@ async fn hook_stdout_steers_mode() {
 #[tokio::test]
 async fn hook_feedback_rides_the_tool_result() {
     let dir = tmp_dir("hook-feedback");
-    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Free, 5)
+    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Allow, 5)
         .with_speaker(
             ka_dialect::Wire::OpenaiChat,
             Scripted::calls(vec![("bash", serde_json::json!({"command": "echo hi"}))]),
@@ -1114,7 +1114,7 @@ async fn hook_feedback_rides_the_tool_result() {
 async fn verify_lint_rides_edit_result() {
     let dir = tmp_dir("verify-lint");
     std::fs::write(dir.join("a.rs"), "fn main() {}\n").unwrap();
-    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Free, 5)
+    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Allow, 5)
         .with_speaker(
             ka_dialect::Wire::OpenaiChat,
             Scripted::calls(vec![
@@ -1156,7 +1156,7 @@ async fn verify_lint_rides_edit_result() {
 #[tokio::test]
 async fn background_delegate_registers_and_reports() {
     let dir = tmp_dir("bg-delegate");
-    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Free, 5)
+    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Allow, 5)
         .with_speaker(
             ka_dialect::Wire::OpenaiChat,
             Scripted::calls(vec![(
@@ -1188,7 +1188,7 @@ async fn background_delegate_registers_and_reports() {
             output: None,
         }],
         voice.pathfinder_slot(),
-        ka_protocol::Mode::Free,
+        ka_protocol::Mode::Allow,
         table.clone(),
         note_tx,
         voice.feature_slot(),
@@ -1279,7 +1279,7 @@ fn secrets_redact_pairs_contract() {
 async fn snapshot_undo_contract() {
     let dir = tmp_dir("snapshots");
     std::fs::write(dir.join("existing.txt"), "original").unwrap();
-    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Free, 5)
+    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Allow, 5)
         .with_speaker(
             ka_dialect::Wire::OpenaiChat,
             Scripted::calls(vec![
@@ -1335,7 +1335,7 @@ async fn sandbox_expansion_grant_ask_allow_deny_always() {
 
     // allow (this run): one grant-only ask, then execution with the
     // grant riding exactly this call
-    let mut voice = Voice::new(test_catalog(), inside.clone(), ka_protocol::Mode::Free, 5)
+    let mut voice = Voice::new(test_catalog(), inside.clone(), ka_protocol::Mode::Allow, 5)
         .with_speaker(
             ka_dialect::Wire::OpenaiChat,
             Scripted::calls(vec![("bash", serde_json::json!({"command": command}))]),
@@ -1364,7 +1364,7 @@ async fn sandbox_expansion_grant_ask_allow_deny_always() {
     // case below starts from a clean slate
     let _ = std::fs::remove_file(&target);
     // a command inside the allowlist never asks
-    let mut voice = Voice::new(test_catalog(), inside.clone(), ka_protocol::Mode::Free, 5)
+    let mut voice = Voice::new(test_catalog(), inside.clone(), ka_protocol::Mode::Allow, 5)
         .with_speaker(
             ka_dialect::Wire::OpenaiChat,
             Scripted::calls(vec![(
@@ -1380,7 +1380,7 @@ async fn sandbox_expansion_grant_ask_allow_deny_always() {
     );
 
     // deny: the sandbox stays unchanged — the write cannot land
-    let mut voice = Voice::new(test_catalog(), inside.clone(), ka_protocol::Mode::Free, 5)
+    let mut voice = Voice::new(test_catalog(), inside.clone(), ka_protocol::Mode::Allow, 5)
         .with_speaker(
             ka_dialect::Wire::OpenaiChat,
             Scripted::calls(vec![("bash", serde_json::json!({"command": command}))]),
@@ -1394,7 +1394,7 @@ async fn sandbox_expansion_grant_ask_allow_deny_always() {
     );
 
     // always: the write paths persist to the project layer
-    let mut voice = Voice::new(test_catalog(), inside.clone(), ka_protocol::Mode::Free, 5)
+    let mut voice = Voice::new(test_catalog(), inside.clone(), ka_protocol::Mode::Allow, 5)
         .with_speaker(
             ka_dialect::Wire::OpenaiChat,
             Scripted::calls(vec![("bash", serde_json::json!({"command": command}))]),
@@ -1415,7 +1415,7 @@ async fn sandbox_expansion_grant_ask_allow_deny_always() {
 #[tokio::test]
 async fn hook_updated_input_patches_arguments() {
     let dir = tmp_dir("hook-patch");
-    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Free, 5)
+    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Allow, 5)
         .with_speaker(
             ka_dialect::Wire::OpenaiChat,
             Scripted::calls(vec![(
@@ -1496,7 +1496,7 @@ async fn hook_pre_approve_skips_the_ask_but_not_hardstops() {
             serde_json::json!({"command": format!("touch {}", marker.display())}),
         )])),
     });
-    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Guarded, 5)
+    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Ask, 5)
         .with_speaker(ka_dialect::Wire::OpenaiChat, queue.clone());
     voice.set_hooks(vec![Hook {
         event: CfgHookEvent::PreToolUse,
@@ -1544,7 +1544,7 @@ async fn hook_pre_approve_skips_the_ask_but_not_hardstops() {
 async fn hook_pre_approve_cannot_override_deny_verdicts() {
     // deny rule: the refusal stands, no ask, nothing runs
     let dir = tmp_dir("hook-allow-deny");
-    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Guarded, 5)
+    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Ask, 5)
         .with_speaker(
             ka_dialect::Wire::OpenaiChat,
             Scripted::calls(vec![("bash", serde_json::json!({"command": "git status"}))]),
@@ -1573,7 +1573,7 @@ async fn hook_pre_approve_cannot_override_deny_verdicts() {
     drop(voice);
 
     // plan mode: a write outside .ka/plans/ stays denied
-    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Plan, 5)
+    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Readonly, 5)
         .with_speaker(
             ka_dialect::Wire::OpenaiChat,
             Scripted::calls(vec![(
@@ -1624,7 +1624,7 @@ async fn loop_rule_ask_deny_allow_and_default_trip() {
     };
 
     // ask: the 3rd identical call poses the loop question
-    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Free, 10)
+    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Allow, 10)
         .with_speaker(ka_dialect::Wire::OpenaiChat, Scripted::calls(reads(3)));
     voice.set_rules(vec![Rule {
         tool: "loop".into(),
@@ -1640,7 +1640,7 @@ async fn loop_rule_ask_deny_allow_and_default_trip() {
         "allow-once lets the call proceed"
     );
     // ask + deny answer refuses the call
-    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Free, 10)
+    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Allow, 10)
         .with_speaker(ka_dialect::Wire::OpenaiChat, Scripted::calls(reads(3)));
     voice.set_rules(vec![Rule {
         tool: "loop".into(),
@@ -1659,7 +1659,7 @@ async fn loop_rule_ask_deny_allow_and_default_trip() {
     );
 
     // deny: refused outright at the threshold, no ask
-    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Free, 10)
+    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Allow, 10)
         .with_speaker(ka_dialect::Wire::OpenaiChat, Scripted::calls(reads(3)));
     voice.set_rules(vec![Rule {
         tool: "loop".into(),
@@ -1679,7 +1679,7 @@ async fn loop_rule_ask_deny_allow_and_default_trip() {
     );
 
     // allow: the guard is off — identical calls stream through
-    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Free, 10)
+    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Allow, 10)
         .with_speaker(ka_dialect::Wire::OpenaiChat, Scripted::calls(reads(4)));
     voice.set_rules(vec![Rule {
         tool: "loop".into(),
@@ -1693,7 +1693,7 @@ async fn loop_rule_ask_deny_allow_and_default_trip() {
     );
 
     // no rule: the shipped trip at 4 identical calls is unchanged
-    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Free, 10)
+    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Allow, 10)
         .with_speaker(ka_dialect::Wire::OpenaiChat, Scripted::calls(reads(4)));
     let events = run_turn(&mut voice, "go", None).await;
     assert_eq!(
@@ -1757,7 +1757,7 @@ async fn auto_review_allows_confident_and_defers_everything_else() {
     let dir = tmp_dir("auto-review");
     // confident: no ask, the command ran, the auto-allow is visible
     let marker = dir.join("reviewed.txt");
-    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Guarded, 5)
+    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Ask, 5)
         .with_speaker(
             ka_dialect::Wire::OpenaiChat,
             std::sync::Arc::new(ReviewSpeaker {
@@ -1782,7 +1782,7 @@ async fn auto_review_allows_confident_and_defers_everything_else() {
 
     // unconfident: the ask still reaches the human (never auto-denied)
     let marker = dir.join("deferred.txt");
-    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Guarded, 5)
+    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Ask, 5)
         .with_speaker(
             ka_dialect::Wire::OpenaiChat,
             std::sync::Arc::new(ReviewSpeaker {
@@ -1810,7 +1810,7 @@ async fn auto_review_allows_confident_and_defers_everything_else() {
 #[tokio::test]
 async fn turn_scoped_allowed_tools_restrict_the_turn() {
     let dir = tmp_dir("turn-scope");
-    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Free, 5)
+    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Allow, 5)
         .with_speaker(
             ka_dialect::Wire::OpenaiChat,
             // the model tries a bash call the command did not allow

@@ -3076,7 +3076,7 @@ impl Voice {
                 let analysis = analyze(&command);
                 hardstop(&command, &analysis).map(|s| s.reason)
             }
-            Clearance::Write if self.mode != ka_protocol::Mode::Plan => {
+            Clearance::Write if self.mode != ka_protocol::Mode::Readonly => {
                 crate::hands::protected::reason(&self.hand_ctx.cwd, &call.primary_arg())
                     .map(str::to_string)
             }
@@ -3115,10 +3115,10 @@ impl Voice {
     fn gate(&self, clearance: Clearance, call: &ToolCall) -> Gate {
         // protected paths are hardstop-class: checked before rules so no
         // allow-rule or session always-allow can bypass them, and before
-        // mode logic so free mode cannot wave them through. Plan mode is
+        // mode logic so free mode cannot wave them through. Readonly mode is
         // exempt here — it already denies every write outside .ka/plans/,
         // which covers everything the protected list contains.
-        if clearance == Clearance::Write && self.mode != ka_protocol::Mode::Plan {
+        if clearance == Clearance::Write && self.mode != ka_protocol::Mode::Readonly {
             if let Some(reason) =
                 crate::hands::protected::reason(&self.hand_ctx.cwd, &call.primary_arg())
             {
@@ -3160,12 +3160,12 @@ impl Voice {
         match clearance {
             Clearance::Read => Gate::Allow,
             Clearance::Write => match self.mode {
-                ka_protocol::Mode::Free | ka_protocol::Mode::AcceptEdits => Gate::Allow,
-                ka_protocol::Mode::Guarded => Gate::Ask {
+                ka_protocol::Mode::Allow | ka_protocol::Mode::AcceptEdits => Gate::Allow,
+                ka_protocol::Mode::Ask => Gate::Ask {
                     question: format!("allow {} to modify files?", call.tool),
                     reviewable: false,
                 },
-                ka_protocol::Mode::Plan => {
+                ka_protocol::Mode::Readonly => {
                     // research mode: only the project root's plans
                     // directory is writable. Resolve the argument
                     // (absolute or relative) before comparing, so every
@@ -3219,15 +3219,15 @@ use /build to switch to implementation",
                     return Gate::Allow;
                 }
                 match self.mode {
-                    ka_protocol::Mode::Free => Gate::Allow,
-                    ka_protocol::Mode::Plan => Gate::Ask {
+                    ka_protocol::Mode::Allow => Gate::Allow,
+                    ka_protocol::Mode::Readonly => Gate::Ask {
                         question: format!(
                             "plan mode: run `{command}`? (build with /build){}",
                             self.cost_suffix()
                         ),
                         reviewable: false,
                     },
-                    ka_protocol::Mode::AcceptEdits | ka_protocol::Mode::Guarded => Gate::Ask {
+                    ka_protocol::Mode::AcceptEdits | ka_protocol::Mode::Ask => Gate::Ask {
                         question: format!("run `{command}`?{}", self.cost_suffix()),
                         reviewable: true,
                     },
@@ -3292,7 +3292,7 @@ fn core_instructions(
 current — one item per step, mark items done as you finish them (each call replaces the \
 whole list).",
     );
-    if mode == ka_protocol::Mode::Plan {
+    if mode == ka_protocol::Mode::Readonly {
         // absolute, root-anchored: a session launched from a
         // subdirectory must draft into the one project plans dir the
         // /approve flow and the TUI watcher watch
@@ -3907,10 +3907,10 @@ mod tests {
         // rides outside this budget; growth here is harness creep.
         const BUDGET: usize = 2048;
         let modes = [
-            ka_protocol::Mode::Guarded,
+            ka_protocol::Mode::Ask,
             ka_protocol::Mode::AcceptEdits,
-            ka_protocol::Mode::Free,
-            ka_protocol::Mode::Plan,
+            ka_protocol::Mode::Allow,
+            ka_protocol::Mode::Readonly,
         ];
         for mode in modes {
             let core = super::core_instructions(
@@ -3932,7 +3932,7 @@ mod tests {
         let identity = "You are Ka, the resident personal assistant of one person.";
         let with = super::core_instructions(
             "(git: main, clean)",
-            ka_protocol::Mode::Guarded,
+            ka_protocol::Mode::Ask,
             std::path::Path::new("/tmp"),
             Some(identity),
         );
@@ -3952,7 +3952,7 @@ mod tests {
         // unset: byte-identical to the pre-identity default
         let without = super::core_instructions(
             "(git: main, clean)",
-            ka_protocol::Mode::Guarded,
+            ka_protocol::Mode::Ask,
             std::path::Path::new("/tmp"),
             None,
         );
@@ -3964,7 +3964,7 @@ mod tests {
         // whitespace-only identity falls back to the default
         let blank = super::core_instructions(
             "(git: main, clean)",
-            ka_protocol::Mode::Guarded,
+            ka_protocol::Mode::Ask,
             std::path::Path::new("/tmp"),
             Some("  \n"),
         );
@@ -4065,7 +4065,7 @@ mod tests {
         )
         .unwrap();
         let seen = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let mut voice = Voice::new(catalog.clone(), dir.clone(), ka_protocol::Mode::Guarded, 5)
+        let mut voice = Voice::new(catalog.clone(), dir.clone(), ka_protocol::Mode::Ask, 5)
             .with_speaker(
                 Wire::OpenaiChat,
                 std::sync::Arc::new(SystemSpeaker {
@@ -4096,13 +4096,12 @@ mod tests {
         // unreadable path: default identity + exactly one Note, then
         // a second turn stays silent about it
         let seen = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let mut voice = Voice::new(catalog, dir.clone(), ka_protocol::Mode::Guarded, 5)
-            .with_speaker(
-                Wire::OpenaiChat,
-                std::sync::Arc::new(SystemSpeaker {
-                    systems: seen.clone(),
-                }),
-            );
+        let mut voice = Voice::new(catalog, dir.clone(), ka_protocol::Mode::Ask, 5).with_speaker(
+            Wire::OpenaiChat,
+            std::sync::Arc::new(SystemSpeaker {
+                systems: seen.clone(),
+            }),
+        );
         voice.set_identity_file(Some(dir.join("missing.md").display().to_string()));
         let (events, _) = run_identity_turn(&mut voice).await;
         let notes = events
@@ -4268,16 +4267,11 @@ mod tests {
         )
         .unwrap();
         let seen = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let mut voice = Voice::new(
-            catalog,
-            std::env::temp_dir(),
-            ka_protocol::Mode::Guarded,
-            10,
-        )
-        .with_speaker(
-            Wire::OpenaiChat,
-            std::sync::Arc::new(SessionSpeaker { seen: seen.clone() }),
-        );
+        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Ask, 10)
+            .with_speaker(
+                Wire::OpenaiChat,
+                std::sync::Arc::new(SessionSpeaker { seen: seen.clone() }),
+            );
         voice.set_session_id(Some("strand-42".to_string()));
 
         let (_cmd_tx, mut cmd_rx) = mpsc::channel(16);
@@ -4327,11 +4321,10 @@ mod tests {
         )
         .unwrap();
         let seen = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let mut voice = Voice::new(catalog, dir.clone(), ka_protocol::Mode::Guarded, 10)
-            .with_speaker(
-                Wire::OpenaiChat,
-                std::sync::Arc::new(FakeSpeaker { seen: seen.clone() }),
-            );
+        let mut voice = Voice::new(catalog, dir.clone(), ka_protocol::Mode::Ask, 10).with_speaker(
+            Wire::OpenaiChat,
+            std::sync::Arc::new(FakeSpeaker { seen: seen.clone() }),
+        );
 
         let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
         let (evt_tx, mut evt_rx) = mpsc::channel(256);
@@ -4406,10 +4399,11 @@ mod tests {
         )
         .unwrap();
         let seen = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let mut voice = Voice::new(catalog, dir.clone(), ka_protocol::Mode::Free, 10).with_speaker(
-            Wire::OpenaiChat,
-            std::sync::Arc::new(FakeSpeaker { seen: seen.clone() }),
-        );
+        let mut voice = Voice::new(catalog, dir.clone(), ka_protocol::Mode::Allow, 10)
+            .with_speaker(
+                Wire::OpenaiChat,
+                std::sync::Arc::new(FakeSpeaker { seen: seen.clone() }),
+            );
         voice.set_hooks(vec![crate::config::Hook {
             event: crate::config::HookEvent::Stop,
             tool: None,
@@ -4508,13 +4502,8 @@ mod tests {
             "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000\n",
         )
         .unwrap();
-        let mut voice = Voice::new(
-            catalog,
-            std::env::temp_dir(),
-            ka_protocol::Mode::Guarded,
-            10,
-        )
-        .with_speaker(Wire::OpenaiChat, std::sync::Arc::new(TodoSpeaker));
+        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Ask, 10)
+            .with_speaker(Wire::OpenaiChat, std::sync::Arc::new(TodoSpeaker));
 
         let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
         let (evt_tx, mut evt_rx) = mpsc::channel(256);
@@ -4561,7 +4550,7 @@ mod tests {
         )
         .unwrap();
         let dir = std::env::temp_dir();
-        let mut voice = Voice::new(catalog, dir.clone(), ka_protocol::Mode::Guarded, 5);
+        let mut voice = Voice::new(catalog, dir.clone(), ka_protocol::Mode::Ask, 5);
         // ratio 1.0 → tokens == chars
         let big = "x".repeat(30_000); // 30k tokens
         voice.history.push(TurnMessage::user("start"));
@@ -4612,7 +4601,7 @@ mod tests {
         let mut voice = Voice::new(
             catalog.clone(),
             std::env::temp_dir(),
-            ka_protocol::Mode::Guarded,
+            ka_protocol::Mode::Ask,
             5,
         );
         voice.set_model_selector("test/m", 1.0);
@@ -4695,7 +4684,7 @@ mod tests {
         .unwrap();
         let seen2 = seen.clone();
         (
-            Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Free, 5)
+            Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Allow, 5)
                 .with_speaker(Wire::OpenaiChat, speaker),
             seen2,
         )
@@ -4759,7 +4748,7 @@ mod tests {
             "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000\n",
         )
         .unwrap();
-        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Guarded, 5);
+        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Ask, 5);
         let big_args = serde_json::json!({ "q": "x".repeat(500) });
         // stale: a call issued before the last user message
         voice.history.push(TurnMessage::assistant_with_calls(
@@ -4813,7 +4802,7 @@ mod tests {
         let mut voice = Voice::new(
             catalog.clone(),
             std::env::temp_dir(),
-            ka_protocol::Mode::Guarded,
+            ka_protocol::Mode::Ask,
             5,
         );
         let a = std::env::temp_dir().join(format!("ka-hot-a-{}", std::process::id()));
@@ -4848,7 +4837,7 @@ mod tests {
 
         // a nonexistent hot path is skipped, not fatal (fresh voice: the
         // previous phase already merged its files)
-        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Guarded, 5);
+        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Ask, 5);
         let ghost = std::env::temp_dir().join(format!("ka-hot-ghost-{}", std::process::id()));
         std::fs::write(&ghost, "gone\n").unwrap();
         let meta = std::fs::metadata(&ghost).unwrap();
@@ -4870,7 +4859,7 @@ mod tests {
             "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000\n",
         )
         .unwrap();
-        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Guarded, 5);
+        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Ask, 5);
         // ratio 1 char/token; tail budget is 20k, so the filler must not fit
         let filler = "y".repeat(30_000);
         voice.history.push(TurnMessage::user("old question"));
@@ -4930,7 +4919,7 @@ mod tests {
             "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 100000\n",
         )
         .unwrap();
-        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Guarded, 5);
+        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Ask, 5);
         voice.set_model_selector("test/m", 4.0);
         assert!(
             !voice.context_pressure(100_000),
@@ -5006,7 +4995,7 @@ mod tests {
         )
         .unwrap();
         let calls = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Guarded, 5)
+        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Ask, 5)
             .with_speaker(
                 Wire::OpenaiChat,
                 std::sync::Arc::new(OverflowFakeSpeaker {
@@ -5104,7 +5093,7 @@ mod tests {
             "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000\n",
         )
         .unwrap();
-        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Free, 5)
+        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Allow, 5)
             .with_speaker(Wire::OpenaiChat, std::sync::Arc::new(RuleFakeSpeaker));
         voice.set_rules(vec![crate::config::Rule {
             tool: "bash".into(),
@@ -5185,8 +5174,13 @@ mod tests {
                 })
             }
         }
-        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Plan, 5)
-            .with_speaker(Wire::OpenaiChat, std::sync::Arc::new(WriteOutside));
+        let mut voice = Voice::new(
+            catalog,
+            std::env::temp_dir(),
+            ka_protocol::Mode::Readonly,
+            5,
+        )
+        .with_speaker(Wire::OpenaiChat, std::sync::Arc::new(WriteOutside));
 
         let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
         let (evt_tx, mut evt_rx) = mpsc::channel(256);
@@ -5241,7 +5235,7 @@ mod tests {
             tool: "write".into(),
             arguments: serde_json::json!({"path": "out.txt", "content": "x"}),
         };
-        for mode in [ka_protocol::Mode::Free, ka_protocol::Mode::AcceptEdits] {
+        for mode in [ka_protocol::Mode::Allow, ka_protocol::Mode::AcceptEdits] {
             let voice = crate::voice::Voice::new(catalog.clone(), std::env::temp_dir(), mode, 5);
             assert!(
                 matches!(
@@ -5252,7 +5246,7 @@ mod tests {
             );
         }
         let voice =
-            crate::voice::Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Guarded, 5);
+            crate::voice::Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Ask, 5);
         match voice.gate(crate::hands::Clearance::Write, &call) {
             Gate::Ask { question, .. } => assert_eq!(question, "allow write to modify files?"),
             Gate::Allow | Gate::Deny { .. } => {
@@ -5271,17 +5265,14 @@ mod tests {
             arguments: serde_json::json!({"command": command}),
         };
         for (mode, expected) in [
-            (ka_protocol::Mode::Free, None),
+            (ka_protocol::Mode::Allow, None),
             (
                 ka_protocol::Mode::AcceptEdits,
                 Some("run `cargo build --release`?"),
             ),
+            (ka_protocol::Mode::Ask, Some("run `cargo build --release`?")),
             (
-                ka_protocol::Mode::Guarded,
-                Some("run `cargo build --release`?"),
-            ),
-            (
-                ka_protocol::Mode::Plan,
+                ka_protocol::Mode::Readonly,
                 Some("plan mode: run `cargo build --release`? (build with /build)"),
             ),
         ] {
@@ -5306,7 +5297,7 @@ mod tests {
             "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000\n",
         )
         .unwrap();
-        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Guarded, 5);
+        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Ask, 5);
         for (u, a) in [("q1", "a1"), ("q2", "a2"), ("q3", "a3")] {
             voice.history.push(TurnMessage::user(u));
             voice.history.push(TurnMessage::assistant(a));
@@ -5439,7 +5430,7 @@ mod tests {
         let mut voice = Voice::new(
             flaky_catalog(),
             std::env::temp_dir(),
-            ka_protocol::Mode::Free,
+            ka_protocol::Mode::Allow,
             5,
         )
         .with_speaker(Wire::OpenaiChat, std::sync::Arc::new(speaker));
@@ -5480,7 +5471,7 @@ mod tests {
         let mut voice = Voice::new(
             flaky_catalog(),
             std::env::temp_dir(),
-            ka_protocol::Mode::Free,
+            ka_protocol::Mode::Allow,
             5,
         )
         .with_speaker(
@@ -5532,7 +5523,7 @@ mod tests {
         let mut voice = Voice::new(
             flaky_catalog(),
             std::env::temp_dir(),
-            ka_protocol::Mode::Free,
+            ka_protocol::Mode::Allow,
             5,
         )
         .with_speaker(Wire::OpenaiChat, std::sync::Arc::new(speaker));
@@ -5610,7 +5601,7 @@ mod tests {
                 })
             }
         }
-        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Free, 5)
+        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Allow, 5)
             .with_speaker(Wire::OpenaiChat, std::sync::Arc::new(BigUsage));
         let mut guards = GuardRuntime::new(Some(0.5), None);
 
@@ -5693,7 +5684,7 @@ mod tests {
             "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000\n",
         )
         .unwrap();
-        let mut voice = Voice::new(catalog, dir.clone(), ka_protocol::Mode::Guarded, 5)
+        let mut voice = Voice::new(catalog, dir.clone(), ka_protocol::Mode::Ask, 5)
             .with_speaker(Wire::OpenaiChat, std::sync::Arc::new(TwoWrites));
         let mut guards = GuardRuntime::default();
         // choice 1 = "always"
@@ -5766,7 +5757,7 @@ mod tests {
             "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000\npriced = true\n\n[dialects.\"test/m\".price]\ninput_per_mtok = 1.0\noutput_per_mtok = 0.0\n",
         )
         .unwrap();
-        let mut voice = Voice::new(priced, dir.clone(), ka_protocol::Mode::Guarded, 5)
+        let mut voice = Voice::new(priced, dir.clone(), ka_protocol::Mode::Ask, 5)
             .with_speaker(Wire::OpenaiChat, std::sync::Arc::new(WantsBash));
         let mut guards = GuardRuntime::default();
         // choice 2 = deny: the ask text is what we assert on
@@ -5788,7 +5779,7 @@ mod tests {
             "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000\n",
         )
         .unwrap();
-        let mut bare = Voice::new(unpriced, dir.clone(), ka_protocol::Mode::Guarded, 5)
+        let mut bare = Voice::new(unpriced, dir.clone(), ka_protocol::Mode::Ask, 5)
             .with_speaker(Wire::OpenaiChat, std::sync::Arc::new(WantsBash));
         let (events2, _) = drive_turn(&mut bare, &mut guards, "run it", Some(2)).await;
         let ask2 = events2
@@ -5843,7 +5834,7 @@ mod tests {
             "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000\n",
         )
         .unwrap();
-        let mut voice = Voice::new(catalog, dir.clone(), ka_protocol::Mode::Free, 5)
+        let mut voice = Voice::new(catalog, dir.clone(), ka_protocol::Mode::Allow, 5)
             .with_speaker(Wire::OpenaiChat, std::sync::Arc::new(RunsEcho));
         voice.set_hooks(vec![crate::config::Hook {
             event: crate::config::HookEvent::PreToolUse,
@@ -5856,7 +5847,7 @@ mod tests {
             events.iter().any(|e| matches!(
                 e,
                 Event::ModeChanged {
-                    mode: ka_protocol::Mode::Plan
+                    mode: ka_protocol::Mode::Readonly
                 }
             )),
             "steering switched the mode: {events:?}"
@@ -5867,7 +5858,7 @@ mod tests {
                 .any(|e| matches!(e, Event::Note { message } if message == "hook: switching")),
             "steering surfaced the note: {events:?}"
         );
-        assert_eq!(voice.mode, ka_protocol::Mode::Plan, "gate mode updated");
+        assert_eq!(voice.mode, ka_protocol::Mode::Readonly, "gate mode updated");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5920,7 +5911,7 @@ mod tests {
             "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000\n",
         )
         .unwrap();
-        let mut voice = Voice::new(catalog, dir.clone(), ka_protocol::Mode::Guarded, 5)
+        let mut voice = Voice::new(catalog, dir.clone(), ka_protocol::Mode::Ask, 5)
             .with_speaker(Wire::OpenaiChat, std::sync::Arc::new(OneWrite));
         let mut guards = GuardRuntime::default();
         let (events, _) = drive_turn(&mut voice, &mut guards, "rewrite it", Some(0)).await;
@@ -5947,7 +5938,7 @@ mod tests {
             "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000\n",
         )
         .unwrap();
-        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Guarded, 5);
+        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Ask, 5);
         for (u, a) in [("q1", "a1"), ("q2", "a2")] {
             voice.history.push(TurnMessage::user(u));
             voice.history.push(TurnMessage::assistant(a));
@@ -5965,7 +5956,7 @@ mod tests {
             "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000\n",
         )
         .unwrap();
-        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Free, 5);
+        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Allow, 5);
         voice.ratio = 4.0;
         voice.last_context = 10_000;
         voice
@@ -6069,7 +6060,7 @@ mod tests {
             "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000\n",
         )
         .unwrap();
-        let mut voice = Voice::new(catalog, dir.clone(), ka_protocol::Mode::Free, 5).with_speaker(
+        let mut voice = Voice::new(catalog, dir.clone(), ka_protocol::Mode::Allow, 5).with_speaker(
             Wire::OpenaiChat,
             std::sync::Arc::new(BashTrio { log: log.clone() }),
         );
@@ -6155,7 +6146,7 @@ mod tests {
             "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000\n",
         )
         .unwrap();
-        let mut voice = Voice::new(catalog, dir.clone(), ka_protocol::Mode::Free, 5).with_speaker(
+        let mut voice = Voice::new(catalog, dir.clone(), ka_protocol::Mode::Allow, 5).with_speaker(
             Wire::OpenaiChat,
             std::sync::Arc::new(LongBash {
                 pidfile: pidfile.clone(),
@@ -6276,7 +6267,7 @@ mod tests {
             "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000\n",
         )
         .unwrap();
-        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Free, 5)
+        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Allow, 5)
             .with_speaker(Wire::OpenaiChat, std::sync::Arc::new(BgScript));
         voice.set_bash_background_ms(60);
         // capture before the voice moves into the turn task
@@ -6413,7 +6404,7 @@ mod tests {
         let mut voice = Voice::new(
             fallback_catalog(),
             std::env::temp_dir(),
-            ka_protocol::Mode::Free,
+            ka_protocol::Mode::Allow,
             5,
         )
         .with_speaker(
@@ -6526,7 +6517,7 @@ mod tests {
         )
         .unwrap();
         let seen = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Free, 5)
+        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Allow, 5)
             .with_speaker(
                 Wire::OpenaiChat,
                 std::sync::Arc::new(AuthFailSpeaker {
@@ -6625,7 +6616,7 @@ mod tests {
         let mut voice = Voice::new(
             promote_catalog(),
             std::env::temp_dir(),
-            ka_protocol::Mode::Free,
+            ka_protocol::Mode::Allow,
             5,
         )
         .with_speaker(
@@ -6681,7 +6672,7 @@ mod tests {
         let mut voice = Voice::new(
             promote_catalog(),
             std::env::temp_dir(),
-            ka_protocol::Mode::Free,
+            ka_protocol::Mode::Allow,
             5,
         )
         .with_speaker(
@@ -6754,7 +6745,7 @@ mod tests {
             "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000000\n",
         )
         .unwrap();
-        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Free, 5)
+        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Allow, 5)
             .with_speaker(Wire::OpenaiChat, std::sync::Arc::new(SpeculativeSpeaker));
         voice.set_model_selector("test/m", 4.0);
         // 70% of the reserve threshold: speculative zone, not tripping
@@ -6782,7 +6773,7 @@ mod tests {
             "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000000\n",
         )
         .unwrap();
-        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Free, 5)
+        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Allow, 5)
             .with_speaker(Wire::OpenaiChat, std::sync::Arc::new(SpeculativeSpeaker));
         voice.set_model_selector("test/m", 4.0);
         voice.note_context_for_tests(700_000);
@@ -6801,7 +6792,7 @@ mod tests {
             "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000000\n",
         )
         .unwrap();
-        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Free, 5)
+        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Allow, 5)
             .with_speaker(Wire::OpenaiChat, std::sync::Arc::new(SpeculativeSpeaker));
         voice.set_model_selector("test/m", 4.0);
         voice.note_context_for_tests(400_000);
@@ -6841,7 +6832,7 @@ mod tests {
             "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000000\n",
         )
         .unwrap();
-        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Free, 5)
+        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Allow, 5)
             .with_speaker(Wire::OpenaiChat, std::sync::Arc::new(Thinker));
         let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(16);
         let (evt_tx, _evt_rx) = tokio::sync::mpsc::channel(256);
@@ -6956,7 +6947,7 @@ mod tests {
             "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000000\n",
         )
         .unwrap();
-        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Free, 5);
+        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Allow, 5);
         // a blanket allow rule for write must NOT wave protected paths through
         voice.set_rules(vec![crate::config::Rule {
             tool: "write".to_string(),
@@ -6995,7 +6986,7 @@ mod tests {
         )
         .unwrap();
         // guarded mode: writes normally ask, exec normally asks
-        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Guarded, 5);
+        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Ask, 5);
         // `[permissions] allow = ["write"]` — the documented persistent
         // allowlist ("skip the permission ask") is enforced at the gate
         voice.set_allowed_tools(vec!["write".to_string()]);
@@ -7046,7 +7037,12 @@ mod tests {
             "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000000\n",
         )
         .unwrap();
-        let voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Plan, 5);
+        let voice = Voice::new(
+            catalog,
+            std::env::temp_dir(),
+            ka_protocol::Mode::Readonly,
+            5,
+        );
         let call = ToolCall {
             id: "c1".into(),
             tool: "write".into(),

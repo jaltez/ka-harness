@@ -1360,14 +1360,14 @@ async fn auto_poke_stops_at_max_rounds() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Plan mode never pokes — research is not execution.
+/// Readonly mode never pokes — research is not execution.
 #[tokio::test]
 async fn auto_poke_never_fires_in_plan_mode() {
     let dir = tmp_dir("poke-plan");
     let cfg = ka_engine::Config {
         cwd: Some(dir.to_string_lossy().into_owned()),
         model: Some("test/m".into()),
-        mode: Some(ka_protocol::Mode::Plan),
+        mode: Some(ka_protocol::Mode::Readonly),
         ..Default::default()
     };
     let speaker = Scripted::new(vec![
@@ -1683,7 +1683,7 @@ async fn plan_goal_below_hill_climb_gate_gets_pushback() {
     let cfg = ka_engine::Config {
         cwd: Some(dir.to_string_lossy().into_owned()),
         model: Some("test/m".into()),
-        mode: Some(ka_protocol::Mode::Plan),
+        mode: Some(ka_protocol::Mode::Readonly),
         roles: ka_engine::config::Roles {
             default: None,
             fast: Some("test/m".into()),
@@ -1787,7 +1787,7 @@ async fn steer_during_tool_batch_rides_the_next_request() {
     let cfg = ka_engine::Config {
         cwd: Some(dir.to_string_lossy().into_owned()),
         model: Some("test/m".into()),
-        mode: Some(ka_protocol::Mode::Free),
+        mode: Some(ka_protocol::Mode::Allow),
         ..Default::default()
     };
     let speaker = Scripted::new(vec![("bash", serde_json::json!({"command": "sleep 0.25"}))]);
@@ -1933,7 +1933,7 @@ async fn steer_during_final_answer_becomes_a_queued_turn() {
     let cfg = ka_engine::Config {
         cwd: Some(dir.to_string_lossy().into_owned()),
         model: Some("test/m".into()),
-        mode: Some(ka_protocol::Mode::Free),
+        mode: Some(ka_protocol::Mode::Allow),
         ..Default::default()
     };
     let speaker = GatedAnswer::new();
@@ -2028,7 +2028,7 @@ async fn steer_left_over_at_strand_attach_is_not_reinjected() {
     let cfg = ka_engine::Config {
         cwd: Some(dir.to_string_lossy().into_owned()),
         model: Some("test/m".into()),
-        mode: Some(ka_protocol::Mode::Free),
+        mode: Some(ka_protocol::Mode::Allow),
         ..Default::default()
     };
     let speaker = Scripted::new(vec![("bash", serde_json::json!({"command": "true"}))]);
