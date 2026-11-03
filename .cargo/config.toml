@@ -1,2 +1,6 @@
 [alias]
 xtask = "run -p xtask --"
+
+[profile.dev]
+# Keep target/ bounded: no incremental cache (was 71 GB and growing).
+incremental = false
