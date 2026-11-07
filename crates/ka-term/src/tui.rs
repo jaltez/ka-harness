@@ -3831,6 +3831,20 @@ fn startup_keyboard_flags() -> crossterm::event::KeyboardEnhancementFlags {
         | F::REPORT_ALTERNATE_KEYS
 }
 
+// The terminal the TUI runs on: crossterm behind a `BufWriter`, so one
+// rendered frame — cell diff plus the cursor and attribute commands —
+// leaves the process as a single `write` call. On the stock raw
+// `Stdout` handle every `execute!`d cursor command is its own small
+// write, which a per-delta draw cadence turns into a per-glyph syscall
+// storm (cheap pty traps on native Linux, expensive under WSL2/ConPTY).
+// Nothing buffers across frames: each draw flushes.
+type TuiTerminal =
+    ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::BufWriter<std::io::Stdout>>>;
+
+/// How long a busy turn batches redraws: the spinner's own frame step.
+/// Streamed deltas coalesce onto this cadence; idle input draws at once.
+const DRAW_COALESCE: Duration = Duration::from_millis(80);
+
 /// Run the TUI over an engine handle. Blocks until exit.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
@@ -3858,7 +3872,22 @@ pub async fn run(
     // and run_external restores a raw state for editors instead of the
     // cooked one it started from.
     let _ = crossterm::terminal::enable_raw_mode();
-    let mut terminal = ratatui::init();
+    // ratatui::init stays for its side effects — restore-on-panic hook,
+    // raw mode and the alternate screen through ratatui's own crossterm
+    // copy (see the snapshot note below). The terminal it returns is
+    // dropped: ours wraps the writer in a BufWriter so a frame is one
+    // write() (see TuiTerminal).
+    let _ = ratatui::init();
+    let mut terminal = match ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(
+        std::io::BufWriter::new(std::io::stdout()),
+    )) {
+        Ok(t) => t,
+        Err(e) => {
+            ratatui::restore();
+            let _ = crossterm::terminal::disable_raw_mode();
+            return Err(e);
+        }
+    };
     // Kitty keyboard protocol: Shift+Enter as a distinct key + bracketed
     // paste. Best effort — hosts without support degrade to plain Enter;
     // Ctrl+J always works as the newline fallback. Mouse mode defaults
@@ -3930,7 +3959,7 @@ pub async fn run(
 
 #[allow(clippy::too_many_arguments)]
 async fn app(
-    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+    terminal: &mut TuiTerminal,
     commands: &mut mpsc::Sender<Command>,
     events: &mut mpsc::Receiver<Event>,
     updates: &mut mpsc::Receiver<UpdateNotice>,
@@ -3948,7 +3977,9 @@ async fn app(
     let mut scroll: Option<usize> = None;
     let mut transcript = Transcript::default();
 
-    let mut view_rows;
+    // zero until the first frame sizes it (draw coalescing can defer
+    // that to the first wakeup; nothing scrolls before then)
+    let mut view_rows = 0usize;
     let mut input = InputBuffer::default();
     let mut meters = Meters {
         model: initial_model.to_string(),
@@ -4036,6 +4067,9 @@ async fn app(
     // and frame can never disagree about the band/surface width
     let tx_width: std::cell::Cell<u16> = std::cell::Cell::new(0);
     let mut term_events = crossterm::event::EventStream::new();
+    // stays armed until the update checker closes its channel (recv()
+    // on a closed channel is ready forever — a no-op arm would spin)
+    let mut updates_open = true;
     // 80 ms: the spinner's frame step, fast enough for a smooth comet
     let mut spin = tokio::time::interval(Duration::from_millis(80));
     // last mouse mode actually applied to the terminal — the loop owns
@@ -4053,6 +4087,14 @@ async fn app(
     let mut was_overlay_open = false;
     // last (activity, session) published to an opt-in sink
     let mut reported: Option<(AgentActivity, String)> = None;
+    // Draw coalescing: every frame ends in a write() syscall, so a draw
+    // per event turns one streamed answer into hundreds of tiny pty
+    // writes. State changes only mark `dirty`; while a turn runs, frames
+    // batch onto the spinner's 80ms cadence (the live-markdown cache
+    // refreshes at that same staleness, so nothing visible slows down).
+    // Idle always draws immediately — typed input must echo at once.
+    let mut dirty = true;
+    let mut last_draw: Option<Instant> = None;
 
     while exit.is_none() {
         // Hybrid mouse: base native leaves the mouse to the terminal
@@ -4097,111 +4139,118 @@ async fn app(
             }
             reported = Some((activity, session_now));
         }
-        let input_snapshot = input.text.clone();
-        let rsearch = input.search_title();
-        let (term_w, term_h) = match terminal.size() {
-            Ok(s) => (s.width, s.height),
-            Err(_) => (80, 24),
-        };
-        // the markdown cache keys on the width render actually used,
-        // folded exactly like a cached assistant block (W minus its
-        // indent), so the flush never reflows; one tick of staleness
-        // after a resize is fine
-        let last_w = tx_width.get();
-        let md_width = assistant_md_width(if last_w == 0 {
-            transcript_width(term_w)
-        } else {
-            last_w
-        });
-        let input_h = input_height(input_area_rows(
-            picker.as_ref(),
-            &input.text,
-            input_inner_w(term_w),
-        ));
-        let live = if busy_now {
-            let now = Instant::now();
-            let stale = live_cache
-                .as_ref()
-                .map(|(_, _, _, at)| live_stale(*at, now))
-                .unwrap_or(true);
-            let changed = live_cache
-                .as_ref()
-                .is_none_or(|(t, w, _, _)| t != &current_assistant || *w != md_width);
-            if changed && (stale || turn_ended) {
-                live_cache = Some((
-                    current_assistant.clone(),
-                    md_width,
-                    crate::markdown::render(&current_assistant, md_width),
-                    now,
-                ));
-            }
-            live_cache.as_ref().map(|(_, _, rows, _)| LiveBlock {
-                thought: current_thought.clone(),
-                tool_header: current_tool.clone(),
-                live_tool: live_tool.clone(),
-                md: rows.clone(),
-            })
-        } else {
-            live_cache = None;
-            None
-        };
-        view_rows = visible_rows(term_h, input_h);
-        turn_ended = false;
-        let cursor = input.cursor;
-        terminal.draw(|frame| {
-            render(
-                frame,
-                &mut transcript,
-                scroll,
-                &input_snapshot,
-                cursor,
-                busy_now,
-                busy_since,
-                Instant::now(),
-                queue.len(),
-                ask.as_ref(),
-                live.as_ref(),
-                slash_popup.as_ref(),
-                path_popup.as_ref(),
-                rsearch.as_deref(),
-                modal.as_ref(),
+        let draw_now =
+            dirty && last_draw.is_none_or(|at| !busy_now || at.elapsed() >= DRAW_COALESCE);
+        if draw_now {
+            let input_snapshot = input.text.clone();
+            let rsearch = input.search_title();
+            let (term_w, term_h) = match terminal.size() {
+                Ok(s) => (s.width, s.height),
+                Err(_) => (80, 24),
+            };
+            // the markdown cache keys on the width render actually used,
+            // folded exactly like a cached assistant block (W minus its
+            // indent), so the flush never reflows; one tick of staleness
+            // after a resize is fine
+            let last_w = tx_width.get();
+            let md_width = assistant_md_width(if last_w == 0 {
+                transcript_width(term_w)
+            } else {
+                last_w
+            });
+            let input_h = input_height(input_area_rows(
                 picker.as_ref(),
-                &meters,
-                &sidebar,
-                fresh,
-                mouse_captured,
-                header_glyph,
-                &strip_zone,
-                toast
+                &input.text,
+                input_inner_w(term_w),
+            ));
+            let live = if busy_now {
+                let now = Instant::now();
+                let stale = live_cache
                     .as_ref()
-                    .filter(|(_, at)| at.elapsed() < TOAST_TTL)
-                    .map(|(m, _)| m.as_str()),
-                &title_arrows,
-                &modal_zone,
-                &popup_zone,
-                &tx_content,
-                &rail_zone,
-                &tx_width,
-                sel,
-                hover,
-            );
-        })?;
+                    .map(|(_, _, _, at)| live_stale(*at, now))
+                    .unwrap_or(true);
+                let changed = live_cache
+                    .as_ref()
+                    .is_none_or(|(t, w, _, _)| t != &current_assistant || *w != md_width);
+                if changed && (stale || turn_ended) {
+                    live_cache = Some((
+                        current_assistant.clone(),
+                        md_width,
+                        crate::markdown::render(&current_assistant, md_width),
+                        now,
+                    ));
+                }
+                live_cache.as_ref().map(|(_, _, rows, _)| LiveBlock {
+                    thought: current_thought.clone(),
+                    tool_header: current_tool.clone(),
+                    live_tool: live_tool.clone(),
+                    md: rows.clone(),
+                })
+            } else {
+                live_cache = None;
+                None
+            };
+            view_rows = visible_rows(term_h, input_h);
+            turn_ended = false;
+            let cursor = input.cursor;
+            terminal.draw(|frame| {
+                render(
+                    frame,
+                    &mut transcript,
+                    scroll,
+                    &input_snapshot,
+                    cursor,
+                    busy_now,
+                    busy_since,
+                    Instant::now(),
+                    queue.len(),
+                    ask.as_ref(),
+                    live.as_ref(),
+                    slash_popup.as_ref(),
+                    path_popup.as_ref(),
+                    rsearch.as_deref(),
+                    modal.as_ref(),
+                    picker.as_ref(),
+                    &meters,
+                    &sidebar,
+                    fresh,
+                    mouse_captured,
+                    header_glyph,
+                    &strip_zone,
+                    toast
+                        .as_ref()
+                        .filter(|(_, at)| at.elapsed() < TOAST_TTL)
+                        .map(|(m, _)| m.as_str()),
+                    &title_arrows,
+                    &modal_zone,
+                    &popup_zone,
+                    &tx_content,
+                    &rail_zone,
+                    &tx_width,
+                    sel,
+                    hover,
+                );
+            })?;
 
-        // streamed thinking blocks stay expanded while visible; once
-        // fully scrolled out of the window they collapse to the 3-row
-        // band. Deferred while the user holds a scroll anchor: the
-        // height change is only invisible when the view is tail-pinned
-        // (a wrapped band settling under a scrolled view would shift
-        // content); the TurnStarted backstop still settles everything.
-        if scroll.is_none()
-            && let Some((_, first_visible)) = tx_content.get()
-        {
-            transcript.collapse_streamed_above(first_visible);
+            // streamed thinking blocks stay expanded while visible; once
+            // fully scrolled out of the window they collapse to the 3-row
+            // band. Deferred while the user holds a scroll anchor: the
+            // height change is only invisible when the view is tail-pinned
+            // (a wrapped band settling under a scrolled view would shift
+            // content); the TurnStarted backstop still settles everything.
+            if scroll.is_none()
+                && let Some((_, first_visible)) = tx_content.get()
+            {
+                transcript.collapse_streamed_above(first_visible);
+            }
+            dirty = false;
+            last_draw = Some(Instant::now());
         }
 
         tokio::select! {
             biased;
             maybe_term = term_events.next() => {
+                dirty = true;
                 if let Some(Ok(TermEvent::Key(key))) = maybe_term {
                     if key.kind == crossterm::event::KeyEventKind::Release {
                         continue;
@@ -6606,6 +6655,7 @@ async fn app(
                 match maybe_evt {
                     None => { exit = Some(Exit::EngineEnded); }
                     Some(evt) => {
+                        dirty = true;
                         let replayed = matches!(evt, Event::Replay { .. });
                         if let Event::Replay { messages } = &evt {
                             // ↑/↓ recall the resumed session's earlier
@@ -6808,21 +6858,30 @@ async fn app(
                     }
                 }
             }
-            maybe_update = updates.recv() => {
+            // A closed updates channel (the checker task exits as soon
+            // as it decides — immediately when `[update] check = "off"`)
+            // yields `recv() == None` forever: a no-op arm there would
+            // make the select permanently ready and spin the loop at
+            // 100% CPU with nothing to draw. Disable the arm instead.
+            maybe_update = updates.recv(), if updates_open => {
                 if let Some(notice) = maybe_update {
                     // one quiet transcript line; the status-bar badge
                     // persists for the session
+                    dirty = true;
                     meters.update = Some(notice.latest.clone());
                     transcript.push_separated(Line::Info(format!(
                         "update available: {} — run `ka update`",
                         notice.latest
                     )));
+                } else {
+                    updates_open = false;
                 }
             }
             // redraws while busy (spinner/clock) or while a toast is
             // alive; the arm also prunes the expired toast so ticking
             // actually stops once it fades
             _ = spin.tick(), if busy || toast.is_some() => {
+                dirty = true;
                 if toast.as_ref().is_some_and(|(_, at)| at.elapsed() >= TOAST_TTL) {
                     toast = None;
                 }
@@ -7451,7 +7510,7 @@ fn record_spill(spills: &mut Vec<String>, path: &str) {
 fn run_external(
     program: &str,
     args: &[&str],
-    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+    terminal: &mut TuiTerminal,
     mouse_captured: bool,
 ) -> std::io::Result<()> {
     use std::io::Write as _;
@@ -19413,6 +19472,7 @@ mod tests {
     fn tree_rows_label_fork_points_and_count_branches() {
         let msg = |id: &str, role: ka_strand::Role, content: &str| ka_strand::Record::Message {
             id: ka_protocol::RecordId(id.to_string()),
+            images: Vec::new(),
             role,
             content: content.to_string(),
             calls: Vec::new(),

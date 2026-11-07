@@ -7,7 +7,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
-use ka_dialect::dialects::{Catalog, Wire};
+use ka_dialect::dialects::{Catalog, Modality, Wire};
+use ka_dialect::parse_selector;
 use ka_dialect::speaker::{
     SpeakRequest, Speaker, StreamEvent, ToolCall, ToolResult, ToolSpec, TurnMessage, TurnRole,
 };
@@ -1059,6 +1060,9 @@ impl Voice {
             };
             if let Some(result) = self.history[i].results.get_mut(j) {
                 result.content = note;
+                // the elided result's images go with it: an old
+                // screenshot must not ride every request until a digest
+                result.images.clear();
             }
         }
         let _ = total;
@@ -1502,6 +1506,17 @@ impl Voice {
         self.model_selector.clone()
     }
 
+    /// Whether `selector`'s dialect accepts image input — replay
+    /// re-attaches stored image parts only when it does (a text-only
+    /// dialect would hard-error the whole request at the wire's vision
+    /// gate). Absent or unknown selectors conservatively take none.
+    pub fn selector_accepts_images(&self, selector: Option<&str>) -> bool {
+        selector
+            .and_then(|s| parse_selector(s).ok())
+            .and_then(|p| self.catalog.get(&p.model_id()))
+            .is_some_and(|d| d.input.contains(&Modality::Image))
+    }
+
     /// Chars-per-token ratio of the active model.
     pub fn model_ratio(&self) -> f64 {
         self.ratio
@@ -1631,7 +1646,6 @@ impl Voice {
         schema: Option<serde_json::Value>,
         images: Vec<ka_dialect::ImagePart>,
     ) -> Usage {
-        use ka_dialect::parse_selector;
         self.edited.lock().clear();
         let mut parsed = match parse_selector(model_selector) {
             Ok(p) => p,
@@ -4566,7 +4580,10 @@ mod tests {
             call_id: "c1".into(),
             content: big.clone(),
             is_error: false,
-            images: Vec::new(),
+            images: vec![ka_dialect::ImagePart {
+                data: "aW1n".into(),
+                media_type: "image/png".into(),
+            }],
         }]));
         // recent large exchange: fills the 40k protect window so the old
         // tool result falls outside it
@@ -4585,6 +4602,9 @@ mod tests {
         let content = &tool_msg.results[0].content;
         assert!(content.starts_with("[pruned output"), "{content}");
         assert!(content.contains("spill://"), "{content}");
+        // the pruned result's images go with it — an old screenshot must
+        // not ride every request until a digest
+        assert!(tool_msg.results[0].images.is_empty());
         assert!(
             voice.history[3].content.starts_with("recent"),
             "recent messages untouched"

@@ -1,4 +1,54 @@
 {
-  "version_p50_us": 2321,
-  "peak_rss_kb": 4016
+  "version_p50_us": 2466,
+  "peak_rss_kb": 4756,
+  "session": {
+    "idle_cpu_pct": {
+      "base": 0.0,
+      "max": 2.0
+    },
+    "long_cpu_p25_ms": {
+      "base": 19.7,
+      "max": 40.61
+    },
+    "long_cpu_p75_ms": {
+      "base": 20.0,
+      "max": 41.0
+    },
+    "long_own_mb": {
+      "base": 9.0,
+      "max": 15.700000000000001
+    },
+    "long_wall_p75_ms": {
+      "base": 24.0,
+      "max": 46.2
+    },
+    "p_tools4_ms": {
+      "base": 14.1,
+      "max": 33.33
+    },
+    "ready_ms": {
+      "base": 7.6,
+      "max": 24.88
+    },
+    "sess5_cpu_ms": {
+      "base": 84.1,
+      "max": 149.32999999999998
+    },
+    "sess5_peak_mb": {
+      "base": 9.2,
+      "max": 15.959999999999999
+    },
+    "stream60k_cpu_ms": {
+      "base": 21.2,
+      "max": 77.56
+    },
+    "tty_writes_turn": {
+      "base": 64.0,
+      "max": 233.2
+    },
+    "write200k_ms": {
+      "base": 20.5,
+      "max": 76.65
+    }
+  }
 }

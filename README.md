@@ -96,6 +96,7 @@ cargo build -p ka-harness     # debug build
 cargo xtask dev -- models     # rebuild + run dev binary with args
 cargo xtask size              # binary size vs the 10 MB contract
 cargo xtask deps              # dependency-graph allowlist gate
+cargo xtask bench             # perf gate: version p50 + RSS + session bench ([bench/](bench/))
 cargo xtask link              # build release + symlink `kad` → target/release/ka
 ```
 

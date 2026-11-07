@@ -173,8 +173,13 @@ fn repo_snapshot(cwd: &std::path::Path) -> Option<ka_strand::RepoSnapshot> {
 
 /// Convert persisted records into conversation history + active digest.
 /// Digest records reset the accumulated history (the summary carries it).
+/// Stored image parts re-attach only when `vision` — the active dialect
+/// takes image input; replaying them onto a text-only model would
+/// hard-error every request at the wire's vision gate, so they drop (the
+/// placeholder text inside the persisted tool result still stands).
 fn history_from_records(
     records: &[ka_strand::Record],
+    vision: bool,
 ) -> (
     Vec<ka_dialect::speaker::TurnMessage>,
     Vec<ka_protocol::RecordId>,
@@ -192,6 +197,7 @@ fn history_from_records(
                 calls,
                 results,
                 thinking,
+                images,
                 ..
             } => {
                 let turn_role = match role {
@@ -220,10 +226,10 @@ fn history_from_records(
                             call_id: r.call_id.clone(),
                             content: r.content.clone(),
                             is_error: r.is_error,
-                            images: Vec::new(),
+                            images: if vision { r.images.clone() } else { Vec::new() },
                         })
                         .collect(),
-                    images: Vec::new(),
+                    images: if vision { images.clone() } else { Vec::new() },
                 });
             }
             ka_strand::Record::Digest { summary, .. } => {
@@ -265,6 +271,7 @@ fn record_from_message(msg: &ka_dialect::speaker::TurnMessage) -> ka_strand::Rec
         role,
         content: msg.content.clone(),
         thinking: msg.thinking.clone(),
+        images: msg.images.clone(),
         calls: msg
             .calls
             .iter()
@@ -281,6 +288,7 @@ fn record_from_message(msg: &ka_dialect::speaker::TurnMessage) -> ka_strand::Rec
                 call_id: r.call_id.clone(),
                 content: r.content.clone(),
                 is_error: r.is_error,
+                images: r.images.clone(),
             })
             .collect(),
     }
@@ -2437,7 +2445,8 @@ async fn attach_strand(
     }
     voice.pathfinder_slot().write().model = state.model.clone();
     voice.set_effort(state.effort.map(|e| effort_name(e).to_string()));
-    let (history, ids, digest) = history_from_records(strand.records());
+    let vision = voice.selector_accepts_images(state.model.as_deref());
+    let (history, ids, digest) = history_from_records(strand.records(), vision);
     voice.load_history(history, digest);
     state.record_ids = ids;
     // a fresh strand (no prior user turns) may earn an auto-title after
@@ -4955,6 +4964,110 @@ mod tests {
         let _ = std::fs::remove_dir_all(&work);
     }
 
+    #[tokio::test]
+    async fn resume_replays_stored_image_parts() {
+        use crate::engine::{StrandChoice, spawn_full};
+        use ka_protocol::ImagePart;
+
+        let vision_catalog = |addr: std::net::SocketAddr| {
+            ka_dialect::Catalog::parse(&format!(
+                "[dialects.\"test/main\"]\nwire = \"openai_chat\"\nbase_url = \
+                 \"http://{addr}/v1\"\ncontext = 100000\ninput = [\"text\", \"image\"]\n"
+            ))
+            .unwrap()
+        };
+        let cfg = |work: &std::path::Path| Config {
+            model: Some("test/main".into()),
+            cwd: Some(work.display().to_string()),
+            ..Config::default()
+        };
+        let work = title_workdir("img-replay");
+
+        // session 1: the prompt carries an image
+        let cap_a = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let addr_a = serve_sse(vec![TURN_SSE], cap_a.clone());
+        let mut h1 = spawn_full(cfg(&work), vision_catalog(addr_a), StrandChoice::New);
+        h1.commands
+            .send(Command::Prompt {
+                allowed_tools: None,
+                model: None,
+                text: "what is in this picture".into(),
+                schema: None,
+                images: vec![ImagePart {
+                    data: "aW1n".into(),
+                    media_type: "image/png".into(),
+                }],
+                skills: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let first = drain_to_idle(&mut h1).await;
+        assert!(
+            first.iter().all(|e| !matches!(e, Event::Error { .. })),
+            "{first:?}"
+        );
+        drop(h1);
+
+        // the strand persisted the image at message level
+        let sessions = ka_strand::list(&work).unwrap();
+        let stored = ka_strand::read(&sessions[0].path)
+            .unwrap()
+            .iter()
+            .any(|r| matches!(r, ka_strand::Record::Message { images, .. } if !images.is_empty()));
+        assert!(stored, "image parts must persist in the strand");
+
+        // session 2 (resume, vision dialect): the request re-sends them
+        let cap_b = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let addr_b = serve_sse(vec![TURN_SSE], cap_b.clone());
+        let mut h2 = spawn_full(cfg(&work), vision_catalog(addr_b), StrandChoice::Latest);
+        h2.commands
+            .send(Command::Prompt {
+                allowed_tools: None,
+                model: None,
+                text: "and now".into(),
+                schema: None,
+                images: Vec::new(),
+                skills: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let second = drain_to_idle(&mut h2).await;
+        assert!(
+            second.iter().all(|e| !matches!(e, Event::Error { .. })),
+            "{second:?}"
+        );
+        assert_eq!(cap_b.lock().len(), 1, "requests: {:?}", cap_b.lock());
+        assert!(
+            cap_b.lock()[0].contains("data:image/png;base64,aW1n"),
+            "the replayed image must ride the resumed request"
+        );
+        drop(h2);
+
+        // session 3 (resume, text-only dialect): replay drops them or
+        // the wire's vision gate fails every request
+        let cap_c = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let addr_c = serve_sse(vec![TURN_SSE], cap_c.clone());
+        let mut h3 = spawn_full(cfg(&work), live_catalog(addr_c, None), StrandChoice::Latest);
+        h3.commands
+            .send(Command::Prompt {
+                allowed_tools: None,
+                model: None,
+                text: "again".into(),
+                schema: None,
+                images: Vec::new(),
+                skills: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let third = drain_to_idle(&mut h3).await;
+        assert!(
+            third.iter().all(|e| !matches!(e, Event::Error { .. })),
+            "text-only resume must not hit the vision gate: {third:?}"
+        );
+        assert!(!cap_c.lock()[0].contains("base64"), "images dropped");
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
     #[test]
     fn fork_records_parent_linkage() {
         let work = std::env::temp_dir().join(format!("ka-fork-parent-{}", std::process::id()));
@@ -4964,6 +5077,7 @@ mod tests {
         parent
             .append(ka_strand::Record::Message {
                 id: ka_strand::new_record_id(),
+                images: Vec::new(),
                 role: ka_strand::Role::User,
                 content: "hello".into(),
                 calls: Vec::new(),
@@ -5045,8 +5159,39 @@ mod tests {
             images: Vec::new(),
         };
         let record = super::record_from_message(&msg);
-        let (history, _, _) = super::history_from_records(&[record]);
+        let (history, _, _) = super::history_from_records(&[record], true);
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].thinking.as_deref(), Some("pondering"));
+    }
+
+    #[test]
+    fn record_and_history_roundtrip_images_vision_gated() {
+        let img = || ka_dialect::ImagePart {
+            data: "aW1n".into(),
+            media_type: "image/png".into(),
+        };
+        let msg = ka_dialect::speaker::TurnMessage {
+            role: ka_dialect::speaker::TurnRole::Tool,
+            content: String::new(),
+            thinking: None,
+            calls: Vec::new(),
+            results: vec![ka_dialect::speaker::ToolResult {
+                call_id: "c1".into(),
+                content: "[image pic.png]".into(),
+                is_error: false,
+                images: vec![img()],
+            }],
+            images: vec![img()],
+        };
+        let record = super::record_from_message(&msg);
+        // a vision dialect re-attaches images at both levels
+        let (history, _, _) = super::history_from_records(std::slice::from_ref(&record), true);
+        assert_eq!(history[0].images.len(), 1);
+        assert_eq!(history[0].results[0].images.len(), 1);
+        // a text-only dialect drops them: the wire vision gate would
+        // otherwise fail the whole request
+        let (history, _, _) = super::history_from_records(&[record], false);
+        assert!(history[0].images.is_empty());
+        assert!(history[0].results[0].images.is_empty());
     }
 }

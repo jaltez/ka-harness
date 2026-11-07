@@ -65,9 +65,12 @@ fn print_help() {
             target/release/ka; --bin gates any artifact, e.g. musl)
   deps      ka binary dependency-graph allowlist gate — fails on any new
             crate name (list: crates/xtask/deps-allowlist.txt)
-  bench [--update] [--bin <path>]
-            p50 `ka --version` latency + peak RSS vs baselines.json
-            (±30% tolerance; --update rewrites the baseline)
+  bench [--update] [--bin <path>] [--quick]
+            version p50 + peak RSS vs baselines.json, plus the session
+            bench (bench/session_bench.py: TUI/headless against the mock
+            provider — startup, per-prompt CPU, memory, streaming,
+            syscalls, idle guard). ±30%-style gates; --update rewrites
+            baselines on this machine (do it on the release machine)
   live-smoke  scripted one-turn conversations against real providers
             (ANTHROPIC_API_KEY / OPENAI_API_KEY / KA_LM_URL; never in CI)
   help      this message"
@@ -578,6 +581,31 @@ struct Baselines {
     version_p50_us: u64,
     /// Peak RSS of one `ka --version` run in KB (None: no GNU time).
     peak_rss_kb: Option<u64>,
+    /// Session-bench baselines (`cargo xtask bench`): metric name ->
+    /// recorded p50 (`base`) and the gate ceiling (`max`). Baselines are
+    /// per-machine: refresh on the release machine with `--update`.
+    #[serde(default)]
+    session: std::collections::BTreeMap<String, SessionBaseline>,
+}
+
+/// One gated session metric: fail when a run exceeds `max`.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy)]
+struct SessionBaseline {
+    base: f64,
+    max: f64,
+}
+
+/// Absolute slack added to base*1.3 when `--update` recomputes a gate:
+/// small values need room for scheduler jitter, not just 30%.
+fn session_floor(metric: &str) -> f64 {
+    match metric {
+        "idle_cpu_pct" => 2.0,
+        "tty_writes_turn" => 150.0,
+        "sess5_peak_mb" | "long_own_mb" => 4.0,
+        "write200k_ms" | "stream60k_cpu_ms" => 50.0,
+        "sess5_cpu_ms" => 40.0,
+        _ => 15.0,
+    }
 }
 
 /// µs timer around one fresh-process run; returns (duration µs, peak RSS KB).
@@ -603,9 +631,15 @@ fn within_tolerance(baseline: u64, current: u64) -> bool {
     current <= baseline.saturating_add(baseline * 30 / 100)
 }
 
-/// `xtask bench [--update] [--bin <path>]`: measure and gate.
+/// `xtask bench [--update] [--bin <path>] [--quick]`: measure and gate.
+///
+/// Two layers: `ka --version` p50 + peak RSS (always), and the session
+/// bench (`bench/session_bench.py`: TUI + headless against the mock
+/// provider — startup, per-prompt CPU, memory, streaming, syscall
+/// count, idle livelock guard). `--quick` skips the session part.
 fn bench(rest: &[String]) -> i32 {
     let update = rest.iter().any(|a| a == "--update");
+    let quick = rest.iter().any(|a| a == "--quick");
     let bin = rest
         .iter()
         .position(|a| a == "--bin")
@@ -627,21 +661,44 @@ fn bench(rest: &[String]) -> i32 {
     runs.sort_by_key(|(us, _)| *us);
     let (p50_us, rss) = runs[2];
 
+    // session bench: metric name -> measured value (None: unavailable)
+    let session = if quick {
+        None
+    } else {
+        run_session_bench(&bin_path)
+    };
+
     let baseline_path = repo_root().join("baselines.json");
     if update || !baseline_path.exists() {
-        let b = Baselines {
+        let mut b = Baselines {
             version_p50_us: p50_us,
             peak_rss_kb: rss,
+            session: std::collections::BTreeMap::new(),
         };
+        if let Some(results) = &session {
+            for (metric, value) in results {
+                if let Some(v) = value {
+                    let floor = session_floor(metric);
+                    b.session.insert(
+                        metric.clone(),
+                        SessionBaseline {
+                            base: *v,
+                            max: v * 1.3 + floor,
+                        },
+                    );
+                }
+            }
+        }
         let json = serde_json::to_string_pretty(&b).unwrap_or_else(|_| "{}".into());
         if let Err(e) = std::fs::write(&baseline_path, json + "\n") {
             eprintln!("xtask: write {}: {e}", baseline_path.display());
             return 2;
         }
         println!(
-            "baseline written: p50 {p50_us}µs, rss {}",
+            "baseline written: p50 {p50_us}µs, rss {}, session metrics {}",
             rss.map(|k| format!("{k} KB"))
-                .unwrap_or_else(|| "n/a".into())
+                .unwrap_or_else(|| "n/a".into()),
+            b.session.len()
         );
         return 0;
     }
@@ -687,11 +744,103 @@ fn bench(rest: &[String]) -> i32 {
             );
         }
     }
+
+    // session gates: fail only when a measured value exceeds its ceiling
+    match (&session, parsed.session.is_empty()) {
+        (None, false) if !quick => {
+            println!("session bench: skipped (unavailable) — baselines not verified");
+        }
+        _ => {}
+    }
+    if let Some(results) = &session {
+        if parsed.session.is_empty() {
+            println!(
+                "session bench: {} metrics measured, no baselines yet — rerun with --update",
+                results.len()
+            );
+        }
+        let mut names: Vec<&String> = results.keys().collect();
+        names.sort();
+        for name in names {
+            let Some(value) = results[name] else {
+                println!("session {name}: not measured — skipped");
+                continue;
+            };
+            match parsed.session.get(name) {
+                Some(b) => {
+                    let ok = value <= b.max;
+                    failed |= !ok;
+                    println!(
+                        "session {name}: {value} (base {}, max {}) {}",
+                        b.base,
+                        b.max,
+                        if ok { "ok" } else { "REGRESSION" }
+                    );
+                }
+                None => println!("session {name}: {value} — no baseline"),
+            }
+        }
+    }
     if failed {
         eprintln!("xtask: perf regression vs baselines.json (investigate or --update)");
         return 1;
     }
     0
+}
+
+/// Run `bench/session_bench.py`, parse its results JSON: metric -> value.
+/// `None` marks unavailable measurements (e.g. no strace).
+fn run_session_bench(
+    bin: &std::path::Path,
+) -> Option<std::collections::BTreeMap<String, Option<f64>>> {
+    let python_ok = Command::new("python3")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if !python_ok {
+        println!("session bench: skipped (no python3)");
+        return None;
+    }
+    let out_path = repo_root().join("target/session-bench.json");
+    println!(
+        "$ python3 bench/session_bench.py --ka {} --out {}",
+        bin.display(),
+        out_path.display()
+    );
+    let status = Command::new("python3")
+        .arg(repo_root().join("bench/session_bench.py"))
+        .arg("--ka")
+        .arg(bin)
+        .arg("--out")
+        .arg(&out_path)
+        .status();
+    if !status.map(|s| s.success()).unwrap_or(false) {
+        eprintln!("xtask: session bench failed (see output above)");
+        std::process::exit(3);
+    }
+    let text = std::fs::read_to_string(&out_path).unwrap_or_default();
+    let parsed: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("xtask: parse {}: {e}", out_path.display());
+            return None;
+        }
+    };
+    let mut results = std::collections::BTreeMap::new();
+    if let Some(map) = parsed.as_object() {
+        for (k, v) in map {
+            // null = measured-unavailable (e.g. no strace); the "host"
+            // string is metadata, not a metric — kept as None and skipped
+            // by the gate and by --update
+            let value = v.as_f64();
+            if k != "host" {
+                results.insert(k.clone(), value);
+            }
+        }
+    }
+    Some(results)
 }
 
 /// One live-smoke scenario.

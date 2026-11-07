@@ -29,6 +29,7 @@ fn append_reopen_replays_records() {
     let mut strand = StrandFile::create(&cwd, None).unwrap();
     strand
         .append(Record::Message {
+            images: Vec::new(),
             id: ka_strand::new_record_id(),
             role: Role::User,
             content: "hello world".into(),
@@ -63,6 +64,7 @@ fn render_markdown_includes_roles_and_content() {
     let records = vec![
         Record::Message {
             id: ka_strand::new_record_id(),
+            images: Vec::new(),
             role: Role::User,
             content: "what is this repo".into(),
             calls: Vec::new(),
@@ -71,6 +73,7 @@ fn render_markdown_includes_roles_and_content() {
         },
         Record::Message {
             id: ka_strand::new_record_id(),
+            images: Vec::new(),
             role: Role::Assistant,
             content: "a rust workspace".into(),
             calls: Vec::new(),
@@ -101,6 +104,7 @@ fn resolve_id_unique_ambiguous_none() {
     for strand in [&mut a, &mut b] {
         strand
             .append(Record::Message {
+                images: Vec::new(),
                 id: ka_strand::new_record_id(),
                 role: Role::User,
                 content: "materialize".into(),
@@ -159,6 +163,7 @@ fn synthesize_aborted_marks_dangling_turn() {
     let mut strand = StrandFile::create(&cwd, None).unwrap();
     strand
         .append(Record::Message {
+            images: Vec::new(),
             id: ka_strand::new_record_id(),
             role: Role::User,
             content: "start something".into(),
@@ -203,6 +208,7 @@ fn fork_parent_pointer_survives_listing() {
     let mut parent = StrandFile::create(&cwd, None).unwrap();
     parent
         .append(Record::Message {
+            images: Vec::new(),
             id: ka_strand::new_record_id(),
             role: Role::User,
             content: "trunk conversation".into(),
@@ -219,6 +225,7 @@ fn fork_parent_pointer_survives_listing() {
     child.set_parent(&parent_id);
     child
         .append(Record::Message {
+            images: Vec::new(),
             id: ka_strand::new_record_id(),
             role: Role::User,
             content: "offshoot".into(),

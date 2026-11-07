@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ka_protocol::{Effort, Mode, RecordId, StrandId};
+use ka_protocol::{Effort, ImagePart, Mode, RecordId, StrandId};
 use serde::{Deserialize, Serialize};
 
 /// Git snapshot carried in the strand header (read-only awareness).
@@ -56,6 +56,10 @@ pub struct StoredResult {
     pub content: String,
     /// Whether the tool reported an error.
     pub is_error: bool,
+    /// Images carried by this result (e.g. the read hand on an image
+    /// file). Base64 rides the JSONL, bounded by the hand's size cap.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImagePart>,
 }
 
 /// One line of a strand file.
@@ -95,6 +99,10 @@ pub enum Record {
         /// Assistant reasoning captured with this message.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         thinking: Option<String>,
+        /// Images attached to this message (user prompts, tool outputs).
+        /// Additive: strands recorded before the field parse as empty.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ImagePart>,
     },
     /// A settings change (model / effort / mode / feature toggles).
     Change {
@@ -513,6 +521,7 @@ impl StrandFile {
             return Ok(false);
         }
         let record = Record::Message {
+            images: Vec::new(),
             id: new_record_id(),
             role: Role::Assistant,
             content: "(turn interrupted)".to_string(),
@@ -1091,6 +1100,7 @@ mod tests {
         .unwrap();
         strand
             .append(Record::Message {
+                images: Vec::new(),
                 id: new_record_id(),
                 role: Role::User,
                 content: "go".into(),
@@ -1101,6 +1111,7 @@ mod tests {
             .unwrap();
         strand
             .append(Record::Message {
+                images: Vec::new(),
                 id: new_record_id(),
                 role: Role::Assistant,
                 content: "working".into(),
@@ -1115,11 +1126,13 @@ mod tests {
             .unwrap();
         strand
             .append(Record::Message {
+                images: Vec::new(),
                 id: new_record_id(),
                 role: Role::Tool,
                 content: String::new(),
                 calls: Vec::new(),
                 results: vec![StoredResult {
+                    images: Vec::new(),
                     call_id: "c1".into(),
                     content: "file body".into(),
                     is_error: false,
@@ -1224,6 +1237,7 @@ mod tests {
         let mut strand = StrandFile::create(&cwd, None).unwrap();
         strand
             .append(Record::Message {
+                images: Vec::new(),
                 id: new_record_id(),
                 role: Role::User,
                 content: "hello?".into(),
@@ -1258,6 +1272,7 @@ mod tests {
             let mut strand = StrandFile::create(&cwd, None).unwrap();
             strand
                 .append(Record::Message {
+                    images: Vec::new(),
                     id: new_record_id(),
                     role: Role::User,
                     content: prompt.into(),
@@ -1283,6 +1298,7 @@ mod tests {
         assert!(strand.path().is_none(), "no file before the first message");
         strand
             .append(Record::Message {
+                images: Vec::new(),
                 id: new_record_id(),
                 role: Role::User,
                 content: "first message".into(),
@@ -1306,6 +1322,7 @@ mod tests {
         let mut strand = StrandFile::create(&cwd, None).unwrap();
         strand
             .append(Record::Message {
+                images: Vec::new(),
                 id: new_record_id(),
                 role: Role::User,
                 content: "survives corruption".into(),
@@ -1319,6 +1336,7 @@ mod tests {
         let mut writer = StrandWriter::open(&path).unwrap();
         writer
             .append(&Record::Message {
+                images: Vec::new(),
                 id: new_record_id(),
                 role: Role::Assistant,
                 content: "fine".into(),
@@ -1350,6 +1368,7 @@ mod tests {
         let mut strand = StrandFile::create(&cwd, None).unwrap();
         strand
             .append(Record::Message {
+                images: Vec::new(),
                 id: new_record_id(),
                 role: Role::User,
                 content: "kept".into(),
@@ -1398,6 +1417,7 @@ mod tests {
         for prompt in ["alpha session", "beta session"] {
             let mut s = StrandFile::create(&cwd, None).unwrap();
             s.append(Record::Message {
+                images: Vec::new(),
                 id: new_record_id(),
                 role: Role::User,
                 content: prompt.into(),
@@ -1452,6 +1472,7 @@ mod tests {
         let cwd = PathBuf::from("/tmp/proj-names");
         let mut a = StrandFile::create(&cwd, None).unwrap();
         a.append(Record::Message {
+            images: Vec::new(),
             id: new_record_id(),
             role: Role::User,
             content: "fix the pump".into(),
@@ -1554,6 +1575,7 @@ mod tests {
             },
             Record::Message {
                 id: new_record_id(),
+                images: Vec::new(),
                 role: Role::User,
                 content: "hi\n there".into(),
                 calls: Vec::new(),
@@ -1562,6 +1584,7 @@ mod tests {
             },
             Record::Message {
                 id: new_record_id(),
+                images: Vec::new(),
                 role: Role::Assistant,
                 content: "**bold**".into(),
                 calls: Vec::new(),
@@ -1575,6 +1598,7 @@ mod tests {
             },
             Record::Message {
                 id: new_record_id(),
+                images: Vec::new(),
                 role: Role::Tool,
                 content: "  ".into(),
                 calls: Vec::new(),
@@ -1608,8 +1632,52 @@ mod tests {
     }
 
     #[test]
+    fn images_roundtrip_and_legacy_lines_decode() {
+        let record = Record::Message {
+            id: new_record_id(),
+            role: Role::Tool,
+            content: String::new(),
+            calls: Vec::new(),
+            results: vec![StoredResult {
+                call_id: "c1".into(),
+                content: "[image pic.png]".into(),
+                is_error: false,
+                images: vec![ImagePart {
+                    data: "aW1n".into(),
+                    media_type: "image/png".into(),
+                }],
+            }],
+            thinking: None,
+            images: vec![ImagePart {
+                data: "aW1nLXVzZXI=".into(),
+                media_type: "image/jpeg".into(),
+            }],
+        };
+        let text = serde_json::to_string(&record).unwrap();
+        assert!(text.contains(r#""media_type":"image/png""#), "{text}");
+        assert_eq!(serde_json::from_str::<Record>(&text).unwrap(), record);
+
+        // strands recorded before the field: images default to empty at
+        // both levels
+        let legacy = concat!(
+            r#"{"record":"message","id":"r1","role":"tool","content":"","#,
+            r#""results":[{"call_id":"c1","content":"x","is_error":false}]}"#
+        );
+        match serde_json::from_str::<Record>(legacy).unwrap() {
+            Record::Message {
+                images, results, ..
+            } => {
+                assert!(images.is_empty());
+                assert!(results[0].images.is_empty());
+            }
+            other => panic!("expected message, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn thinking_roundtrips_and_stays_absent_when_none() {
         let record = Record::Message {
+            images: Vec::new(),
             id: new_record_id(),
             role: Role::Assistant,
             content: "answer".into(),
@@ -1624,6 +1692,7 @@ mod tests {
 
         // None never serializes (the JSONL stays minimal)…
         let bare = serde_json::to_string(&Record::Message {
+            images: Vec::new(),
             id: new_record_id(),
             role: Role::Assistant,
             content: "plain".into(),
@@ -1651,6 +1720,7 @@ mod tests {
         for (cost, input, output) in [(0.01, 100, 50), (0.02, 200, 80)] {
             strand
                 .append(Record::Message {
+                    images: Vec::new(),
                     id: new_record_id(),
                     role: Role::User,
                     content: "question".into(),
@@ -1701,6 +1771,7 @@ mod tests {
         let mut strand = StrandFile::create(&cwd, None).unwrap();
         strand
             .append(Record::Message {
+                images: Vec::new(),
                 id: new_record_id(),
                 role: Role::User,
                 content: "plain".into(),
