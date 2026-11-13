@@ -433,20 +433,20 @@ mod tests {
         // repo-rooted one level up: the child carrying SKILL.md wins
         assert_eq!(locate_skill_dir(&src).unwrap(), skill);
 
-        install(&root, Kind::Skill, skill.to_str().unwrap(), false).unwrap();
+        let _ = install(&root, Kind::Skill, skill.to_str().unwrap(), false).unwrap();
         assert!(target.join("SKILL.md").is_file());
         assert!(target.join("helper.txt").is_file());
 
         // re-install without --force refuses
         assert!(install(&root, Kind::Skill, skill.to_str().unwrap(), false).is_err());
         // with --force it overwrites
-        install(&root, Kind::Skill, skill.to_str().unwrap(), true).unwrap();
+        let _ = install(&root, Kind::Skill, skill.to_str().unwrap(), true).unwrap();
 
         // list sees it (discovery over the root's skills dir)
         let skills = ka_engine::conventions::discover_skills_in(vec![root.join("skills")]);
         assert!(skills.iter().any(|s| s.name == "my-skill"));
 
-        remove(&root, Kind::Skill, "my-skill").unwrap();
+        let _ = remove(&root, Kind::Skill, "my-skill").unwrap();
         assert!(!target.exists());
         // traversal-safe remove
         assert!(remove(&root, Kind::Skill, "../evil").is_err());
@@ -469,7 +469,7 @@ mod tests {
     #[test]
     fn root_layout_source_installs_under_its_own_name() {
         // a repo-rooted source: SKILL.md at the top, dir named like the repo
-        let root = temp_dir("root");
+        let root = temp_dir("layout-root");
         let repo = temp_dir("repo-src").join("ka-cool-skill");
         std::fs::create_dir_all(&repo).unwrap();
         std::fs::write(
@@ -495,7 +495,7 @@ mod tests {
         std::fs::write(src.join("my-rule.md"), "body").unwrap();
 
         // direct-file install
-        install(
+        let _ = install(
             &root,
             Kind::Agent,
             src.join("my-agent.md").to_str().unwrap(),
@@ -506,7 +506,7 @@ mod tests {
 
         // dotted name installs and removes symmetrically (my.agent.md → my.agent)
         std::fs::write(src.join("my.agent.md"), "body").unwrap();
-        install(
+        let _ = install(
             &root,
             Kind::Agent,
             src.join("my.agent.md").to_str().unwrap(),
@@ -514,13 +514,13 @@ mod tests {
         )
         .unwrap();
         assert!(root.join("agents/my.agent.md").is_file());
-        remove(&root, Kind::Agent, "my.agent").unwrap();
+        let _ = remove(&root, Kind::Agent, "my.agent").unwrap();
         assert!(!root.join("agents/my.agent.md").exists());
 
         // directory install with exactly one candidate of the kind
         let rule_src = temp_dir("rule-src");
         std::fs::write(rule_src.join("my-rule.md"), "body").unwrap();
-        install(&root, Kind::Rule, rule_src.to_str().unwrap(), false).unwrap();
+        let _ = install(&root, Kind::Rule, rule_src.to_str().unwrap(), false).unwrap();
         assert!(root.join("rules/my-rule.md").is_file());
 
         // a bare file is not a valid skill source
@@ -548,13 +548,13 @@ mod tests {
         assert!(Kind::parse("theme").is_err());
 
         // list runs over the isolated root (extension/dotfile filtering)
-        list(&root, None).unwrap();
+        let _ = list(&root, None).unwrap();
 
         // remove takes bare names only: empty names and path
         // separators/dot-dot are refused outright, and an extension in
         // the name just fails to match a target (target_for appends it)
         assert!(remove(&root, Kind::Agent, "my-agent.md").is_err());
-        remove(&root, Kind::Agent, "my-agent").unwrap();
+        let _ = remove(&root, Kind::Agent, "my-agent").unwrap();
         assert!(!root.join("agents/my-agent.md").exists());
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&src);
