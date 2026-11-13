@@ -43,7 +43,7 @@ pub fn parse_specs(specs: &[String]) -> Result<Vec<FeatureSpec>, String> {
 }
 
 /// The live toggle set. `disabled` is a snapshot (persisted whole); the
-/// live-MCP names feed the `{server}.{tool}` prefix matching.
+/// live-MCP names feed the `server__tool` prefix matching.
 #[derive(Debug, Clone, Default)]
 pub struct FeatureToggles {
     disabled: BTreeSet<FeatureSpec>,
@@ -150,9 +150,11 @@ impl FeatureToggles {
                 FeatureSpec::Lsp => tool.starts_with("lsp_"),
                 FeatureSpec::Debug => tool == "debug",
                 // the meta hand is named `mcp`; lazy calls go through
-                // `mcp_call`; eager hands are `{server}.{tool}`
+                // `mcp_call`; eager hands are `server__tool` wire names
                 FeatureSpec::Mcp => tool == "mcp" || tool == "mcp_call" || self.is_eager_mcp(tool),
-                FeatureSpec::McpServer(server) => tool.starts_with(&format!("{server}.")),
+                FeatureSpec::McpServer(server) => {
+                    tool.starts_with(&crate::mcp::wire_prefix(server))
+                }
                 FeatureSpec::Skills
                 | FeatureSpec::Hooks
                 | FeatureSpec::Skill(_)
@@ -168,7 +170,7 @@ impl FeatureToggles {
     fn is_eager_mcp(&self, tool: &str) -> bool {
         self.live_mcp
             .iter()
-            .any(|s| tool.starts_with(&format!("{s}.")))
+            .any(|s| tool.starts_with(&crate::mcp::wire_prefix(s)))
     }
 }
 
@@ -210,22 +212,43 @@ mod tests {
 
     #[test]
     fn mcp_feature_and_per_server_hide_eager_hands() {
+        // toggles filter the wire names the model sees (`server__tool`),
+        // derived exactly the way mcp.rs builds them
+        let github = crate::mcp::wire_name("github", "create_issue");
+        let jira = crate::mcp::wire_name("jira", "search");
         let all = toggles(&[FeatureSpec::Mcp]);
-        for tool in ["github.create_issue", "jira.search", "mcp_call", "mcp"] {
+        for tool in [github.as_str(), jira.as_str(), "mcp_call", "mcp"] {
             assert!(all.hidden_reason(tool).is_some(), "{tool} hidden by `mcp`");
         }
         // a prefix collision with a server name must not hide base tools
         assert!(all.hidden_reason("read").is_none());
 
         let one = toggles(&[FeatureSpec::McpServer("github".into())]);
-        assert!(one.hidden_reason("github.create_issue").is_some());
-        assert!(one.hidden_reason("jira.search").is_none());
+        assert!(one.hidden_reason(&github).is_some());
+        assert!(one.hidden_reason(&jira).is_none());
         // lazy/meta hands stay visible: they front other servers and
         // reject the disabled one per-call
         assert!(one.hidden_reason("mcp_call").is_none());
         assert!(one.hidden_reason("mcp").is_none());
         assert!(!one.server_enabled("github"));
         assert!(one.server_enabled("jira"));
+    }
+
+    #[test]
+    fn per_server_hiding_follows_wire_name_cleaning() {
+        // wire_name cleans off-pattern server names; hiding must match
+        // the cleaned prefix or `mcp:my.srv` would hide nothing at all
+        let t = toggles(&[FeatureSpec::McpServer("my.srv".into())]);
+        let wire = crate::mcp::wire_name("my.srv", "create_issue");
+        assert_eq!(wire, "my_srv__create_issue");
+        assert!(
+            t.hidden_reason(&wire).is_some(),
+            "`{wire}` hidden by mcp:my.srv"
+        );
+        assert!(
+            t.hidden_reason(&crate::mcp::wire_name("other", "call"))
+                .is_none()
+        );
     }
 
     #[test]

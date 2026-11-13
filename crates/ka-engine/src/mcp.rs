@@ -862,23 +862,31 @@ fn parse_tools(result: &Value, server_name: &str) -> Result<Vec<McpTool>, String
         })
         .collect())
 }
-/// The name the model sees: `{server}__{raw}` with every character
-/// outside `[a-zA-Z0-9_-]` collapsed to `_`. Providers reject function
-/// names off that pattern (`tools[n].function.name`), so a dotted
-/// `server.tool` namespace never reaches the wire.
+/// Collapse every character outside `[a-zA-Z0-9_-]` to `_`. Providers
+/// reject function names off that pattern (`tools[n].function.name`),
+/// so a dotted `server.tool` namespace never reaches the wire.
+fn clean(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// The name the model sees: `{server}__{raw}`.
 pub(crate) fn wire_name(server: &str, raw: &str) -> String {
-    let clean = |s: &str| {
-        s.chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect::<String>()
-    };
     format!("{}__{}", clean(server), clean(raw))
+}
+
+/// The prefix every wire name from `server` shares. Feature toggles
+/// hide a server's eager hands through it — same cleaning as
+/// [`wire_name`], so an off-pattern server name still matches.
+pub(crate) fn wire_prefix(server: &str) -> String {
+    format!("{}__", clean(server))
 }
 
 /// Concatenate a tool result's text content parts.
