@@ -448,12 +448,23 @@ pub fn allowlist_for(cwd: &Path) -> Vec<PathBuf> {
 }
 
 /// Resolve config → policy.
+///
+/// Default-allowlist entries (cwd, /tmp, XDG state/cache) that resolve to
+/// an ancestor of a protected broad root are DROPPED, not fatal: the
+/// defaults must never brick every sandboxed command (a data root under
+/// /tmp with `$HOME` inside it is a real layout — containers, test
+/// harnesses), and dropping only tightens the sandbox. Explicit
+/// `[sandbox] allow_write` entries keep failing hard: the operator asked
+/// for exactly that path.
 pub fn policy_from_config(cfg: &SandboxConfig, cwd: &Path) -> Result<Policy, String> {
     let mode = cfg.mode.as_deref().unwrap_or("off");
     match mode {
         "off" => Ok(Policy::Off),
         "fs" => {
-            let mut allow = allowlist_for(cwd);
+            let mut allow: Vec<PathBuf> = allowlist_for(cwd)
+                .into_iter()
+                .filter(|d| resolve_writable(d).is_ok())
+                .collect();
             for extra in &cfg.allow_write {
                 let path = normalize(Path::new(extra), cwd);
                 if !allow.contains(&path) {
@@ -673,6 +684,50 @@ mod tests {
         );
         let bad: SandboxConfig = serde_json::from_str(r#"{"mode":"yolo"}"#).unwrap();
         assert!(policy_from_config(&bad, Path::new("/tmp")).is_err());
+    }
+
+    #[test]
+    fn default_entries_that_cover_broad_roots_are_dropped_not_fatal() {
+        // A default-allowlist entry that resolves to an ancestor of a
+        // protected broad root must be DROPPED, never brick the policy:
+        // cwd = "/" covers every broad root; the same shape hits /tmp in
+        // real layouts where the (protected) $HOME lives under /tmp
+        // (containers, test harnesses with their data root in tmpfs).
+        let dir = std::env::temp_dir().join(format!("ka-sbx-broad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = SandboxConfig {
+            mode: Some("fs".into()),
+            allow_write: Vec::new(),
+        };
+        let policy = policy_from_config(&cfg, Path::new("/"))
+            .expect("policy builds: invalid defaults are dropped, not fatal");
+        match &policy {
+            Policy::Fs { allow_write, .. } => {
+                assert!(
+                    !allow_write.iter().any(|p| p.as_os_str() == "/"),
+                    "the cwd default at / is dropped: it covers every broad root"
+                );
+                assert!(
+                    allow_write.contains(&PathBuf::from("/tmp")),
+                    "an unrelated default (/tmp, home outside it here) stays"
+                );
+            }
+            other => panic!("expected fs policy, got {other:?}"),
+        }
+        // Explicit operator entries are NOT filtered here — wrap_command
+        // keeps failing them hard at use time (fail-closed is for asks,
+        // not defaults).
+        let bad = SandboxConfig {
+            mode: Some("fs".into()),
+            allow_write: vec!["/root".to_string()],
+        };
+        match policy_from_config(&bad, &dir).expect("explicit entries pass policy build") {
+            Policy::Fs { allow_write, .. } => {
+                assert!(allow_write.contains(&PathBuf::from("/root")))
+            }
+            other => panic!("expected fs policy, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
