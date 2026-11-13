@@ -698,22 +698,11 @@ async fn run(
     for hand in crate::hands::web::hands(search_provider, web_allow_private) {
         ctx.voice.push_hand(hand);
     }
-    // lazy MCP: one hand fronts every server (listing + calls)
-    if ctx.mcp_lazy && !ctx.mcp_shared.is_empty() {
-        ctx.voice
-            .push_hand(std::sync::Arc::new(crate::mcp::McpCallHand::new(
-                ctx.mcp_shared.clone(),
-                features.clone(),
-            )));
-    }
-    // browse hand over every server: resources + prompts discovery
-    if !ctx.mcp_shared.is_empty() {
-        ctx.voice
-            .push_hand(std::sync::Arc::new(crate::mcp::McpMetaHand::new(
-                ctx.mcp_shared.clone(),
-                features.clone(),
-            )));
-    }
+    // lazy `mcp_call` + meta `mcp` hands: rebuild_mcp_meta_hands — run
+    // by ensure_mcp_server on every path that grows the connected set —
+    // is their sole registrar. Pushing either here used to register a
+    // second copy, and providers rejected the whole turn with
+    // "tools: Tool names must be unique".
     // One bootstrap inventory card replaces the old ad-hoc notes: the
     // surface renders tools/MCP/agents/skills compactly at startup.
     emit_inventory(&ctx).await;
@@ -4638,6 +4627,81 @@ mod tests {
         assert!(seen.iter().all(
             |e| !matches!(e, Event::Note { message } if message.contains("agents available") || message.contains("tool(s)"))
         ));
+    }
+
+    #[tokio::test]
+    async fn bootstrap_with_cached_mcp_registers_the_meta_hand_once() {
+        // cache-hit registration is the duplicate path: the remembered
+        // eager hands load synchronously, the meta hand is rebuilt
+        // inside ensure_mcp_server, and a bootstrap push on top used to
+        // register a second `mcp` — providers then reject the whole
+        // turn with "tools: Tool names must be unique"
+        let _cache = crate::mcp_cache::test_support::cache_guard();
+        let server = crate::mcp::McpServerConfig {
+            name: "cached".into(),
+            command: Some("ka-definitely-not-a-binary-9x7".into()),
+            args: Vec::new(),
+            env: Default::default(),
+            url: None,
+            headers: Vec::new(),
+        };
+        crate::mcp_cache::store_tools(
+            &server,
+            &[crate::mcp::McpTool {
+                name: "cached__ping".into(),
+                raw_name: "ping".into(),
+                description: "ping".into(),
+                schema: serde_json::json!({"type": "object"}),
+            }],
+        );
+        let root = std::env::temp_dir().join(format!(
+            "ka-eng-inv-mcpdup-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let cfg = Config {
+            cwd: Some(root.to_string_lossy().into_owned()),
+            mcp: vec![server],
+            ..Config::default()
+        };
+        let mut handle = spawn(cfg);
+        drop(handle.commands);
+        let mut seen = Vec::new();
+        while let Some(evt) = handle.events.recv().await {
+            seen.push(evt);
+        }
+        let _ = std::fs::remove_dir_all(&root);
+
+        let inventories: Vec<&Event> = seen
+            .iter()
+            .filter(|e| matches!(e, Event::Inventory { .. }))
+            .collect();
+        assert!(!inventories.is_empty(), "bootstrap emitted inventory");
+        let Event::Inventory { tools, .. } = inventories[0] else {
+            unreachable!("filtered above")
+        };
+        assert!(
+            tools.contains(&"mcp".to_string()),
+            "meta hand present: {tools:?}"
+        );
+        assert_eq!(
+            tools.iter().filter(|t| *t == "mcp").count(),
+            1,
+            "meta hand registered exactly once: {tools:?}"
+        );
+        let mut sorted = tools.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            tools.len(),
+            "no duplicate tool names at bootstrap: {tools:?}"
+        );
     }
     // ── auto-titles ([roles] fast) ────────────────────────────────────
 
