@@ -107,14 +107,19 @@ impl AgentDef {
 
     /// Discovery roots for a working directory. Project scope anchors
     /// at the root project (nearest `.git` ancestor, else cwd), not the
-    /// launch dir.
+    /// launch dir — and is trust-gated like rules/skills/hooks:
+    /// untrusted projects contribute NOTHING. The user-level agent dir
+    /// always stays.
     fn roots(cwd: &std::path::Path) -> Vec<PathBuf> {
-        let root = crate::project_root(cwd);
-        let mut roots = vec![
-            root.join(".ka/agents"),
-            root.join(".agents"),
-            root.join(".claude/agents"),
-        ];
+        let mut roots = Vec::new();
+        if crate::trust::project_trusted(cwd) {
+            let root = crate::project_root(cwd);
+            roots.extend([
+                root.join(".ka/agents"),
+                root.join(".agents"),
+                root.join(".claude/agents"),
+            ]);
+        }
         if let Ok(home) = std::env::var("HOME") {
             roots.push(PathBuf::from(home).join(".config/ka/agents"));
         }
@@ -267,12 +272,17 @@ mod tests {
         .unwrap();
         std::fs::write(dir.join("proj/.agents/util.md"), "Utility agent.").unwrap();
 
-        let agents = AgentDef::discover(dir.join("proj").as_path());
-        let names: Vec<&str> = agents.iter().map(|a| a.name.as_str()).collect();
-        assert!(names.contains(&"reviewer"), "{names:?}");
-        assert!(names.contains(&"util"), "{names:?}");
-        let reviewer = agents.iter().find(|a| a.name == "reviewer").unwrap();
-        assert_eq!(reviewer.description, "project version");
+        // project agent dirs are trust-gated like rules/skills: approve
+        // the project in a redirected store before discovering
+        crate::trust::test_support::with_trust_file(|_| {
+            crate::trust::approve(&dir.join("proj"));
+            let agents = AgentDef::discover(dir.join("proj").as_path());
+            let names: Vec<&str> = agents.iter().map(|a| a.name.as_str()).collect();
+            assert!(names.contains(&"reviewer"), "{names:?}");
+            assert!(names.contains(&"util"), "{names:?}");
+            let reviewer = agents.iter().find(|a| a.name == "reviewer").unwrap();
+            assert_eq!(reviewer.description, "project version");
+        });
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

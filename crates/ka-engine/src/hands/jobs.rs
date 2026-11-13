@@ -589,6 +589,33 @@ mod tests {
     }
 
     #[test]
+    fn register_after_open_persists_when_path_set_first() {
+        let dir = std::env::temp_dir().join(format!("ka-jobs-openfirst-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let jsonl = dir.join("jobs.jsonl");
+
+        // corrected integration order: attach the file BEFORE any
+        // registration — every subsequent register must persist
+        let spill = dir.join("out-live");
+        let pid = spawn_detached("sleep 30", &spill);
+        let started_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let table = Arc::new(JobTable::new());
+        table.set_path(jsonl.clone());
+        table.register("persisted job".into(), started_ms, spill, Some(pid));
+
+        let snap = table.snapshot();
+        assert_eq!(snap.len(), 1, "{snap:?}");
+        assert_eq!(snap[0].cmd, "persisted job");
+        let disk = std::fs::read_to_string(&jsonl).unwrap();
+        assert!(disk.contains("persisted job"), "{disk}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn kill_clearance_depends_on_action() {
         let hand = JobsHand::new(Arc::new(JobTable::new()));
         assert_eq!(

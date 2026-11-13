@@ -223,8 +223,11 @@ fn extract_frame(buffer: &mut Vec<u8>) -> Option<String> {
 }
 
 /// Parse the `id:`/`data:` lines of one SSE frame into events.
-/// Unparseable data lines surface as `Event::Error` instead of being
-/// silently dropped.
+/// Malformed JSON surfaces as `Event::Error` rather than being silently
+/// dropped. A data line that IS valid JSON but carries a `type` this
+/// client does not know (a newer server's event) is skipped: the tagged
+/// `Event` enum has no catch-all, so deserializing would fail — the
+/// failure mode is a newer-server/older-client pair, not corruption.
 fn parse_frame(frame: &str, last_id: &mut Option<String>) -> Vec<Event> {
     let mut out = Vec::new();
     for line in frame.lines() {
@@ -239,8 +242,14 @@ fn parse_frame(frame: &str, last_id: &mut Option<String>) -> Vec<Event> {
             .or_else(|| line.strip_prefix("data:"));
         if let Some(payload) = payload {
             let payload = payload.trim();
+            // malformed JSON is a visible error row; valid JSON whose
+            // `type` this build does not know is a newer peer — skip it
+            // (serde reports the tag before the rest of the map, so the
+            // typed error alone cannot tell the two apart)
+            let json_ok = serde_json::from_str::<serde_json::Value>(payload).is_ok();
             match ka_protocol::from_line::<Event>(payload) {
                 Ok(evt) => out.push(evt),
+                Err(_) if json_ok => {}
                 Err(e) => out.push(Event::Error {
                     class: ka_protocol::ErrorClass::Protocol,
                     retryable: false,
@@ -306,6 +315,28 @@ mod tests {
         let mut last_id = None;
         let events = super::parse_frame(&frame, &mut last_id);
         // garbage is not silently dropped: it becomes an Event::Error
+        assert!(matches!(
+            events.as_slice(),
+            [ka_protocol::Event::Error { .. }]
+        ));
+    }
+
+    #[test]
+    fn unknown_event_type_frame_is_skipped_not_errored() {
+        // a newer server emits an event type this client's Event enum
+        // does not know: valid JSON, unknown `type` → skip the frame
+        // entirely (no Event::Error row), unlike malformed JSON.
+        let mut buffer = b"data: {\"type\":\"hologram\",\"holo\":true}\n\n".to_vec();
+        let frame = super::extract_frame(&mut buffer).unwrap();
+        let mut last_id = None;
+        let events = super::parse_frame(&frame, &mut last_id);
+        assert!(events.is_empty());
+
+        // same frame family: malformed JSON still surfaces as an error
+        let mut buffer = b"data: {\"type\":\"hologram\", nope}\n\n".to_vec();
+        let frame = super::extract_frame(&mut buffer).unwrap();
+        let mut last_id = None;
+        let events = super::parse_frame(&frame, &mut last_id);
         assert!(matches!(
             events.as_slice(),
             [ka_protocol::Event::Error { .. }]

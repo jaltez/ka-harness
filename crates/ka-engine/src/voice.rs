@@ -284,6 +284,12 @@ pub struct Voice {
     /// skills' full SKILL.md bodies ride this turn's system prompt.
     /// Set by the engine around one turn, cleared after.
     turn_skills: Option<Vec<String>>,
+    /// Cached tool-spec set for the current hand set: building it
+    /// clones every description/schema per call, so it is built once
+    /// and reused across steps/retries. Invalidated at turn start and
+    /// wherever the visible hand set can change (`set_turn_tools`,
+    /// `set_feature`, `restore_feature_snapshot`).
+    specs_cache: parking_lot::Mutex<Option<Vec<ToolSpec>>>,
     /// Session feature toggles, shared with the hands that validate
     /// dynamically (delegate roster, lazy MCP calls). Filtering happens
     /// in `specs()` (hide) and `admit_call` (reject strays).
@@ -358,6 +364,7 @@ impl Voice {
             reviewer_model: None,
             turn_tools: None,
             turn_skills: None,
+            specs_cache: parking_lot::Mutex::new(None),
             features: crate::features::FeatureToggles::slot(Vec::new()),
             pending_features: parking_lot::Mutex::new(Vec::new()),
         }
@@ -366,6 +373,7 @@ impl Voice {
     /// Register an extra tool (MCP hands arrive after async discovery).
     pub fn push_hand(&mut self, hand: std::sync::Arc<dyn Hand>) {
         self.hands.push(hand);
+        self.specs_cache.lock().take();
     }
 
     /// Replace one MCP server's hands in registry order (reconnect or
@@ -440,12 +448,17 @@ impl Voice {
     /// fresh all-on slot before hands that share it are constructed).
     pub fn set_feature_slot(&mut self, slot: crate::features::FeatureSlot) {
         self.features = slot;
+        self.specs_cache.lock().take();
     }
 
     /// Apply one feature toggle to the live set (returns whether it
     /// changed anything). Spawn/suspend side effects are the engine's.
     pub fn set_feature(&mut self, spec: &ka_protocol::FeatureSpec, enabled: bool) -> bool {
-        self.features.write().set(spec, enabled)
+        let changed = self.features.write().set(spec, enabled);
+        if changed {
+            self.specs_cache.lock().take();
+        }
+        changed
     }
 
     /// Replace the whole toggle snapshot (strand restore). Live MCP
@@ -457,6 +470,7 @@ impl Voice {
         sandbox: Option<String>,
     ) {
         self.features.write().replace_snapshot(disabled, sandbox);
+        self.specs_cache.lock().take();
     }
 
     /// The current toggle snapshot: disabled specs + sandbox override.
@@ -499,11 +513,16 @@ impl Voice {
             crate::hands::pathfinder::PathfinderSource::default(),
         ));
         let todos = crate::hands::todo::slot();
-        let hands = crate::hands::registry_with_pathfinder(
+        let mut hands = crate::hands::registry_with_pathfinder(
             slot.clone(),
             todos.clone(),
             std::sync::Arc::new(crate::hands::jobs::JobTable::new()),
         );
+        // Research voices are read-only by contract even when the
+        // engine runs them in Mode::Allow: keep the inspect-only hands
+        // (read/glob/grep/pathfinder/todo/…), drop anything that
+        // mutates (bash/edit/write/jobs).
+        hands.retain(|h| h.def().read_only);
         let hand_ctx = HandContext {
             cwd,
             ledger: std::sync::Arc::new(parking_lot::Mutex::new(Ledger::default())),
@@ -555,6 +574,7 @@ impl Voice {
             reviewer_model: None,
             turn_tools: None,
             turn_skills: None,
+            specs_cache: parking_lot::Mutex::new(None),
             features: crate::features::FeatureToggles::slot(Vec::new()),
             pending_features: parking_lot::Mutex::new(Vec::new()),
         }
@@ -620,6 +640,15 @@ impl Voice {
     /// Whether an active digest summary rides the system prompt.
     pub fn has_digest(&self) -> bool {
         self.digest.is_some()
+    }
+
+    /// Drop the active digest summary AND its watermark: rewind-to-zero
+    /// appends a `Boundary` (replay clears both), and the live session
+    /// must agree — else live requests keep prepending a summary of the
+    /// deleted content while a resumed session drops it.
+    pub fn clear_digest(&mut self) {
+        self.digest = None;
+        self.last_digest = None;
     }
 
     /// Consume a promotion the engine must apply (model switch with
@@ -821,6 +850,7 @@ impl Voice {
     /// any stragglers at admit time.
     pub fn set_turn_tools(&mut self, tools: Option<Vec<String>>) {
         self.turn_tools = tools;
+        self.specs_cache.lock().take();
     }
 
     /// Scope one turn to explicitly invoked skills (`/skill:<name>`):
@@ -1607,11 +1637,21 @@ impl Voice {
     }
 
     fn specs(&self) -> Vec<ToolSpec> {
+        // built once per hand set and cached: the per-call build clones
+        // every description/schema, which steps and retries used to
+        // pay again on every round-trip. Invalidation points: turn
+        // start, push_hand, set_turn_tools, set_feature,
+        // set_feature_slot, restore_feature_snapshot.
+        let mut cache = self.specs_cache.lock();
+        if let Some(cached) = cache.as_ref() {
+            return cached.clone();
+        }
         // two filters stack: session feature toggles hide disabled
         // capabilities outright, and a per-turn allowlist
         // (custom-command `allowed-tools`) narrows what remains
         let features = self.features.read();
-        self.hands
+        let specs: Vec<ToolSpec> = self
+            .hands
             .iter()
             .filter(|h| features.hidden_reason(&h.def().name).is_none())
             .filter(|h| {
@@ -1627,7 +1667,9 @@ impl Voice {
                     parameters: def.parameters.clone(),
                 }
             })
-            .collect()
+            .collect();
+        *cache = Some(specs.clone());
+        specs
     }
 
     /// Run one live prompt to completion. Always emits exactly one
@@ -1647,6 +1689,16 @@ impl Voice {
         images: Vec<ka_dialect::ImagePart>,
     ) -> Usage {
         self.edited.lock().clear();
+        // fresh turn → the visible hand set may have changed since the
+        // last one (mid-turn feature commands, MCP discovery); rebuild
+        // the spec cache lazily on first use.
+        self.specs_cache.lock().take();
+        // Persist the user's message BEFORE any selector/catalog/schema
+        // validation: an early model error must not swallow the prompt
+        // (the engine persists history deltas from the voice's copy).
+        let prompt_len = prompt.len();
+        self.history
+            .push(TurnMessage::user_with_images(prompt, images));
         let mut parsed = match parse_selector(model_selector) {
             Ok(p) => p,
             Err(e) => {
@@ -1658,13 +1710,27 @@ impl Voice {
         let mut dialect = match self.catalog.get(&model_id).cloned() {
             Some(d) => d,
             None => {
-                self.stop_hooks(events, "error").await;
-                return finish_after_error(
-                    events,
-                    ErrorClass::Protocol,
-                    &format!("unknown model {model_id:?} (not in catalog; add a dialect overlay)"),
-                )
-                .await;
+                // catalog miss on a known vendor: synthesize the
+                // documented `provider/model` dialect (providers.toml
+                // endpoint/key/wire) instead of erroring — fresh
+                // models work before an overlay lands. Unknown vendor
+                // keeps the instructive error.
+                match ka_dialect::providers::find(&parsed.vendor) {
+                    Some(provider) => {
+                        ka_dialect::providers::synthetic_dialect(provider, &parsed.model)
+                    }
+                    None => {
+                        self.stop_hooks(events, "error").await;
+                        return finish_after_error(
+                            events,
+                            ErrorClass::Protocol,
+                            &format!(
+                                "unknown model {model_id:?} (not in catalog; add a dialect overlay)"
+                            ),
+                        )
+                        .await;
+                    }
+                }
             }
         };
         if schema.is_some() && !dialect.flags.structured {
@@ -1693,7 +1759,7 @@ impl Voice {
         let mut fallback_cursor: usize = 0;
         let mut fallback_hops: usize = 0;
 
-        let est_in = (prompt.len() as f64 / ratio as f64).ceil() as u64;
+        let est_in = (prompt_len as f64 / ratio as f64).ceil() as u64;
         events
             .send(Event::TurnStarted {
                 context: ka_protocol::ContextMeter {
@@ -1831,8 +1897,7 @@ impl Voice {
         } else {
             4.0
         };
-        self.history
-            .push(TurnMessage::user_with_images(prompt, images));
+        // (the user message was persisted before validation above)
         self.state.loop_counts.clear();
         let mut usage_total = Usage::default();
         let mut assistant_text = String::new();
@@ -1986,6 +2051,8 @@ impl Voice {
                                                 question,
                                                 commands,
                                                 events,
+                                                steers,
+                                                queue,
                                             )
                                             .await
                                             {
@@ -2020,6 +2087,8 @@ impl Voice {
                                                 question,
                                                 commands,
                                                 events,
+                                                steers,
+                                                queue,
                                             )
                                             .await
                                             {
@@ -2215,7 +2284,7 @@ impl Voice {
             let mut slots: Vec<Option<ToolOutput>> = vec![None; step_calls.len()];
             let mut approved: Vec<(usize, std::sync::Arc<dyn Hand>)> = Vec::new();
             for (idx, call) in step_calls.iter_mut().enumerate() {
-                match self.admit_call(call, commands, events).await {
+                match self.admit_call(call, commands, events, steers, queue).await {
                     Ok(hand) => approved.push((idx, hand)),
                     Err(output) => slots[idx] = Some(output),
                 }
@@ -2229,17 +2298,87 @@ impl Voice {
             let mut aborted = false;
             if !approved.is_empty() {
                 let mut in_flight = tokio::task::JoinSet::new();
-                let mut task_idx: HashMap<tokio::task::Id, usize> = HashMap::new();
+                let mut task_idx: HashMap<tokio::task::Id, Vec<usize>> = HashMap::new();
                 // the hook table moves into an Arc once per step: each
                 // spawned task then pays an Arc bump, not a Vec<Hook>
                 // deep clone (hand ctx / sender / slots are Arc-cheap)
                 let hooks = std::sync::Arc::new(self.hooks_cfg.clone());
+                // Two write-clearance calls on one file in a single
+                // batch would race read-modify-write to
+                // last-writer-wins, silently losing the first change.
+                // Group admitted edit/write/lsp_write calls by resolved
+                // target path; each group runs as ONE task with its
+                // futures chained in call order (the second verify sees
+                // the first write). Distinct groups and non-write calls
+                // stay fully concurrent.
+                let write_target = |call: &ToolCall| match call.tool.as_str() {
+                    "edit" | "write" => call
+                        .arguments
+                        .get("path")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
+                    // write-through LSP hands take their target under
+                    // `file` (lsp_actions/lsp_format) or `to` for
+                    // kind:"file" renames (the move destination is the
+                    // write target)
+                    "lsp_rename" | "lsp_actions" | "lsp_format" => call
+                        .arguments
+                        .get("file")
+                        .or_else(|| call.arguments.get("to"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
+                    _ => None,
+                };
+                // group keys are RESOLVED paths (~/ expansion + cwd join,
+                // `.` components normalized) so two spellings of one
+                // file cannot race as separate groups
+                let mut group_by_path: HashMap<std::path::PathBuf, usize> = HashMap::new();
+                let mut members_of: Vec<Vec<(usize, std::sync::Arc<dyn Hand>)>> = Vec::new();
+                // same-path groups chain members in ONE task: a panic
+                // later in the chain must not misreport siblings whose
+                // edits already landed, so members flush their results
+                // into this map as they complete; the join-Err arm
+                // harvests it before filling the remaining slots
+                let flushed = flushed_map();
                 for (idx, hand) in approved {
-                    let call = step_calls[idx].clone();
-                    let mut ctx = self.hand_ctx.clone();
-                    // a "this run" sandbox grant rides exactly this call
-                    if let Some(grants) = self.state.sandbox_pending.remove(&call.id) {
-                        ctx.sandbox = ka_sandbox::apply_grants(&ctx.sandbox, &grants);
+                    let group = match write_target(&step_calls[idx]) {
+                        Some(path) => {
+                            // resolve AND lexically normalize (`.`/`..`
+                            // collapsed): components().collect() keeps a
+                            // leading CurDir and ParentDir, so `./a.rs`
+                            // and `src/../a.rs` would otherwise race as
+                            // separate groups
+                            let resolved = crate::hands::protected::normalize(
+                                &crate::hands::read::resolve(&self.hand_ctx, &path),
+                            );
+                            match group_by_path.get(&resolved) {
+                                Some(g) => *g,
+                                None => {
+                                    let g = members_of.len();
+                                    group_by_path.insert(resolved, g);
+                                    members_of.push(Vec::new());
+                                    g
+                                }
+                            }
+                        }
+                        None => {
+                            members_of.push(Vec::new());
+                            members_of.len() - 1
+                        }
+                    };
+                    members_of[group].push((idx, hand));
+                }
+                for members in members_of {
+                    // resolve each member's call + ctx (a "this run"
+                    // sandbox grant rides exactly its call)
+                    let mut prepared = Vec::with_capacity(members.len());
+                    for (idx, hand) in members {
+                        let call = step_calls[idx].clone();
+                        let mut ctx = self.hand_ctx.clone();
+                        if let Some(grants) = self.state.sandbox_pending.remove(&call.id) {
+                            ctx.sandbox = ka_sandbox::apply_grants(&ctx.sandbox, &grants);
+                        }
+                        prepared.push((idx, hand, call, ctx));
                     }
                     let events = events.clone();
                     let hooks = hooks.clone();
@@ -2247,67 +2386,22 @@ impl Voice {
                     let lsp = self.lsp.clone();
                     let verify = self.verify.clone();
                     let edited = self.edited.clone();
+                    let flushed = flushed.clone();
+                    let idxs: Vec<usize> = prepared.iter().map(|(i, ..)| *i).collect();
                     let handle = in_flight.spawn(async move {
-                        let (mut output, steer) =
-                            execute_approved(&hand, &hooks, &call, &ctx, &events).await;
-                        // LSP diagnostics and [verify] lints ride successful
-                        // edit/write results as informational context — never
-                        // errors (opencode #9102: diagnostics must not read as
-                        // tool failure)
-                        if !output.is_error && (call.tool == "edit" || call.tool == "write") {
-                            if let Some(path) = call
-                                .arguments
-                                .get("path")
-                                .and_then(serde_json::Value::as_str)
-                            {
-                                edited.lock().push(path.to_string());
-                            }
-                            if let Some(lsp) = lsp.as_ref() {
-                                enrich_with_lsp(&mut output, &call, &ctx, lsp).await;
-                            }
-                            enrich_with_lint(&mut output, &call, &ctx, &verify).await;
+                        let mut results = Vec::with_capacity(prepared.len());
+                        for (idx, hand, call, ctx) in prepared {
+                            let res = run_admitted_call(
+                                idx, hand, call, &ctx, &hooks, &events, &todo, &lsp, &verify,
+                                &edited,
+                            )
+                            .await;
+                            flushed.lock().insert(idx, (res.1.clone(), res.2.clone()));
+                            results.push(res);
                         }
-                        // the todo hand owns normalization; surfaces get the
-                        // fresh list as a whole-replacement event, and any
-                        // confidence-spike advisory rides out as a note so
-                        // the user sees the re-check request too
-                        if call.tool == "todo" && !output.is_error {
-                            let items = todo.lock().clone();
-                            events.send(Event::Todos { items }).await.ok();
-                            for line in output
-                                .content
-                                .lines()
-                                .filter(|l| l.contains(crate::hands::todo::SPIKE_MARK))
-                            {
-                                events
-                                    .send(Event::Note {
-                                        message: format!("todo: {line}"),
-                                    })
-                                    .await
-                                    .ok();
-                            }
-                        }
-                        events
-                            .send(Event::CallOutput {
-                                tool: call.tool.clone(),
-                                id: call.id.clone(),
-                                excerpt: truncate_excerpt(&output.content),
-                                is_error: output.is_error,
-                                spill: output.spill.clone(),
-                            })
-                            .await
-                            .ok();
-                        events
-                            .send(Event::CallFinished {
-                                tool: call.tool.clone(),
-                                id: call.id.clone(),
-                                ok: !output.is_error,
-                            })
-                            .await
-                            .ok();
-                        (idx, output, steer)
+                        results
                     });
-                    task_idx.insert(handle.id(), idx);
+                    task_idx.insert(handle.id(), idxs);
                 }
                 let mut mode_change: Option<ka_protocol::Mode> = None;
                 while !in_flight.is_empty() {
@@ -2326,48 +2420,79 @@ impl Voice {
                             Some(_) => {}
                         },
                         joined = in_flight.join_next() => match joined {
-                            Some(Ok((idx, output, steer))) => {
-                                slots[idx] = Some(output);
-                                // post-tool steering: note now, mode via
-                                // the shared seam below
-                                if let Some(s) = steer {
-                                    if let Some(note) = s.note {
-                                        events
-                                            .send(Event::Note {
-                                                message: format!("hook: {note}"),
-                                            })
-                                            .await
-                                            .ok();
-                                    }
-                                    if s.mode.is_some() {
-                                        mode_change = s.mode;
+                            Some(Ok(results)) => {
+                                for (idx, output, steer) in results {
+                                    slots[idx] = Some(output);
+                                    // post-tool steering: note now, mode via
+                                    // the shared seam below
+                                    if let Some(s) = steer {
+                                        if let Some(note) = s.note {
+                                            events
+                                                .send(Event::Note {
+                                                    message: format!("hook: {note}"),
+                                                })
+                                                .await
+                                                .ok();
+                                        }
+                                        if s.mode.is_some() {
+                                            mode_change = s.mode;
+                                        }
                                     }
                                 }
                             }
                             Some(Err(e)) => {
-                                // a panicking hand must not wedge the step
-                                if let Some(idx) = task_idx.remove(&e.id()) {
-                                    let output =
-                                        ToolOutput::err(format!("tool task failed: {e}"));
-                                    events
-                                        .send(Event::CallOutput {
-                                            tool: step_calls[idx].tool.clone(),
-                                            id: step_calls[idx].id.clone(),
-                                            excerpt: truncate_excerpt(&output.content),
-                                            is_error: true,
-                                            spill: None,
-                                        })
-                                        .await
-                                        .ok();
-                                    events
-                                        .send(Event::CallFinished {
-                                            tool: step_calls[idx].tool.clone(),
-                                            id: step_calls[idx].id.clone(),
-                                            ok: false,
-                                        })
-                                        .await
-                                        .ok();
-                                    slots[idx] = Some(output);
+                                // a panicking hand must not wedge the step:
+                                // members of the failed task that already
+                                // completed (same-path chains flush as they
+                                // go) keep their real results; only the
+                                // never-started/aborted remainder surfaces
+                                // as an error result
+                                if let Some(idxs) = task_idx.remove(&e.id()) {
+                                    for idx in idxs {
+                                        let harvested = flushed.lock().remove(&idx);
+                                        if let Some((output, steer)) = harvested {
+                                            slots[idx] = Some(output);
+                                            // the completed sibling's
+                                            // post-tool steering still
+                                            // applies (note now, mode via
+                                            // the shared seam below)
+                                            if let Some(s) = steer {
+                                                if let Some(note) = s.note {
+                                                    events
+                                                        .send(Event::Note {
+                                                            message: format!("hook: {note}"),
+                                                        })
+                                                        .await
+                                                        .ok();
+                                                }
+                                                if s.mode.is_some() {
+                                                    mode_change = s.mode;
+                                                }
+                                            }
+                                            continue;
+                                        }
+                                        let output =
+                                            ToolOutput::err(format!("tool task failed: {e}"));
+                                        events
+                                            .send(Event::CallOutput {
+                                                tool: step_calls[idx].tool.clone(),
+                                                id: step_calls[idx].id.clone(),
+                                                excerpt: truncate_excerpt(&output.content),
+                                                is_error: true,
+                                                spill: None,
+                                            })
+                                            .await
+                                            .ok();
+                                        events
+                                            .send(Event::CallFinished {
+                                                tool: step_calls[idx].tool.clone(),
+                                                id: step_calls[idx].id.clone(),
+                                                ok: false,
+                                            })
+                                            .await
+                                            .ok();
+                                        slots[idx] = Some(output);
+                                    }
                                 }
                             }
                             None => {}
@@ -2561,11 +2686,16 @@ impl Voice {
         call: &mut ToolCall,
         commands: &mut mpsc::Receiver<Command>,
         events: &mpsc::Sender<Event>,
+        steers: &mut Vec<String>,
+        queue: &mut VecDeque<String>,
     ) -> Result<std::sync::Arc<dyn Hand>, ToolOutput> {
         let sig = format!("{}|{}", call.tool, call.arguments);
         *self.state.loop_counts.entry(sig.clone()).or_insert(0) += 1;
         let count = self.state.loop_counts.get(&sig).copied().unwrap_or(0);
-        if let Some(output) = self.loop_gate(call, &sig, count, commands, events).await {
+        if let Some(output) = self
+            .loop_gate(call, &sig, count, commands, events, steers, queue)
+            .await
+        {
             return Err(output);
         }
         let Some(hand) = self
@@ -2764,7 +2894,10 @@ impl Voice {
                              sandbox unchanged; the command will likely fail)",
                             g.summary()
                         );
-                        match self.pose_ask(question, None, commands, events).await {
+                        match self
+                            .pose_ask(question, None, commands, events, steers, queue)
+                            .await
+                        {
                             AskOutcome::Choice(0) => {
                                 pending = Some(g);
                             }
@@ -2808,7 +2941,10 @@ impl Voice {
                     question
                 };
                 let detail = self.ask_detail(call);
-                match self.pose_ask(question, detail, commands, events).await {
+                match self
+                    .pose_ask(question, detail, commands, events, steers, queue)
+                    .await
+                {
                     AskOutcome::Choice(1) => {
                         self.state.rules.insert(format!("tool:{}", call.tool));
                         // persist the allowlist entry to the project
@@ -2895,14 +3031,18 @@ impl Voice {
 
     /// Pose one allow/always/deny ask and await the answer. `Abort` and
     /// a closed surface are distinct outcomes so callers keep their
-    /// existing error strings. Other commands arriving mid-ask are
-    /// dropped (the ask stays exclusive).
+    /// existing error strings. Steer/Queue arriving mid-ask are captured
+    /// into the pending buffers (they land at the next batch boundary
+    /// like any other steer); other verbs get an acknowledging note
+    /// instead of vanishing (the ask stays exclusive).
     async fn pose_ask(
         &mut self,
         question: String,
         detail: Option<String>,
         commands: &mut mpsc::Receiver<Command>,
         events: &mpsc::Sender<Event>,
+        steers: &mut Vec<String>,
+        queue: &mut VecDeque<String>,
     ) -> AskOutcome {
         self.state.ask_counter += 1;
         let ask_id = AskId(format!("ask-{}", self.state.ask_counter));
@@ -2930,15 +3070,58 @@ impl Voice {
                     return AskOutcome::Choice(choice);
                 }
                 Some(Command::Abort) => return AskOutcome::Abort,
-                Some(_) => {}
+                Some(Command::Steer { text }) => steers.push(text),
+                Some(Command::Queue { text }) => queue.push_back(text),
+                Some(cmd) => {
+                    let verb = Self::command_verb(&cmd);
+                    events
+                        .send(Event::Note {
+                            message: format!(
+                                "command {verb} ignored while an ask is pending — \
+                                 resend it after answering"
+                            ),
+                        })
+                        .await
+                        .ok();
+                }
                 None => return AskOutcome::Closed,
             }
+        }
+    }
+
+    /// One-line verb name for the ask loops' "queued until the current
+    /// step finishes" note: swallowed commands are acknowledged, not
+    /// silenced.
+    fn command_verb(cmd: &Command) -> &'static str {
+        match cmd {
+            Command::Prompt { .. } => "prompt",
+            Command::RefreshMcp => "refresh_mcp",
+            Command::CallPrompt { .. } => "call_prompt",
+            Command::Shell { .. } => "shell",
+            Command::TaskDetail { .. } => "task_detail",
+            Command::SetModel { .. } => "set_model",
+            Command::SetEffort { .. } => "set_effort",
+            Command::SetMode { .. } => "set_mode",
+            Command::SetFeature { .. } => "set_feature",
+            Command::SetSandbox { .. } => "set_sandbox",
+            Command::Compact { .. } => "compact",
+            Command::SetName { .. } => "set_name",
+            Command::TransferStrand { .. } => "transfer_strand",
+            Command::Rewind { .. } => "rewind",
+            Command::ForkStrand { .. } => "fork_strand",
+            Command::RestoreCheckpoint { .. } => "restore_checkpoint",
+            Command::SwitchStrand { .. } => "switch_strand",
+            Command::SaveApiKey { .. } => "save_api_key",
+            Command::ExportMarkdown { .. } => "export_markdown",
+            Command::SaveSettings { .. } => "save_settings",
+            _ => "command",
         }
     }
 
     /// The loop gate (`[[rules]] tool = "loop"`, roadmap 9.4).
     /// `Some(output)` = the call is refused. Without a loop rule the
     /// guard keeps its shipped shape: identical calls error at 4+.
+    #[allow(clippy::too_many_arguments)]
     async fn loop_gate(
         &mut self,
         call: &ToolCall,
@@ -2946,6 +3129,8 @@ impl Voice {
         count: u32,
         commands: &mut mpsc::Receiver<Command>,
         events: &mpsc::Sender<Event>,
+        steers: &mut Vec<String>,
+        queue: &mut VecDeque<String>,
     ) -> Option<ToolOutput> {
         let rule = self
             .rules_cfg
@@ -2977,7 +3162,10 @@ impl Voice {
                          continue?",
                         call.tool
                     );
-                    match self.pose_ask(question, None, commands, events).await {
+                    match self
+                        .pose_ask(question, None, commands, events, steers, queue)
+                        .await
+                    {
                         AskOutcome::Choice(1) => {
                             self.state.loop_ok.insert(sig.to_string());
                         }
@@ -3396,6 +3584,92 @@ async fn execute_approved(
     (output, steering)
 }
 
+/// Flushed-results map: same-path group members push their
+/// (output, steering) here as they complete so a later panic in the
+/// chain cannot erase already-landed results.
+type FlushedResults = std::sync::Arc<
+    parking_lot::Mutex<HashMap<usize, (ToolOutput, Option<crate::fshooks::Steering>)>>,
+>;
+
+/// A fresh flushed-results map for one batch.
+fn flushed_map() -> FlushedResults {
+    std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new()))
+}
+
+/// One admitted call's execution tail — the shared body of the batch
+/// executor, used identically by concurrent singleton tasks and
+/// chained same-path groups: hand execution, edit/write enrichment,
+/// todo/event surfacing. Returns (call index, output, steering).
+#[allow(clippy::too_many_arguments)]
+async fn run_admitted_call(
+    idx: usize,
+    hand: std::sync::Arc<dyn Hand>,
+    call: ToolCall,
+    ctx: &HandContext,
+    hooks: &[crate::config::Hook],
+    events: &mpsc::Sender<Event>,
+    todo: &crate::hands::todo::TodoSlot,
+    lsp: &Option<LspSlot>,
+    verify: &crate::config::Verify,
+    edited: &std::sync::Arc<parking_lot::Mutex<Vec<String>>>,
+) -> (usize, ToolOutput, Option<crate::fshooks::Steering>) {
+    let (mut output, steer) = execute_approved(&hand, hooks, &call, ctx, events).await;
+    // LSP diagnostics and [verify] lints ride successful edit/write
+    // results as informational context — never errors (opencode
+    // #9102: diagnostics must not read as tool failure)
+    if !output.is_error && (call.tool == "edit" || call.tool == "write") {
+        if let Some(path) = call
+            .arguments
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+        {
+            edited.lock().push(path.to_string());
+        }
+        if let Some(lsp) = lsp.as_ref() {
+            enrich_with_lsp(&mut output, &call, ctx, lsp).await;
+        }
+        enrich_with_lint(&mut output, &call, ctx, verify).await;
+    }
+    // the todo hand owns normalization; surfaces get the fresh list
+    // as a whole-replacement event, and any confidence-spike advisory
+    // rides out as a note so the user sees the re-check request too
+    if call.tool == "todo" && !output.is_error {
+        let items = todo.lock().clone();
+        events.send(Event::Todos { items }).await.ok();
+        for line in output
+            .content
+            .lines()
+            .filter(|l| l.contains(crate::hands::todo::SPIKE_MARK))
+        {
+            events
+                .send(Event::Note {
+                    message: format!("todo: {line}"),
+                })
+                .await
+                .ok();
+        }
+    }
+    events
+        .send(Event::CallOutput {
+            tool: call.tool.clone(),
+            id: call.id.clone(),
+            excerpt: truncate_excerpt(&output.content),
+            is_error: output.is_error,
+            spill: output.spill.clone(),
+        })
+        .await
+        .ok();
+    events
+        .send(Event::CallFinished {
+            tool: call.tool.clone(),
+            id: call.id.clone(),
+            ok: !output.is_error,
+        })
+        .await
+        .ok();
+    (idx, output, steer)
+}
+
 /// Append LSP diagnostics to a successful edit/write result. The file
 /// on disk is authoritative (the hand just wrote it); `touch` feeds it
 /// to the language server and we poll the diagnostics cache for up to
@@ -3483,11 +3757,7 @@ async fn enrich_with_lint(
     else {
         return;
     };
-    let command = if rule.command.contains("{file}") {
-        rule.command.replace("{file}", &rel)
-    } else {
-        format!("{} {rel}", rule.command)
-    };
+    let command = lint_command(&rule.command, &rel);
     let started = std::time::Instant::now();
     let ran = tokio::time::timeout(
         std::time::Duration::from_secs(60),
@@ -3527,6 +3797,36 @@ async fn enrich_with_lint(
             started.elapsed().as_secs_f32()
         ));
         output.content.push_str(&block);
+    }
+}
+
+/// POSIX single-quote `s` for safe interpolation into a `sh -c`
+/// command string: wrap in `'…'` with embedded quotes escaped as
+/// `'\''`, so a model-authored path containing `;`, backticks or
+/// `$( )` can never execute as a command tail.
+fn sh_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// Build a `[verify]` lint command with the file path shell-quoted in
+/// both interpolation shapes (the `{file}` placeholder and the plain
+/// suffix-append fallback).
+fn lint_command(rule_command: &str, rel: &str) -> String {
+    let quoted = sh_quote(rel);
+    if rule_command.contains("{file}") {
+        rule_command.replace("{file}", &quoted)
+    } else {
+        format!("{rule_command} {quoted}")
     }
 }
 
@@ -3829,6 +4129,8 @@ async fn ask_continue_or_stop(
     question: String,
     commands: &mut mpsc::Receiver<Command>,
     events: &mpsc::Sender<Event>,
+    steers: &mut Vec<String>,
+    queue: &mut VecDeque<String>,
 ) -> bool {
     state.ask_counter += 1;
     let id = AskId(format!("ask-{}", state.ask_counter));
@@ -3850,7 +4152,18 @@ async fn ask_continue_or_stop(
                     return choice == 0;
                 }
                 Some(Command::Abort) => return false,
-                Some(_) => {}
+                Some(Command::Steer { text }) => steers.push(text),
+                Some(Command::Queue { text }) => queue.push_back(text),
+                Some(_) => {
+                    events
+                        .send(Event::Note {
+                            message:
+                                "command ignored while an ask is pending — \
+                                 resend it after answering".to_string(),
+                        })
+                        .await
+                        .ok();
+                }
                 None => return false,
             }
         }
@@ -6121,7 +6434,112 @@ mod tests {
             last_start < first_end,
             "calls must overlap, not serialize: {lines:?}"
         );
+
+        // same-file double edit in ONE batch: the two edits target one
+        // path, so they must run chained in call order — BOTH
+        // replacements present, both results successful (a concurrent
+        // read-modify-write race would silently drop the first edit)
+        let target = dir.join("same.txt");
+        std::fs::write(&target, "alpha bravo\n").unwrap();
+        let mut voice = Voice::new(
+            catalog_for("test/m"),
+            dir.clone(),
+            ka_protocol::Mode::Allow,
+            5,
+        )
+        .with_speaker(
+            Wire::OpenaiChat,
+            std::sync::Arc::new(ReadThenEdits {
+                path: target.clone(),
+            }),
+        );
+        // direct-turn tests bypass the engine bootstrap that binds the
+        // snapshot journal to a strand; bind it or edits are refused
+        voice.snapshot_sink().lock().set_strand("samefile-test");
+        let mut guards = GuardRuntime::default();
+        let (_events, _) = drive_turn(&mut voice, &mut guards, "edit twice", None).await;
+        let text = std::fs::read_to_string(&target).unwrap();
+        assert!(
+            text.contains("alpha-one") && text.contains("bravo-two"),
+            "both edits must land: {text:?}"
+        );
+        let edit_results: Vec<&ka_dialect::speaker::ToolResult> = voice
+            .history
+            .iter()
+            .filter(|m| m.role == TurnRole::Tool)
+            .flat_map(|m| m.results.iter())
+            .filter(|r| r.call_id.starts_with("e"))
+            .collect();
+        assert_eq!(edit_results.len(), 2, "two edit results expected");
+        assert!(
+            edit_results.iter().all(|r| !r.is_error),
+            "both same-file edits must succeed: {:?}",
+            edit_results
+                .iter()
+                .map(|r| r.content.clone())
+                .collect::<Vec<_>>()
+        );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn catalog_for(id: &str) -> Catalog {
+        Catalog::parse(&format!(
+            "[dialects.\"{id}\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000\n"
+        ))
+        .unwrap()
+    }
+
+    /// Round 1 reads the target; round 2 issues TWO edits on the same
+    /// path in one batch; round 3 rests.
+    struct ReadThenEdits {
+        path: std::path::PathBuf,
+    }
+
+    impl Speaker for ReadThenEdits {
+        fn speak<'a>(
+            &'a self,
+            _req: SpeakRequest,
+            out: tokio::sync::mpsc::Sender<StreamEvent>,
+        ) -> SpeakFuture<'a> {
+            Box::pin(async move {
+                static ROUND: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                let round = ROUND.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if round == 0 {
+                    out.send(StreamEvent::Call(ToolCall {
+                        id: "r1".into(),
+                        tool: "read".into(),
+                        arguments: serde_json::json!({"path": self.path.display().to_string()}),
+                    }))
+                    .await
+                    .ok();
+                } else if round == 1 {
+                    for (id, old, new) in
+                        [("e1", "alpha", "alpha-one"), ("e2", "bravo", "bravo-two")]
+                    {
+                        out.send(StreamEvent::Call(ToolCall {
+                            id: id.into(),
+                            tool: "edit".into(),
+                            arguments: serde_json::json!({
+                                "path": self.path.display().to_string(),
+                                "old": old,
+                                "new": new,
+                            }),
+                        }))
+                        .await
+                        .ok();
+                    }
+                } else {
+                    out.send(StreamEvent::Text("done".into())).await.ok();
+                }
+                out.send(StreamEvent::Finished {
+                    stop: ka_protocol::Stop::Done,
+                    usage: Usage::default(),
+                })
+                .await
+                .ok();
+            })
+        }
     }
 
     /// One long-running bash call; the abort arrives mid-step.
@@ -6551,40 +6969,318 @@ mod tests {
         let mut queue = std::collections::VecDeque::new();
         let mut guards = GuardRuntime::default();
         let schema = serde_json::json!({"type": "object"});
-        let handle = tokio::spawn(async move {
+        let collector = tokio::spawn(async move {
+            let mut events = Vec::new();
+            while let Some(evt) = evt_rx.recv().await {
+                let done = matches!(evt, Event::TurnFinished { .. });
+                events.push(evt);
+                if done {
+                    break;
+                }
+            }
+            events
+        });
+        voice
+            .turn(
+                "test/ns",
+                "precious user prompt".into(),
+                &mut cmd_rx,
+                &evt_tx,
+                &mut steers,
+                &mut queue,
+                &mut guards,
+                Some(schema),
+                Vec::new(),
+            )
+            .await;
+        drop(cmd_rx);
+        let events = collector.await.unwrap();
+        let saw_unsupported = events.iter().any(|evt| {
+            matches!(evt,
+            Event::Error {
+                class: ka_protocol::ErrorClass::Unsupported,
+                message,
+                ..
+            } if message.contains("structured output"))
+        });
+        assert!(saw_unsupported, "expected an Unsupported error event");
+        assert!(
+            seen.lock().is_empty(),
+            "the speaker must not be reached for unsupported schemas"
+        );
+        // the early error must not lose the user's prompt: it was
+        // persisted into history before the structured-flag check
+        assert!(
             voice
+                .history
+                .iter()
+                .any(|m| m.role == TurnRole::User && m.content.contains("precious user prompt")),
+            "user prompt must survive the early model error: {:?}",
+            voice.history
+        );
+    }
+
+    #[test]
+    fn nested_research_voice_offers_no_mutating_tools() {
+        let voice = Voice::new_readonly(
+            catalog_for("test/m"),
+            std::env::temp_dir(),
+            ka_protocol::Mode::Allow,
+            5,
+        );
+        let specs = voice.specs();
+        let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+        for mutating in ["bash", "edit", "write", "jobs"] {
+            assert!(
+                !names.contains(&mutating),
+                "readonly voice must not offer {mutating}: {names:?}"
+            );
+        }
+        for inspect in ["read", "grep"] {
+            assert!(
+                names.contains(&inspect),
+                "readonly voice must still offer {inspect}: {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lint_paths_are_shell_quoted() {
+        assert_eq!(super::sh_quote("we'ird;name"), "'we'\\''ird;name'");
+        let cmd = super::lint_command("echo {file}", "we'ird;name");
+        assert_eq!(cmd, "echo 'we'\\''ird;name'");
+        // with the quoted path removed, no command separator survives
+        let stripped = cmd.replace("'we'\\''ird;name'", "");
+        assert!(
+            !stripped.contains(';') && !stripped.contains('$') && !stripped.contains('`'),
+            "unquoted separator leaked: {stripped:?}"
+        );
+        // suffix-append branch quotes too
+        assert_eq!(
+            super::lint_command("true", "we'ird;name"),
+            "true 'we'\\''ird;name'"
+        );
+    }
+
+    /// Records (model_id, base_url) per request, then rests.
+    struct UrlSpeaker {
+        seen: std::sync::Arc<parking_lot::Mutex<Vec<(String, String)>>>,
+    }
+
+    impl Speaker for UrlSpeaker {
+        fn speak<'a>(
+            &'a self,
+            req: SpeakRequest,
+            out: mpsc::Sender<StreamEvent>,
+        ) -> SpeakFuture<'a> {
+            let seen = self.seen.clone();
+            Box::pin(async move {
+                seen.lock().push((
+                    req.model_id.clone(),
+                    req.dialect.base_url.clone().unwrap_or_default(),
+                ));
+                out.send(StreamEvent::Text("ok".into())).await.ok();
+                out.send(StreamEvent::Finished {
+                    stop: ka_protocol::Stop::Done,
+                    usage: Usage::default(),
+                })
+                .await
+                .ok();
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_model_on_known_vendor_gets_synthetic_dialect() {
+        let seen = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let mut voice = Voice::new(
+            catalog_for("test/m"),
+            std::env::temp_dir(),
+            ka_protocol::Mode::Allow,
+            5,
+        )
+        .with_speaker(
+            Wire::OpenaiChat,
+            std::sync::Arc::new(UrlSpeaker { seen: seen.clone() }),
+        );
+        let (_cmd_tx, mut cmd_rx) = mpsc::channel(16);
+        let (evt_tx, mut evt_rx) = mpsc::channel(256);
+        let mut steers = Vec::new();
+        let mut queue = std::collections::VecDeque::new();
+        let mut guards = GuardRuntime::default();
+        let collector = tokio::spawn(async move {
+            let mut events = Vec::new();
+            while let Some(evt) = evt_rx.recv().await {
+                let done = matches!(evt, Event::TurnFinished { .. });
+                events.push(evt);
+                if done {
+                    break;
+                }
+            }
+            events
+        });
+        voice
+            .turn(
+                "groq/some-fresh-model",
+                "hi".into(),
+                &mut cmd_rx,
+                &evt_tx,
+                &mut steers,
+                &mut queue,
+                &mut guards,
+                None,
+                Vec::new(),
+            )
+            .await;
+        drop(cmd_rx);
+        let events = collector.await.unwrap();
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::Error { .. })),
+            "synthetic dialect must speak instead of erroring"
+        );
+        assert_eq!(
+            seen.lock().as_slice(),
+            [(
+                "groq/some-fresh-model".to_string(),
+                "https://api.groq.com/openai/v1".to_string()
+            )],
+            "the speaker must see the synthesized groq endpoint"
+        );
+    }
+
+    /// Round 1 asks to write a file (a permission ask in Mode::Ask);
+    /// round 2 rests.
+    struct OneWrite {
+        path: std::path::PathBuf,
+    }
+
+    impl Speaker for OneWrite {
+        fn speak<'a>(
+            &'a self,
+            _req: SpeakRequest,
+            out: mpsc::Sender<StreamEvent>,
+        ) -> SpeakFuture<'a> {
+            Box::pin(async move {
+                static ROUND: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                let round = ROUND.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if round == 0 {
+                    out.send(StreamEvent::Call(ToolCall {
+                        id: "w1".into(),
+                        tool: "write".into(),
+                        arguments: serde_json::json!({
+                            "path": self.path.display().to_string(),
+                            "content": "x",
+                        }),
+                    }))
+                    .await
+                    .ok();
+                } else {
+                    out.send(StreamEvent::Text("done".into())).await.ok();
+                }
+                out.send(StreamEvent::Finished {
+                    stop: ka_protocol::Stop::Done,
+                    usage: Usage::default(),
+                })
+                .await
+                .ok();
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn steer_during_ask_lands_after_resolution() {
+        let dir = std::env::temp_dir().join(format!("ka-voice-asksteer-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("out.txt");
+        let voice = Voice::new(
+            catalog_for("test/m"),
+            dir.clone(),
+            ka_protocol::Mode::Ask,
+            5,
+        )
+        .with_speaker(
+            Wire::OpenaiChat,
+            std::sync::Arc::new(OneWrite {
+                path: target.clone(),
+            }),
+        );
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
+        let (evt_tx, mut evt_rx) = mpsc::channel(256);
+        let mut steers = Vec::new();
+        let mut queue = std::collections::VecDeque::new();
+        let mut guards = GuardRuntime::default();
+        // direct-turn tests bypass the engine bootstrap that binds the
+        // snapshot journal to a strand (engine.rs spawn path); bind it
+        // here or every mutation is refused fail-closed
+        voice.snapshot_sink().lock().set_strand("asksteer-test");
+        let voice = std::sync::Arc::new(tokio::sync::Mutex::new(voice));
+        let voice_for_turn = voice.clone();
+        let turn = tokio::spawn(async move {
+            voice_for_turn
+                .lock()
+                .await
                 .turn(
-                    "test/ns",
-                    "hi".into(),
+                    "test/m",
+                    "write it".into(),
                     &mut cmd_rx,
                     &evt_tx,
                     &mut steers,
                     &mut queue,
                     &mut guards,
-                    Some(schema),
+                    None,
                     Vec::new(),
                 )
                 .await
         });
-        let mut saw_unsupported = false;
+        let mut steered = false;
+        let mut answered = false;
         while let Some(evt) = evt_rx.recv().await {
-            if let Event::Error {
-                class: ka_protocol::ErrorClass::Unsupported,
-                message,
-                ..
-            } = evt
-            {
-                assert!(message.contains("structured output"), "{message}");
-                saw_unsupported = true;
-                break;
+            match evt {
+                Event::Ask { id, .. } if !answered => {
+                    // steer WHILE the ask is pending, then answer allow
+                    if !steered {
+                        steered = true;
+                        cmd_tx
+                            .send(Command::Steer {
+                                text: "pivot: also check the tests".into(),
+                            })
+                            .await
+                            .unwrap();
+                    }
+                    cmd_tx
+                        .send(Command::Answer {
+                            question: id,
+                            choice: 0,
+                        })
+                        .await
+                        .unwrap();
+                    answered = true;
+                }
+                Event::TurnFinished { .. } => break,
+                _ => {}
             }
         }
-        assert!(saw_unsupported, "expected an Unsupported error event");
-        let _ = handle.await.unwrap();
+        turn.await.unwrap();
+        assert!(target.exists(), "the write must have been allowed");
         assert!(
-            seen.lock().is_empty(),
-            "the speaker must not be reached for unsupported schemas"
+            steered && answered,
+            "test must have raced the steer into the ask window"
         );
+        // the steer was captured, not dropped: it lands in history at
+        // the batch boundary right after the tool results
+        assert!(
+            voice
+                .lock()
+                .await
+                .history
+                .iter()
+                .any(|m| m.role == TurnRole::User
+                    && m.content.contains("pivot: also check the tests")),
+            "steer text must land in history after the ask resolves"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Overflows on the small model, succeeds otherwise; records models.
@@ -6932,8 +7628,8 @@ mod tests {
         assert!(
             output
                 .content
-                .contains("echo LINT-FAIL >&2; exit 3 src/a.rs"),
-            "substituted command shown: {}",
+                .contains("echo LINT-FAIL >&2; exit 3 'src/a.rs'"),
+            "substituted command shown (path shell-quoted): {}",
             output.content
         );
         // passing lint: nothing appended

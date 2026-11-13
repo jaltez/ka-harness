@@ -191,7 +191,9 @@ async fn speak_anthropic(
         match m.role {
             crate::speaker::TurnRole::User if !m.images.is_empty() => {
                 let mut blocks = image_blocks(&m.images);
-                blocks.push(json!({"type": "text", "text": m.content}));
+                if !m.content.is_empty() {
+                    blocks.push(json!({"type": "text", "text": m.content}));
+                }
                 push_user(&mut messages, Value::Array(blocks));
             }
             crate::speaker::TurnRole::User => {
@@ -230,7 +232,9 @@ async fn speak_anthropic(
                         } else {
                             // native: tool_result content takes image blocks
                             let mut parts = image_blocks(&r.images);
-                            parts.push(json!({"type": "text", "text": r.content}));
+                            if !r.content.is_empty() {
+                                parts.push(json!({"type": "text", "text": r.content}));
+                            }
                             json!({
                                 "type": "tool_result",
                                 "tool_use_id": r.call_id,
@@ -271,16 +275,31 @@ async fn speak_anthropic(
     let mut saw_terminal = false;
     let mut blocks: Vec<Block> = Vec::new();
 
+    let mut first_chunk = true;
     loop {
-        let item =
-            match tokio::time::timeout(std::time::Duration::from_secs(300), stream.next()).await {
-                Ok(item) => item,
-                Err(_) => {
-                    return Err(WireError::network(
-                        "idle timeout: 300s without a stream chunk",
-                    ));
-                }
-            };
+        // The HTTP layer's first-byte timeout resolves at headers; the
+        // wire must separately bound time-to-first-STREAM-chunk so a
+        // stalled prefill behind 200 OK still fails fast and retryably.
+        let deadline = if first_chunk && dialect.first_byte_timeout_ms > 0 {
+            tokio::time::Duration::from_millis(dialect.first_byte_timeout_ms)
+        } else {
+            std::time::Duration::from_secs(300)
+        };
+        let item = match tokio::time::timeout(deadline, stream.next()).await {
+            Ok(item) => item,
+            Err(_) if first_chunk && dialect.first_byte_timeout_ms > 0 => {
+                return Err(WireError::network(format!(
+                    "no first byte within {}ms (headers arrived, stream stalled)",
+                    dialect.first_byte_timeout_ms
+                )));
+            }
+            Err(_) => {
+                return Err(WireError::network(
+                    "idle timeout: 300s without a stream chunk",
+                ));
+            }
+        };
+        first_chunk = false;
         let Some(chunk) = item else {
             break;
         };
@@ -309,6 +328,11 @@ async fn speak_anthropic(
                         .pointer("/content_block/type")
                         .and_then(Value::as_str)
                         .unwrap_or("");
+                    // wire-controlled index: a garbage/hostile frame must
+                    // not drive an unbounded pad allocation
+                    if index > 1024 {
+                        continue;
+                    }
                     while blocks.len() <= index {
                         blocks.push(Block::default());
                     }
@@ -325,6 +349,12 @@ async fn speak_anthropic(
                             .unwrap_or("")
                             .to_string(),
                         args: String::new(),
+                        // some proxies ship the full tool input on the
+                        // start event with no input_json_delta to follow
+                        input: v
+                            .pointer("/content_block/input")
+                            .filter(|i| i.as_object().is_some_and(|o| !o.is_empty()))
+                            .map(|i| i.to_string()),
                     };
                     // web_search_tool_result arrives complete in the
                     // start event: surface the sources as text the
@@ -381,16 +411,23 @@ async fn speak_anthropic(
                     let index = v.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
                     if index < blocks.len() {
                         let b = &blocks[index];
+                        // no deltas accumulated → the start event's full
+                        // input object (if any) is the argument set
+                        let args = if b.args.trim().is_empty() {
+                            b.input.as_deref().unwrap_or("")
+                        } else {
+                            b.args.as_str()
+                        };
                         if b.kind == "tool_use" && !b.tool.is_empty() {
                             // a structured-output request surfaces the forced
                             // tool's arguments as the reply text
                             if b.tool == "structured_output" {
-                                out.send(StreamEvent::Text(b.args.clone())).await.ok();
+                                out.send(StreamEvent::Text(args.to_string())).await.ok();
                             } else {
                                 out.send(StreamEvent::Call(ToolCall {
                                     id: b.id.clone(),
                                     tool: b.tool.clone(),
-                                    arguments: repair_json(&b.args),
+                                    arguments: repair_json(args),
                                 }))
                                 .await
                                 .ok();
@@ -398,8 +435,11 @@ async fn speak_anthropic(
                         }
                         // provider-executed search: the harness never
                         // runs it — surface the query the model asked
+                        // (same input-at-start fallback as tool_use:
+                        // some proxies ship the full input object on
+                        // content_block_start with no delta frames)
                         if b.kind == "server_tool_use" {
-                            let query = repair_json(&b.args)
+                            let query = repair_json(args)
                                 .get("query")
                                 .and_then(Value::as_str)
                                 .unwrap_or_default()
@@ -438,10 +478,20 @@ async fn speak_anthropic(
                         .and_then(Value::as_str)
                         .unwrap_or("provider stream error")
                         .to_string();
-                    return Err(WireError {
-                        class: ka_protocol::ErrorClass::Protocol,
-                        retryable: false,
-                        message,
+                    // Anthropic streams transient overloads as mid-stream
+                    // error events: map them retryable so the engine's
+                    // backoff re-drives the request instead of failing the
+                    // turn on a 529-class blip
+                    let etype = v.pointer("/error/type").and_then(Value::as_str);
+                    return Err(match etype {
+                        Some(
+                            "overloaded_error" | "api_error" | "rate_limit_error" | "timeout_error",
+                        ) => WireError::network(message),
+                        _ => WireError {
+                            class: ka_protocol::ErrorClass::Protocol,
+                            retryable: false,
+                            message,
+                        },
                     });
                 }
                 _ => {} // ping etc.
@@ -507,6 +557,9 @@ struct Block {
     id: String,
     tool: String,
     args: String,
+    /// Full `input` object from content_block_start, when a proxy ships
+    /// it complete instead of via input_json_delta frames.
+    input: Option<String>,
 }
 
 /// Render a `web_search_tool_result` block's content array as source

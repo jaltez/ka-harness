@@ -101,12 +101,13 @@ pub async fn post_sse(
     first_byte_timeout_ms: u64,
     attempts: u32,
 ) -> Result<reqwest::Response, WireError> {
+    let header_map = clone_headers(headers)?;
     let mut attempt = 0;
     loop {
         attempt += 1;
         let request = client
             .post(url)
-            .headers(clone_headers(headers))
+            .headers(header_map.clone())
             .body(body.clone());
         let sent = if first_byte_timeout_ms == 0 {
             match request.send().await {
@@ -158,17 +159,49 @@ pub async fn post_sse(
     }
 }
 
-fn clone_headers(headers: &[(String, String)]) -> reqwest::header::HeaderMap {
+fn clone_headers(headers: &[(String, String)]) -> Result<reqwest::header::HeaderMap, WireError> {
     let mut map = reqwest::header::HeaderMap::new();
     for (k, v) in headers {
-        if let (Ok(name), Ok(value)) = (
-            reqwest::header::HeaderName::try_from(k.as_str()),
-            reqwest::header::HeaderValue::try_from(v.as_str()),
-        ) {
-            map.insert(name, value);
-        }
+        let name = match reqwest::header::HeaderName::try_from(k.as_str()) {
+            Ok(n) => n,
+            Err(_) => return Err(unencodable_header(k, v, false)),
+        };
+        let value = match reqwest::header::HeaderValue::try_from(v.as_str()) {
+            Ok(val) => val,
+            Err(_) => return Err(unencodable_header(k, v, true)),
+        };
+        map.insert(name, value);
     }
-    map
+    Ok(map)
+}
+
+/// A header name or value containing characters HTTP headers cannot
+/// carry (control bytes, DEL). Multibyte UTF-8 is legal obs-text and
+/// still sends. Never silently dropped: an omitted auth header would
+/// surface as an undiagnosable 401.
+fn unencodable_header(name: &str, value: &str, value_is_culprit: bool) -> WireError {
+    // control bytes must not ride the diagnostic (a BEL beeps, a
+    // newline breaks the message across lines) — show U+FFFD instead
+    let sanitize = |s: &str| {
+        s.chars()
+            .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
+            .take(16)
+            .collect::<String>()
+    };
+    let (kind, shown) = if value_is_culprit {
+        ("value", sanitize(value))
+    } else {
+        ("name", sanitize(name))
+    };
+    WireError {
+        class: ErrorClass::Protocol,
+        retryable: false,
+        message: format!(
+            "header `{name}` cannot be sent: the {kind} `{shown}` contains control \
+             characters not representable in an HTTP header (check the token for \
+             stray newlines or non-printable characters)"
+        ),
+    }
 }
 
 fn retry_delay(attempt: u32, retry_after: Option<u64>) -> Duration {
@@ -278,5 +311,40 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.class, ErrorClass::Auth);
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_token_header_is_protocol_error() {
+        // a control character in a token must hard-error naming the
+        // header, never silently drop the auth header (undiagnosable
+        // 401); multibyte UTF-8 is legal obs-text and still sends
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = reqwest::Client::new();
+        let err = post_sse(
+            &client,
+            &format!("http://{addr}/x"),
+            &[("x-api-key".to_string(), "bad\u{7}key".to_string())],
+            "{}".to_string(),
+            5_000,
+            3,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.class,
+            ErrorClass::Protocol,
+            "unexpected class; message: {}",
+            err.message
+        );
+        assert!(!err.retryable);
+        assert!(err.message.contains("x-api-key"), "got: {}", err.message);
+        // no request was sent: nothing arrives on the listener
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err(),
+            "no request must reach the server"
+        );
     }
 }

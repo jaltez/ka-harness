@@ -2,7 +2,7 @@
 //! Image files (png/jpg/webp/gif, detected by magic bytes) come back as
 //! a placeholder plus an `ImagePart` for vision models.
 use std::future::Future;
-use std::io::Read;
+use std::io::{BufRead, Read};
 use std::path::PathBuf;
 use std::pin::Pin;
 
@@ -124,18 +124,41 @@ fn read_blocking(
         };
     }
 
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
+    // stream the file line by line: never materialize the whole text,
+    // keep only the requested window (lossy per line — one bad byte
+    // must not fail the whole read)
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
         Err(e) => return ToolOutput::err(format!("read {}: {e}", path.display())),
     };
-
-    let lines: Vec<&str> = text.lines().collect();
-    let total = lines.len();
-    let start = (offset - 1).min(total);
-    let end = (start + limit).min(total);
+    let mut reader = std::io::BufReader::new(file);
+    let start = offset.saturating_sub(1);
+    let mut total = 0usize;
+    let mut window: Vec<String> = Vec::new();
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(e) => return ToolOutput::err(format!("read {}: {e}", path.display())),
+        }
+        if total >= start && window.len() < limit {
+            let mut line = String::from_utf8_lossy(&buf).into_owned();
+            if line.ends_with('\n') {
+                line.pop();
+                if line.ends_with('\r') {
+                    line.pop();
+                }
+            }
+            window.push(line);
+        }
+        total += 1;
+    }
+    let end = start + window.len();
     let mut out = String::new();
     let mut bytes = 0usize;
-    for (i, line) in lines[start..end].iter().enumerate() {
+    for (i, line) in window.iter().enumerate() {
         let numbered = format!("{}\t{}\n", start + i + 1, line);
         bytes += numbered.len();
         if bytes > MAX_BYTES {
@@ -285,6 +308,64 @@ mod tests {
         assert!(
             ctx.ledger.lock().verify(&dir.join("f.txt")).is_ok(),
             "read must mint ledger"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn read_huge_file_returns_window() {
+        let dir = std::env::temp_dir().join(format!("ka-read-huge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("huge.txt");
+        // ~200k lines written incrementally — the reader must never
+        // materialize the whole file, only the requested window
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&path).unwrap();
+            for i in 1..=200_000u32 {
+                writeln!(f, "line-{i}").unwrap();
+            }
+        }
+        let ctx = ctx_for(&dir);
+        let out = ReadHand
+            .execute(
+                &json!({"path": "huge.txt", "offset": 199_995, "limit": 3}),
+                &ctx,
+            )
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(
+            out.content,
+            "199995\tline-199995\n199996\tline-199996\n199997\tline-199997\n\
+             [...3 of 200000 lines shown; lines 199998-200000 remain]\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn invalid_utf8_lines_decode_lossily() {
+        // deliberate behavior change vs the old read_to_string (which
+        // hard-failed the whole read): one bad byte must not lose the
+        // good lines around it — lines decode per-line with U+FFFD
+        let dir = std::env::temp_dir().join(format!("ka-read-utf8-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mixed.bin");
+        std::fs::write(&path, b"ok line\n\xff\xfe bad bytes\nend line\n").unwrap();
+        let ctx = ctx_for(&dir);
+        let out = ReadHand.execute(&json!({"path": "mixed.bin"}), &ctx).await;
+        assert!(
+            !out.is_error,
+            "lossy decode must not error: {}",
+            out.content
+        );
+        assert!(out.content.contains("ok line"), "{}", out.content);
+        assert!(out.content.contains("end line"), "{}", out.content);
+        assert!(
+            out.content.contains('\u{FFFD}'),
+            "replacement char marks the bad line: {}",
+            out.content
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

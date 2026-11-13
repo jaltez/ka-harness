@@ -18,7 +18,6 @@ input_per_mtok = 3.0
 output_per_mtok = 15.0
 [dialects."anthropic/claude-sonnet-5".flags]
 reasoning_field = "thinking"
-developer_role = true
 [dialects."anthropic/claude-sonnet-5".effort_budgets]
 low = 2048
 medium = 8192
@@ -41,8 +40,6 @@ input_per_mtok = 1.25
 output_per_mtok = 10.0
 [dialects."openai/gpt-5.1".flags]
 reasoning_field = "reasoning"
-developer_role = true
-requires_tool_result_name = true
 max_tokens_field = "max_completion_tokens"
 
 [dialects."ollama/qwen3-32b"]
@@ -56,7 +53,6 @@ ratio = 3.2
 first_byte_timeout_ms = 0
 [dialects."ollama/qwen3-32b".flags]
 replay_reasoning = true
-tool_choice = "pin_or_auto"
 
 [dialects."openai/o4-mini"]
 wire = "openai_responses"

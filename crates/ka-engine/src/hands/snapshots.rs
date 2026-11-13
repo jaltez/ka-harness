@@ -24,6 +24,12 @@ pub struct SnapEntry {
     pub existed: bool,
     /// RFC 3339-ish timestamp.
     pub ts: String,
+    /// Stored blob file name: the pid suffix makes blob names unique
+    /// across sessions sharing the store, and undo must read the
+    /// snapshotting session's blob, not one named after its own pid.
+    /// Empty on pre-existing journals (legacy `{seq}.blob` spelling).
+    #[serde(default)]
+    pub blob: String,
 }
 
 /// The snapshot store. Shared by the engine (strand tracking, undo) and
@@ -98,15 +104,21 @@ impl Snapshots {
         }
         self.seq += 1;
         let existed = path.is_file();
+        // pid-suffixed blob names: a second session whose seq starts
+        // from the same manifest max must not overwrite this session's
+        // blobs (the journal stays the truth); the name rides the
+        // journal entry so a later session's undo finds THIS blob
+        let blob_name = format!("{}-{}.blob", self.seq, std::process::id());
         let entry = SnapEntry {
             seq: self.seq,
             strand: self.strand.clone(),
             path: path.to_path_buf(),
             existed,
             ts: now_stamp(),
+            blob: blob_name.clone(),
         };
         if existed {
-            let blob = root.join(format!("{}.blob", entry.seq));
+            let blob = root.join(&blob_name);
             std::fs::create_dir_all(root)?;
             std::fs::copy(path, &blob)?;
         }
@@ -133,6 +145,7 @@ impl Snapshots {
             path: path.to_path_buf(),
             existed: false,
             ts: now_stamp(),
+            blob: String::new(),
         };
         self.manifest.push(entry.clone());
         self.append_journal(root.as_path(), &entry)?;
@@ -150,7 +163,15 @@ impl Snapshots {
         };
         let entry = self.manifest.remove(idx);
         if entry.existed {
-            let blob = root.join(format!("{}.blob", entry.seq));
+            // the blob name recorded at snapshot time — an undo from a
+            // later session must read the snapshotting session's blob,
+            // not one named after its own pid; legacy journals (no
+            // recorded name) keep the pre-pid `{seq}.blob` spelling
+            let blob = if entry.blob.is_empty() {
+                root.join(format!("{}.blob", entry.seq))
+            } else {
+                root.join(&entry.blob)
+            };
             let bytes = std::fs::read(&blob)?;
             if let Some(dir) = entry.path.parent() {
                 std::fs::create_dir_all(dir)?;
@@ -159,7 +180,7 @@ impl Snapshots {
         } else if entry.path.exists() {
             std::fs::remove_file(&entry.path)?;
         }
-        self.rewrite_journal(root)?;
+        self.rewrite_journal(root, &entry)?;
         Ok(Some(entry))
     }
 
@@ -181,10 +202,24 @@ impl Snapshots {
         file.write_all(line.as_bytes())
     }
 
-    fn rewrite_journal(&self, root: &Path) -> io::Result<()> {
+    /// Rewrite the journal from the ON-DISK manifest minus the undone
+    /// entry: sibling sessions may have appended lines this process's
+    /// in-memory copy never saw, and they must survive an undo.
+    fn rewrite_journal(&self, root: &Path, undone: &SnapEntry) -> io::Result<()> {
+        let disk: Vec<SnapEntry> = std::fs::read_to_string(root.join("manifest.jsonl"))
+            .ok()
+            .map(|text| {
+                text.lines()
+                    .filter_map(|l| serde_json::from_str(l).ok())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let mut text = String::new();
-        for entry in &self.manifest {
-            if let Ok(line) = serde_json::to_string(entry) {
+        for entry in disk {
+            if &entry == undone {
+                continue;
+            }
+            if let Ok(line) = serde_json::to_string(&entry) {
                 text.push_str(&line);
                 text.push('\n');
             }
@@ -310,5 +345,54 @@ mod tests {
         std::fs::write(&f, "x").unwrap();
         assert!(snaps.snapshot(&f).is_err(), "no strand = refuse mutation");
         let _ = std::fs::remove_file(&f);
+    }
+
+    #[test]
+    fn undo_keeps_sibling_session_entries() {
+        let (mut snaps, dir) = store("sibling");
+        snaps.set_strand("mine");
+        let f = dir.join("mine.txt");
+        std::fs::write(&f, "v1").unwrap();
+        snaps.snapshot(&f).unwrap();
+        std::fs::write(&f, "v2").unwrap();
+
+        // a sibling session (same repo root) appends its own journal
+        // line and blob behind our back
+        let repo_root = dir.join("repo");
+        let snap_root = ka_strand::data_dir()
+            .join("snapshots")
+            .join(encode(&repo_root));
+        let sibling = SnapEntry {
+            seq: 1,
+            strand: "theirs".into(),
+            path: dir.join("theirs.txt"),
+            existed: true,
+            ts: "1".into(),
+            blob: "1-999999.blob".into(),
+        };
+        {
+            use std::io::Write;
+            let mut m = std::fs::OpenOptions::new()
+                .append(true)
+                .open(snap_root.join("manifest.jsonl"))
+                .unwrap();
+            writeln!(m, "{}", serde_json::to_string(&sibling).unwrap()).unwrap();
+        }
+        std::fs::write(snap_root.join("1-999999.blob"), "sibling bytes").unwrap();
+
+        let undone = snaps.undo().unwrap().unwrap();
+        assert_eq!(undone.strand, "mine");
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "v1");
+
+        // the sibling's journal line survives, and its blob is untouched
+        let manifest = std::fs::read_to_string(snap_root.join("manifest.jsonl")).unwrap();
+        assert!(
+            manifest.lines().any(|l| l.contains("\"theirs\"")),
+            "sibling entry must survive undo: {manifest}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(snap_root.join("1-999999.blob")).unwrap(),
+            "sibling bytes"
+        );
     }
 }

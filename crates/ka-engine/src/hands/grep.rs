@@ -18,6 +18,8 @@ pub const TOTAL_CAP: usize = 200;
 pub const LINE_CAP: usize = 512;
 /// Maximum files scanned.
 pub const FILE_CAP: usize = 2_000;
+/// Files larger than this are skipped with a note (whole-file reads).
+pub const MAX_SCAN_BYTES: u64 = 8 * 1024 * 1024;
 /// Below this many candidate files the walk scans sequentially — thread
 /// handoff costs more than it saves.
 const PARALLEL_THRESHOLD: usize = 16;
@@ -224,8 +226,23 @@ impl FileHits {
     }
 }
 
-/// Scan one file (binary or unreadable → no hits).
+/// Scan one file (binary, unreadable, or over MAX_SCAN_BYTES → note or
+/// no hits).
 fn scan_one(path: &std::path::Path, root: &std::path::Path, re: &regex::Regex) -> FileHits {
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.len() > MAX_SCAN_BYTES {
+            let rel = path.strip_prefix(root).unwrap_or(path);
+            return FileHits {
+                lines: vec![format!(
+                    "{}:[...file is {} bytes, over the {}-byte scan cap; skipped]\n",
+                    rel.display(),
+                    meta.len(),
+                    MAX_SCAN_BYTES
+                )],
+                capped: false,
+            };
+        }
+    }
     let Ok(text) = std::fs::read_to_string(path) else {
         return FileHits::none(); // binary or unreadable: skip silently
     };
@@ -354,6 +371,34 @@ mod tests {
             .execute(&json!({"pattern": "fn", "glob": "*.txt"}), &ctx)
             .await;
         assert_eq!(out.content.trim(), "no matches");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn grep_skips_oversized_files() {
+        let dir = std::env::temp_dir().join(format!("ka-grep-big-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // just over MAX_SCAN_BYTES
+        let big = dir.join("big.log");
+        let line = "needle in a very long haystack line\n";
+        let reps = (MAX_SCAN_BYTES as usize) / line.len() + 2;
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&big).unwrap();
+            for _ in 0..reps {
+                f.write_all(line.as_bytes()).unwrap();
+            }
+        }
+        assert!(std::fs::metadata(&big).unwrap().len() > MAX_SCAN_BYTES);
+        let ctx = ctx_for(&dir);
+        let out = GrepHand.execute(&json!({"pattern": "needle"}), &ctx).await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(
+            out.content.contains("over the") && out.content.contains("scan cap; skipped"),
+            "oversize note missing: {}",
+            out.content
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

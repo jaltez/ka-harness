@@ -1034,6 +1034,22 @@ impl Transcript {
         dropped
     }
 
+    /// Truncate at an entry index: everything from `idx` on is
+    /// dropped, with the same stale-override cleanup as
+    /// [`Transcript::rewind_user`]. Used when the cut is anchored to a
+    /// specific prompt's row rather than an nth-from-end count.
+    pub fn rewind_at(&mut self, idx: usize) {
+        if idx >= self.lines.len() {
+            return;
+        }
+        self.lines.truncate(idx);
+        self.rendered.truncate(idx);
+        // stale index-based overrides would attach to whatever entry
+        // lands on the recycled indices after the rewind
+        self.thought_overrides.retain(|&i| i < idx);
+        self.streamed_open.retain(|&i| i < idx);
+    }
+
     /// The source entries, in order.
     pub fn entries(&self) -> &[Line] {
         &self.lines
@@ -2134,14 +2150,18 @@ fn live_region_rows(
     ));
     if !lb.md.is_empty() {
         air(&mut rows);
-        // the markdown cache stays cursor-free: clone, trim room for the
-        // cursor, then append it
-        let mut md = lb.md.clone();
-        if let Some(last) = md.last_mut() {
-            live_cursor(last, w.saturating_sub(ASSISTANT_INDENT));
+        // the markdown cache stays cursor-free: clone the rows (the
+        // Arc is shared, the rows are not), trim room for the cursor
+        // on the last one, then indent
+        let last = lb.md.len() - 1;
+        for (i, row) in lb.md.iter().enumerate() {
+            let mut r = row.clone();
+            if i == last {
+                live_cursor(&mut r, w.saturating_sub(ASSISTANT_INDENT));
+            }
+            indent_assistant(std::slice::from_mut(&mut r));
+            rows.push(r);
         }
-        indent_assistant(&mut md);
-        rows.extend(md);
     }
     // transient tail: the working indicator between air rows, so it
     // never crowds the live blocks or the composer
@@ -2154,6 +2174,84 @@ fn live_region_rows(
 fn live_stale(cached_at: Instant, now: Instant) -> bool {
     now.duration_since(cached_at).as_millis() >= 80
 }
+
+/// Tick-side cache for the streaming markdown: the full text and width
+/// it was rendered for, the rendered rows (Arc-shared with the frame's
+/// [`LiveBlock`]), and the settled prefix — everything up to the last
+/// paragraph boundary, whose rows cannot change again and are reused
+/// verbatim across reparses so per-tick cost is the trailing paragraph
+/// only.
+struct LiveMdCache {
+    text: String,
+    width: u16,
+    rows: std::sync::Arc<Vec<ratatui::text::Line<'static>>>,
+    prefix_text: String,
+    prefix_rows: std::sync::Arc<Vec<ratatui::text::Line<'static>>>,
+    at: Instant,
+}
+
+/// Split streamed markdown at its last settled boundary: the end of the
+/// final blank-line run outside every code fence. Blocks render
+/// line-independently and a blank line separates them, so nothing after
+/// the boundary can change the rows before it — the prefix's rendered
+/// rows are cacheable, and `render(prefix) ++ render(tail)` equals
+/// `render(whole)` because the prefix keeps its trailing blank rows.
+fn settled_prefix_split(text: &str) -> (&str, &str) {
+    let mut boundary = 0usize;
+    let mut in_fence = false;
+    let mut off = 0usize;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            in_fence = !in_fence;
+        } else if !in_fence && trimmed.trim_end().is_empty() {
+            boundary = off + line.len();
+        }
+        off += line.len();
+    }
+    (&text[..boundary], &text[boundary..])
+}
+
+/// Render used by the live-markdown cache: a thin seam over
+/// [`crate::markdown::render`] the tests can count.
+fn md_render(text: &str, width: u16) -> Vec<ratatui::text::Line<'static>> {
+    #[cfg(test)]
+    {
+        use std::sync::atomic::Ordering;
+        MD_RENDERS.fetch_add(1, Ordering::SeqCst);
+        if let Ok(mut inputs) = MD_RENDER_INPUTS.lock() {
+            inputs.push(text.to_string());
+        }
+    }
+    crate::markdown::render(text, width)
+}
+
+/// (Re)render the live markdown with settled-prefix caching: when the
+/// new text's settled prefix matches the cached one (same width), the
+/// prefix rows are reused and only the trailing paragraph renders.
+fn render_live_md(cached: Option<&LiveMdCache>, text: &str, width: u16) -> LiveMdCache {
+    let (prefix_text, tail) = settled_prefix_split(text);
+    let prefix_rows = cached
+        .filter(|c| c.width == width && c.prefix_text == prefix_text)
+        .map(|c| c.prefix_rows.clone())
+        .unwrap_or_else(|| std::sync::Arc::new(md_render(prefix_text, width)));
+    let tail_rows = md_render(tail, width);
+    let mut rows: Vec<ratatui::text::Line<'static>> = (*prefix_rows).clone();
+    rows.extend(tail_rows);
+    LiveMdCache {
+        text: text.to_string(),
+        width,
+        rows: std::sync::Arc::new(rows),
+        prefix_text: prefix_text.to_string(),
+        prefix_rows,
+        at: Instant::now(),
+    }
+}
+
+#[cfg(test)]
+static MD_RENDERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static MD_RENDER_INPUTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
 /// Append the streaming cursor `▌` to a live markdown row that must fit
 /// `width` columns: code panels and rules pad to the full fold width, so
@@ -2245,6 +2343,25 @@ fn b64encode(data: impl AsRef<[u8]>) -> String {
         });
     }
     out
+}
+
+/// OSC 52 payloads are capped at 64 KiB of raw text (computed before
+/// encoding): terminals treat megabyte payloads as abuse, and a huge
+/// selection base64'd inline on the UI thread freezes a slow pty.
+const OSC52_MAX_RAW: usize = 64 * 1024;
+
+/// Copy `text` to the clipboard via OSC 52, dropping any write past
+/// [`OSC52_MAX_RAW`]. Returns false (nothing written) when over the
+/// cap, so callers degrade to a toast instead of freezing the pty.
+fn osc52_copy<W: std::io::Write>(out: &mut W, text: &str) -> bool {
+    if text.len() > OSC52_MAX_RAW {
+        return false;
+    }
+    let _ = out.write_all(b"\x1b]52;c;");
+    let _ = out.write_all(b64encode(text).as_bytes());
+    let _ = out.write_all(b"\x07");
+    let _ = out.flush();
+    true
 }
 
 /// Scroll one page up from the current anchor (pinned counts from the
@@ -2515,6 +2632,157 @@ fn detect_branch() -> Option<String> {
         .ok()?;
     let branch = String::from_utf8_lossy(&out.stdout).trim().to_string();
     (out.status.success() && !branch.is_empty()).then_some(branch)
+}
+
+/// What a pressed Esc does, in the key loop's precedence order: popups
+/// and the search own Esc first (their own arms above); then a pinned
+/// scroll unpins — even mid-turn, so the scroll pill's promised 'esc'
+/// never costs a running turn the abort; then a busy turn aborts; a
+/// double-press on an empty idle input opens the rewind menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EscAction {
+    /// Release the pinned viewport back to the tail.
+    UnpinScroll,
+    /// Abort the running turn.
+    Abort,
+    /// Second Esc within the window: open the rewind menu.
+    RewindMenu,
+    /// First Esc of a potential double: start the window.
+    ArmRewind,
+    /// Nothing owns this Esc.
+    None,
+}
+
+fn esc_action(
+    scrolled: bool,
+    busy: bool,
+    input_empty: bool,
+    ask_open: bool,
+    last_esc: Option<Instant>,
+    now: Instant,
+) -> EscAction {
+    if scrolled {
+        EscAction::UnpinScroll
+    } else if busy {
+        EscAction::Abort
+    } else if ask_open || !input_empty {
+        EscAction::None
+    } else {
+        let doubled = last_esc.is_some_and(|t| now.duration_since(t) < Duration::from_millis(600));
+        if doubled {
+            EscAction::RewindMenu
+        } else {
+            EscAction::ArmRewind
+        }
+    }
+}
+
+/// Rewind menu rows, built from the CURRENT STRAND's records: the
+/// engine's Rewind cuts the Nth-last user RECORD, so the menu must
+/// count the same list (transcript `Line::User` rows drift — steers
+/// never persist, /plan-style followups persist without an echo,
+/// rewinds keep stale records). Newest first, `turns` counted from the
+/// newest input.
+fn rewind_items(session: Option<&str>) -> Vec<(usize, String)> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let sessions = ka_strand::list(&cwd).unwrap_or_default();
+    rewind_items_from(session, &sessions)
+}
+
+fn rewind_items_from(
+    session: Option<&str>,
+    sessions: &[ka_strand::StrandSummary],
+) -> Vec<(usize, String)> {
+    session
+        .map(|id| {
+            sessions
+                .iter()
+                .find(|s| s.id == id)
+                .and_then(|s| ka_strand::read(&s.path).ok())
+        })
+        .unwrap_or_default()
+        .map(|records| {
+            // The menu numbers LIVE engine history, but raw strand
+            // records are append-only: fold the replay markers exactly
+            // like `history_from_records` (engine.rs) before collecting
+            // user prompts — else an already-rewound prompt shows up as
+            // a numbered target and picking it cuts the wrong turn.
+            let mut msgs: Vec<(String, Option<String>)> = Vec::new();
+            for r in records.iter() {
+                match r {
+                    ka_strand::Record::Message {
+                        id,
+                        role: ka_strand::Role::User,
+                        content,
+                        ..
+                    } => msgs.push((id.0.clone(), Some(content.clone()))),
+                    ka_strand::Record::Message { id, .. } => {
+                        msgs.push((id.0.clone(), None));
+                    }
+                    ka_strand::Record::Digest { .. } => {
+                        // everything before the digest is carried by
+                        // its summary: replay drops it from history
+                        msgs.clear();
+                    }
+                    ka_strand::Record::Boundary { .. } => msgs.clear(),
+                    ka_strand::Record::Rewind { kept_from, .. } => {
+                        if let Some(pos) = msgs.iter().position(|(i, _)| i == &kept_from.0) {
+                            msgs.truncate(pos + 1);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            msgs.into_iter()
+                .filter_map(|(_, c)| c)
+                .filter(|t| !t.trim_start().starts_with('/'))
+                .rev()
+                .take(20)
+                .enumerate()
+                .map(|(i, t)| (i + 1, t))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The Esc arm of the key loop, extracted so its precedence is testable
+/// against the command channel: unpin first, abort only unscrolled,
+/// rewind on the double-press. `rewind` is computed lazily — only the
+/// rewind arm reads the strand.
+#[allow(clippy::too_many_arguments)]
+async fn handle_esc(
+    commands: &mut mpsc::Sender<Command>,
+    scroll: &mut Option<usize>,
+    busy: bool,
+    input_empty: bool,
+    ask_open: bool,
+    last_esc: &mut Option<Instant>,
+    modal: &mut Option<Modal>,
+    rewind: impl FnOnce() -> Vec<(usize, String)>,
+    now: Instant,
+) {
+    match esc_action(
+        scroll.is_some(),
+        busy,
+        input_empty,
+        ask_open,
+        *last_esc,
+        now,
+    ) {
+        EscAction::UnpinScroll => *scroll = None,
+        EscAction::Abort => {
+            let _ = commands.send(Command::Abort).await;
+        }
+        EscAction::RewindMenu => {
+            *last_esc = None;
+            let items = rewind();
+            if !items.is_empty() {
+                *modal = Some(Modal::Rewind { items, selected: 0 });
+            }
+        }
+        EscAction::ArmRewind => *last_esc = Some(now),
+        EscAction::None => {}
+    }
 }
 /// Popup rows for the todos strip button: done items struck through,
 /// the first pending item accented as "next".
@@ -3137,26 +3405,41 @@ impl SessionPicker {
         rows
     }
 
-    /// The session id the selected row switches to (None = new session).
-    pub fn pick(&self) -> Option<String> {
-        let rows = self.rows();
-        if self.selected == 0 {
-            return None;
-        }
-        let visible: Vec<&ka_strand::StrandSummary> = self
-            .sessions
+    /// Sessions surviving the current filter, oldest-listed first.
+    fn visible_sessions(&self) -> Vec<&ka_strand::StrandSummary> {
+        let f = self.filter.to_lowercase();
+        self.sessions
             .iter()
             .filter(|s| {
-                let f = self.filter.to_lowercase();
                 f.is_empty()
                     || s.title.to_lowercase().contains(&f)
                     || s.id.to_lowercase().contains(&f)
             })
-            .collect();
+            .collect()
+    }
+
+    /// The session id the selected row switches to (None = new session).
+    pub fn pick(&self) -> Option<String> {
+        if self.selected == 0 {
+            return None;
+        }
         // selected counts only session rows after row 0
-        let idx = self.selected.saturating_sub(1);
-        let _ = rows;
-        visible.get(idx).map(|s| s.id.clone())
+        self.visible_sessions()
+            .get(self.selected - 1)
+            .map(|s| s.id.clone())
+    }
+
+    /// Typing into the session filter (key or bracketed paste) extends
+    /// it AND resets the selection onto the FIRST VISIBLE SESSION row:
+    /// the previously selected row may no longer exist once the list
+    /// narrows, and a stale out-of-range selection makes `pick` return
+    /// None — Enter would silently start a NEW session instead of the
+    /// first match. (Row 0 is the new-session row, so an empty result
+    /// stays there.)
+    pub fn filter_typed(&mut self, text: &str) {
+        self.filter
+            .extend(text.chars().filter(|c| !c.is_whitespace()));
+        self.selected = usize::from(!self.visible_sessions().is_empty());
     }
 }
 
@@ -4007,7 +4290,7 @@ async fn app(
     let mut last_esc: Option<Instant> = None;
     let mut last_user: Option<String> = None;
     let mut last_error: Option<String> = None;
-    let mut live_cache: Option<(String, u16, Vec<ratatui::text::Line<'static>>, Instant)> = None;
+    let mut live_cache: Option<LiveMdCache> = None;
     let mut turn_ended = false;
     let mut pending: Option<PendingAsk> = None;
     // user-queued prompts (`+` or alt+q while busy), held locally and auto-sent
@@ -4031,9 +4314,16 @@ async fn app(
     let mut pending_image: Option<ka_protocol::ImagePart> = None;
     let mut sidebar = SidebarState {
         cwd: shorten_cwd(&std::env::current_dir().unwrap_or_default()),
-        branch: detect_branch(),
+        // branch detection is a git subprocess — run it off the first
+        // frame's path (same detachment as the update check) and fill
+        // the sidebar when it lands; the placeholder renders until then
+        branch: None,
         ..Default::default()
     };
+    let (branch_tx, mut branch_rx) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = branch_tx.send(detect_branch());
+    });
     let mut exit = None;
     let mut slash_popup: Option<SlashPopup> = None;
     let mut path_popup: Option<PathPopup> = None;
@@ -4070,6 +4360,9 @@ async fn app(
     // stays armed until the update checker closes its channel (recv()
     // on a closed channel is ready forever — a no-op arm would spin)
     let mut updates_open = true;
+    // the detached branch probe fills the sidebar once, then the arm
+    // disarms (a finished oneshot polls ready forever)
+    let mut branch_open = true;
     // 80 ms: the spinner's frame step, fast enough for a smooth comet
     let mut spin = tokio::time::interval(Duration::from_millis(80));
     // last mouse mode actually applied to the terminal — the loop owns
@@ -4167,24 +4460,25 @@ async fn app(
                 let now = Instant::now();
                 let stale = live_cache
                     .as_ref()
-                    .map(|(_, _, _, at)| live_stale(*at, now))
+                    .map(|c| live_stale(c.at, now))
                     .unwrap_or(true);
                 let changed = live_cache
                     .as_ref()
-                    .is_none_or(|(t, w, _, _)| t != &current_assistant || *w != md_width);
+                    .is_none_or(|c| c.text != current_assistant || c.width != md_width);
                 if changed && (stale || turn_ended) {
-                    live_cache = Some((
-                        current_assistant.clone(),
+                    // settled-prefix cache: only the trailing paragraph
+                    // re-renders per tick; the rows Arc into the frame
+                    live_cache = Some(render_live_md(
+                        live_cache.as_ref(),
+                        &current_assistant,
                         md_width,
-                        crate::markdown::render(&current_assistant, md_width),
-                        now,
                     ));
                 }
-                live_cache.as_ref().map(|(_, _, rows, _)| LiveBlock {
+                live_cache.as_ref().map(|c| LiveBlock {
                     thought: current_thought.clone(),
                     tool_header: current_tool.clone(),
                     live_tool: live_tool.clone(),
-                    md: rows.clone(),
+                    md: c.rows.clone(),
                 })
             } else {
                 live_cache = None;
@@ -4415,7 +4709,7 @@ async fn app(
                                 }
                                 KeyCode::Backspace => {
                                     picker.filter.pop();
-                                    picker.selected = 0;
+                                    picker.filter_typed("");
                                 }
                                 KeyCode::Enter => {
                                     let id = picker.pick();
@@ -4427,7 +4721,11 @@ async fn app(
                                     modal = None;
                                     busy = true;
                                 }
-                                KeyCode::Char(c) => picker.filter.push(c),
+                                KeyCode::Char(c) => {
+                                    let mut one = String::new();
+                                    one.push(c);
+                                    picker.filter_typed(&one);
+                                }
                                 _ => {}
                             },
                             Modal::Help => {
@@ -4723,7 +5021,26 @@ async fn app(
                                         let _ = commands
                                             .send(Command::Rewind { turns: turns as u32 })
                                             .await;
-                                        transcript.rewind_user(turns);
+                                        // the menu numbers strand user records;
+                                        // transcript rows diverge from them
+                                        // (steers render as Info rows) — cut at
+                                        // the picked prompt's own row, falling
+                                        // back to the count when the text never
+                                        // echoed onto the transcript
+                                        let row = transcript
+                                            .entries()
+                                            .iter()
+                                            .rposition(
+                                                |l| matches!(l, Line::User(t) if *t == prompt),
+                                            );
+                                        match row {
+                                            Some(i) => {
+                                                transcript.rewind_at(i);
+                                            }
+                                            None => {
+                                                transcript.rewind_user(turns);
+                                            }
+                                        }
                                         if edit {
                                             input.text = prompt;
                                             input.cursor = input.text.chars().count();
@@ -5294,50 +5611,29 @@ async fn app(
                         {
                             slash_popup = None;
                             path_popup = None;
+                            invalidate_custom_command_scan();
                             continue;
                         }
-                        (KeyCode::Esc, _) if busy => {
-                            let _ = commands.send(Command::Abort).await;
+                        // every other Esc runs one precedence chain: a
+                        // pinned scroll unpins FIRST (the pill promises
+                        // 'esc', even mid-turn — the abort must not steal
+                        // it), then the abort, then the double-Esc rewind
+                        (KeyCode::Esc, _) => {
+                            handle_esc(
+                                commands,
+                                &mut scroll,
+                                busy,
+                                input.text.is_empty(),
+                                pending.is_some(),
+                                &mut last_esc,
+                                &mut modal,
+                                || rewind_items(
+                                    Some(meters.session.as_str()).filter(|s| !s.is_empty()),
+                                ),
+                                Instant::now(),
+                            )
+                            .await;
                         }
-                        (KeyCode::Esc, _)
-                            if !busy
-                                && slash_popup.is_none()
-                                && path_popup.is_none()
-                                && pending.is_none()
-                                && input.text.is_empty() =>
-                        {
-                            // double-Esc on an empty idle input opens the
-                            // rewind menu (claude-code muscle memory)
-                            let now = Instant::now();
-                            let doubled = last_esc
-                                .is_some_and(|t| now.duration_since(t) < Duration::from_millis(600));
-                            if doubled {
-                                last_esc = None;
-                                let items: Vec<(usize, String)> = transcript
-                                    .entries()
-                                    .iter()
-                                    .rev()
-                                    .filter_map(|l| match l {
-                                        Line::User(t) if !t.trim_start().starts_with('/') => {
-                                            Some(t.clone())
-                                        }
-                                        _ => None,
-                                    })
-                                    .take(20)
-                                    .enumerate()
-                                    .map(|(i, t)| (i + 1, t))
-                                    .collect();
-                                if !items.is_empty() {
-                                    modal = Some(Modal::Rewind {
-                                        items,
-                                        selected: 0,
-                                    });
-                                }
-                            } else {
-                                last_esc = Some(now);
-                            }
-                        }
-                        (KeyCode::Esc, _) if scroll.is_some() => scroll = None,
                         (KeyCode::Enter, KeyModifiers::SHIFT) => input.newline(),
                         (KeyCode::Char('j'), KeyModifiers::CONTROL) => input.newline(),
                         (KeyCode::Enter, _) => {
@@ -5523,13 +5819,20 @@ async fn app(
                                         "no assistant reply to copy".into(),
                                     )),
                                     Some(s) => {
-                                        // OSC52 into the clipboard; the ack is a toast
-                                        let mut stdout = std::io::stdout().lock();
-                                        let _ = stdout.write_all(b"\x1b]52;c;");
-                                        let _ = stdout.write_all(b64encode(&s).as_bytes());
-                                        let _ = stdout.write_all(b"\x07");
-                                        let _ = stdout.flush();
-                                        pop_toast(&mut toast, "✓ copied last reply");
+                                        // OSC52 into the clipboard (capped);
+                                        // the ack is a toast, or the cap's
+                                        // notice instead of a frozen pty
+                                        let mut stdout = std::io::BufWriter::new(
+                                            std::io::stdout().lock(),
+                                        );
+                                        if osc52_copy(&mut stdout, &s) {
+                                            pop_toast(&mut toast, "✓ copied last reply");
+                                        } else {
+                                            pop_toast(
+                                                &mut toast,
+                                                "selection too large for OSC 52",
+                                            );
+                                        }
                                     }
                                 }
                                 continue;
@@ -5975,6 +6278,7 @@ async fn app(
                                 if let Some((name, _)) = popup.items.get(popup.selected).cloned() {
                                     input.text = complete_slash(&name);
                                     input.cursor = input.text.chars().count();
+                                    invalidate_custom_command_scan();
                                     slash_popup = update_suggestions(&input.text);
                                 }
                             } else if path_popup.is_none() {
@@ -6299,7 +6603,7 @@ async fn app(
                             Modal::Tree { .. } => {}
                             Modal::Features { .. } => {}
                             Modal::Session(picker) => {
-                                picker.filter.extend(text.chars().filter(|c| !c.is_whitespace()));
+                                picker.filter_typed(&text);
                             }
                             Modal::Model(picker) => {
                                 picker.filter.extend(text.chars().filter(|c| !c.is_whitespace()));
@@ -6568,20 +6872,27 @@ async fn app(
                                 if let Some(span) = sel {
                                     let picked = selection_text(&transcript, span);
                                     if !picked.is_empty() {
-                                        let mut stdout = std::io::stdout().lock();
-                                        let _ = stdout.write_all(b"\x1b]52;c;");
-                                        let _ =
-                                            stdout.write_all(b64encode(&picked).as_bytes());
-                                        let _ = stdout.write_all(b"\x07");
-                                        let _ = stdout.flush();
                                         let n = span.1.0 - span.0.0 + 1;
-                                        pop_toast(
-                                            &mut toast,
-                                            format!(
-                                                "✓ copied {n} row{} to the clipboard",
-                                                if n == 1 { "" } else { "s" }
-                                            ),
+                                        // capped OSC 52 (capped pre-encode): a
+                                        // huge selection degrades to a toast,
+                                        // not a frozen pty
+                                        let mut stdout = std::io::BufWriter::new(
+                                            std::io::stdout().lock(),
                                         );
+                                        if osc52_copy(&mut stdout, &picked) {
+                                            pop_toast(
+                                                &mut toast,
+                                                format!(
+                                                    "✓ copied {n} row{} to the clipboard",
+                                                    if n == 1 { "" } else { "s" }
+                                                ),
+                                            );
+                                        } else {
+                                            pop_toast(
+                                                &mut toast,
+                                                "selection too large for OSC 52",
+                                            );
+                                        }
                                     }
                                 } else if let Some((col, row)) = press.take() {
                                     match click_target(
@@ -6877,6 +7188,16 @@ async fn app(
                     updates_open = false;
                 }
             }
+            // the detached branch probe landed: fill the sidebar once,
+            // then disarm the arm (a finished oneshot polls ready
+            // forever)
+            branch = &mut branch_rx, if branch_open => {
+                branch_open = false;
+                if let Ok(Some(b)) = branch {
+                    sidebar.branch = Some(b);
+                    dirty = true;
+                }
+            }
             // redraws while busy (spinner/clock) or while a toast is
             // alive; the arm also prunes the expired toast so ticking
             // actually stops once it fades
@@ -7075,10 +7396,14 @@ fn apply_event(
                 _ => {}
             }
         }
-        Event::CallFinished { ok, .. } => {
-            // collapse the live block: the preview was transient; the
-            // compact ` │ → tool … ✓` row is what gets cached
-            if let Some(lt) = live_tool.take() {
+        Event::CallFinished { id, ok, .. } => {
+            // collapse the live block — but only when the ids match
+            // (mirroring CallOutput): an out-of-order finish must not
+            // land its verdict on the wrong row. A mismatched block
+            // stays live for its own finish; the TurnFinished arm is
+            // the backstop that closes whatever remains.
+            let matches = live_tool.as_ref().is_some_and(|lt| lt.id == *id);
+            if matches && let Some(lt) = live_tool.take() {
                 let (note, excerpt) = match lt.last {
                     Some((excerpt, _)) => (tool_note(&excerpt), excerpt),
                     None => (String::new(), String::new()),
@@ -7726,16 +8051,42 @@ async fn clip_image_bytes() -> Result<Vec<u8>, String> {
     Err("no image on clipboard (tried wl-paste, xclip, powershell)".to_string())
 }
 
+/// Session cache for the custom-command scan (see
+/// [`available_slash_commands`]): `None` = not yet scanned.
+static CUSTOM_COMMANDS: std::sync::Mutex<Option<Vec<CustomCommand>>> = std::sync::Mutex::new(None);
+
+/// Custom commands for the popup, from the session cache: the first
+/// '/' keystroke scans once, later keystrokes reuse it until
+/// invalidated.
+fn cached_custom_commands() -> Vec<CustomCommand> {
+    let mut cache = CUSTOM_COMMANDS.lock().unwrap_or_else(|e| e.into_inner());
+    if cache.is_none() {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        *cache = Some(scan_custom_commands(&cwd));
+    }
+    cache.clone().unwrap_or_default()
+}
+
+/// Force the next '/' popup to rescan custom commands (Tab completion
+/// and popup close — the moments a command file can have changed).
+fn invalidate_custom_command_scan() {
+    *CUSTOM_COMMANDS.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+#[cfg(test)]
+static SCAN_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 pub fn available_slash_commands() -> Vec<(String, String)> {
     let mut out = builtin_slash_commands();
     // custom files come after builtins, named like any slash command so
-    // the popup prefix-filter and Tab-accept work the same way
-    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    // safe mode: custom commands are customizations — built-ins only
+    // the popup prefix-filter and Tab-accept work the same way.
+    // Scanning costs a trust.json parse plus a frontmatter read of
+    // every custom .md — cache it for the session instead of paying
+    // per keystroke (invalidated on Tab completion and popup close).
     let custom = if ka_engine::conventions::bare_mode() {
         Vec::new()
     } else {
-        scan_custom_commands(&cwd)
+        cached_custom_commands()
     };
     for c in custom {
         let hint = if c.argument_hint.is_empty() {
@@ -8246,6 +8597,7 @@ fn project_trusted_in(state_home: &std::path::Path, cwd: &std::path::Path) -> bo
 }
 
 /// One discovered custom slash command.
+#[derive(Debug, Clone)]
 pub struct CustomCommand {
     /// Command name (without `/`).
     pub name: String,
@@ -8274,6 +8626,11 @@ pub fn scan_custom_commands_in(
     cwd: &std::path::Path,
     state_home: &std::path::Path,
 ) -> Vec<CustomCommand> {
+    #[cfg(test)]
+    {
+        use std::sync::atomic::Ordering;
+        SCAN_COUNT.fetch_add(1, Ordering::SeqCst);
+    }
     let mut out: Vec<CustomCommand> = Vec::new();
     let mut dirs: Vec<std::path::PathBuf> = Vec::new();
     // project scope anchors at the root project, matching the engine's
@@ -9029,7 +9386,9 @@ struct LiveBlock {
     tool_header: String,
     /// The in-flight call's rolling output preview.
     live_tool: Option<LiveTool>,
-    md: Vec<ratatui::text::Line<'static>>,
+    /// Rendered streaming markdown, shared with the tick-side cache
+    /// (clone the Arc, never the rows).
+    md: std::sync::Arc<Vec<ratatui::text::Line<'static>>>,
 }
 
 /// Most recent preview lines shown under the running tool header.
@@ -11633,8 +11992,8 @@ fn help_modal_rows(width: usize) -> Vec<ratatui::text::Line<'static>> {
         ("⇧⏎ / ctrl+j", "newline in the draft"),
         ("+text · alt+q", "queue until the turn ends"),
         ("!cmd", "run a shell command directly"),
-        ("esc", "close popups & modals · unpin scroll"),
-        ("esc (busy)", "abort the running turn"),
+        ("esc", "close popups & modals · unpin scroll first"),
+        ("esc (busy)", "abort the turn (unscrolled)"),
         ("esc esc", "rewind menu (empty input)"),
         ("ctrl+c", "quit · clear draft · twice to exit"),
         ("↑ ↓", "prompt history · navigate pickers"),
@@ -12020,43 +12379,68 @@ fn jump_to_user_message(
     }
 }
 
-/// Read the system clipboard as text: wayland → X11 → WSL2/Windows.
+/// Read the system clipboard as text: WSL2/Windows → wayland → X11,
+/// under the single outer budget of [`clipboard_text_with`] — three
+/// sequential 2 s probes froze input for up to ~6 s when the owners
+/// were unresponsive; on timeout the paste degrades to nothing.
 async fn clipboard_text() -> String {
-    // Every probe is capped (a hanging xclip against an unresponsive
-    // selection owner must not freeze the event loop).
-    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
-    let run = |program: &str, args: &[&str]| {
-        tokio::time::timeout(
+    clipboard_text_probes().await
+}
+
+/// The probe chain behind [`clipboard_text`], injectable for tests:
+/// `run` executes one probe and yields its text (None = miss).
+async fn clipboard_text_probes() -> String {
+    clipboard_text_with(|program, args| async move {
+        // every probe stays individually capped too (a hanging xclip
+        // against an unresponsive selection owner must not pin a
+        // worker once the overall budget lets it run)
+        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+        match tokio::time::timeout(
             TIMEOUT,
             tokio::process::Command::new(program).args(args).output(),
         )
-    };
-    // WSL2 first: the Windows clipboard lives behind powershell.exe.
-    if let Ok(Ok(out)) = run(
-        "powershell.exe",
-        &["-NoProfile", "-Command", "Get-Clipboard"],
-    )
-    .await
-    {
-        if out.status.success() && !out.stdout.is_empty() {
-            return String::from_utf8_lossy(&out.stdout)
-                .trim_end_matches(['\r', '\n'])
-                .to_string();
-        }
-    }
-    for (program, args) in [
-        ("wl-paste", vec!["--no-newline"]),
-        ("xclip", vec!["-selection", "clipboard", "-o"]),
-    ] {
-        if let Ok(Ok(out)) = run(program, &args).await {
-            if out.status.success() && !out.stdout.is_empty() {
-                return String::from_utf8_lossy(&out.stdout)
+        .await
+        {
+            Ok(Ok(out)) if out.status.success() && !out.stdout.is_empty() => Some(
+                String::from_utf8_lossy(&out.stdout)
                     .trim_end_matches(['\r', '\n'])
-                    .to_string();
+                    .to_string(),
+            ),
+            _ => None,
+        }
+    })
+    .await
+}
+
+async fn clipboard_text_with<F, Fut>(run: F) -> String
+where
+    F: Fn(&'static str, &'static [&'static str]) -> Fut,
+    Fut: Future<Output = Option<String>>,
+{
+    // ONE outer budget around the whole chain: three sequential
+    // unresponsive owners must not freeze input for seconds on end.
+    // 2s: the first probe is powershell.exe, whose cold start alone
+    // can exceed 500ms on WSL2 — tighter budgets silently kill pastes
+    // that used to succeed.
+    const OVERALL: std::time::Duration = std::time::Duration::from_secs(2);
+    const WL_PASTE_ARGS: &[&str] = &["--no-newline"];
+    const XCLIP_ARGS: &[&str] = &["-selection", "clipboard", "-o"];
+    const POWERSHELL_ARGS: &[&str] = &["-NoProfile", "-Command", "Get-Clipboard"];
+    let probes = async {
+        // WSL2 first: the Windows clipboard lives behind powershell.exe.
+        if let Some(text) = run("powershell.exe", POWERSHELL_ARGS).await {
+            return text;
+        }
+        for (program, args) in [("wl-paste", WL_PASTE_ARGS), ("xclip", XCLIP_ARGS)] {
+            if let Some(text) = run(program, args).await {
+                return text;
             }
         }
-    }
-    String::new()
+        String::new()
+    };
+    tokio::time::timeout(OVERALL, probes)
+        .await
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -13617,6 +14001,109 @@ mod tests {
         let mut fresh = picker.clone();
         fresh.selected = 0;
         assert_eq!(fresh.pick(), None, "row 0 = new session");
+
+        // typing a NARROWING filter resets the selection: a stale
+        // out-of-range pick would return None and Enter would silently
+        // start a NEW session instead of the first visible row
+        let mut narrowed = picker.clone();
+        narrowed.sessions.push(ka_strand::StrandSummary {
+            path: std::path::PathBuf::from("/tmp/b.jsonl"),
+            id: "s2-bbbb33334444".to_string(),
+            ts: "2026-01-02T00:00:00Z".to_string(),
+            title: "fix the tests".to_string(),
+            messages: 2,
+            cost: 0.0,
+            tokens: 0,
+            parent: None,
+            name: None,
+        });
+        narrowed.filter.clear();
+        narrowed.selected = 2; // moved down onto the second session
+        // without the reset, the narrowed list leaves pick() out of
+        // range → None → Enter starts a NEW session
+        let mut stale = narrowed.clone();
+        stale.filter.push_str("parser");
+        assert_eq!(
+            stale.pick(),
+            None,
+            "a stale selection past the narrowed list must not pick"
+        );
+        narrowed.filter_typed("parser");
+        assert_eq!(narrowed.selected, 1, "typing selects the first match");
+        assert_eq!(
+            narrowed.pick().as_deref(),
+            Some("s1-aaaa11112222"),
+            "Enter targets the first visible row, not a new session"
+        );
+    }
+
+    #[tokio::test]
+    async fn esc_unpins_scroll_before_abort_and_rewind() {
+        // the pure decision: scrolled wins over busy, busy over rewind
+        let now = Instant::now();
+        assert_eq!(
+            esc_action(true, true, true, false, None, now),
+            EscAction::UnpinScroll,
+            "a pinned scroll owns Esc even mid-turn"
+        );
+        assert_eq!(
+            esc_action(false, true, true, false, None, now),
+            EscAction::Abort
+        );
+        assert_eq!(
+            esc_action(false, false, true, false, None, now),
+            EscAction::ArmRewind
+        );
+        // through the command-sender seam: busy + scrolled sends NO
+        // Abort — Esc unpins only
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut commands = tx.clone();
+        let mut scroll = Some(3usize);
+        let mut modal = None;
+        let mut last_esc = None;
+        handle_esc(
+            &mut commands,
+            &mut scroll,
+            true,
+            true,
+            false,
+            &mut last_esc,
+            &mut modal,
+            || unreachable!("no strand read while scrolled/busy"),
+            now,
+        )
+        .await;
+        assert_eq!(scroll, None, "the pin released");
+        assert!(rx.try_recv().is_err(), "no Abort was sent");
+        // unscrolled: the same busy turn now aborts
+        handle_esc(
+            &mut commands,
+            &mut scroll,
+            true,
+            true,
+            false,
+            &mut last_esc,
+            &mut modal,
+            Vec::new,
+            now,
+        )
+        .await;
+        assert!(matches!(rx.try_recv(), Ok(Command::Abort)));
+        // idle, empty, unscrolled: first Esc arms the rewind window
+        handle_esc(
+            &mut commands,
+            &mut scroll,
+            false,
+            true,
+            false,
+            &mut last_esc,
+            &mut modal,
+            Vec::new,
+            now,
+        )
+        .await;
+        assert_eq!(last_esc, Some(now));
+        assert!(rx.try_recv().is_err(), "idle Esc sends nothing");
     }
 
     #[test]
@@ -14071,11 +14558,11 @@ mod tests {
             thought: thought.into(),
             tool_header: String::new(),
             live_tool: None,
-            md: if md.is_empty() {
+            md: std::sync::Arc::new(if md.is_empty() {
                 Vec::new()
             } else {
                 crate::markdown::render(md, assistant_md_width(40))
-            },
+            }),
         };
         let no_double_air = |rows: &[ratatui::text::Line<'static>]| {
             for pair in rows.windows(2) {
@@ -14122,6 +14609,51 @@ mod tests {
         assert!(!live_stale(t0, t0 + Duration::from_millis(79)));
         assert!(live_stale(t0, t0 + Duration::from_millis(80)));
         assert!(live_stale(t0, t0 + Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn live_markdown_caches_settled_prefix() {
+        use std::sync::atomic::Ordering;
+        MD_RENDERS.store(0, Ordering::SeqCst);
+        MD_RENDER_INPUTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        let w = 40;
+        // first tick: settled prefix + trailing paragraph, once each —
+        // and the concat equals a full render (the prefix keeps its
+        // blank separator rows)
+        let cache = render_live_md(None, "para one\n\nstreaming a", w);
+        assert_eq!(
+            cache.rows.as_ref(),
+            &crate::markdown::render("para one\n\nstreaming a", w),
+            "cached rows equal the full render"
+        );
+        // two appends to the SAME trailing paragraph
+        let cache = render_live_md(Some(&cache), "para one\n\nstreaming ap", w);
+        let cache = render_live_md(Some(&cache), "para one\n\nstreaming append", w);
+        assert_eq!(
+            cache.rows.as_ref(),
+            &crate::markdown::render("para one\n\nstreaming append", w),
+            "cached rows still equal the full render"
+        );
+        let inputs = MD_RENDER_INPUTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let prefix_renders = inputs.iter().filter(|t| t.contains("para one")).count();
+        assert_eq!(
+            prefix_renders, 1,
+            "the settled prefix renders exactly once across the appends: {inputs:?}"
+        );
+        // every re-render input after the first stops at the boundary:
+        // only the trailing paragraph ever re-renders
+        for t in inputs.iter().skip(1) {
+            assert!(
+                !t.contains("para one"),
+                "re-renders never reach the settled prefix: {inputs:?}"
+            );
+        }
     }
 
     #[test]
@@ -15135,6 +15667,111 @@ mod tests {
         assert_eq!(blocks[0][0].note, "line-3");
         assert!(!blocks[1][0].ok);
         assert_eq!(blocks[1][0].note, "boom");
+
+        // out-of-order finish: c1's stale verdict arrives while c3 is
+        // the live block — it must NOT collapse it; each verdict lands
+        // its own row
+        let _ = apply_event(
+            &Event::CallStarted {
+                tool: "bash".into(),
+                id: "c3".into(),
+                detail: "cargo test".into(),
+            },
+            &mut lines,
+            &mut busy,
+            &mut busy_since,
+            &mut meters,
+            &mut pending,
+            &mut turn_produced,
+            &mut usage,
+            &mut a,
+            &mut t,
+            &mut tool,
+            &mut live_tool,
+            &mut last_user,
+            &mut last_error,
+            &mut spills,
+            &mut sidebar,
+        );
+        let _ = apply_event(
+            &Event::CallOutput {
+                tool: "bash".into(),
+                id: "c3".into(),
+                excerpt: "ok rows".into(),
+                is_error: false,
+                spill: None,
+            },
+            &mut lines,
+            &mut busy,
+            &mut busy_since,
+            &mut meters,
+            &mut pending,
+            &mut turn_produced,
+            &mut usage,
+            &mut a,
+            &mut t,
+            &mut tool,
+            &mut live_tool,
+            &mut last_user,
+            &mut last_error,
+            &mut spills,
+            &mut sidebar,
+        );
+        // the stale id's finish (from the earlier pair above): the live
+        // block is c3 and must survive it untouched
+        let _ = apply_event(
+            &Event::CallFinished {
+                tool: "bash".into(),
+                id: "c1".into(),
+                ok: true,
+            },
+            &mut lines,
+            &mut busy,
+            &mut busy_since,
+            &mut meters,
+            &mut pending,
+            &mut turn_produced,
+            &mut usage,
+            &mut a,
+            &mut t,
+            &mut tool,
+            &mut live_tool,
+            &mut last_user,
+            &mut last_error,
+            &mut spills,
+            &mut sidebar,
+        );
+        assert!(
+            live_tool.as_ref().is_some_and(|lt| lt.id == "c3"),
+            "a mismatched finish leaves the live block alone"
+        );
+        // the matching finish collapses c3 with ITS OWN verdict + note
+        let finished = apply_event(
+            &Event::CallFinished {
+                tool: "bash".into(),
+                id: "c3".into(),
+                ok: false,
+            },
+            &mut lines,
+            &mut busy,
+            &mut busy_since,
+            &mut meters,
+            &mut pending,
+            &mut turn_produced,
+            &mut usage,
+            &mut a,
+            &mut t,
+            &mut tool,
+            &mut live_tool,
+            &mut last_user,
+            &mut last_error,
+            &mut spills,
+            &mut sidebar,
+        );
+        assert!(live_tool.is_none(), "the matching finish collapses c3");
+        let call = finished.expect("the collapsed row is surfaced");
+        assert!(!call.ok, "c3's own verdict, not c1's");
+        assert_eq!(call.note, "ok rows", "c3's own output note");
     }
 
     #[test]
@@ -15465,6 +16102,45 @@ mod tests {
             "YW55IGNhcm5hbCBwbGVhc3VyZS4="
         );
         assert_eq!(b64encode("héllo"), "aMOpbGxv", "multibyte input");
+    }
+
+    #[test]
+    fn osc52_payload_capped() {
+        // an oversized selection writes NOTHING: no prefix, no bytes
+        let oversized = "x".repeat(OSC52_MAX_RAW + 1);
+        let mut sink = Vec::new();
+        assert!(!osc52_copy(&mut sink, &oversized), "over the cap");
+        assert!(sink.is_empty(), "no write attempted past the cap");
+        // a payload at the cap is encoded whole (4/3 expansion, +8
+        // bytes of OSC 52 framing)
+        let at_cap = "y".repeat(OSC52_MAX_RAW);
+        let mut sink = Vec::new();
+        assert!(osc52_copy(&mut sink, &at_cap));
+        assert!(sink.starts_with(b"\x1b]52;c;"));
+        assert!(sink.ends_with(b"\x07"));
+        assert!(sink.len() <= OSC52_MAX_RAW.div_ceil(3) * 4 + 8);
+    }
+
+    #[tokio::test]
+    async fn clipboard_text_timeout_bounds() {
+        // a hanging first probe: the whole chain is bounded by ONE
+        // outer budget, so the paste degrades to empty instead of
+        // freezing input
+        let started = std::time::Instant::now();
+        let text = clipboard_text_with(|_program, _args| async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            None
+        })
+        .await;
+        let elapsed = started.elapsed();
+        assert_eq!(text, "", "timeout degrades to an empty paste");
+        // the budget is 2s (powershell cold starts on WSL2 alone can
+        // exceed 500ms) — assert the outer bound actually fired, with
+        // scheduler slack on top
+        assert!(
+            elapsed >= Duration::from_secs(2) && elapsed < Duration::from_secs(3),
+            "bounded by the outer budget with slack: {elapsed:?}"
+        );
     }
 
     #[test]
@@ -16849,6 +17525,35 @@ mod tests {
         let names: Vec<&str> = popup.items.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, vec!["/skill:pdf"], "{names:?}");
         *SKILLS.write().unwrap() = Vec::new();
+    }
+
+    #[test]
+    fn update_suggestions_uses_cached_scan() {
+        use std::sync::atomic::Ordering;
+        // cold cache: the first '/' popup scans once (via the seam
+        // available_slash_commands consults), subsequent keystrokes add
+        // ZERO rescans — the per-keystroke trust.json parse + a
+        // frontmatter read of every custom .md was the bug
+        invalidate_custom_command_scan();
+        SCAN_COUNT.store(0, Ordering::SeqCst);
+        let _ = cached_custom_commands();
+        let first = SCAN_COUNT.load(Ordering::SeqCst);
+        assert_eq!(first, 1, "the first '/' keystroke scans once");
+        let _ = cached_custom_commands();
+        let _ = cached_custom_commands();
+        assert_eq!(
+            SCAN_COUNT.load(Ordering::SeqCst),
+            first,
+            "later keystrokes reuse the cached scan"
+        );
+        // invalidation forces exactly one rescan
+        invalidate_custom_command_scan();
+        let _ = cached_custom_commands();
+        assert_eq!(
+            SCAN_COUNT.load(Ordering::SeqCst),
+            first + 1,
+            "invalidation rescans once, then the cache holds again"
+        );
     }
 
     #[test]
@@ -18352,7 +19057,7 @@ mod tests {
                 last: None,
                 started: Instant::now(),
             }),
-            md: crate::markdown::render("# heading\ntext", 60),
+            md: std::sync::Arc::new(crate::markdown::render("# heading\ntext", 60)),
         };
         let surfaces = [
             crate::palette::BG_TOOL,
@@ -19569,6 +20274,78 @@ mod tests {
             "branch count rides the prompt: {:?}",
             rows[5]
         );
+    }
+
+    #[test]
+    fn rewind_menu_turns_match_strand_user_records() {
+        // a strand whose RECORDS diverge from the transcript rows: the
+        // engine's Rewind cuts the Nth-last user RECORD, so the menu
+        // must count records — not transcript Line::User rows (steers
+        // never persist, /plan-style followups persist without an echo)
+        let dir = std::env::temp_dir().join(format!("ka-rewind-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        ka_strand::set_data_dir_for_tests(dir.clone());
+        let msg = |id: &str, role: ka_strand::Role, content: &str| ka_strand::Record::Message {
+            id: ka_protocol::RecordId(id.to_string()),
+            images: Vec::new(),
+            role,
+            content: content.to_string(),
+            calls: Vec::new(),
+            results: Vec::new(),
+            thinking: None,
+        };
+        let mut strand = ka_strand::StrandFile::create(&dir, None).unwrap();
+        strand
+            .append(msg("m1", ka_strand::Role::User, "first prompt"))
+            .unwrap();
+        strand
+            .append(msg("m2", ka_strand::Role::Assistant, "first answer"))
+            .unwrap();
+        // persisted WITHOUT a transcript echo (a /plan-style followup)
+        strand
+            .append(msg("m3", ka_strand::Role::User, "plan followup"))
+            .unwrap();
+        strand
+            .append(msg("m4", ka_strand::Role::User, "/plan"))
+            .unwrap();
+        let sessions = vec![ka_strand::StrandSummary {
+            path: strand.path().unwrap().to_path_buf(),
+            id: "s1".to_string(),
+            ts: "2026-01-01T00:00:00Z".to_string(),
+            title: "fix the parser".to_string(),
+            messages: 4,
+            cost: 0.0,
+            tokens: 0,
+            parent: None,
+            name: None,
+        }];
+        // the transcript only ever saw ONE of the user rows
+        let mut transcript = Transcript::default();
+        transcript.push_separated(Line::User("first prompt".into()));
+        let tx_users = transcript
+            .entries()
+            .iter()
+            .filter(|l| matches!(l, Line::User(_)))
+            .count();
+        assert_eq!(tx_users, 1, "fixture: transcript and records diverge");
+
+        let items = rewind_items_from(Some("s1"), &sessions);
+        // two user RECORDS survive the '/' filter, newest first, turns
+        // counted from the newest exactly like the engine cuts
+        assert_eq!(
+            items,
+            vec![
+                (1, "plan followup".to_string()),
+                (2, "first prompt".to_string()),
+            ],
+            "the slash command record is not a rewind target"
+        );
+        assert!(
+            items.len() > tx_users,
+            "the menu counts records, not transcript rows"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

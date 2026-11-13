@@ -287,6 +287,10 @@ pub struct Ledger {
 struct FileStamp {
     mtime: SystemTime,
     size: u64,
+    /// Wall-clock instant the read was recorded — the recency signal
+    /// for [`Ledger::hot_paths`] (file mtime says when the FILE
+    /// changed, not when it was read).
+    read_at: std::time::Instant,
 }
 
 impl Ledger {
@@ -297,6 +301,7 @@ impl Ledger {
             FileStamp {
                 mtime: meta.modified().unwrap_or(UNIX_EPOCH),
                 size: meta.len(),
+                read_at: std::time::Instant::now(),
             },
         );
     }
@@ -367,12 +372,12 @@ impl Ledger {
     /// The `n` most recently read/edited paths (ledger-hot), newest
     /// first — the post-digest re-read set.
     pub fn hot_paths(&self, n: usize) -> Vec<PathBuf> {
-        let mut stamps: Vec<(PathBuf, SystemTime)> = self
+        let mut stamps: Vec<(PathBuf, std::time::Instant)> = self
             .stamps
             .iter()
-            .map(|(p, s)| (p.clone(), s.mtime))
+            .map(|(p, s)| (p.clone(), s.read_at))
             .collect();
-        stamps.sort_by_key(|(_, mtime)| std::cmp::Reverse(*mtime));
+        stamps.sort_by_key(|(_, read_at)| std::cmp::Reverse(*read_at));
         stamps.into_iter().take(n).map(|(p, _)| p).collect()
     }
 }
@@ -392,12 +397,7 @@ impl Default for Spill {
 impl Spill {
     /// Spill directory under the state root (created lazily).
     pub fn new() -> Self {
-        let dir = std::env::var("XDG_STATE_HOME")
-            .map(PathBuf::from)
-            .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".local/state")))
-            .map(|base| base.join("ka/spills"))
-            .unwrap_or_else(|_| std::env::temp_dir().join("ka-spills"));
-        Self { dir }
+        Self { dir: spills_root() }
     }
 
     /// Create an empty spill slot for streamed (backgrounded) output;
@@ -405,8 +405,7 @@ impl Spill {
     /// created eagerly so tail reads never race creation.
     pub fn slot(&self) -> std::io::Result<(PathBuf, String)> {
         std::fs::create_dir_all(&self.dir)?;
-        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let n = SPILL_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let id = format!(
             "job-{}-{}",
             SystemTime::now()
@@ -423,17 +422,68 @@ impl Spill {
     /// Park `content`, returning its `spill://<id>` pointer.
     pub fn park(&self, content: &str) -> std::io::Result<String> {
         std::fs::create_dir_all(&self.dir)?;
+        // process-wide counter: same-ms equal-length parks must not
+        // collide (millis+length alone overwrite each other)
+        let n = SPILL_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let id = format!(
             "{}-{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_millis())
                 .unwrap_or(0),
-            content.len()
+            n
         );
         std::fs::write(self.dir.join(&id), content)?;
         Ok(format!("spill://{id}"))
     }
+}
+
+/// Process-wide spill id counter (shared by [`Spill::slot`] and
+/// [`Spill::park`] so ids never collide).
+static SPILL_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The spill directory under the state root.
+pub(crate) fn spills_root() -> PathBuf {
+    std::env::var("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".local/state")))
+        .map(|base| base.join("ka/spills"))
+        .unwrap_or_else(|_| std::env::temp_dir().join("ka-spills"))
+}
+
+/// Spill retention window: files older than this are GC'd at startup.
+pub(crate) const SPILL_RETENTION: std::time::Duration =
+    std::time::Duration::from_secs(7 * 24 * 60 * 60);
+
+/// Opportunistic spill-directory GC: delete every regular file (spill
+/// outputs and `.done` markers live here) whose mtime is older than
+/// `older_than` before `now`. Best-effort — errors are ignored, no
+/// logging, never fatal. Snapshot blobs live elsewhere and are not
+/// touched.
+pub(crate) fn gc_spills_with_now(root: &Path, now: SystemTime, older_than: std::time::Duration) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let Ok(mtime) = meta.modified() else {
+            continue;
+        };
+        if now.duration_since(mtime).is_ok_and(|age| age > older_than) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// [`gc_spills_with_now`] with the wall clock and the default
+/// 7-day retention.
+pub(crate) fn gc_spills(root: &Path) {
+    gc_spills_with_now(root, SystemTime::now(), SPILL_RETENTION);
 }
 
 /// The full registry wired for Phase 2: an internally-owned todo slot.
@@ -635,5 +685,66 @@ mod tests {
         let path = spill.dir.join(id);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "huge output");
         let _ = std::fs::remove_file(&path);
+        // same-ms equal-length parks must not collide: both pointers
+        // read back their OWN content
+        let a = spill.park("first one!").unwrap();
+        let b = spill.park("second one").unwrap();
+        assert_ne!(a, b, "park ids collided: {a}");
+        let pa = spill.dir.join(a.trim_start_matches("spill://"));
+        let pb = spill.dir.join(b.trim_start_matches("spill://"));
+        assert_eq!(std::fs::read_to_string(&pa).unwrap(), "first one!");
+        assert_eq!(std::fs::read_to_string(&pb).unwrap(), "second one");
+        let _ = std::fs::remove_file(&pa);
+        let _ = std::fs::remove_file(&pb);
+    }
+
+    #[test]
+    fn hot_paths_order_follows_read_time() {
+        let dir = std::env::temp_dir().join(format!("ka-hotpaths-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // B's file is created FIRST (older mtime), then A's
+        let fb = dir.join("older-mtime.txt");
+        std::fs::write(&fb, "b").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let fa = dir.join("newer-mtime.txt");
+        std::fs::write(&fa, "a").unwrap();
+
+        let mut ledger = Ledger::default();
+        // read A first, then B — B is the more recent READ despite the
+        // older file mtime, so B must rank first
+        ledger.mint(&fa, &std::fs::metadata(&fa).unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        ledger.mint(&fb, &std::fs::metadata(&fb).unwrap());
+        let hot = ledger.hot_paths(2);
+        assert_eq!(hot[0], fb, "most recently READ ranks first: {hot:?}");
+        assert_eq!(hot[1], fa, "{hot:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gc_spills_removes_only_stale() {
+        let dir = std::env::temp_dir().join(format!("ka-gcspills-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // real mtimes cannot be fabricated without deps and two files
+        // written milliseconds apart age identically, so test the two
+        // ends of the age comparison instead of a same-run split:
+        // a synthetic clock far past creation removes everything…
+        let old = dir.join("old-spill");
+        std::fs::write(&old, "x").unwrap();
+        std::fs::write(dir.join("old-spill.done"), "0").unwrap();
+        let mtime = std::fs::metadata(&old).unwrap().modified().unwrap();
+        let now = mtime + std::time::Duration::from_secs(8 * 24 * 60 * 60);
+        gc_spills_with_now(&dir, now, SPILL_RETENTION);
+        assert!(!old.exists(), "8-day-old spill must be removed");
+        assert!(!dir.join("old-spill.done").exists(), "stale .done removed");
+        // …and a clock at creation time removes nothing
+        std::fs::write(&old, "x").unwrap();
+        std::fs::write(dir.join("old-spill.done"), "0").unwrap();
+        gc_spills_with_now(&dir, mtime, SPILL_RETENTION);
+        assert!(old.exists(), "just-written spill must survive");
+        assert!(dir.join("old-spill.done").exists(), "fresh .done survives");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

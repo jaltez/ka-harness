@@ -720,7 +720,11 @@ pub enum Event {
     /// Observer presence changed on a `ka serve` session (roadmap 9.6):
     /// emitted to subscribers when an attach client arrives or leaves.
     /// The writing surface never sees it (the engine does not emit it —
-    /// the server does); older consumers ignore it as an unknown type.
+    /// the server does). Note the tagged `Event` enum has NO catch-all:
+    /// a consumer built before this variant fails to deserialize such a
+    /// line rather than ignoring it — consumers that must tolerate
+    /// newer event types (e.g. `ka attach`) skip unknown `type`s
+    /// themselves at their parse boundary.
     Presence {
         /// A turn is in flight on the session.
         busy: bool,

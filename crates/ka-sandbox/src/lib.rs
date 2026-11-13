@@ -171,6 +171,77 @@ fn broad_dirs() -> Vec<PathBuf> {
     dirs
 }
 
+/// The only `/dev` entries the landlock backend grants writes to —
+/// an enumerated surface matching what builds need, instead of the
+/// whole host `/dev` (bwrap's `--dev` is a fresh tmpfs, so wholesale
+/// `/dev` there was never the parity).
+const DEV_NODES: &[&str] = &[
+    "/dev/null",
+    "/dev/zero",
+    "/dev/full",
+    "/dev/random",
+    "/dev/urandom",
+    "/dev/shm",
+];
+
+/// Resolve a writable-allowlist entry to its real on-disk target:
+/// canonicalize the nearest existing ancestor, then re-append the
+/// not-yet-created remainder (grant dirs may not exist yet). Both
+/// enforcement backends bind/attach the resolved inode, so a symlink
+/// spelling must never widen what the rule actually covers: if the
+/// resolved path IS a broad root (`/`, `$HOME`, `/etc`, …) or sits
+/// above one, the entry is refused — fail closed.
+pub(crate) fn resolve_writable(p: &Path) -> Result<PathBuf, String> {
+    let mut prefix = p.to_path_buf();
+    let mut suffix: Vec<std::ffi::OsString> = Vec::new();
+    let canonical = loop {
+        match std::fs::canonicalize(&prefix) {
+            Ok(c) => break Some(c),
+            Err(_) => match (prefix.parent(), prefix.file_name()) {
+                (Some(parent), Some(name)) => {
+                    suffix.push(name.to_os_string());
+                    prefix = parent.to_path_buf();
+                }
+                _ => break None,
+            },
+        }
+    };
+    let Some(mut resolved) = canonical else {
+        return Err(format!(
+            "sandbox: cannot resolve writable path {} — refusing",
+            p.display()
+        ));
+    };
+    for seg in suffix.into_iter().rev() {
+        resolved.push(seg);
+    }
+    // `b.starts_with(&resolved)` covers both equality (resolved IS the
+    // broad root) and resolved being a proper ancestor of it (a grant
+    // at or above `$HOME`, `/`, … unsandboxes everything beneath).
+    // Broad roots may themselves be symlink spellings ($HOME under an
+    // automount), so canonicalized forms join the comparison — else a
+    // grant resolving to the real home slips past the lexical entries.
+    let broad = broad_dirs();
+    let broad_resolved: Vec<PathBuf> = broad
+        .iter()
+        .filter_map(|b| std::fs::canonicalize(b).ok())
+        .collect();
+    if let Some(b) = broad
+        .iter()
+        .chain(broad_resolved.iter())
+        .find(|b| b.starts_with(&resolved))
+    {
+        return Err(format!(
+            "sandbox: writable path {} resolves to {}, which is or contains the broad \
+             root {} — refusing",
+            p.display(),
+            resolved.display(),
+            b.display()
+        ));
+    }
+    Ok(resolved)
+}
+
 /// Lexically normalize a path (no filesystem access): resolve `.`/`..`,
 /// make relative paths absolute against `cwd`, expand a leading `~` or
 /// `~/` to `$HOME` (a `~user` prefix is left alone). Sandbox grant
@@ -202,7 +273,12 @@ fn normalize(p: &Path, cwd: &Path) -> PathBuf {
         match comp {
             std::path::Component::CurDir => {}
             std::path::Component::ParentDir => {
-                out.pop();
+                // never pop past the root: `/w/../../etc` must stay
+                // absolute (`/etc`), not collapse to a relative path
+                // that would bind the wrong subtree
+                if out.parent().is_some() {
+                    out.pop();
+                }
             }
             other => out.push(other),
         }
@@ -237,31 +313,55 @@ pub fn missing_grants(
     let mut grants = Grants::default();
     let broad = broad_dirs();
     for target in redirect_targets {
-        let full = normalize(Path::new(target), cwd);
+        let lexical = normalize(Path::new(target), cwd);
+        // enforcement binds/attaches the RESOLVED inode, so grant asks
+        // must point at the resolved target, not the lexical spelling;
+        // an unresolvable target stays denied (fail-closed)
+        let resolved = resolve_writable(&lexical).ok();
         // Path::starts_with compares whole components, so `/tmpfoo`
         // is NOT inside `/tmp` — no string-prefix escape here
-        if allow_write.iter().any(|a| full.starts_with(a)) {
+        let covered = |p: &Path| allow_write.iter().any(|a| p.starts_with(a));
+        if resolved.as_ref().is_some_and(|r| covered(r)) || covered(&lexical) {
             continue;
         }
         // the target is a file the command writes; the sandbox grants
-        // directories, so the grant is its parent
-        let Some(parent) = full.parent() else {
+        // directories, so the grant is its parent (resolved spelling)
+        let base = resolved.as_deref().unwrap_or(&lexical);
+        let Some(parent) = base.parent() else {
             continue;
         };
-        if parent.as_os_str().is_empty() || broad.iter().any(|b| parent == b.as_path()) {
+        let lexical_parent = lexical.parent();
+        // canonicalized broad spellings too: a redirect into the real
+        // home behind a symlinked $HOME must stay denied
+        let broad_resolved: Vec<PathBuf> = broad
+            .iter()
+            .filter_map(|b| std::fs::canonicalize(b).ok())
+            .collect();
+        let is_broad = |p: &Path| {
+            broad.iter().any(|b| p == b.as_path())
+                || broad_resolved.iter().any(|b| p == b.as_path())
+        };
+        if parent.as_os_str().is_empty() || is_broad(parent) || lexical_parent.is_some_and(is_broad)
+        {
             continue; // not grantable without unsandboxing — stays denied
         }
         // hidden dirs directly under $HOME (.ssh, .gnupg, .config …)
         // are persistence/config territory: never offered as a write
-        // grant, same refusal class as $HOME itself
-        if let Ok(home) = std::env::var("HOME")
-            && parent.parent().is_some_and(|gp| gp == Path::new(&home))
-            && parent
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with('.'))
-        {
-            continue;
+        // grant, same refusal class as $HOME itself — checked on both
+        // spellings so a symlinked $HOME cannot sneak one through
+        if let Ok(home) = std::env::var("HOME") {
+            let home_resolved = std::fs::canonicalize(&home).ok();
+            let hidden = |p: &Path| {
+                p.parent().is_some_and(|gp| {
+                    gp == Path::new(&home) || home_resolved.as_deref() == Some(gp)
+                }) && p
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with('.'))
+            };
+            if hidden(parent) || lexical_parent.is_some_and(hidden) {
+                continue;
+            }
         }
         if !grants
             .write_paths
@@ -440,105 +540,121 @@ pub fn wrap_command(policy: &Policy, command: &str, cwd: &Path) -> Result<Vec<St
             allow_write,
             allow_net,
             pass_env,
-        } => match detect_tool() {
-            Some(Tool::Bubblewrap) => {
-                let mut argv = vec![
-                    "bwrap".into(),
-                    "--unshare-all".into(),
-                    "--die-with-parent".into(),
-                    "--new-session".into(),
-                    "--ro-bind".into(),
-                    "/".into(),
-                    "/".into(),
-                    "--dev".into(),
-                    "/dev".into(),
-                    "--proc".into(),
-                    "/proc".into(),
-                ];
-                if *allow_net {
-                    // ordered after --unshare-all: re-share the network
-                    // stack for this command (expansion grant)
-                    argv.push("--share-net".into());
-                }
-                for dir in allow_write {
-                    argv.push("--bind".into());
-                    argv.push(dir.to_string_lossy().into_owned());
-                    argv.push(dir.to_string_lossy().into_owned());
-                }
-                argv.push("--clearenv".into());
-                // --setenv values ride bwrap's own argv, so they are
-                // visible in /proc/<pid>/cmdline to anyone who can read
-                // it — never expand the pass-through with secret-bearing
-                // env names
-                for name in pass_env {
-                    if let Ok(value) = std::env::var(name) {
-                        argv.push("--setenv".into());
-                        argv.push(name.clone());
-                        argv.push(value);
+        } => {
+            // both backends bind/attach the RESOLVED inode: resolve
+            // every writable entry up front and refuse (fail closed)
+            // any that lands on or above a broad root via symlink
+            let resolved: Vec<PathBuf> = allow_write
+                .iter()
+                .map(|d| resolve_writable(d.as_path()))
+                .collect::<Result<_, _>>()?;
+            match detect_tool() {
+                Some(Tool::Bubblewrap) => {
+                    let mut argv = vec![
+                        "bwrap".into(),
+                        "--unshare-all".into(),
+                        "--die-with-parent".into(),
+                        "--new-session".into(),
+                        "--ro-bind".into(),
+                        "/".into(),
+                        "/".into(),
+                        "--dev".into(),
+                        "/dev".into(),
+                        "--proc".into(),
+                        "/proc".into(),
+                    ];
+                    if *allow_net {
+                        // ordered after --unshare-all: re-share the network
+                        // stack for this command (expansion grant)
+                        argv.push("--share-net".into());
                     }
+                    for dir in &resolved {
+                        argv.push("--bind".into());
+                        argv.push(dir.to_string_lossy().into_owned());
+                        argv.push(dir.to_string_lossy().into_owned());
+                    }
+                    argv.push("--clearenv".into());
+                    // --setenv values ride bwrap's own argv, so they are
+                    // visible in /proc/<pid>/cmdline to anyone who can read
+                    // it — never expand the pass-through with secret-bearing
+                    // env names
+                    for name in pass_env {
+                        if let Ok(value) = std::env::var(name) {
+                            argv.push("--setenv".into());
+                            argv.push(name.clone());
+                            argv.push(value);
+                        }
+                    }
+                    argv.push("sh".into());
+                    argv.push("-c".into());
+                    argv.push(command.into());
+                    Ok(argv)
                 }
-                argv.push("sh".into());
-                argv.push("-c".into());
-                argv.push(command.into());
-                Ok(argv)
-            }
-            Some(Tool::Firejail) => {
-                // firejail keeps the environment and (without --net=none)
-                // the network: only the write allowlist applies
-                let mut argv = vec![
-                    "firejail".into(),
-                    "--quiet".into(),
-                    "--private=.".into(),
-                    "--read-only=/".into(),
-                ];
-                for dir in allow_write {
-                    argv.push(format!("--whitelist={}", dir.display()));
+                Some(Tool::Firejail) => {
+                    // firejail keeps the environment and (without --net=none)
+                    // the network: only the write allowlist applies
+                    let mut argv = vec![
+                        "firejail".into(),
+                        "--quiet".into(),
+                        "--private=.".into(),
+                        "--read-only=/".into(),
+                    ];
+                    for dir in &resolved {
+                        argv.push(format!("--whitelist={}", dir.display()));
+                    }
+                    argv.push("--".into());
+                    argv.push("sh".into());
+                    argv.push("-c".into());
+                    argv.push(command.into());
+                    let _ = cwd;
+                    Ok(argv)
                 }
-                argv.push("--".into());
-                argv.push("sh".into());
-                argv.push("-c".into());
-                argv.push(command.into());
-                let _ = cwd;
-                Ok(argv)
+                Some(Tool::Landlock) => {
+                    // self re-exec trampoline: the sandboxed command becomes
+                    // `<ka> ka-sandbox-exec <policy-json> -- <argv…>`;
+                    // the hidden subcommand applies the landlock ruleset to
+                    // itself, then execs the real argv (the workspace forbids
+                    // `unsafe`, so no Command::pre_exec). The policy JSON is
+                    // the resolved allow_write list plus an enumerated /dev
+                    // surface (bwrap's --dev is a fresh tmpfs, so granting
+                    // the host /dev wholesale was never the parity) plus
+                    // the net/env expansion grants.
+                    let mut writable = resolved;
+                    writable.extend(
+                        DEV_NODES
+                            .iter()
+                            .filter(|p| Path::new(p).exists())
+                            .map(|p| PathBuf::from(*p)),
+                    );
+                    let policy = serde_json::to_string(&TrampolinePolicy {
+                        writable,
+                        net: *allow_net,
+                        env: pass_env.clone(),
+                    })
+                    .map_err(|e| format!("sandbox policy: {e}"))?;
+                    // readlink(/proc/self/exe) once per process, not per call
+                    static EXE: std::sync::LazyLock<Result<PathBuf, String>> =
+                        std::sync::LazyLock::new(|| {
+                            std::env::current_exe().map_err(|e| format!("sandbox trampoline: {e}"))
+                        });
+                    let exe = EXE.as_ref().map_err(Clone::clone)?;
+                    Ok(vec![
+                        exe.to_string_lossy().into_owned(),
+                        TRAMPOLINE_ARG.into(),
+                        policy,
+                        "--".into(),
+                        "sh".into(),
+                        "-c".into(),
+                        command.into(),
+                    ])
+                }
+                None => Err(
+                    "sandbox: mode \"fs\" requires bubblewrap (bwrap), firejail, or kernel \
+                     landlock on this host — refusing to run unsandboxed"
+                        .into(),
+                ),
             }
-            Some(Tool::Landlock) => {
-                // self re-exec trampoline: the sandboxed command becomes
-                // `<ka> ka-sandbox-exec <policy-json> -- sh -c <command>`;
-                // the hidden subcommand applies the landlock ruleset to
-                // itself, then execs the real argv (the workspace forbids
-                // `unsafe`, so no Command::pre_exec). The policy JSON is
-                // the allow_write list (+ /dev, matching bwrap's --dev)
-                // plus the net/env expansion grants.
-                let mut writable = allow_write.clone();
-                writable.push(PathBuf::from("/dev"));
-                let policy = serde_json::to_string(&TrampolinePolicy {
-                    writable,
-                    net: *allow_net,
-                    env: pass_env.clone(),
-                })
-                .map_err(|e| format!("sandbox policy: {e}"))?;
-                // readlink(/proc/self/exe) once per process, not per call
-                static EXE: std::sync::LazyLock<Result<PathBuf, String>> =
-                    std::sync::LazyLock::new(|| {
-                        std::env::current_exe().map_err(|e| format!("sandbox trampoline: {e}"))
-                    });
-                let exe = EXE.as_ref().map_err(Clone::clone)?;
-                Ok(vec![
-                    exe.to_string_lossy().into_owned(),
-                    TRAMPOLINE_ARG.into(),
-                    policy,
-                    "--".into(),
-                    "sh".into(),
-                    "-c".into(),
-                    command.into(),
-                ])
-            }
-            None => Err(
-                "sandbox: mode \"fs\" requires bubblewrap (bwrap), firejail, or kernel \
-                 landlock on this host — refusing to run unsandboxed"
-                    .into(),
-            ),
-        },
+        }
     }
 }
 
@@ -591,7 +707,31 @@ mod tests {
                     assert_eq!(argv[1], "ka-sandbox-exec", "{argv:?}");
                     let policy: TrampolinePolicy = serde_json::from_str(&argv[2]).unwrap();
                     assert!(policy.writable.contains(&PathBuf::from("/tmp")), "{argv:?}");
-                    assert!(policy.writable.contains(&PathBuf::from("/dev")), "{argv:?}");
+                    // enumerated /dev surface only — never the host /dev
+                    // wholesale (no /dev/shm OOM, no device nodes)
+                    assert!(
+                        !policy.writable.contains(&PathBuf::from("/dev")),
+                        "{argv:?}"
+                    );
+                    assert!(
+                        !policy.writable.iter().any(|w| w.starts_with("/dev/dri")),
+                        "{argv:?}"
+                    );
+                    for node in DEV_NODES.iter().filter(|p| Path::new(p).exists()) {
+                        assert!(
+                            policy.writable.contains(&PathBuf::from(*node)),
+                            "{node} missing: {argv:?}"
+                        );
+                    }
+                    // nothing else under /dev snuck in
+                    assert!(
+                        policy
+                            .writable
+                            .iter()
+                            .filter(|w| w.starts_with("/dev"))
+                            .all(|w| DEV_NODES.contains(&w.to_string_lossy().as_ref())),
+                        "{argv:?}"
+                    );
                     assert!(!policy.net, "base policy never grants network");
                     assert_eq!(argv[3], "--", "{argv:?}");
                     assert_eq!(argv[6], "make", "{argv:?}");
@@ -599,6 +739,62 @@ mod tests {
             }
             Err(e) => assert!(e.contains("refusing"), "{e}"),
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn allow_write_symlink_to_root_is_refused() {
+        let dir = std::env::temp_dir().join(format!("ka-sb-link-root-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let link = dir.join("link");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink("/", &link).unwrap();
+        let p = Policy::fs(vec![link.clone()]);
+        // whichever backend this host offers, the symlinked entry must
+        // fail closed — naming the link — before any bind/rule is built
+        let err = wrap_command(&p, "make", &dir).unwrap_err();
+        assert!(err.contains("link"), "{err}");
+        assert!(err.contains("refusing"), "{err}");
+        std::fs::remove_file(&link).ok();
+        std::fs::remove_dir(&dir).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn allow_write_symlink_within_granted_tree_still_resolves() {
+        let dir = std::env::temp_dir().join(format!("ka-sb-link-proj-{}", std::process::id()));
+        let real = dir.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let alias = dir.join("alias");
+        let _ = std::fs::remove_file(&alias);
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let resolved = std::fs::canonicalize(&real).unwrap();
+        if crate::detect_tool().is_none() {
+            return; // nothing to wrap with on this host
+        }
+        let p = Policy::fs(vec![alias.clone()]);
+        let argv = wrap_command(&p, "make", &dir)
+            .unwrap_or_else(|e| panic!("in-tree symlink must stay grantable: {e}"));
+        if argv[0] == "bwrap" {
+            let s = resolved.to_string_lossy();
+            assert!(
+                argv.windows(3)
+                    .any(|w| w[0] == "--bind" && w[1] == s && w[2] == s),
+                "{argv:?}"
+            );
+        } else if argv[0] == "firejail" {
+            assert!(
+                argv.iter()
+                    .any(|a| a == &format!("--whitelist={}", resolved.display())),
+                "{argv:?}"
+            );
+        } else {
+            // landlock trampoline
+            let pol: TrampolinePolicy = serde_json::from_str(&argv[2]).unwrap();
+            assert!(pol.writable.contains(&resolved), "{pol:?}");
+        }
+        std::fs::remove_file(&alias).ok();
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -778,5 +974,12 @@ mod tests {
         // /tmp/sub IS inside /tmp: no grant
         let g = missing_grants(&policy, cwd, &["/tmp/sub/x".to_string()], &[], false);
         assert!(g.write_paths.is_empty(), "{g:?}");
+        // normalize never pops past the root: results stay absolute so
+        // path_beneath_rules bind the subtree the OS would resolve
+        assert_eq!(
+            normalize(Path::new("/w/../../etc"), cwd),
+            PathBuf::from("/etc")
+        );
+        assert_eq!(normalize(Path::new("/w/.."), cwd), PathBuf::from("/"));
     }
 }

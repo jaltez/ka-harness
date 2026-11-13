@@ -13,6 +13,9 @@ pub struct Analysis {
     pub redirects: bool,
     /// Shell metacharacters used beyond simple quoting.
     pub has_compounds: bool,
+    /// Command substitution (`$(` or a backtick) present in the raw line.
+    /// Not parsed — its presence alone defeats read-only auto-allow.
+    pub has_substitution: bool,
     /// Resolved canonical program paths (wrapper-proof), per segment.
     pub resolved: Vec<Option<String>>,
 }
@@ -27,8 +30,8 @@ pub struct Hardstop {
 const WRAPPERS_NO_ARGS: &[&str] = &["nohup", "command", "builtin", "noglob"];
 const WRAPPERS_WITH_ARGS: &[&str] = &["nice", "stdbuf", "timeout"];
 const READONLY: &[&str] = &[
-    "ls", "cat", "pwd", "echo", "head", "tail", "wc", "which", "grep", "find", "stat", "du",
-    "diff", "rg", "file", "whoami", "uname", "true", "false", "git", "sed",
+    "ls", "cat", "pwd", "echo", "head", "tail", "wc", "which", "grep", "stat", "du", "diff", "rg",
+    "file", "whoami", "uname", "true", "false", "git",
 ];
 /// Programs whose normal use touches the network — the sandbox-expansion
 /// grant computation offers a network grant when one of these leads a
@@ -214,6 +217,7 @@ pub fn analyze(line: &str) -> Analysis {
         segments,
         redirects,
         has_compounds,
+        has_substitution: line.contains("$(") || line.contains('`'),
         resolved,
     }
 }
@@ -542,7 +546,7 @@ pub fn network_hosts(analysis: &Analysis) -> Vec<String> {
 /// Whether every segment is a known read-only program with no redirection
 /// (auto-allowed in guarded mode).
 pub fn all_readonly(analysis: &Analysis) -> bool {
-    if analysis.redirects || analysis.segments.is_empty() {
+    if analysis.redirects || analysis.has_substitution || analysis.segments.is_empty() {
         return false;
     }
     analysis.segments.iter().all(|seg| {
@@ -554,13 +558,7 @@ pub fn all_readonly(analysis: &Analysis) -> bool {
                         || seg.get(1).is_none_or(|sub| {
                             matches!(
                                 sub.as_str(),
-                                "status"
-                                    | "log"
-                                    | "diff"
-                                    | "show"
-                                    | "branch"
-                                    | "rev-parse"
-                                    | "ls-files"
+                                "status" | "log" | "diff" | "show" | "rev-parse" | "ls-files"
                             )
                         }))
             })
@@ -622,6 +620,14 @@ mod tests {
         assert!(!all_readonly(&analyze("cargo build")));
         assert!(!all_readonly(&analyze("git push origin main")));
         assert!(!all_readonly(&analyze("rm file")));
+        // sed/find were dropped: flag-parsing is too error-prone to auto-allow
+        assert!(!all_readonly(&analyze("sed -i 's/a/b/' f.txt")));
+        assert!(!all_readonly(&analyze("find . -name '*.tmp' -delete")));
+        // git branch mutates with -D/-m; asking is the correct default
+        assert!(!all_readonly(&analyze("git branch -D x")));
+        // command substitution is never parsed — treat as non-readonly
+        assert!(!all_readonly(&analyze("ls $(rm -rf build)")));
+        assert!(!all_readonly(&analyze("echo `whoami`")));
     }
 
     #[test]

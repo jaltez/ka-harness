@@ -220,16 +220,31 @@ async fn speak_responses(
     let mut saw_any_event = false;
     let mut saw_terminal = false;
 
+    let mut first_chunk = true;
     loop {
-        let item =
-            match tokio::time::timeout(std::time::Duration::from_secs(300), stream.next()).await {
-                Ok(item) => item,
-                Err(_) => {
-                    return Err(WireError::network(
-                        "idle timeout: 300s without a stream chunk",
-                    ));
-                }
-            };
+        // The HTTP layer's first-byte timeout resolves at headers; the
+        // wire must separately bound time-to-first-STREAM-chunk so a
+        // stalled prefill behind 200 OK still fails fast and retryably.
+        let deadline = if first_chunk && dialect.first_byte_timeout_ms > 0 {
+            tokio::time::Duration::from_millis(dialect.first_byte_timeout_ms)
+        } else {
+            std::time::Duration::from_secs(300)
+        };
+        let item = match tokio::time::timeout(deadline, stream.next()).await {
+            Ok(item) => item,
+            Err(_) if first_chunk && dialect.first_byte_timeout_ms > 0 => {
+                return Err(WireError::network(format!(
+                    "no first byte within {}ms (headers arrived, stream stalled)",
+                    dialect.first_byte_timeout_ms
+                )));
+            }
+            Err(_) => {
+                return Err(WireError::network(
+                    "idle timeout: 300s without a stream chunk",
+                ));
+            }
+        };
+        first_chunk = false;
         let Some(chunk) = item else {
             break;
         };
@@ -328,9 +343,27 @@ async fn speak_responses(
                             .unwrap_or("")
                             .to_string();
                         if !tool.is_empty() {
-                            calls.retain(|c| c.call_id != call_id);
+                            let incoming_id = item
+                                .get("id")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string();
+                            calls.retain(|c| {
+                                dedup_key(&c.call_id, &c.item_id)
+                                    != dedup_key(&call_id, &incoming_id)
+                            });
                             calls.push(PendingItem {
-                                item_id: String::new(),
+                                // a call_id-less proxy emits `id` on both
+                                // added and done: keep it, or emission
+                                // would send an empty call id the
+                                // provider rejects; with call_id present
+                                // the deltas match by call_id, so the
+                                // item id stays blank as before
+                                item_id: if call_id.is_empty() {
+                                    incoming_id
+                                } else {
+                                    String::new()
+                                },
                                 call_id,
                                 tool,
                                 args,
@@ -367,22 +400,22 @@ async fn speak_responses(
                         .pointer("/response/error/message")
                         .and_then(Value::as_str)
                         .unwrap_or("response failed");
-                    return Err(WireError {
-                        class: ka_protocol::ErrorClass::Protocol,
-                        retryable: false,
-                        message: message.to_string(),
-                    });
+                    let code = v
+                        .pointer("/response/error/code")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    return Err(failed_wire_error(code, message.to_string()));
                 }
                 "error" => {
                     let message = v
                         .pointer("/error/message")
                         .and_then(Value::as_str)
                         .unwrap_or("stream error event");
-                    return Err(WireError {
-                        class: ka_protocol::ErrorClass::Protocol,
-                        retryable: false,
-                        message: message.to_string(),
-                    });
+                    let code = v
+                        .pointer("/error/code")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    return Err(failed_wire_error(code, message.to_string()));
                 }
                 _ => {} // created/in_progress/other frames: ignored
             }
@@ -419,19 +452,22 @@ async fn speak_responses(
         ));
     }
 
-    // Emit complete calls (deduped by call_id, arguments repaired).
+    // Emit complete calls (deduped by call_id, falling back to item_id
+    // when parallel calls ship without one, arguments repaired).
     let mut seen: Vec<String> = Vec::new();
     for pending in calls {
-        if pending.tool.is_empty() || seen.contains(&pending.call_id) {
+        let key = dedup_key(&pending.call_id, &pending.item_id);
+        if pending.tool.is_empty() || seen.contains(&key) {
             continue;
         }
-        seen.push(pending.call_id.clone());
+        seen.push(key.clone());
+        let id = if pending.call_id.is_empty() {
+            pending.item_id
+        } else {
+            pending.call_id
+        };
         out.send(StreamEvent::Call(ToolCall {
-            id: if pending.call_id.is_empty() {
-                pending.item_id.clone()
-            } else {
-                pending.call_id
-            },
+            id,
             tool: pending.tool,
             arguments: repair_json(&pending.args),
         }))
@@ -448,4 +484,28 @@ struct PendingItem {
     call_id: String,
     tool: String,
     args: String,
+}
+
+/// Dedup key for a function call: call_id when present, else the item's
+/// own id — two parallel calls without call_id must not collide on "".
+fn dedup_key(call_id: &str, item_id: &str) -> String {
+    if call_id.is_empty() {
+        item_id.to_string()
+    } else {
+        call_id.to_string()
+    }
+}
+
+/// A failed-response error: documented transient codes (server_error,
+/// rate_limit_exceeded, timeout) stay retryable so the engine's backoff
+/// re-drives; everything else is a protocol failure.
+fn failed_wire_error(code: &str, message: String) -> WireError {
+    match code {
+        "server_error" | "rate_limit_exceeded" | "timeout" => WireError::network(message),
+        _ => WireError {
+            class: ka_protocol::ErrorClass::Protocol,
+            retryable: false,
+            message,
+        },
+    }
 }

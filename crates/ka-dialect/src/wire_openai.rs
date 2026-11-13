@@ -185,11 +185,25 @@ async fn speak_openai(
                 } else {
                     json!(m.content)
                 };
-                messages
-                    .push(json!({"role": "assistant", "content": content, "tool_calls": calls}));
+                let mut msg = json!({"role": "assistant", "content": content, "tool_calls": calls});
+                if dialect.flags.replay_reasoning
+                    && let Some(t) = m.thinking.as_deref().filter(|t| !t.is_empty())
+                {
+                    // KV-cache prefix reuse (ollama qwen3-style): replay
+                    // the assistant's reasoning verbatim, same field the
+                    // wire reads on input
+                    msg["reasoning_content"] = json!(t);
+                }
+                messages.push(msg);
             }
             crate::speaker::TurnRole::Assistant => {
-                messages.push(json!({"role": "assistant", "content": m.content}));
+                let mut msg = json!({"role": "assistant", "content": m.content});
+                if dialect.flags.replay_reasoning
+                    && let Some(t) = m.thinking.as_deref().filter(|t| !t.is_empty())
+                {
+                    msg["reasoning_content"] = json!(t);
+                }
+                messages.push(msg);
             }
             crate::speaker::TurnRole::Tool => {
                 for r in &m.results {
@@ -245,16 +259,31 @@ async fn speak_openai(
     let mut finished = false;
     let mut saw_finish_reason = false;
 
+    let mut first_chunk = true;
     loop {
-        let item =
-            match tokio::time::timeout(std::time::Duration::from_secs(300), stream.next()).await {
-                Ok(item) => item,
-                Err(_) => {
-                    return Err(WireError::network(
-                        "idle timeout: 300s without a stream chunk",
-                    ));
-                }
-            };
+        // The HTTP layer's first-byte timeout resolves at headers; the
+        // wire must separately bound time-to-first-STREAM-chunk so a
+        // stalled prefill behind 200 OK still fails fast and retryably.
+        let deadline = if first_chunk && dialect.first_byte_timeout_ms > 0 {
+            tokio::time::Duration::from_millis(dialect.first_byte_timeout_ms)
+        } else {
+            std::time::Duration::from_secs(300)
+        };
+        let item = match tokio::time::timeout(deadline, stream.next()).await {
+            Ok(item) => item,
+            Err(_) if first_chunk && dialect.first_byte_timeout_ms > 0 => {
+                return Err(WireError::network(format!(
+                    "no first byte within {}ms (headers arrived, stream stalled)",
+                    dialect.first_byte_timeout_ms
+                )));
+            }
+            Err(_) => {
+                return Err(WireError::network(
+                    "idle timeout: 300s without a stream chunk",
+                ));
+            }
+        };
+        first_chunk = false;
         let Some(chunk) = item else {
             break;
         };
@@ -268,25 +297,7 @@ async fn speak_openai(
                 continue; // malformed chunk: drop, keep streaming
             };
             if let Some(u) = v.get("usage").filter(|u| u.is_object()) {
-                // OpenAI reports cached_tokens as a SUBSET of
-                // prompt_tokens: keep input cache-exclusive (matching
-                // wire_responses and the Anthropic wire) so consumers
-                // that compute input + cache_read don't double-count
-                let prompt = u.get("prompt_tokens").and_then(Value::as_u64);
-                let cached = u
-                    .get("prompt_tokens_details")
-                    .and_then(|d| d.get("cached_tokens"))
-                    .and_then(Value::as_u64)
-                    .or_else(|| u.get("cached_tokens").and_then(Value::as_u64))
-                    .unwrap_or(0);
-                if let Some(p) = prompt {
-                    usage.input = p.saturating_sub(cached);
-                }
-                usage.output = u
-                    .get("completion_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(usage.output);
-                usage.cache_read = cached;
+                parse_usage(u, &mut usage);
             }
             let Some(choice) = v.pointer("/choices/0") else {
                 continue;
@@ -330,6 +341,10 @@ async fn speak_openai(
             continue;
         }
         if let Ok(v) = serde_json::from_str::<Value>(&evt.data) {
+            // a final usage frame without a trailing separator still counts
+            if let Some(u) = v.get("usage").filter(|u| u.is_object()) {
+                parse_usage(u, &mut usage);
+            }
             if let Some(choice) = v.pointer("/choices/0") {
                 if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
                     saw_finish_reason = true;
@@ -383,6 +398,11 @@ struct PendingCall {
 
 fn ingest_tool_fragment(calls: &mut Vec<PendingCall>, frag: &Value) {
     let index = frag.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+    // wire-controlled index: a garbage/hostile frame must not drive an
+    // unbounded pad allocation
+    if index > 1024 {
+        return;
+    }
     while calls.len() <= index {
         calls.push(PendingCall::default());
     }
@@ -396,6 +416,28 @@ fn ingest_tool_fragment(calls: &mut Vec<PendingCall>, frag: &Value) {
     if let Some(args) = frag.pointer("/function/arguments").and_then(Value::as_str) {
         pending.args.push_str(args);
     }
+}
+
+/// Merge one Chat Completions `usage` object into the running total.
+/// OpenAI reports cached_tokens as a SUBSET of prompt_tokens: keep input
+/// cache-exclusive (matching wire_responses and the Anthropic wire) so
+/// consumers that compute input + cache_read don't double-count.
+fn parse_usage(u: &Value, usage: &mut ka_protocol::Usage) {
+    let prompt = u.get("prompt_tokens").and_then(Value::as_u64);
+    let cached = u
+        .get("prompt_tokens_details")
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(Value::as_u64)
+        .or_else(|| u.get("cached_tokens").and_then(Value::as_u64))
+        .unwrap_or(0);
+    if let Some(p) = prompt {
+        usage.input = p.saturating_sub(cached);
+    }
+    usage.output = u
+        .get("completion_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(usage.output);
+    usage.cache_read = cached;
 }
 
 /// The reasoning-effort value the endpoint accepts, if any. The dialect

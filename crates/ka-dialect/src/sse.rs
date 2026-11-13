@@ -27,7 +27,16 @@ impl SseParser {
 
     /// Feed bytes; returns any complete events decoded from them.
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<SseEvent> {
+        // strip a leading UTF-8 BOM at the buffer head (checked every
+        // feed: a BOM split across a tiny first chunk would otherwise
+        // survive the once-at-start strip and break the first frame).
+        // Safe to re-check: `buf`'s head is only ever at a frame
+        // boundary, and a frame starts with an ASCII field name —
+        // never with 0xEF, a UTF-8 lead byte.
         self.buf.extend_from_slice(bytes);
+        if self.buf.starts_with([0xEF, 0xBB, 0xBF].as_slice()) {
+            self.buf.drain(..3);
+        }
         self.drain()
     }
 
@@ -44,7 +53,7 @@ impl SseParser {
 
     fn drain(&mut self) -> Vec<SseEvent> {
         let mut out = Vec::new();
-        // Split on blank line separators; both "\n\n" and "\r\n\r\n".
+        // Split on blank-line separators: "\n\n", "\r\n\r\n", or mixed.
         while let Some((idx, sep_len)) = find_separator(&self.buf) {
             let frame: Vec<u8> = self.buf.drain(..idx + sep_len).collect();
             // decode the frame WITHOUT the separator, at a char boundary
@@ -57,15 +66,21 @@ impl SseParser {
     }
 }
 
-/// Earliest blank-line separator: `(index, length)` for `\n\n` (2) or
-/// `\r\n\r\n` (4).
+/// Earliest blank-line separator: `(index, length)` for `\n\n` (2),
+/// `\r\n\r\n` (4), or the spec-legal mixed `\n\r\n` (3).
 fn find_separator(buf: &[u8]) -> Option<(usize, usize)> {
     if buf.len() < 2 {
         return None;
     }
     for i in 0..buf.len() - 1 {
-        if buf[i] == b'\n' && buf[i + 1] == b'\n' {
-            return Some((i, 2));
+        if buf[i] == b'\n' {
+            if buf[i + 1] == b'\n' {
+                return Some((i, 2));
+            }
+            // mixed line endings: LF then CRLF
+            if buf.len() >= i + 3 && buf[i + 1] == b'\r' && buf[i + 2] == b'\n' {
+                return Some((i, 3));
+            }
         }
         if buf[i] == b'\r'
             && buf.len() >= i + 4
@@ -155,5 +170,26 @@ mod tests {
         let mut p = SseParser::new();
         let evts = p.feed(b"data: a\ndata: b\n\n");
         assert_eq!(evts[0].data, "a\nb");
+    }
+
+    #[test]
+    fn mixed_lf_crlf_separator_splits_events() {
+        let mut p = SseParser::new();
+        let evts = p.feed(b"data: x\n\r\ndata: y\n\n");
+        assert_eq!(evts.len(), 2);
+        assert_eq!(evts[0].data, "x");
+        assert_eq!(evts[1].data, "y");
+    }
+
+    #[test]
+    fn leading_bom_is_stripped_once() {
+        let mut p = SseParser::new();
+        let bytes: Vec<u8> = [0xEF, 0xBB, 0xBF]
+            .into_iter()
+            .chain(b"data: bom\n\n".iter().copied())
+            .collect();
+        let evts = p.feed(&bytes);
+        assert_eq!(evts.len(), 1);
+        assert_eq!(evts[0].data, "bom");
     }
 }

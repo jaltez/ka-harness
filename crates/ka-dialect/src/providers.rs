@@ -2,7 +2,10 @@
 //! and API-key environment variable. Powers `ka providers`, the settings
 //! panel, and synthetic dialects for unseeded models — any
 //! `provider/model` selector on a registered provider works without a
-//! catalog row.
+//! catalog row. Synthetic rows are conservative-but-usable: tools are
+//! enabled (every registered provider speaks them on its wire), while
+//! structured output, server search, and reasoning replay stay off
+//! until a catalog row confirms them; the context window is unknown (0).
 //!
 //! Curation (v2): official providers first and FEW — Anthropic, OpenAI,
 //! Google, z.ai (API), z.ai (Coding Readonly) — then community/alternative
@@ -15,7 +18,7 @@
 //! Excluded entirely: Azure/Bedrock/Vertex (sigv4/Entra machinery),
 //! JWT-only flows, and mirrors/duplicates of the official five.
 
-use crate::dialects::{Dialect, Wire};
+use crate::dialects::{Dialect, Flags, Wire};
 
 /// One known provider.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -232,7 +235,8 @@ pub fn session_header(vendor: &str) -> Option<&'static str> {
 }
 
 /// Synthesize a dialect for `provider/model` when the catalog has no row.
-/// Context window unknown (0); conservative defaults elsewhere.
+/// Context window unknown (0); tools enabled (every registered provider
+/// accepts tool calls on its wire); everything else conservative.
 pub fn synthetic_dialect(provider: &Provider, model: &str) -> Dialect {
     Dialect {
         wire: provider.wire,
@@ -249,7 +253,10 @@ pub fn synthetic_dialect(provider: &Provider, model: &str) -> Dialect {
         ratio: 3.6,
         price: Default::default(),
         priced: false,
-        flags: Default::default(),
+        flags: Flags {
+            tools: true,
+            ..Flags::default()
+        },
         effort_budgets: Default::default(),
         first_byte_timeout_ms: 120_000,
     }
@@ -312,6 +319,26 @@ mod tests {
         );
         assert_eq!(d.api_key_env.as_deref(), Some("OPENCODE_API_KEY"));
         assert_eq!(d.wire, Wire::OpenaiChat);
+    }
+
+    #[test]
+    fn synthetic_dialect_flags_are_conservative() {
+        let p = find("groq").unwrap();
+        let d = synthetic_dialect(p, "llama-3.3-70b-versatile");
+        assert!(d.flags.tools, "registered providers accept tool calls");
+        assert!(
+            !d.flags.structured,
+            "structured output stays off without a row"
+        );
+        assert!(
+            !d.flags.server_search,
+            "server search stays off without a row"
+        );
+        assert!(
+            !d.flags.replay_reasoning,
+            "reasoning replay stays off without a row"
+        );
+        assert_eq!(d.context, 0, "context window unknown without a row");
     }
 
     #[test]

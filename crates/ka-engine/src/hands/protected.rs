@@ -48,7 +48,14 @@ pub fn reason(cwd: &Path, raw: &str) -> Option<&'static str> {
     let git_internals = |p: &Path| -> bool {
         let rel = p.strip_prefix(cwd).unwrap_or(p);
         let s = rel.to_string_lossy().replace('\\', "/");
-        s.starts_with(".git/hooks/") || s == ".git/config" || s.starts_with(".git/modules/")
+        // absolute paths outside cwd carry their own markers
+        let full = p.to_string_lossy().replace('\\', "/");
+        s.starts_with(".git/hooks/")
+            || s == ".git/config"
+            || s.starts_with(".git/modules/")
+            || full.contains("/.git/hooks/")
+            || full.ends_with("/.git/config")
+            || full.contains("/.git/modules/")
     };
     if git_internals(&path) {
         return Some("git internals (.git/hooks/.git/config) can execute code or rewrite remotes");
@@ -139,6 +146,8 @@ mod tests {
             (".git/hooks/pre-commit", Some("git internals")),
             ("src/../.git/config", Some("git internals")),
             (".git/modules/x/config", Some("git internals")),
+            ("/tmp/other/.git/hooks/pre-commit", Some("git internals")),
+            ("/tmp/other/.git/config", Some("git internals")),
             ("src/main.rs", None),
             (".gitignore", None),
         ];

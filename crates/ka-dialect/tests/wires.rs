@@ -619,6 +619,11 @@ data: {"type":"response.incomplete","response":{"status":"incomplete","usage":{"
 "#;
 
 const RESPONSES_FAILED: &str = r#"
+data: {"type":"response.failed","response":{"error":{"code":"invalid_prompt","message":"bad prompt"}}}
+
+"#;
+
+const RESPONSES_SERVER_ERROR: &str = r#"
 data: {"type":"response.failed","response":{"error":{"code":"server_error","message":"model overloaded"}}}
 
 "#;
@@ -1148,4 +1153,306 @@ async fn chat_wire_refuses_server_search_instructively() {
         ),
         other => panic!("expected instructive failure, got {other:?}"),
     }
+}
+
+// ------------------------------------------------- audit-fix fixtures
+
+/// Serve one canned SSE response that writes headers then stalls before
+/// the first stream chunk — the first-byte-timeout shape (headers arrive,
+/// prefill never produces output).
+async fn serve_headers_then_stall() -> std::net::SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut tmp = [0u8; 8192];
+        loop {
+            let n = sock.read(&mut tmp).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if request_complete(&buf) {
+                break;
+            }
+        }
+        let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n";
+        sock.write_all(headers.as_bytes()).await.unwrap();
+        sock.flush().await.unwrap();
+        // stall long past both deadlines under test
+        tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+        sock.write_all(b"data: {}\n\n").await.ok();
+        sock.shutdown().await.ok();
+    });
+    addr
+}
+
+const ANTHROPIC_OVERLOADED_ERROR: &str = r#"
+data: {"type":"message_start","message":{"usage":{"input_tokens":5}}}
+
+data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}
+
+"#;
+
+const ANTHROPIC_INVALID_REQUEST_ERROR: &str = r#"
+data: {"type":"error","error":{"type":"invalid_request_error","message":"max_tokens is required"}}
+
+"#;
+
+#[tokio::test]
+async fn anthropic_overloaded_error_event_is_retryable() {
+    let (addr, _cap) = serve_sse(ANTHROPIC_OVERLOADED_ERROR).await;
+    let dialect = dialect_for("anthropic_messages", addr, "");
+    let events = collect(&AnthropicMessages::new(), request(dialect, "")).await;
+    match events.last() {
+        Some(StreamEvent::Failed {
+            class: ka_protocol::ErrorClass::Network,
+            retryable: true,
+            message,
+        }) => assert!(message.contains("Overloaded"), "{message}"),
+        other => panic!("expected retryable network failure, got {other:?}"),
+    }
+
+    let (addr, _cap) = serve_sse(ANTHROPIC_INVALID_REQUEST_ERROR).await;
+    let dialect = dialect_for("anthropic_messages", addr, "");
+    let events = collect(&AnthropicMessages::new(), request(dialect, "")).await;
+    match events.last() {
+        Some(StreamEvent::Failed {
+            class: ka_protocol::ErrorClass::Protocol,
+            retryable: false,
+            ..
+        }) => {}
+        other => panic!("expected non-retryable protocol failure, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn responses_server_error_failed_event_is_retryable() {
+    let (addr, _cap) = serve_sse(RESPONSES_SERVER_ERROR).await;
+    let dialect = dialect_for("openai_responses", addr, "");
+    let events = collect(&OpenaiResponses::new(), request(dialect, "")).await;
+    match events.last() {
+        Some(StreamEvent::Failed {
+            class: ka_protocol::ErrorClass::Network,
+            retryable: true,
+            message,
+        }) => assert!(message.contains("overloaded"), "{message}"),
+        other => panic!("expected retryable network failure, got {other:?}"),
+    }
+}
+
+const ANTHROPIC_ABSURD_INDEX: &str = r#"
+data: {"type":"message_start","message":{"usage":{"input_tokens":5}}}
+
+data: {"type":"content_block_start","index":2000000000,"content_block":{"type":"text","text":""}}
+
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"fine"}}
+
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}
+
+data: {"type":"message_stop"}
+
+"#;
+
+const OPENAI_ABSURD_INDEX: &str = r#"
+data: {"choices":[{"delta":{"tool_calls":[{"index":2000000000,"id":"call_evil","function":{"name":"rm","arguments":"{}"}}]}}]}
+
+data: {"choices":[{"delta":{"content":"fine"}}]}
+
+data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+"#;
+
+#[tokio::test]
+async fn absurd_index_frame_is_ignored() {
+    let (addr, _cap) = serve_sse(ANTHROPIC_ABSURD_INDEX).await;
+    let dialect = dialect_for("anthropic_messages", addr, "");
+    let events = collect(&AnthropicMessages::new(), request(dialect, "")).await;
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::Text(t) if t == "fine"))
+    );
+    assert!(matches!(events.last(), Some(StreamEvent::Finished { .. })));
+
+    let (addr, _cap) = serve_sse(OPENAI_ABSURD_INDEX).await;
+    let dialect = dialect_for("openai_chat", addr, "");
+    let events = collect(&OpenaiChat::new(), request(dialect, "")).await;
+    assert!(
+        !events.iter().any(|e| matches!(e, StreamEvent::Call(_))),
+        "huge-index fragment must not materialize a call: {events:?}"
+    );
+    assert!(matches!(events.last(), Some(StreamEvent::Finished { .. })));
+}
+
+#[tokio::test]
+async fn openai_replays_reasoning_when_flag_set() {
+    use ka_dialect::speaker::ToolCall;
+
+    let assistant_turn = || TurnMessage {
+        role: TurnRole::Assistant,
+        content: "did the thing".into(),
+        thinking: Some("step-by-step plan".into()),
+        calls: vec![ToolCall {
+            id: "c1".into(),
+            tool: "bash".into(),
+            arguments: serde_json::json!({"command": "make"}),
+        }],
+        results: Vec::new(),
+        images: Vec::new(),
+    };
+
+    let (addr, captured) = serve_sse(OPENAI_BASIC).await;
+    let dialect = dialect_for(
+        "openai_chat",
+        addr,
+        "[dialects.\"test/m\".flags]\nreplay_reasoning = true\n",
+    );
+    let mut req = request(dialect, "");
+    req.messages.push(assistant_turn());
+    let _ = collect(&OpenaiChat::new(), req).await;
+    let raw = captured.lock().clone().unwrap();
+    assert!(
+        raw.contains("\"reasoning_content\":\"step-by-step plan\""),
+        "flag on must replay thinking as reasoning_content:\n{raw}"
+    );
+
+    let (addr, captured) = serve_sse(OPENAI_BASIC).await;
+    let dialect = dialect_for("openai_chat", addr, "");
+    let mut req = request(dialect, "");
+    req.messages.push(assistant_turn());
+    let _ = collect(&OpenaiChat::new(), req).await;
+    let raw = captured.lock().clone().unwrap();
+    assert!(
+        !raw.contains("reasoning_content"),
+        "flag off must omit reasoning_content:\n{raw}"
+    );
+}
+
+#[tokio::test]
+async fn anthropic_image_only_turn_omits_empty_text_block() {
+    let (addr, captured) = serve_sse(ANTHROPIC_VISION_OK).await;
+    let dialect = dialect_for("anthropic_messages", addr, "input = [\"text\", \"image\"]");
+    let mut req = request(dialect, "look");
+    req.messages[0].content = String::new();
+    req.messages[0].images = vec![ka_dialect::ImagePart {
+        data: PNG_B64.into(),
+        media_type: "image/png".into(),
+    }];
+    let _ = collect(&AnthropicMessages::new(), req).await;
+
+    let raw = captured.lock().clone().unwrap();
+    let body: serde_json::Value =
+        serde_json::from_str(raw.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    let content = body["messages"][0]["content"].as_array().unwrap();
+    assert_eq!(
+        content.len(),
+        1,
+        "empty caption must not produce a text block: {content:?}"
+    );
+    assert_eq!(content[0]["type"], "image");
+}
+
+const OPENAI_TRAILING_USAGE: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2}}";
+
+#[tokio::test]
+async fn openai_trailing_usage_frame_counts() {
+    let (addr, _cap) = serve_sse(OPENAI_TRAILING_USAGE).await;
+    let dialect = dialect_for("openai_chat", addr, "");
+    let events = collect(&OpenaiChat::new(), request(dialect, "")).await;
+    match events.last() {
+        Some(StreamEvent::Finished { usage, .. }) => {
+            assert_eq!(usage.input, 10);
+            assert_eq!(usage.output, 2);
+        }
+        other => panic!("expected Finished with usage, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn first_byte_timeout_fires_before_idle() {
+    for wire in ["openai_chat", "anthropic_messages", "openai_responses"] {
+        let addr = serve_headers_then_stall().await;
+        let dialect = dialect_for(wire, addr, "first_byte_timeout_ms = 200\n");
+        let events = match wire {
+            "openai_chat" => collect(&OpenaiChat::new(), request(dialect, "")).await,
+            "anthropic_messages" => collect(&AnthropicMessages::new(), request(dialect, "")).await,
+            _ => collect(&OpenaiResponses::new(), request(dialect, "")).await,
+        };
+        match events.last() {
+            Some(StreamEvent::Failed {
+                class: ka_protocol::ErrorClass::Network,
+                retryable: true,
+                message,
+            }) => assert!(
+                message.contains("first byte"),
+                "{wire} must name the first-byte deadline: {message}"
+            ),
+            other => panic!("{wire}: expected first-byte timeout, got {other:?}"),
+        }
+    }
+}
+
+const RESPONSES_PARALLEL_NO_CALL_ID: &str = r#"
+data: {"type":"response.output_item.added","item":{"type":"function_call","id":"fc_1","name":"read","arguments":""}}
+
+data: {"type":"response.output_item.added","item":{"type":"function_call","id":"fc_2","name":"bash","arguments":""}}
+
+data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":5,"output_tokens":2}}}
+
+"#;
+
+#[tokio::test]
+async fn responses_parallel_calls_without_call_id_both_emit() {
+    let (addr, _cap) = serve_sse(RESPONSES_PARALLEL_NO_CALL_ID).await;
+    let dialect = dialect_for("openai_responses", addr, "");
+    let events = collect(&OpenaiResponses::new(), request(dialect, "")).await;
+    let calls: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            StreamEvent::Call(c) => Some(c.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(calls.len(), 2, "both id-only calls must emit: {calls:?}");
+    assert_eq!(calls[0].id, "fc_1");
+    assert_eq!(calls[0].tool, "read");
+    assert_eq!(calls[1].id, "fc_2");
+    assert_eq!(calls[1].tool, "bash");
+}
+
+const ANTHROPIC_TOOL_INPUT_AT_START: &str = r#"
+data: {"type":"message_start","message":{"usage":{"input_tokens":5}}}
+
+data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_9","name":"edit","input":{"path":"src/a.rs"}}}
+
+data: {"type":"content_block_stop","index":0}
+
+data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":4}}
+
+data: {"type":"message_stop"}
+
+"#;
+
+#[tokio::test]
+async fn tool_use_input_at_start_used_when_no_deltas() {
+    let (addr, _cap) = serve_sse(ANTHROPIC_TOOL_INPUT_AT_START).await;
+    let dialect = dialect_for("anthropic_messages", addr, "");
+    let events = collect(&AnthropicMessages::new(), request(dialect, "")).await;
+    let call = events.iter().find_map(|e| match e {
+        StreamEvent::Call(c) => Some(c.clone()),
+        _ => None,
+    });
+    let call = call.expect("expected a tool call");
+    assert_eq!(call.id, "toolu_9");
+    assert_eq!(call.tool, "edit");
+    assert_eq!(
+        call.arguments.get("path").and_then(|v| v.as_str()),
+        Some("src/a.rs")
+    );
 }

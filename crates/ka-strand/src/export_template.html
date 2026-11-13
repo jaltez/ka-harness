@@ -30,12 +30,18 @@ footer{margin-top:4rem}
 /* vendored minimal markdown renderer: headings, lists, code fences,
    quotes, rules, inline code/bold/italic/links — no dependencies */
 (function(){
-function esc(s){return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")}
+function esc(s){return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;")}
+/* percent-encode quotes/control chars in a URL so it cannot break out
+   of the href attribute, and only emit <a> for safe schemes */
+function pct(u){return u.replace(/["\u0000-\u001f\u007f]/g,function(c){return "%"+("0"+c.charCodeAt(0).toString(16)).slice(-2).toUpperCase()})}
+function safeHref(u){u=pct(u);return /^(https?:|mailto:|#|\/|\./|\.\.\/)/i.test(u)?'<a href="'+u+'">':null}
 function inline(s){return esc(s)
  .replace(/`([^`]+)`/g,"<code>$1</code>")
  .replace(/\*\*([^*]+)\*\*/g,"<strong>$1</strong>")
  .replace(/\*([^*]+)\*/g,"<em>$1</em>")
- .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g,'<a href="$2">$1</a>')}
+ .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g,function(_,t,u){
+   var a=safeHref(u);
+   return a?a+t+"</a>":t+" ("+pct(u)+")"})}
 var md=document.getElementById("ka-md").textContent;
 var out=[],code=null,list=null,items=[];
 function flushList(){if(list){out.push("<"+list+">"+items.map(function(li){return "<li>"+inline(li)+"</li>"}).join("")+"</"+list+">");list=null;items=[]}}

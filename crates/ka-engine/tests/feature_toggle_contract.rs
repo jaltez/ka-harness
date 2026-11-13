@@ -175,6 +175,10 @@ fn engine(
 async fn agents_toggle_hides_rejects_and_restores() {
     let dir = tmp_dir("agents");
     write_agent(&dir);
+    // project agent dirs are trust-gated (same as rules/skills/hooks):
+    // hold a redirected store open across the awaits, then approve
+    let (_store, _guard) = trust::test_support::trust_guard();
+    trust::approve(&dir);
     let rec = Rec::new();
     let mut handle = engine(&dir, rec.clone(), ka_engine::StrandChoice::New);
 

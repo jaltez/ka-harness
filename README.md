@@ -26,7 +26,7 @@ ka --session 3f9c2a81               # resume by id prefix or name
 ka run "summarize the build error"  # one headless turn, NDJSON events on stdout
 ```
 
-Essential keys: `Enter` send or steer mid-turn · `⇧Enter` newline (`Ctrl+J` fallback) · `Esc`/`Ctrl-C` abort · `/help` for the rest.
+Essential keys: `Enter` send or steer mid-turn · `⇧Enter` newline (`Ctrl+J` fallback) · `Esc` unpin scroll, then abort · `Ctrl-C` abort · `/help` for the rest.
 
 
 Markdown answers render with shaded code panels, tables, and mermaid diagrams drawn as box-drawing flowcharts, sequence and state diagrams, quadrant planes; anything the renderer does not cover keeps its source panel.
@@ -61,7 +61,7 @@ Every key with its default: [ka.toml reference](https://ka-harness.dev/docs/refe
 - **Unbypassable hardstops** — root rm, fork bombs, fetch-and-execute: they ask even in allow mode; headless denies.
 - **Read ledger** — edits refuse files the model has not read, or that changed since.
 - **Secret redaction**, one-way, in every tool result.
-- **Optional fs sandbox** for bash children (bwrap / firejail / landlock), fail-closed.
+- **Optional fs sandbox** for bash children (bwrap / firejail / landlock), fail-closed; the landlock backend exposes only an enumerated `/dev` surface (`null`, `zero`, `full`, `random`, `urandom`, `shm`) rather than the host `/dev`.
 - **`ka --safe-mode`** — the troubleshooting floor: every customization off, built-ins kept.
 
 Details — doom-loop rules, protected paths, project trust, runtime feature toggles: [safety model](https://ka-harness.dev/docs/concepts/safety/).
@@ -87,6 +87,7 @@ Also: `ka sessions` · `ka export` (markdown/HTML) · `ka rewind` · `ka attach`
 Opt-in integrations, all config tables: **LSP** (diagnostics, navigation, rename/format), **DAP debugging**, the **verify loop** (auto-lint / auto-test after edits), **runtime feature toggles** (`ka --disable agents,mcp:github,tool:bash` — fail-closed), and **Herdr** (`[tui] herdr = true` — reports the agent's `idle`/`working`/`blocked` state, its resume command, and exit to the pane that hosts it; inert outside Herdr). See the [config reference](https://ka-harness.dev/docs/reference/config/).
 
 ka reads the ecosystem automatically: `AGENTS.md` (`CLAUDE.md` compatible) and `.agents/` / `.claude/` directories. Every session is an append-only JSONL [strand](https://ka-harness.dev/docs/concepts/strands/) — rewind, fork, export, replay. `/tree` shows the session's fork tree and branches from any past input: picking one forks the strand there (original stays intact) and the chat continues from that point. The [harness loop](https://ka-harness.dev/docs/concepts/harness/) reads the model's own todo list back and pushes on claims that don't hold up.
+Every append is fsynced (`sync_data`, plus a directory sync when the file is created), and a torn final line from a crash mid-append is healed on the next open, so a session survives power loss resumable to its last complete record.
 
 ## Development
 
@@ -116,7 +117,7 @@ Design docs live in [`research/ka-harness/`](research/ka-harness/): [architectur
 | `ka-harness` | the published `ka` binary |
 | `ka-index` / `ka-sandbox` | optional: FTS search (`index` feature), fs sandboxing |
 
-Dependencies flow one way: every crate may depend on `ka-protocol`; only the surfaces (`ka-harness`, `ka-term`) depend on `ka-engine`. The engine never imports a surface; `ka-protocol` is pure serde types with no I/O. Overview: [architecture](https://ka-harness.dev/docs/concepts/architecture/).
+Dependencies flow one way: every crate may depend on `ka-protocol`; only the surfaces (`ka-harness`, `ka-term`) depend on `ka-engine`. The engine never imports a surface; `ka-protocol` is pure serde types with no I/O. Protocol compat: the `Event` enum has no catch-all, so an older consumer fails to parse a newer event type — `ka attach` therefore skips SSE frames whose `type` it does not recognize (malformed JSON still surfaces as an error). Overview: [architecture](https://ka-harness.dev/docs/concepts/architecture/).
 
 ## Footprint contract
 

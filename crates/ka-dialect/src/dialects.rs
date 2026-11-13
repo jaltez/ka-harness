@@ -61,17 +61,6 @@ pub enum Cache {
     Key,
 }
 
-/// Tool-choice downgrade behavior for models with weak native support.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolChoice {
-    /// Full native tool choice.
-    #[default]
-    Auto,
-    /// Only a pinned tool or plain auto (local-server quirk).
-    PinOrAuto,
-}
-
 /// Per-mtok pricing (placeholder seed values; verify before release).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct Price {
@@ -90,18 +79,9 @@ pub struct Flags {
     /// Wire field carrying reasoning config (empty = not supported).
     #[serde(default)]
     pub reasoning_field: Option<String>,
-    /// Whether a developer/system role separate from user is supported.
-    #[serde(default)]
-    pub developer_role: bool,
-    /// Whether tool results must re-state the tool name.
-    #[serde(default)]
-    pub requires_tool_result_name: bool,
     /// Re-emit reasoning content byte-exact for KV-cache prefix reuse.
     #[serde(default)]
     pub replay_reasoning: bool,
-    /// Tool-choice downgrade mode.
-    #[serde(default)]
-    pub tool_choice: ToolChoice,
     /// Request field for output-token cap (None = `max_tokens`).
     #[serde(default)]
     pub max_tokens_field: Option<String>,
@@ -216,12 +196,74 @@ impl Catalog {
     /// per selector, so a hand-curated row can enrich a models.dev
     /// entry (efforts, flags) without the generator clobbering it.
     pub fn embedded() -> Self {
-        let mut catalog = Self::parse(MODELS_DEV).unwrap_or_else(|_| Self::default());
+        let mut catalog = Self::parse(MODELS_DEV)
+            .unwrap_or_else(|e| panic!("models.dev overlay catalog is invalid: {e}"));
         match Self::parse(EMBEDDED) {
             Ok(curated) => catalog.overlay(curated),
             Err(e) => panic!("embedded dialect catalog is invalid: {e}"),
         }
         catalog
+    }
+
+    /// Leaf-merge partial user overlay TOMLs onto the embedded catalog.
+    /// Unlike [`Catalog::overlay`] (whole-row replacement, used for the
+    /// models.dev path by design), user rows winning per leaf: a
+    /// `[dialects."x"]` table setting only `context` keeps the
+    /// embedded row's wire/base_url/api_key_env/flags, and unknown
+    /// selectors create new rows. Multiple overlay files compose
+    /// leaf-wise (later files win per leaf over earlier ones — never
+    /// back to embedded). Strict-TOML discipline: an overlay whose
+    /// top level is not exactly a `[dialects]` table is a hard error
+    /// naming what was found (a typo'd `[dialect]` must not silently
+    /// no-op), and row-level unknown keys still name the key.
+    pub fn merged_embedded_with_overlays<'a>(
+        overlay_texts: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Self, String> {
+        fn parse_table(text: &str, what: &str) -> Result<toml::Table, String> {
+            toml::from_str(text).map_err(|e| format!("{what} is invalid: {e}"))
+        }
+        let mut base = parse_table(MODELS_DEV, "models.dev overlay catalog")?;
+        let curated = parse_table(EMBEDDED, "embedded dialect catalog")?;
+        // curated rows win per selector (same semantics as `embedded`)
+        if let (Some(b), Some(c)) = (base.get_mut("dialects"), curated.get("dialects")) {
+            if let (Some(bd), Some(cd)) = (b.as_table_mut(), c.as_table()) {
+                for (k, v) in cd {
+                    bd.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        for overlay_text in overlay_texts {
+            let overlay = parse_table(overlay_text, "user catalog overlay")?;
+            if overlay.is_empty() {
+                continue;
+            }
+            // EXACTLY a `[dialects]` table: a valid section beside a
+            // typo'd sibling (`[dialect]`) must not silently drop the
+            // typo'd row — reject naming every top-level key found
+            if overlay.len() != 1 || !overlay.contains_key("dialects") {
+                return Err(format!(
+                    "user catalog overlay is invalid: expected exactly a `[dialects]` \
+                     table, found keys: {}",
+                    overlay
+                        .keys()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            let od = overlay
+                .get("dialects")
+                .and_then(|v| v.as_table())
+                .ok_or_else(|| {
+                    "user catalog overlay is invalid: `dialects` must be a table".to_string()
+                })?;
+            if let Some(bd) = base.get_mut("dialects") {
+                merge_tables(bd, &toml::Value::Table(od.clone()));
+            }
+        }
+        let text = toml::to_string(&base)
+            .map_err(|e| format!("re-serializing merged catalog failed: {e}"))?;
+        Self::parse(&text).map_err(|e| e.to_string())
     }
 
     /// Overlay another catalog on top (user wins per key).
@@ -234,6 +276,22 @@ impl Catalog {
     /// Look a dialect up by exact `vendor/model` id.
     pub fn get(&self, model_id: &str) -> Option<&Dialect> {
         self.dialects.get(model_id)
+    }
+}
+
+/// Recursively merge TOML values per leaf: `src` wins field by field;
+/// scalar/array leaves replace, tables recurse. Unknown selectors
+/// create new rows.
+fn merge_tables(dst: &mut toml::Value, src: &toml::Value) {
+    if let (Some(d), Some(s)) = (dst.as_table_mut(), src.as_table()) {
+        for (k, v) in s {
+            match d.get_mut(k) {
+                Some(slot) if slot.is_table() && v.is_table() => merge_tables(slot, v),
+                _ => {
+                    d.insert(k.clone(), v.clone());
+                }
+            }
+        }
     }
 }
 
@@ -386,6 +444,9 @@ mod tests {
 
     #[test]
     fn embedded_catalog_parses() {
+        // generated data regressions must be loud: both embedded tables
+        // parse (Catalog::embedded panics otherwise)
+        assert!(Catalog::parse(MODELS_DEV).is_ok());
         let c = Catalog::embedded();
         assert!(c.dialects.len() >= 3);
         let d = c.get("anthropic/claude-sonnet-5").unwrap();
@@ -394,7 +455,6 @@ mod tests {
         assert_eq!(d.base_url.as_deref(), Some("https://api.anthropic.com"));
         assert_eq!(d.api_key_env.as_deref(), Some("ANTHROPIC_API_KEY"));
         assert_eq!(d.flags.reasoning_field.as_deref(), Some("thinking"));
-        assert!(d.flags.developer_role);
         assert_eq!(d.effort_budgets.get("high"), Some(&16_384));
         let o = c.get("openai/gpt-5.1").unwrap();
         assert_eq!(
@@ -404,7 +464,6 @@ mod tests {
         let q = c.get("ollama/qwen3-32b").unwrap();
         assert_eq!(q.first_byte_timeout_ms, 0);
         assert!(q.flags.replay_reasoning);
-        assert_eq!(q.flags.tool_choice, ToolChoice::PinOrAuto);
     }
 
     #[test]
@@ -470,6 +529,44 @@ mod tests {
         .unwrap();
         c.overlay(over);
         assert_eq!(c.get("anthropic/claude-sonnet-5").unwrap().context, 123);
+    }
+
+    #[test]
+    fn partial_user_overlay_keeps_embedded_fields() {
+        let c = Catalog::merged_embedded_with_overlays([
+            "[dialects.\"anthropic/claude-sonnet-5\"]\ncontext = 123\n",
+        ])
+        .unwrap();
+        let d = c.get("anthropic/claude-sonnet-5").unwrap();
+        assert_eq!(d.wire, Wire::AnthropicMessages);
+        assert_eq!(d.base_url.as_deref(), Some("https://api.anthropic.com"));
+        assert_eq!(d.api_key_env.as_deref(), Some("ANTHROPIC_API_KEY"));
+        assert_eq!(d.context, 123);
+        // unknown selectors create new rows
+        let c = Catalog::merged_embedded_with_overlays([
+            "[dialects.\"acme/new-model\"]\nwire = \"openai_chat\"\ncontext = 7\n",
+        ])
+        .unwrap();
+        assert_eq!(c.get("acme/new-model").unwrap().context, 7);
+        // multiple files compose LEAF-wise: b's merged row must not
+        // revert a's context override back to the embedded value
+        let c = Catalog::merged_embedded_with_overlays([
+            "[dialects.\"anthropic/claude-sonnet-5\"]\ncontext = 123\n",
+            "[dialects.\"anthropic/claude-sonnet-5\"]\nmax_output = 456\n",
+        ])
+        .unwrap();
+        let d = c.get("anthropic/claude-sonnet-5").unwrap();
+        assert_eq!(d.context, 123, "earlier file's leaf survives");
+        assert_eq!(d.max_output, 456, "later file's leaf applies");
+        // a typo'd top-level section is a hard error, never a silent no-op
+        let err = Catalog::merged_embedded_with_overlays(["[dialect]\ncontext = 1\n"]).unwrap_err();
+        assert!(err.contains("dialect"), "got: {err}");
+        // unknown keys still hard-error naming the key
+        let err = Catalog::merged_embedded_with_overlays([
+            "[dialects.\"acme/new-model\"]\nwire = \"openai_chat\"\nbogus_key = 1\n",
+        ])
+        .unwrap_err();
+        assert!(err.contains("bogus_key"), "got: {err}");
     }
 
     #[test]

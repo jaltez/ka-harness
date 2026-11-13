@@ -722,6 +722,16 @@ async fn run(
             &ctx.events,
         )
         .await;
+    // attach the jobs persistence file BEFORE the command loop: every
+    // registration during the session must persist (adoption of
+    // survivors from earlier sessions happens here, at startup — the
+    // documented `set_path` semantic)
+    if let Some(path) = crate::hands::jobs::default_jobs_file() {
+        ctx.voice.jobs().set_path(path);
+    }
+    // opportunistic spill-dir GC: detached-job spill files older than
+    // the retention window are deleted once per engine start
+    crate::hands::gc_spills(&crate::hands::spills_root());
     loop {
         tokio::select! {
             maybe = commands.recv() => {
@@ -734,12 +744,6 @@ async fn run(
                 }
             }
         }
-    }
-    // session shutdown: no backgrounded bash job may outlive the engine
-    // detached jobs intentionally SURVIVE session exit; adopt any
-    // survivors from earlier sessions into this table
-    if let Some(path) = crate::hands::jobs::default_jobs_file() {
-        ctx.voice.jobs().set_path(path);
     }
     // session_end hook (roadmap 9.2): the command channel closed; the
     // surface may already be gone, so steering surfaces best-effort
@@ -2122,7 +2126,7 @@ async fn handle_command(
                             commands,
                             AskId(format!("ckpt-restore-{cid}")),
                             format!(
-                                "restore checkpoint {} ({ts})? overwrites working tree",
+                                "restore checkpoint {} ({ts})? restores tracked files as of {ts} (untracked/post-checkpoint files remain)",
                                 crate::checkpoint::short(&cid)
                             ),
                             vec!["restore".to_string(), "cancel".to_string()],
@@ -2169,20 +2173,38 @@ async fn handle_command(
         Command::Rewind { turns } => {
             match ctx.voice.rewind(turns) {
                 Some(kept) => {
-                    // kept = index of the dropped user message; keep
-                    // everything strictly before it
-                    let keep_idx = kept.saturating_sub(1);
-                    let kept_from = ctx
-                        .state
-                        .record_ids
-                        .get(keep_idx)
-                        .cloned()
-                        .unwrap_or_else(ka_strand::new_record_id);
-                    let _ = ctx.strand.append(ka_strand::Record::Rewind {
-                        id: ka_strand::new_record_id(),
-                        kept_from,
-                    });
-                    ctx.state.record_ids.truncate(keep_idx + 1);
+                    if kept == 0 {
+                        // the FIRST turn was rewound: nothing survives.
+                        // A Rewind record pointing at the dropped
+                        // record's own id would resurrect it on replay
+                        // (history_from_records truncates to pos+1, so
+                        // the dropped message stays) — a Boundary
+                        // clears the history instead.
+                        let _ = ctx.strand.append(ka_strand::Record::Boundary {
+                            id: ka_strand::new_record_id(),
+                        });
+                        ctx.state.record_ids.clear();
+                        // live/replay parity: Boundary clears the digest
+                        // on replay, so the live session drops it too —
+                        // else requests keep prepending a summary of the
+                        // content the rewind deleted
+                        ctx.voice.clear_digest();
+                    } else {
+                        // kept = index of the dropped user message; keep
+                        // everything strictly before it
+                        let keep_idx = kept - 1;
+                        let kept_from = ctx
+                            .state
+                            .record_ids
+                            .get(keep_idx)
+                            .cloned()
+                            .unwrap_or_else(ka_strand::new_record_id);
+                        let _ = ctx.strand.append(ka_strand::Record::Rewind {
+                            id: ka_strand::new_record_id(),
+                            kept_from,
+                        });
+                        ctx.state.record_ids.truncate(keep_idx + 1);
+                    }
                     ctx.events
                         .send(Event::Note {
                             message: format!("rewound {turns} turn(s)"),
@@ -3242,7 +3264,19 @@ async fn engine_ask(
                     Some(Command::Answer { question: q, choice }) if q == id => {
                         return Some(choice);
                     }
-                    Some(_) => {}
+                    // answered asks own the channel until they resolve:
+                    // other verbs cannot be replayed here, so
+                    // acknowledge instead of vanishing silently
+                    Some(_cmd) => {
+                        events
+                            .send(Event::Note {
+                                message: "command ignored while an ask is pending — \
+                                          resend it after answering"
+                                    .to_string(),
+                            })
+                            .await
+                            .ok();
+                    }
                 }
             }
         }
@@ -4195,6 +4229,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rewind_of_first_turn_stays_rewound_after_resume() {
+        use crate::engine::{StrandChoice, spawn_full};
+        use ka_protocol::Command;
+
+        let data = std::env::temp_dir().join(format!("ka-eng-rewind1-{}", std::process::id()));
+        let work = data.join("work");
+        let _ = std::fs::remove_dir_all(&data);
+        std::fs::create_dir_all(&work).unwrap();
+        ka_strand::set_data_dir_for_tests(data.clone());
+
+        let cfg = Config {
+            cwd: Some(work.display().to_string()),
+            ..Default::default()
+        };
+        let mut h = spawn_full(cfg, ka_dialect::Catalog::embedded(), StrandChoice::New);
+        h.commands
+            .send(Command::Prompt {
+                allowed_tools: None,
+                model: None,
+                text: "doomed question".into(),
+                schema: None,
+                images: Vec::new(),
+                skills: Vec::new(),
+            })
+            .await
+            .unwrap();
+        while let Some(evt) = h.events.recv().await {
+            if matches!(evt, Event::Idle) {
+                break;
+            }
+        }
+        // rewinding the FIRST turn: nothing survives — a naive Rewind
+        // record pointing at the dropped message's own id resurrects
+        // it on replay
+        h.commands.send(Command::Rewind { turns: 1 }).await.unwrap();
+        while let Some(evt) = h.events.recv().await {
+            if matches!(evt, Event::Idle) {
+                break;
+            }
+        }
+        h.commands
+            .send(Command::Prompt {
+                allowed_tools: None,
+                model: None,
+                text: "fresh start".into(),
+                schema: None,
+                images: Vec::new(),
+                skills: Vec::new(),
+            })
+            .await
+            .unwrap();
+        while let Some(evt) = h.events.recv().await {
+            if matches!(evt, Event::Idle) {
+                break;
+            }
+        }
+        drop(h);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // replay from the persisted strand: the rewound content must
+        // stay gone, the post-rewind turn must be there
+        let summary = ka_strand::latest(&work).unwrap().unwrap();
+        let strand = ka_strand::StrandFile::open(&summary.path).unwrap();
+        let (history, _, _) = super::history_from_records(strand.records(), true);
+        let joined: Vec<&str> = history.iter().map(|m| m.content.as_str()).collect();
+        assert!(
+            !joined.iter().any(|c| c.contains("doomed question")),
+            "rewound first turn must not resurrect: {joined:?}"
+        );
+        assert!(
+            joined.iter().any(|c| c.contains("fresh start")),
+            "post-rewind turn must survive: {joined:?}"
+        );
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[tokio::test]
     async fn switch_strand_replays_target_history() {
         let data = std::env::temp_dir().join(format!("ka-test-switch-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&data);
@@ -4631,11 +4742,11 @@ mod tests {
 
     #[tokio::test]
     async fn bootstrap_with_cached_mcp_registers_the_meta_hand_once() {
-        // cache-hit registration is the duplicate path: the remembered
-        // eager hands load synchronously, the meta hand is rebuilt
-        // inside ensure_mcp_server, and a bootstrap push on top used to
-        // register a second `mcp` — providers then reject the whole
-        // turn with "tools: Tool names must be unique"
+        // cache-hit registration is the reported duplicate path: the
+        // remembered eager hands load synchronously, the meta hand is
+        // rebuilt inside ensure_mcp_server, and a bootstrap push on top
+        // used to register a second `mcp` — providers then reject the
+        // whole turn with "tools: Tool names must be unique"
         let _cache = crate::mcp_cache::test_support::cache_guard();
         let server = crate::mcp::McpServerConfig {
             name: "cached".into(),
@@ -4702,6 +4813,62 @@ mod tests {
             tools.len(),
             "no duplicate tool names at bootstrap: {tools:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn untrusted_project_agents_absent_from_inventory_until_approved() {
+        let root = std::env::temp_dir().join(format!(
+            "ka-eng-inv-untrusted-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".ka/agents")).unwrap();
+        // fresh trust store pointing at nothing: the project is NOT
+        // trusted yet
+        let _trust = crate::trust::test_support::trust_guard();
+        std::fs::write(
+            root.join(".ka/agents/reviewer.md"),
+            "---\nname: reviewer\ndescription: reviews code\n---\nBe harsh.\n",
+        )
+        .unwrap();
+
+        let mk_cfg = || Config {
+            cwd: Some(root.to_string_lossy().into_owned()),
+            ..Config::default()
+        };
+        let inventory_agents = |cfg: Config| async {
+            let mut handle = spawn(cfg);
+            drop(handle.commands);
+            let mut agents = None;
+            while let Some(evt) = handle.events.recv().await {
+                if let Event::Inventory { agents: a, .. } = evt {
+                    agents = Some(a);
+                }
+            }
+            agents
+        };
+
+        // untrusted: project agent dir must contribute NOTHING — the
+        // project reviewer must be absent no matter what user-level
+        // agents this machine has ($HOME/.config/ka/agents always loads)
+        let agents = inventory_agents(mk_cfg()).await;
+        assert!(
+            !agents.iter().flatten().any(|a| a == "reviewer"),
+            "untrusted project agents must be absent: {agents:?}"
+        );
+
+        // after approval the roster appears
+        crate::trust::approve(&root);
+        let agents = inventory_agents(mk_cfg()).await;
+        assert!(
+            agents.iter().flatten().any(|a| a == "reviewer"),
+            "approved project agents appear: {agents:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
     // ── auto-titles ([roles] fast) ────────────────────────────────────
 

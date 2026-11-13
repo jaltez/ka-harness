@@ -24,12 +24,7 @@ pub async fn discover_openai_compatible(
     discovery: Discovery,
 ) -> Vec<FoundModel> {
     let url = format!("{}/models", base_url.trim_end_matches('/'));
-    let Ok(resp) = client
-        .get(&url)
-        .timeout(std::time::Duration::from_secs(2))
-        .send()
-        .await
-    else {
+    let Ok(resp) = client.get(&url).timeout(PROBE_TIMEOUT).send().await else {
         return Vec::new();
     };
     if !resp.status().is_success() {
@@ -46,7 +41,8 @@ pub async fn discover_openai_compatible(
     };
     let probes: Vec<_> = ids
         .iter()
-        .filter_map(|entry| entry.get("id").and_then(|i| i.as_str()))
+        .filter_map(|entry| entry.get("id").and_then(|i: &serde_json::Value| i.as_str()))
+        .take(MAX_PROBE_FANOUT)
         .map(|id| {
             let sniffed = sniff_caps(client, base_url, discovery, id);
             async move {
@@ -78,9 +74,14 @@ pub async fn discover_openai_compatible(
     futures_util::future::join_all(probes).await
 }
 
-/// Per-probe metadata timeout: detail endpoints must answer fast or be
-/// skipped (discovery runs at CLI startup).
-const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+/// Per-probe timeout: local endpoints must answer fast or be skipped
+/// (discovery runs at CLI startup against a ~50ms cold-start budget).
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Cap on concurrent detail probes per endpoint: giant local model
+/// lists (100+ ids) must not fan out into hundreds of simultaneous
+/// requests. The `/v1/models` list still enumerates every id.
+const MAX_PROBE_FANOUT: usize = 64;
 
 /// Default context assumed when nothing sniffs or heuristically matches.
 const DEFAULT_CONTEXT: u32 = 32_768;
@@ -250,9 +251,10 @@ fn resolve_caps(id: &str, sniffed: SniffedCaps) -> (u32, bool, bool) {
 /// into the catalog. Explicit catalog rows always win over discovered ones.
 pub async fn overlay_discovered(catalog: &mut crate::dialects::Catalog) {
     let client = reqwest::Client::new();
-    let mut found = discover_ollama(&client).await;
-    found.extend(discover_lmstudio(&client).await);
-    for f in found {
+    // independent endpoints: probe both in parallel so one dead port
+    // cannot add its full timeout to cold start
+    let (ollama, lmstudio) = tokio::join!(discover_ollama(&client), discover_lmstudio(&client));
+    for f in ollama.into_iter().chain(lmstudio) {
         catalog.dialects.entry(f.model_id).or_insert(f.dialect);
     }
 }
@@ -360,8 +362,14 @@ mod tests {
     /// Serve one JSON response per accepted connection, draining the
     /// request fully (headers + Content-Length body) first.
     async fn serve_json(listener: &tokio::net::TcpListener, body: &str) {
+        let (sock, _) = listener.accept().await.unwrap();
+        serve_json_on(sock, body).await;
+    }
+
+    /// Drain one request from an accepted socket, then answer with one
+    /// JSON response.
+    async fn serve_json_on(mut sock: tokio::net::TcpStream, body: &str) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let (mut sock, _) = listener.accept().await.unwrap();
         let mut buf = vec![0u8; 8192];
         let mut got = 0;
         loop {
@@ -507,5 +515,56 @@ mod tests {
         assert!(f.dialect.input.contains(&Modality::Image));
         assert!(!f.dialect.flags.tools);
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn probe_fanout_is_capped() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let list = format!(
+            r#"{{"data":[{}]}}"#,
+            (0..100)
+                .map(|i| format!(r#"{{"id":"m{i}"}}"#))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let server = tokio::spawn(async move {
+            serve_json(&listener, &list).await;
+            let mut detail_hits = 0usize;
+            while let Ok(Ok((sock, _))) =
+                tokio::time::timeout(std::time::Duration::from_millis(750), listener.accept()).await
+            {
+                serve_json_on(sock, r#"{"data":{"context_length":1024}}"#).await;
+                detail_hits += 1;
+            }
+            detail_hits
+        });
+        let client = reqwest::Client::new();
+        let found = discover_openai_compatible(
+            &client,
+            "lmstudio",
+            &format!("http://{addr}/v1"),
+            Discovery::LmStudio,
+        )
+        .await;
+        assert_eq!(found.len(), 64, "only the first 64 ids are probed");
+        let hits = server.await.unwrap();
+        assert!(hits <= 64, "detail probes must be capped, got {hits}");
+    }
+
+    #[tokio::test]
+    async fn parallel_discovery_bounds_dead_endpoint() {
+        // worst case: the ollama port accepts and never answers. Hold a
+        // bound-but-silent listener there when the port is free; if a
+        // real ollama answers instead, discovery is live-fast anyway.
+        let _dead = tokio::net::TcpListener::bind("127.0.0.1:11434").await.ok();
+        let start = std::time::Instant::now();
+        let mut catalog = crate::dialects::Catalog::default();
+        overlay_discovered(&mut catalog).await;
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(1500),
+            "dead-endpoint probes must run in parallel within one probe timeout (took {:?})",
+            start.elapsed()
+        );
     }
 }

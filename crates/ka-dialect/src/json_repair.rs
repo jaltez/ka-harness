@@ -19,8 +19,23 @@ pub fn repair_json(raw: &str) -> Value {
     if let Ok(v) = serde_json::from_str::<Value>(&repaired) {
         return v;
     }
+    // Truncated mid-key (`{"a": 1, "b"`): close_open leaves the dangling
+    // key unparsed. Complete the pair and re-close before salvage.
+    if s.ends_with('"') && !s.ends_with("\\\"") {
+        let completed = close_open(&format!("{s}: null"));
+        if let Ok(v) = serde_json::from_str::<Value>(&completed) {
+            return v;
+        }
+    }
     // Last resort: salvage `key: "value"` pairs by wrapping and closing.
-    let salvaged = format!("{{{}}}", strip_trailing_garbage(s));
+    // A prefix that already opens an object must be closed, not re-wrapped
+    // (double-`{` never parses).
+    let stripped = strip_trailing_garbage(s);
+    let salvaged = if stripped.starts_with('{') {
+        close_open(&stripped)
+    } else {
+        format!("{{{stripped}}}")
+    };
     serde_json::from_str::<Value>(&salvaged).unwrap_or(Value::Object(Default::default()))
 }
 
@@ -145,5 +160,20 @@ mod tests {
     fn dangling_key_neutralized() {
         let v = repair_json("{\"a\": 1, \"b\":");
         assert_eq!(v.get("a").and_then(Value::as_i64), Some(1));
+    }
+
+    #[test]
+    fn truncated_mid_key_preserves_earlier_pairs() {
+        // stream cut after the key but before the colon
+        let v = repair_json("{\"a\": 1, \"b\"");
+        assert_eq!(v.get("a").and_then(Value::as_i64), Some(1));
+    }
+
+    #[test]
+    fn salvage_does_not_double_open() {
+        // close_open cannot fix the juxtaposed garbage; salvage must close
+        // the existing `{`, not wrap a second one around it
+        let v = repair_json("{\"cmd\": \"run\" trailing junk");
+        assert_eq!(v.get("cmd").and_then(Value::as_str), Some("run"));
     }
 }

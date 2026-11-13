@@ -42,6 +42,13 @@ pub fn exec_trampoline(
     let (program, args) = argv
         .split_first()
         .ok_or_else(|| "sandbox-exec: no command after --".to_string())?;
+    // defense in depth: even though wrap_command resolves entries, any
+    // embedder can hand us a policy — re-resolve and refuse (fail
+    // closed) anything that lands on or above a broad root via symlink
+    let writable: Vec<std::path::PathBuf> = writable
+        .iter()
+        .map(|w| crate::resolve_writable(w.as_path()))
+        .collect::<Result<_, _>>()?;
     apply_landlock(&writable, allow_net)?;
     // parity with bwrap --clearenv: the sandboxed command must not see
     // the parent's environment (provider API keys live there). PATH is
@@ -140,5 +147,14 @@ mod tests {
         let policy = serde_json::json!({"writable": [], "net": false, "env": []}).to_string();
         let err = exec_trampoline(&policy, &[]).unwrap_err();
         assert!(err.contains("no command"), "{err}");
+    }
+
+    #[test]
+    fn trampoline_refuses_writable_broad_root() {
+        // a writable entry that IS a broad root must fail closed before
+        // any ruleset is built — this errors before landlock is touched
+        let policy = serde_json::json!({"writable": ["/"], "net": false, "env": []}).to_string();
+        let err = exec_trampoline(&policy, &["true".to_string()]).unwrap_err();
+        assert!(err.contains("refusing"), "{err}");
     }
 }

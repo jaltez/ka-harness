@@ -566,13 +566,38 @@ fn wire_str(w: ka_dialect::Wire) -> String {
 }
 
 fn load_catalog(overlays: &[PathBuf]) -> Result<Catalog, String> {
-    let mut catalog = Catalog::embedded();
-    for path in overlays {
-        let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let over = Catalog::parse(&text).map_err(|e| format!("{}: {e}", path.display()))?;
-        catalog.overlay(over);
-    }
+    // Leaf-merge ALL user overlays against the embedded catalog in one
+    // pass: plain `Catalog::parse` + `overlay` would hard-error on a
+    // partial row (missing `wire`) and whole-row-replace the fields the
+    // user did not mention (base_url, api_key_env, flags). Accumulating
+    // the texts before the merge means file B's leaves compose with
+    // file A's instead of reverting them to embedded.
+    let texts: Vec<String> = overlays
+        .iter()
+        .map(|path| std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display())))
+        .collect::<Result<Vec<_>, _>>()?;
+    let str_refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+    // bare texts cannot name their file inside the merge; list the
+    // candidate overlays so a syntax error is traceable to a file
+    let catalog =
+        ka_dialect::dialects::Catalog::merged_embedded_with_overlays(str_refs).map_err(|e| {
+            let files = overlays
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("catalog overlay failed ({files}): {e}")
+        })?;
     Ok(catalog)
+}
+
+/// Headless auto-deny: pick the deny option of an ask, which by
+/// convention is the last one. Hardcoding 2 was only right while every
+/// ask had exactly three options.
+fn deny_choice(questions: &[ka_protocol::AskQuestion]) -> usize {
+    questions
+        .first()
+        .map_or(2, |q| q.options.len().saturating_sub(1))
 }
 
 async fn build_catalog(overlays: &[PathBuf], with_discovery: bool) -> Result<Catalog, String> {
@@ -894,23 +919,27 @@ async fn run_headless(
 
     let mut stdout = std::io::stdout().lock();
     let mut final_stop: Option<Stop> = None;
+    let mut idle_seen = false;
     let mut final_text = String::new();
     let mut sj = StreamJsonPrinter::with_model(cfg_model.clone());
     while let Some(event) = handle.events.recv().await {
         // headless policy: permission asks auto-deny (last option = deny)
-        if let Event::Ask { id, .. } = &event {
+        if let Event::Ask { id, questions } = &event {
             handle
                 .commands
                 .send(Command::Answer {
                     question: id.clone(),
-                    choice: 2,
+                    choice: deny_choice(questions),
                 })
                 .await
                 .map_err(|_| "engine closed during ask")?;
         }
         match &event {
             Event::TurnFinished { stop, .. } => final_stop = Some(*stop),
-            Event::Idle => break,
+            Event::Idle => {
+                idle_seen = true;
+                break;
+            }
             _ => {}
         }
         for line in headless_sink(&print, &event, &mut sj, &mut final_text)? {
@@ -943,10 +972,27 @@ async fn run_headless(
         writeln!(stdout, "{final_text}").map_err(|e| format!("stdout: {e}"))?;
     }
     std::io::Write::flush(&mut stdout).map_err(|e| format!("stdout: {e}"))?;
+    // the loop only exits without Idle when the events channel closed
+    // (engine task gone) — same "no final stop" condition
+    exit_code_for(final_stop, idle_seen, idle_seen)
+}
+
+/// Terminal exit status of a headless run. A missing final stop with no
+/// Idle marker means the engine died mid-turn (events channel returned
+/// None) — that must fail the run (exit 1 via the dispatcher's error
+/// path), not exit 0, or CI pipelines sail on broken runs. The
+/// stream-json writer already treats the same condition as an error.
+fn exit_code_for(
+    final_stop: Option<Stop>,
+    idle_seen: bool,
+    stream_ended_cleanly: bool,
+) -> Result<ExitCode, String> {
     match final_stop {
         Some(Stop::Aborted) => Ok(ExitCode::from(2)),
         Some(Stop::Error) => Ok(ExitCode::from(1)),
-        _ => Ok(ExitCode::SUCCESS),
+        Some(_) => Ok(ExitCode::SUCCESS),
+        None if idle_seen && stream_ended_cleanly => Ok(ExitCode::SUCCESS),
+        None => Err("engine ended before the turn finished".to_string()),
     }
 }
 
@@ -2243,5 +2289,73 @@ mod completions_tests {
         .unwrap();
         assert_eq!(cli.interactive_prompt.as_deref(), Some("review this"));
         assert_eq!(cli.session.as_deref(), Some("abc"));
+    }
+}
+
+#[cfg(test)]
+mod audit_fix_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    fn temp_overlay(contents: &str) -> PathBuf {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "ka-audit-overlay-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    #[test]
+    fn partial_overlay_file_keeps_embedded_fields() {
+        // a user overlay naming only `context` must not brick the row:
+        // no missing-`wire` startup error, and the embedded wire /
+        // base_url / api_key_env / flags survive the merge.
+        let path = temp_overlay("[dialects.\"anthropic/claude-sonnet-5\"]\ncontext = 123\n");
+        let catalog = load_catalog(std::slice::from_ref(&path)).unwrap();
+        std::fs::remove_file(&path).ok();
+        let d = catalog.get("anthropic/claude-sonnet-5").unwrap();
+        assert_eq!(d.context, 123);
+        assert_eq!(d.wire, ka_dialect::Wire::AnthropicMessages);
+        assert_eq!(d.base_url.as_deref(), Some("https://api.anthropic.com"));
+        assert_eq!(d.api_key_env.as_deref(), Some("ANTHROPIC_API_KEY"));
+        assert_eq!(d.flags.reasoning_field.as_deref(), Some("thinking"));
+    }
+
+    #[test]
+    fn engine_death_mid_turn_fails() {
+        // engine task gone: no final stop, no Idle → error, not exit 0
+        assert!(exit_code_for(None, false, true).is_err());
+        // clean idle shutdown without a TurnFinished (e.g. resumed
+        // session already idle) is still success
+        assert_eq!(exit_code_for(None, true, true).unwrap(), ExitCode::SUCCESS);
+        // mapped stop reasons unchanged
+        assert_eq!(
+            exit_code_for(Some(Stop::Error), true, true).unwrap(),
+            ExitCode::from(1)
+        );
+        assert_eq!(
+            exit_code_for(Some(Stop::Aborted), true, true).unwrap(),
+            ExitCode::from(2)
+        );
+        assert_eq!(
+            exit_code_for(Some(Stop::Done), true, true).unwrap(),
+            ExitCode::SUCCESS
+        );
+    }
+
+    #[test]
+    fn deny_choice_picks_last_option() {
+        let ask = |opts: &[&str]| ka_protocol::AskQuestion {
+            text: "proceed?".to_string(),
+            options: opts.iter().map(|s| s.to_string()).collect(),
+            detail: None,
+        };
+        assert_eq!(deny_choice(&[ask(&["allow once", "always", "deny"])]), 2);
+        assert_eq!(deny_choice(&[ask(&["allow", "deny"])]), 1);
+        // degenerate ask: fall back to the historical hardcoded 2
+        assert_eq!(deny_choice(&[]), 2);
     }
 }
