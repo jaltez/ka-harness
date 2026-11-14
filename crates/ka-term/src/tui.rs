@@ -7275,6 +7275,18 @@ fn tool_note(excerpt: &str) -> String {
     trunc_cols(first, 40)
 }
 
+/// Tabs never reach the terminal as-is: a `\t` inside a span shifts the
+/// written run to the next tab stop while the cell model stays put, so
+/// the row garbles (the read hand's `N\tline` numbering hit this).
+/// Space them out at ingestion, before any preview/note keeps them.
+fn detab(s: &str) -> std::borrow::Cow<'_, str> {
+    if s.contains('\t') {
+        std::borrow::Cow::Owned(s.replace('\t', " "))
+    } else {
+        std::borrow::Cow::Borrowed(s)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn apply_event(
     evt: &Event,
@@ -7388,8 +7400,9 @@ fn apply_event(
                 // live block: refresh the rolling preview; the compact
                 // note is built from `last` when the call finishes
                 Some(lt) if lt.id == *id => {
-                    observe_preview(&mut lt.preview, excerpt);
-                    lt.last = Some((excerpt.clone(), *is_error));
+                    let clean = detab(excerpt);
+                    observe_preview(&mut lt.preview, &clean);
+                    lt.last = Some((clean.into_owned(), *is_error));
                 }
                 // no matching block (replay paths, id drift): the note
                 // is lost — the row still renders from its head
@@ -7634,11 +7647,12 @@ fn apply_event(
                     transcript.push_separated(Line::Thought(t));
                 }
                 for c in &m.calls {
+                    let result = detab(c.result.as_deref().unwrap_or("")).into_owned();
                     transcript.push_tool_call(ToolCall {
                         head: tool_header(&c.tool, &c.detail),
                         ok: !c.is_error,
-                        note: tool_note(c.result.as_deref().unwrap_or("")),
-                        excerpt: c.result.clone().unwrap_or_default(),
+                        note: tool_note(&result),
+                        excerpt: result,
                         spill: None,
                         dur: None,
                         expanded: false,
@@ -16963,6 +16977,94 @@ mod tests {
         assert_eq!(v[0].head, "→ bash · cargo build");
         assert!(!v[0].ok, "a call closed without CallFinished reads failed");
         assert_eq!(head, "→ read · lib.rs");
+    }
+
+    #[test]
+    fn read_numbering_tabs_detabbed_before_render() {
+        // the read hand numbers lines `N\tline`; a literal tab inside a
+        // span makes the terminal shift the run to the next tab stop
+        // while the cell model stays put — the row garbles. The TUI
+        // must space tabs out before the note/excerpt keep them.
+        let mut lines = Transcript::default();
+        let mut busy = true;
+        let mut busy_since = None;
+        let mut meters = Meters::default();
+        let mut pending = None;
+        let mut turn_produced = false;
+        let mut usage = None;
+        let mut a = String::new();
+        let mut t = String::new();
+        let mut tool = String::new();
+        let mut live_tool: Option<LiveTool> = None;
+        let mut last_user = None;
+        let mut last_error = None;
+        let mut spills: Vec<String> = Vec::new();
+        let mut sidebar = SidebarState::default();
+        let mut feed = |lines: &mut Transcript, evt: &Event| {
+            apply_event(
+                evt,
+                lines,
+                &mut busy,
+                &mut busy_since,
+                &mut meters,
+                &mut pending,
+                &mut turn_produced,
+                &mut usage,
+                &mut a,
+                &mut t,
+                &mut tool,
+                &mut live_tool,
+                &mut last_user,
+                &mut last_error,
+                &mut spills,
+                &mut sidebar,
+            )
+        };
+        feed(
+            &mut lines,
+            &Event::Delta {
+                kind: ka_protocol::DeltaKind::Call {
+                    tool: "read".into(),
+                    id: "c1".into(),
+                },
+            },
+        );
+        feed(
+            &mut lines,
+            &Event::CallStarted {
+                tool: "read".into(),
+                id: "c1".into(),
+                detail: "backoff.rs".into(),
+            },
+        );
+        feed(
+            &mut lines,
+            &Event::CallOutput {
+                id: "c1".into(),
+                tool: "read".into(),
+                excerpt: "1\t//! Retry policy\n2\tuse std::time::Duration;\n".into(),
+                is_error: false,
+                spill: None,
+            },
+        );
+        let finished = feed(
+            &mut lines,
+            &Event::CallFinished {
+                tool: "read".into(),
+                id: "c1".into(),
+                ok: true,
+            },
+        )
+        .expect("CallFinished surfaces the ToolCall");
+        assert_eq!(
+            finished.note, "1 //! Retry policy",
+            "numbering kept, spaced"
+        );
+        assert!(
+            !finished.excerpt.contains('\t'),
+            "excerpt: {:?}",
+            finished.excerpt
+        );
     }
 
     #[test]
