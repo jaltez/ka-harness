@@ -1,10 +1,14 @@
-# ka
+# Ka
 
 A model-agnostic, very-low-footprint coding agent in Rust. One static binary, no daemons, no telemetry.
 
-> ⚠️ **Under heavy development.** ka is experimental and moving fast — features, commands, config, and behavior may change or break without notice. Not ready for production use.
+> **Under development.** ka is experimental and moving fast — features, commands, config, and behavior may change or break without notice. Not ready for production use.
 
 📖 **Full documentation: <https://ka-harness.dev/docs>** — this README sticks to the basics; each topic below links to its detailed page there.
+
+![ka in a terminal: a backoff fix with tool calls, thinking, a code panel and a mermaid flowchart](assets/ka-tui.png)
+
+*Scripted session against a local `vllm/qwen3.5-coder-32b` — real renderer, fake model.*
 
 ## Install
 
@@ -27,7 +31,6 @@ ka run "summarize the build error"  # one headless turn, NDJSON events on stdout
 ```
 
 Essential keys: `Enter` send or steer mid-turn · `⇧Enter` newline (`Ctrl+J` fallback) · `Esc` unpin scroll, then abort · `Ctrl-C` abort · `/help` for the rest.
-
 
 Markdown answers render with shaded code panels, tables, and mermaid diagrams drawn as box-drawing flowcharts, sequence and state diagrams, quadrant planes; anything the renderer does not cover keeps its source panel.
 
@@ -68,12 +71,12 @@ Details — doom-loop rules, protected paths, project trust, runtime feature tog
 
 ## Surfaces
 
-| Surface | Use |
-|---|---|
-| `ka` | terminal UI |
-| `ka run "…"` | headless one-turn, NDJSON events, exit 0/1/2 |
-| `ka serve` | HTTP: prompt via POST, SSE event streams, read-only observers |
-| `ka acp` | Agent Client Protocol for editors |
+| Surface      | Use                                                           |
+| ------------ | ------------------------------------------------------------- |
+| `ka`         | terminal UI                                                   |
+| `ka run "…"` | headless one-turn, NDJSON events, exit 0/1/2                  |
+| `ka serve`   | HTTP: prompt via POST, SSE event streams, read-only observers |
+| `ka acp`     | Agent Client Protocol for editors                             |
 
 Also: `ka sessions` · `ka export` (markdown/HTML) · `ka rewind` · `ka attach` · `ka completions` · `ka init` · `ka update`.
 
@@ -107,15 +110,15 @@ Design docs live in [`research/ka-harness/`](research/ka-harness/): [architectur
 
 ### Crates
 
-| Crate | Role |
-|---|---|
-| `ka-protocol` | Command/Event wire enums (NDJSON-shaped) |
-| `ka-engine` | turn machine, tools (Hands) + clearance gate, digests, ledger |
-| `ka-dialect` | model catalog + wires (anthropic-messages, openai-chat, openai-responses) + local discovery |
-| `ka-strand` | append-only JSONL session store, waypoints |
-| `ka-term` | ratatui TUI |
-| `ka-harness` | the published `ka` binary |
-| `ka-index` / `ka-sandbox` | optional: FTS search (`index` feature), fs sandboxing |
+| Crate                     | Role                                                                                        |
+| ------------------------- | ------------------------------------------------------------------------------------------- |
+| `ka-protocol`             | Command/Event wire enums (NDJSON-shaped)                                                    |
+| `ka-engine`               | turn machine, tools (Hands) + clearance gate, digests, ledger                               |
+| `ka-dialect`              | model catalog + wires (anthropic-messages, openai-chat, openai-responses) + local discovery |
+| `ka-strand`               | append-only JSONL session store, waypoints                                                  |
+| `ka-term`                 | ratatui TUI                                                                                 |
+| `ka-harness`              | the published `ka` binary                                                                   |
+| `ka-index` / `ka-sandbox` | optional: FTS search (`index` feature), fs sandboxing                                       |
 
 Dependencies flow one way: every crate may depend on `ka-protocol`; only the surfaces (`ka-harness`, `ka-term`) depend on `ka-engine`. The engine never imports a surface; `ka-protocol` is pure serde types with no I/O. Protocol compat: the `Event` enum has no catch-all, so an older consumer fails to parse a newer event type — `ka attach` therefore skips SSE frames whose `type` it does not recognize (malformed JSON still surfaces as an error). Overview: [architecture](https://ka-harness.dev/docs/concepts/architecture/).
 
