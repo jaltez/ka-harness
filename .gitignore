@@ -9,10 +9,13 @@ ka-harness-release.key
 ka-*.tar.gz
 ka-*.tar.gz.*
 
-# harnesses — anchored to the repo root so fixture dirs named the
-# same never silently disappear
-/.pi/
-/.omp/
-/.zcode/
-/.codex/
-/.claude/
+# agents
+.pi/
+.omp/
+.amp/
+.zcode/
+.opencode/
+.codegraph/
+.voyager/
+.codex/
+.claude/
