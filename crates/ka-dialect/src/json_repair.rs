@@ -21,7 +21,7 @@ pub fn repair_json(raw: &str) -> Value {
     }
     // Truncated mid-key (`{"a": 1, "b"`): close_open leaves the dangling
     // key unparsed. Complete the pair and re-close before salvage.
-    if s.ends_with('"') && !s.ends_with("\\\"") {
+    if s.ends_with('"') && !quote_escaped(s, s.len() - 1) {
         let completed = close_open(&format!("{s}: null"));
         if let Ok(v) = serde_json::from_str::<Value>(&completed) {
             return v;
@@ -37,6 +37,19 @@ pub fn repair_json(raw: &str) -> Value {
         format!("{{{stripped}}}")
     };
     serde_json::from_str::<Value>(&salvaged).unwrap_or(Value::Object(Default::default()))
+}
+
+/// Is the quote at `quote_end` escaped? Only an ODD run of
+/// backslashes escapes it — `\\"` is an escaped backslash followed
+/// by a real closing quote.
+fn quote_escaped(s: &str, quote_end: usize) -> bool {
+    s.as_bytes()[..quote_end]
+        .iter()
+        .rev()
+        .take_while(|b| **b == b'\\')
+        .count()
+        % 2
+        == 1
 }
 
 fn close_open(s: &str) -> String {
@@ -99,7 +112,7 @@ fn close_open(s: &str) -> String {
 fn strip_trailing_garbage(s: &str) -> String {
     // Cut at the last complete `"..."` pair boundary we can find.
     match s.rfind('"') {
-        Some(pos) if pos > 0 && !s[..pos].ends_with('\\') => s[..=pos].to_string(),
+        Some(pos) if pos > 0 && !quote_escaped(s, pos) => s[..=pos].to_string(),
         _ => String::new(),
     }
 }
@@ -175,5 +188,24 @@ mod tests {
         // the existing `{`, not wrap a second one around it
         let v = repair_json("{\"cmd\": \"run\" trailing junk");
         assert_eq!(v.get("cmd").and_then(Value::as_str), Some("run"));
+    }
+
+    #[test]
+    fn escaped_backslash_before_quote_is_a_real_quote() {
+        // `\\"` is an escaped backslash followed by a REAL closing quote:
+        // the key `b\` is complete and only the `: value` was cut. The old
+        // single-char lookbehind saw `\"` and wrongly skipped the fix-up,
+        // collapsing the whole repair to `{}`.
+        let v = repair_json(r#"{"a":1,"b\\""#);
+        assert_eq!(v.get("a").and_then(Value::as_i64), Some(1));
+        assert_eq!(v.get("b\\").and_then(Value::as_null), Some(()));
+    }
+
+    #[test]
+    fn quote_escaped_counts_the_backslash_run() {
+        assert!(quote_escaped("\\\"", 1)); // one backslash escapes
+        assert!(!quote_escaped("\\\\\"", 2)); // escaped backslash + real quote
+        assert!(quote_escaped("\\\\\\\"", 3)); // three: escapes
+        assert!(!quote_escaped("\"", 0)); // bare quote
     }
 }

@@ -59,6 +59,13 @@ impl ObserverState {
         }
     }
 
+    /// Stream closed: flush the last partial assistant text — it must
+    /// not vanish — and mark the state ended.
+    fn close(&mut self) {
+        self.flush_pending();
+        self.ended = true;
+    }
+
     fn push(&mut self, text: String, dim: bool, accent: Option<Color>) {
         self.rows.push(Row { text, dim, accent });
         if self.rows.len() > MAX_ROWS {
@@ -243,7 +250,7 @@ async fn event_loop(
                     redraw = true;
                 }
                 None => {
-                    state.ended = true;
+                    state.close();
                     draw(terminal, &state, addr, scrollback)?;
                     break;
                 }
@@ -454,6 +461,26 @@ mod tests {
                 .rows
                 .iter()
                 .any(|r| r.text.contains("the writer decides"))
+        );
+    }
+
+    #[test]
+    fn close_flushes_the_partial_tail() {
+        // the engine stream died mid-text: the partial row must land,
+        // not vanish with the channel
+        let mut state = ObserverState::new("s");
+        apply_event(
+            &mut state,
+            &Event::Delta {
+                kind: ka_protocol::DeltaKind::Text("partial tail".into()),
+            },
+        );
+        assert!(state.rows.is_empty(), "streaming text stays pending");
+        state.close();
+        assert!(state.ended);
+        assert!(
+            state.rows.iter().any(|r| r.text.contains("partial tail")),
+            "the last partial assistant text must not vanish on close"
         );
     }
 

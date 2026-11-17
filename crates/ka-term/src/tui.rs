@@ -2440,6 +2440,9 @@ pub struct Meters {
     pub model: String,
     /// Permission mode.
     pub mode: String,
+    /// The mode itself — mode gates compare the enum, never the label
+    /// (a label refactor must not silently open or close a gate).
+    pub mode_kind: ka_protocol::Mode,
     /// Mode icon glyph; rendered before the word in status surfaces.
     pub mode_icon: String,
     /// Active session (strand) id.
@@ -4269,6 +4272,7 @@ async fn app(
         // default mode is Allow (yolo default); the bootstrap
         // ModeChanged event re-renders this with the true state
         mode: mode_label(ka_protocol::Mode::Allow).to_string(),
+        mode_kind: ka_protocol::Mode::Allow,
         ..Default::default()
     };
     // the reasoning segment must be visible from the first frame: the
@@ -4296,7 +4300,7 @@ async fn app(
     // user-queued prompts (`+` or alt+q while busy), held locally and auto-sent
     // FIFO, one per turn settle (see the TurnFinished arm below)
     let mut queue: Vec<String> = Vec::new();
-    let mut turn_produced = false;
+    let mut orphaned: Vec<(String, usize)> = Vec::new();
     let mut turn_usage: Option<(u64, u64, u64)> = None; // (input+cache_read, total_in_seen, output)
     let mut plan_started: Option<std::time::SystemTime> = None;
     let mut current_assistant = String::new();
@@ -5603,7 +5607,6 @@ async fn app(
                         (KeyCode::Tab, _) if input.searching() => {}
                         (KeyCode::Up, _) if input.searching() => {}
                         (KeyCode::Down, _) if input.searching() => {}
-                        (KeyCode::Esc, _) if input.searching() => input.search_cancel(),
                         // a popup or path-completion overlay owns Esc:
                         // close it, never abort a running turn
                         (KeyCode::Esc, _)
@@ -6240,9 +6243,11 @@ async fn app(
                             }
                             transcript.push_separated(Line::User(text.clone()));
                             let cmd = if busy {
-                                transcript.push_separated(Line::Info(
-                                    "steering this turn".into(),
-                                ));
+                                let mut note = "steering this turn".to_string();
+                                if pending_image.is_some() {
+                                    note.push_str(" (1 staged image waits for the next prompt)");
+                                }
+                                transcript.push_separated(Line::Info(note));
                                 Command::Steer { text }
                             } else {
                                 // plain new turn: the /retry target; a
@@ -6964,7 +6969,10 @@ async fn app(
             }
             maybe_evt = events.recv() => {
                 match maybe_evt {
-                    None => { exit = Some(Exit::EngineEnded); }
+                    None => {
+                        pending_modal = None;
+                        exit = Some(Exit::EngineEnded);
+                    }
                     Some(evt) => {
                         dirty = true;
                         let replayed = matches!(evt, Event::Replay { .. });
@@ -7037,7 +7045,7 @@ async fn app(
                             &mut busy_since,
                             &mut meters,
                             &mut pending,
-                            &mut turn_produced,
+                            &mut orphaned,
                             &mut turn_usage,
                             &mut current_assistant,
                             &mut current_thought,
@@ -7052,6 +7060,22 @@ async fn app(
                         {
                             // Ctrl+O and click-to-expand target this call
                             last_tool_ref = transcript.last_tool_ref();
+                        }
+                        // a superseded ask would wedge the engine's
+                        // pose_ask forever — auto-deny it (deny-last,
+                        // the Esc rule)
+                        for (id, deny) in orphaned.drain(..) {
+                            let _ = commands
+                                .send(Command::Answer {
+                                    question: AskId(id),
+                                    choice: deny,
+                                })
+                                .await;
+                        }
+                        // Idle is settle-complete: a roster that never
+                        // came must not leave the modal armed forever
+                        if matches!(evt, Event::Idle) {
+                            pending_modal = None;
                         }
                         // the effort segment renders only for models
                         // that expose reasoning control; the model may
@@ -7149,7 +7173,7 @@ async fn app(
                             }
                         }
                         if matches!(evt, Event::TurnFinished { .. })
-                            && meters.mode == mode_label(ka_protocol::Mode::Readonly)
+                            && meters.mode_kind == ka_protocol::Mode::Readonly
                             && plan_drafted(plan_started, &plan_file_path())
                         {
                             plan_started = None;
@@ -7295,7 +7319,7 @@ fn apply_event(
     busy_since: &mut Option<Instant>,
     meters: &mut Meters,
     pending: &mut Option<PendingAsk>,
-    turn_produced: &mut bool,
+    orphaned: &mut Vec<(String, usize)>,
     turn_usage: &mut Option<(u64, u64, u64)>,
     current_assistant: &mut String,
     current_thought: &mut String,
@@ -7321,7 +7345,6 @@ fn apply_event(
             *current_thought = String::new();
             *current_tool = String::new();
             *live_tool = None;
-            *turn_produced = false;
             *turn_usage = None;
             // a new turn invalidates a stale in-turn error buffer; the
             // retry target survives so /retry can resend the prompt
@@ -7330,15 +7353,12 @@ fn apply_event(
         }
         Event::Delta { kind } => match kind {
             ka_protocol::DeltaKind::Text(t) => {
-                *turn_produced = true;
                 current_assistant.push_str(t);
             }
             ka_protocol::DeltaKind::Thought(t) => {
-                *turn_produced = true;
                 current_thought.push_str(t);
             }
             ka_protocol::DeltaKind::Call { tool, id } => {
-                *turn_produced = true;
                 // chronology: text streamed before the call must render
                 // above it, exactly like the turn-end flush
                 flush_live_text(transcript, current_thought, current_assistant);
@@ -7352,7 +7372,6 @@ fn apply_event(
             }
         },
         Event::CallStarted { tool, id, detail } => {
-            *turn_produced = true;
             flush_live_text(transcript, current_thought, current_assistant);
             match live_tool.as_ref() {
                 // the streaming header for this exact call is still the
@@ -7392,7 +7411,6 @@ fn apply_event(
             spill,
             ..
         } => {
-            *turn_produced = true;
             if let Some(path) = spill {
                 record_spill(spills, path);
             }
@@ -7436,6 +7454,12 @@ fn apply_event(
         }
         Event::Ask { id, questions } => {
             if let Some(q) = questions.first() {
+                // a second ask supersedes the open one: report the
+                // orphan for auto-deny (deny-last, the Esc rule) or
+                // its pose_ask wedges the engine forever
+                if let Some(old) = pending.as_ref() {
+                    orphaned.push((old.id.0.clone(), old.options.len().saturating_sub(1)));
+                }
                 *pending = Some(PendingAsk {
                     id: id.clone(),
                     question: q.text.clone(),
@@ -7605,6 +7629,7 @@ fn apply_event(
         Event::SessionInfo { id } => meters.session = id.clone(),
         Event::ModeChanged { mode } => {
             meters.mode = mode_label(*mode).to_string();
+            meters.mode_kind = *mode;
             meters.mode_icon = crate::icons::mode_icon(*mode).to_string();
         }
         Event::Error { message, .. } => {
@@ -15215,7 +15240,7 @@ mod tests {
         let mut busy_since = None;
         let mut meters = Meters::default();
         let mut pending = None;
-        let mut turn_produced = false;
+        let mut orphaned: Vec<(String, usize)> = Vec::new();
         let mut usage = None;
         let mut a = String::new();
         let mut t = String::new();
@@ -15235,7 +15260,7 @@ mod tests {
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut turn_produced,
+            &mut orphaned,
             &mut usage,
             &mut a,
             &mut t,
@@ -15255,7 +15280,7 @@ mod tests {
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut turn_produced,
+            &mut orphaned,
             &mut usage,
             &mut a,
             &mut t,
@@ -15277,7 +15302,7 @@ mod tests {
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut turn_produced,
+            &mut orphaned,
             &mut usage,
             &mut a,
             &mut t,
@@ -15301,7 +15326,7 @@ mod tests {
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut turn_produced,
+            &mut orphaned,
             &mut usage,
             &mut a,
             &mut t,
@@ -15326,7 +15351,7 @@ mod tests {
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut turn_produced,
+            &mut orphaned,
             &mut usage,
             &mut a,
             &mut t,
@@ -15364,13 +15389,85 @@ mod tests {
     }
 
     #[test]
+    fn superseded_ask_is_orphaned_for_auto_deny() {
+        let mut lines = Transcript::default();
+        let mut busy = true;
+        let mut busy_since = None;
+        let mut meters = Meters::default();
+        let mut pending = None;
+        let mut orphaned: Vec<(String, usize)> = Vec::new();
+        let mut usage = None;
+        let mut a = String::new();
+        let mut t = String::new();
+        let mut tool = String::new();
+        let mut live_tool: Option<LiveTool> = None;
+        let mut last_user: Option<String> = None;
+        let mut last_error: Option<String> = None;
+        let mut spills: Vec<String> = Vec::new();
+        let mut sidebar = SidebarState::default();
+        let ask = |id: &str| Event::Ask {
+            id: AskId(id.into()),
+            questions: vec![ka_protocol::AskQuestion {
+                text: "run it?".into(),
+                options: vec!["allow".into(), "deny".into()],
+                detail: None,
+            }],
+        };
+        let _ = apply_event(
+            &ask("a1"),
+            &mut lines,
+            &mut busy,
+            &mut busy_since,
+            &mut meters,
+            &mut pending,
+            &mut orphaned,
+            &mut usage,
+            &mut a,
+            &mut t,
+            &mut tool,
+            &mut live_tool,
+            &mut last_user,
+            &mut last_error,
+            &mut spills,
+            &mut sidebar,
+        );
+        let _ = apply_event(
+            &ask("a2"),
+            &mut lines,
+            &mut busy,
+            &mut busy_since,
+            &mut meters,
+            &mut pending,
+            &mut orphaned,
+            &mut usage,
+            &mut a,
+            &mut t,
+            &mut tool,
+            &mut live_tool,
+            &mut last_user,
+            &mut last_error,
+            &mut spills,
+            &mut sidebar,
+        );
+        assert_eq!(
+            orphaned,
+            vec![("a1".to_string(), 1)],
+            "the superseded ask is reported with the deny-last index"
+        );
+        assert_eq!(
+            pending.as_ref().map(|p| p.id.clone()),
+            Some(AskId("a2".into()))
+        );
+    }
+
+    #[test]
     fn call_boundary_flushes_text_before_the_tool_row() {
         let mut lines = Transcript::default();
         let mut busy = false;
         let mut busy_since = None;
         let mut meters = Meters::default();
         let mut pending = None;
-        let mut turn_produced = false;
+        let mut orphaned: Vec<(String, usize)> = Vec::new();
         let mut usage = None;
         let mut a = String::new();
         let mut t = String::new();
@@ -15390,7 +15487,7 @@ mod tests {
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut turn_produced,
+            &mut orphaned,
             &mut usage,
             &mut a,
             &mut t,
@@ -15410,7 +15507,7 @@ mod tests {
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut turn_produced,
+            &mut orphaned,
             &mut usage,
             &mut a,
             &mut t,
@@ -15433,7 +15530,7 @@ mod tests {
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut turn_produced,
+            &mut orphaned,
             &mut usage,
             &mut a,
             &mut t,
@@ -15463,7 +15560,7 @@ mod tests {
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut turn_produced,
+            &mut orphaned,
             &mut usage,
             &mut a,
             &mut t,
@@ -15487,7 +15584,7 @@ mod tests {
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut turn_produced,
+            &mut orphaned,
             &mut usage,
             &mut a,
             &mut t,
@@ -15512,7 +15609,7 @@ mod tests {
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut turn_produced,
+            &mut orphaned,
             &mut usage,
             &mut a,
             &mut t,
@@ -15533,7 +15630,7 @@ mod tests {
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut turn_produced,
+            &mut orphaned,
             &mut usage,
             &mut a,
             &mut t,
@@ -15555,7 +15652,7 @@ mod tests {
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut turn_produced,
+            &mut orphaned,
             &mut usage,
             &mut a,
             &mut t,
@@ -15579,7 +15676,7 @@ mod tests {
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut turn_produced,
+            &mut orphaned,
             &mut usage,
             &mut a,
             &mut t,
@@ -15601,7 +15698,7 @@ mod tests {
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut turn_produced,
+            &mut orphaned,
             &mut usage,
             &mut a,
             &mut t,
@@ -15622,7 +15719,7 @@ mod tests {
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut turn_produced,
+            &mut orphaned,
             &mut usage,
             &mut a,
             &mut t,
@@ -15696,7 +15793,7 @@ mod tests {
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut turn_produced,
+            &mut orphaned,
             &mut usage,
             &mut a,
             &mut t,
@@ -15720,7 +15817,7 @@ mod tests {
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut turn_produced,
+            &mut orphaned,
             &mut usage,
             &mut a,
             &mut t,
@@ -15744,7 +15841,7 @@ mod tests {
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut turn_produced,
+            &mut orphaned,
             &mut usage,
             &mut a,
             &mut t,
@@ -15771,7 +15868,7 @@ mod tests {
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut turn_produced,
+            &mut orphaned,
             &mut usage,
             &mut a,
             &mut t,
@@ -15883,7 +15980,7 @@ mod tests {
         let mut busy_since = None;
         let mut meters = Meters::default();
         let mut pending = None;
-        let mut turn_produced = false;
+        let mut orphaned: Vec<(String, usize)> = Vec::new();
         let mut usage = None;
         let mut a = String::new();
         let mut t = String::new();
@@ -15906,7 +16003,7 @@ mod tests {
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut turn_produced,
+            &mut orphaned,
             &mut usage,
             &mut a,
             &mut t,
@@ -15926,7 +16023,7 @@ mod tests {
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut turn_produced,
+            &mut orphaned,
             &mut usage,
             &mut a,
             &mut t,
@@ -15948,7 +16045,7 @@ mod tests {
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut turn_produced,
+            &mut orphaned,
             &mut usage,
             &mut a,
             &mut t,
@@ -15978,7 +16075,7 @@ mod tests {
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut turn_produced,
+            &mut orphaned,
             &mut usage,
             &mut a,
             &mut t,
@@ -16022,7 +16119,7 @@ mod tests {
         let mut busy_since = None;
         let mut meters = Meters::default();
         let mut pending = None;
-        let mut turn_produced = false;
+        let mut orphaned: Vec<(String, usize)> = Vec::new();
         let mut usage = None;
         let mut a = String::new();
         let mut t = String::new();
@@ -16042,7 +16139,7 @@ mod tests {
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut turn_produced,
+            &mut orphaned,
             &mut usage,
             &mut a,
             &mut t,
@@ -16063,7 +16160,7 @@ mod tests {
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut turn_produced,
+            &mut orphaned,
             &mut usage,
             &mut a,
             &mut t,
@@ -16618,7 +16715,7 @@ mod tests {
         let mut busy_since = None;
         let mut meters = Meters::default();
         let mut pending = None;
-        let mut turn_produced = false;
+        let mut orphaned: Vec<(String, usize)> = Vec::new();
         let mut usage = None;
         let mut a = String::new();
         let mut t = String::new();
@@ -16635,7 +16732,7 @@ mod tests {
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut turn_produced,
+            &mut orphaned,
             &mut usage,
             &mut a,
             &mut t,
@@ -16910,7 +17007,7 @@ mod tests {
         let mut busy_since = None;
         let mut meters = Meters::default();
         let mut pending = None;
-        let mut turn_produced = false;
+        let mut orphaned: Vec<(String, usize)> = Vec::new();
         let mut usage = None;
         let mut a = String::new();
         let mut t = String::new();
@@ -16928,7 +17025,7 @@ mod tests {
                 &mut busy_since,
                 &mut meters,
                 &mut pending,
-                &mut turn_produced,
+                &mut orphaned,
                 &mut usage,
                 &mut a,
                 &mut t,
@@ -16990,7 +17087,7 @@ mod tests {
         let mut busy_since = None;
         let mut meters = Meters::default();
         let mut pending = None;
-        let mut turn_produced = false;
+        let mut orphaned: Vec<(String, usize)> = Vec::new();
         let mut usage = None;
         let mut a = String::new();
         let mut t = String::new();
@@ -17008,7 +17105,7 @@ mod tests {
                 &mut busy_since,
                 &mut meters,
                 &mut pending,
-                &mut turn_produced,
+                &mut orphaned,
                 &mut usage,
                 &mut a,
                 &mut t,
@@ -17264,7 +17361,7 @@ mod tests {
         let mut busy_since = None;
         let mut meters = Meters::default();
         let mut pending = None;
-        let mut turn_produced = false;
+        let mut orphaned: Vec<(String, usize)> = Vec::new();
         let mut usage = None;
         let mut a = String::new();
         let mut t = String::new();
@@ -17287,7 +17384,7 @@ mod tests {
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut turn_produced,
+            &mut orphaned,
             &mut usage,
             &mut a,
             &mut t,
@@ -17310,7 +17407,7 @@ mod tests {
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut turn_produced,
+            &mut orphaned,
             &mut usage,
             &mut a,
             &mut t,
@@ -17336,7 +17433,7 @@ mod tests {
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut turn_produced,
+            &mut orphaned,
             &mut usage,
             &mut a,
             &mut t,
@@ -18028,7 +18125,7 @@ mod tests {
         let mut busy_since = None;
         let mut meters = Meters::default();
         let mut pending = None;
-        let mut turn_produced = false;
+        let mut orphaned: Vec<(String, usize)> = Vec::new();
         let mut usage = None;
         let mut a = String::new();
         let mut t = String::new();
@@ -18057,7 +18154,7 @@ mod tests {
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut turn_produced,
+            &mut orphaned,
             &mut usage,
             &mut a,
             &mut t,
@@ -18084,7 +18181,7 @@ mod tests {
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut turn_produced,
+            &mut orphaned,
             &mut usage,
             &mut a,
             &mut t,
@@ -18105,7 +18202,7 @@ mod tests {
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut turn_produced,
+            &mut orphaned,
             &mut usage,
             &mut a,
             &mut t,
@@ -18125,7 +18222,7 @@ mod tests {
         let mut busy_since = None;
         let mut meters = Meters::default();
         let mut pending = None;
-        let mut turn_produced = false;
+        let mut orphaned: Vec<(String, usize)> = Vec::new();
         let mut usage = None;
         let mut a = String::new();
         let mut t = String::new();
@@ -18143,7 +18240,7 @@ mod tests {
                 &mut busy_since,
                 &mut meters,
                 &mut pending,
-                &mut turn_produced,
+                &mut orphaned,
                 &mut usage,
                 &mut a,
                 &mut t,

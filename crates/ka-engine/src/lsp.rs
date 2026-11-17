@@ -1265,7 +1265,7 @@ async fn read_loop<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
     loop {
         let body = match crate::wire::read_frame(&mut reader).await {
             Some(b) => b,
-            None => return,
+            None => break,
         };
         let Ok(msg) = serde_json::from_slice::<serde_json::Value>(&body) else {
             continue;
@@ -1378,6 +1378,15 @@ async fn read_loop<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
         }
         // everything else (logMessage, progress, ...) is ignored
     }
+    // pipe closed: the server died. Wake a handshake still waiting on
+    // the initialize response, then demote so requests fail fast
+    // instead of hanging to REQUEST_TIMEOUT on a dead stdin.
+    if let Some(tx) = init_tx.take() {
+        let _ = tx.send(false);
+    }
+    let mut inner = shared.inner.lock();
+    inner.servers.remove(&lang);
+    inner.failed.insert(lang);
 }
 
 #[cfg(test)]

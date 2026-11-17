@@ -190,7 +190,7 @@ track it with the tasks tool.",
                 let tasks = self.tasks.clone();
                 let events = self.events.clone();
                 let tasks_in = tasks.clone();
-                let handle = tokio::spawn(async move {
+                let runner = tokio::spawn(async move {
                     let (outcome, branch, cost) =
                         run_agent(def, task.clone(), cwd, source, parent_mode, roster, |tx| {
                             tasks_in.attach_cmds(id, tx)
@@ -200,21 +200,14 @@ track it with the tasks tool.",
                     if let Some(branch) = &branch {
                         tasks_in.set_branch(id, branch.clone());
                     }
-                    tasks_in.finish(id, outcome.clone());
-                    let (label, note) = match &outcome {
-                        Ok(summary) => ("finished", truncate_for_note(summary, 200)),
-                        Err(reason) => ("failed", truncate_for_note(reason, 200)),
-                    };
-                    events
-                        .send(ka_protocol::Event::Note {
-                            message: format!(
-                                "background t-{id} {label} — full result via the tasks tool: {note}"
-                            ),
-                        })
-                        .await
-                        .ok();
+                    outcome
                 });
-                tasks.attach(id, handle);
+                // the runner never writes final state or notes; the
+                // watcher alone does — a cancel aborts the runner and
+                // its state stands, a panic fails the task instead of
+                // wedging it Running forever
+                tasks.attach(id, runner.abort_handle());
+                tokio::spawn(super::tasks::watch_runner(tasks, events, id, runner));
                 return ToolOutput::ok(format!(
                     "background task t-{id} started (agent {agent_name}); continue other work \
                      and check the tasks tool for the result"
@@ -241,7 +234,7 @@ track it with the tasks tool.",
 }
 
 /// Cap a note to `cap` chars with an ellipsis.
-fn truncate_for_note(text: &str, cap: usize) -> String {
+pub(crate) fn truncate_for_note(text: &str, cap: usize) -> String {
     if text.chars().count() > cap {
         let cut: String = text.chars().take(cap).collect();
         format!("{cut}…")

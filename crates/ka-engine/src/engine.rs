@@ -246,10 +246,18 @@ fn history_from_records(
             ka_strand::Record::Rewind { kept_from, .. } => {
                 // drop messages after the kept point (the tail of the log
                 // is the abandoned branch)
-                if let Some(pos) = ids.iter().position(|i| i == kept_from) {
-                    let keep_msgs = pos + 1;
-                    out.truncate(keep_msgs);
-                    ids.truncate(keep_msgs);
+                match ids.iter().position(|i| i == kept_from) {
+                    Some(pos) => {
+                        out.truncate(pos + 1);
+                        ids.truncate(pos + 1);
+                    }
+                    // unknown anchor (e.g. behind a digest that cleared
+                    // ids): drop everything replayable — never silently
+                    // keep the abandoned tail logically live
+                    None => {
+                        out.clear();
+                        ids.clear();
+                    }
                 }
             }
             _ => {}
@@ -5393,6 +5401,41 @@ mod tests {
         let (history, _, _) = super::history_from_records(&[record], true);
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].thinking.as_deref(), Some("pondering"));
+    }
+
+    #[test]
+    fn rewind_with_unknown_anchor_fails_toward_the_rewind() {
+        // anchor behind a digest that cleared ids: replay must not keep
+        // the abandoned tail logically live
+        let msg = |role, content: &str| {
+            super::record_from_message(&ka_dialect::speaker::TurnMessage {
+                role,
+                content: content.into(),
+                thinking: None,
+                calls: Vec::new(),
+                results: Vec::new(),
+                images: Vec::new(),
+            })
+        };
+        let user = msg(ka_dialect::speaker::TurnRole::User, "doomed question");
+        let anchor = user.id().unwrap().clone();
+        let records = vec![
+            user,
+            msg(ka_dialect::speaker::TurnRole::Assistant, "doomed answer"),
+            ka_strand::Record::Digest {
+                id: ka_strand::new_record_id(),
+                summary: "collapsed".into(),
+                kept_from: ka_strand::new_record_id(),
+            },
+            ka_strand::Record::Rewind {
+                id: ka_strand::new_record_id(),
+                kept_from: anchor,
+            },
+        ];
+        let (history, ids, digest) = super::history_from_records(&records, true);
+        assert!(history.is_empty(), "abandoned tail must not replay");
+        assert!(ids.is_empty());
+        assert_eq!(digest.as_deref(), Some("collapsed"));
     }
 
     #[test]

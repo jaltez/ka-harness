@@ -443,6 +443,15 @@ impl Session {
         self.ended.notify_one();
         Ok(())
     }
+
+    /// Abandon a session whose handshake failed: kill the adapter and
+    /// mark it dead so `reap` drops it immediately — a half-configured
+    /// session must never answer `session(None)` ("newest").
+    fn abandon(&self) {
+        self.child.lock().start_kill().ok();
+        self.dead.store(true, Ordering::Relaxed);
+        self.ended.notify_one();
+    }
 }
 
 impl Drop for Session {
@@ -587,49 +596,67 @@ impl DebugManager {
         tokio::spawn(read_loop(stdout, session.clone()));
         self.sessions.lock().push(session.clone());
 
-        // handshake
-        let caps = session
-            .request(
-                "initialize",
-                json!({
-                    "clientID": "ka",
-                    "clientName": "ka",
-                    "adapterID": adapter,
-                    "locale": "en",
-                    "linesStartAt1": true,
-                    "columnsStartAt1": true,
-                    "pathFormat": "path",
-                    "supportsVariableType": true,
-                    "supportsRunInTerminalRequest": false,
-                }),
-            )
-            .await?;
-        *session.capabilities.lock() = caps;
-        // launch/attach goes out immediately after the initialize
-        // response — VS Code's order, and required by adapters (debugpy)
-        // that only emit `initialized` once the debuggee is started. Its
-        // RESPONSE is deferred until configurationDone by such adapters,
-        // so the request is fire-and-forget and configurationDone below
-        // is the synchronization point.
-        let method = if launch { "launch" } else { "attach" };
-        session.send_request(method, launch_args).await?;
-        if tokio::time::timeout(READY_TIMEOUT, session.initialized.notified())
-            .await
-            .is_err()
-        {
-            return Err(format!("{adapter}: no `initialized` event in time"));
+        // handshake — on failure, abandon: the half-configured session
+        // must never answer `session(None)` ("newest")
+        if let Err(e) = handshake(&session, adapter, launch, launch_args, breakpoints).await {
+            session.abandon();
+            return Err(e);
         }
-        // The client does NOT echo an `initialized` event: debugpy treats
-        // a client-sent one as "start the debuggee now", which would run
-        // the program before breakpoints are registered. setBreakpoints
-        // is legal as soon as the event above arrives.
-        for (file, lines) in breakpoints {
-            session.set_breakpoints(file, lines).await?;
-        }
-        session.request("configurationDone", Value::Null).await?;
         session.touch();
         Ok(session)
     }
+}
+
+/// The handshake tail of [`DebugManager::start`]: initialize →
+/// launch/attach (fire-and-forget) → `initialized` event →
+/// breakpoints → configurationDone.
+async fn handshake(
+    session: &Session,
+    adapter: &str,
+    launch: bool,
+    launch_args: Value,
+    breakpoints: &[(String, Vec<u64>)],
+) -> Result<(), String> {
+    let caps = session
+        .request(
+            "initialize",
+            json!({
+                "clientID": "ka",
+                "clientName": "ka",
+                "adapterID": adapter,
+                "locale": "en",
+                "linesStartAt1": true,
+                "columnsStartAt1": true,
+                "pathFormat": "path",
+                "supportsVariableType": true,
+                "supportsRunInTerminalRequest": false,
+            }),
+        )
+        .await?;
+    *session.capabilities.lock() = caps;
+    // launch/attach goes out immediately after the initialize
+    // response — VS Code's order, and required by adapters (debugpy)
+    // that only emit `initialized` once the debuggee is started. Its
+    // RESPONSE is deferred until configurationDone by such adapters,
+    // so the request is fire-and-forget and configurationDone below
+    // is the synchronization point.
+    let method = if launch { "launch" } else { "attach" };
+    session.send_request(method, launch_args).await?;
+    if tokio::time::timeout(READY_TIMEOUT, session.initialized.notified())
+        .await
+        .is_err()
+    {
+        return Err(format!("{adapter}: no `initialized` event in time"));
+    }
+    // The client does NOT echo an `initialized` event: debugpy treats
+    // a client-sent one as "start the debuggee now", which would run
+    // the program before breakpoints are registered. setBreakpoints
+    // is legal as soon as the event above arrives.
+    for (file, lines) in breakpoints {
+        session.set_breakpoints(file, lines).await?;
+    }
+    session.request("configurationDone", Value::Null).await?;
+    Ok(())
 }
 
 /// Reader task: routes responses by `request_seq`, collects console
@@ -1179,5 +1206,68 @@ while True:
         assert_eq!(s.resume("continue").await.unwrap(), Wait::Ended);
         s.disconnect().await.unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn failed_handshake_leaves_no_half_configured_session() {
+        // a spawn failure returns pre-push: nothing is registered
+        let mut ov = BTreeMap::new();
+        ov.insert(
+            "ghost".to_string(),
+            "/nonexistent/ghost-adapter".to_string(),
+        );
+        let mgr = DebugManager::new(Some(ov), None);
+        let Err(err) = mgr
+            .start(
+                "ghost",
+                true,
+                json!({ "program": "x" }),
+                &[],
+                Path::new("."),
+            )
+            .await
+        else {
+            panic!("spawning a nonexistent adapter must fail");
+        };
+        assert!(err.contains("spawn"), "{err}");
+        assert!(
+            mgr.session(None).is_err(),
+            "spawn failure must not register"
+        );
+
+        // a handshake failure after the push must abandon the session:
+        // dead ⇒ reaped ⇒ never answers `session(None)` ("newest")
+        let mgr = DebugManager::new(None, None);
+        let session = Arc::new(Session {
+            id: "d1".to_string(),
+            child: Mutex::new(
+                tokio::process::Command::new("sleep")
+                    .arg("30")
+                    .spawn()
+                    .unwrap(),
+            ),
+            writer: Arc::new(tokio::sync::Mutex::new(None)),
+            seq: AtomicI64::new(1),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            capabilities: Mutex::new(Value::Null),
+            stopped: Arc::new(Notify::new()),
+            ended: Arc::new(Notify::new()),
+            initialized: Arc::new(Notify::new()),
+            output: Arc::new(Mutex::new(VecDeque::new())),
+            thread: Mutex::new(None),
+            frame: Mutex::new(0),
+            dead: AtomicBool::new(false),
+            breaks: Mutex::new(Vec::new()),
+            notes: None,
+            hand_waiting: AtomicBool::new(false),
+            last_used: Mutex::new(Instant::now()),
+        });
+        mgr.sessions.lock().push(session.clone());
+        assert!(mgr.session(None).is_ok(), "live before the abandon");
+        session.abandon();
+        let Err(err) = mgr.session(None) else {
+            panic!("an abandoned session must not answer session(None)");
+        };
+        assert!(err.contains("no debug session"), "{err}");
     }
 }

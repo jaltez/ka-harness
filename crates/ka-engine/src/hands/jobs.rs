@@ -48,6 +48,9 @@ struct JobEntry {
     started_epoch_ms: u64,
     spill: PathBuf,
     pid: Option<u32>,
+    /// /proc starttime of the registered pid — a live-looking pid with
+    /// a different starttime is a recycled process, not our job.
+    start_ticks: Option<u64>,
 }
 
 /// Immutable snapshot row handed to the jobs hand.
@@ -91,13 +94,26 @@ pub(crate) fn pid_alive(pid: Option<u32>) -> bool {
     }
 }
 
+/// Field 22 of /proc/<pid>/stat (starttime, clock ticks), recorded at
+/// registration so a recycled pid can never masquerade as a live job.
+fn proc_start_ticks(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_comm = stat.rsplit_once(')').map(|(_, rest)| rest)?;
+    after_comm
+        .split_whitespace()
+        .nth(19)
+        .and_then(|f| f.parse().ok())
+}
+
 /// Derive a job's lifecycle state from disk: `.done` present → exited
 /// with the recorded code; pid live → running; otherwise died unknown.
-fn derived_state(spill: &Path, pid: Option<u32>) -> JobState {
+fn derived_state(spill: &Path, pid: Option<u32>, start_ticks: Option<u64>) -> JobState {
     if let Ok(text) = std::fs::read_to_string(done_path(spill)) {
         return JobState::Exited(text.trim().parse::<i32>().unwrap_or(-1));
     }
-    if pid_alive(pid) {
+    // start_ticks None = legacy line written before the field existed:
+    // keep the old pid-only behavior
+    if pid_alive(pid) && (start_ticks.is_none() || pid.and_then(proc_start_ticks) == start_ticks) {
         JobState::Running
     } else {
         JobState::Exited(-1)
@@ -136,10 +152,11 @@ impl JobTable {
                 started_epoch_ms: v["started_ms"].as_u64().unwrap_or(0),
                 spill: PathBuf::from(v["spill"].as_str().unwrap_or_default()),
                 pid: v["pid"].as_u64().map(|p| p as u32),
+                start_ticks: v["start_ticks"].as_u64(),
             };
             next_id = next_id.max(entry.id);
             // adopt only survivors; dead entries silently compact away
-            if derived_state(&entry.spill, entry.pid) == JobState::Running {
+            if derived_state(&entry.spill, entry.pid, entry.start_ticks) == JobState::Running {
                 adopted.push(entry);
             }
         }
@@ -168,6 +185,7 @@ impl JobTable {
             started_epoch_ms,
             spill,
             pid,
+            start_ticks: pid.and_then(proc_start_ticks),
         };
         t.jobs.push(entry);
         if let Some(path) = self.path.lock().clone() {
@@ -180,6 +198,7 @@ impl JobTable {
                 "started_ms": e.started_epoch_ms,
                 "spill": e.spill.to_string_lossy(),
                 "pid": e.pid,
+                "start_ticks": e.start_ticks,
             });
             use std::io::Write;
             if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -200,7 +219,7 @@ impl JobTable {
         let Some(e) = t.jobs.iter().find(|e| e.id == id) else {
             return Err(format!("no such job: {id}"));
         };
-        if let JobState::Exited(code) = derived_state(&e.spill, e.pid) {
+        if let JobState::Exited(code) = derived_state(&e.spill, e.pid, e.start_ticks) {
             return Err(format!("job {id} already exited ({code})"));
         }
         if let Some(pid) = e.pid {
@@ -222,7 +241,7 @@ impl JobTable {
                 cmd: e.cmd.clone(),
                 started: std::time::SystemTime::UNIX_EPOCH
                     + std::time::Duration::from_millis(e.started_epoch_ms),
-                state: derived_state(&e.spill, e.pid),
+                state: derived_state(&e.spill, e.pid, e.start_ticks),
                 spill: e.spill.clone(),
             })
             .collect()
@@ -237,6 +256,7 @@ impl JobTable {
                 "started_ms": e.started_epoch_ms,
                 "spill": e.spill.to_string_lossy(),
                 "pid": e.pid,
+                "start_ticks": e.start_ticks,
             });
             out.push_str(&v.to_string());
             out.push('\n');
@@ -646,6 +666,43 @@ mod tests {
         let empty = dir.join("empty");
         std::fs::write(&empty, "").unwrap();
         assert_eq!(tail_of(&empty), "");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recycled_pid_does_not_read_as_running() {
+        let dir = std::env::temp_dir().join(format!("ka-jobs-recycle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let spill = dir.join("out-x");
+        let pid = std::process::id();
+
+        // this test process is alive, but the recorded starttime is
+        // bogus: the pid reads as recycled, not as our job
+        assert_eq!(
+            derived_state(&spill, Some(pid), Some(1)),
+            JobState::Exited(-1)
+        );
+        // legacy line without start_ticks keeps the old behavior
+        assert_eq!(derived_state(&spill, Some(pid), None), JobState::Running);
+
+        // the persisted round-trip: adoption compacts the mismatch away
+        let jsonl = dir.join("jobs.jsonl");
+        std::fs::write(
+            &jsonl,
+            format!(
+                "{{\"id\":1,\"cmd\":\"old\",\"started_ms\":0,\"spill\":\"{}\",\"pid\":{pid},\"start_ticks\":1}}\n",
+                spill.display()
+            ),
+        )
+        .unwrap();
+        let t = Arc::new(JobTable::new());
+        t.set_path(jsonl.clone());
+        assert!(
+            t.snapshot().is_empty(),
+            "a recycled pid must not be adopted as Running: {:?}",
+            t.snapshot()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

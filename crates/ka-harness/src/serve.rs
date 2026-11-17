@@ -74,6 +74,14 @@ impl Session {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
         let _ = self.broadcast.send((seq, presence_event(busy, attached)));
     }
+
+    /// Engine stream closed mid-turn: `/sessions` must not report
+    /// busy forever — clear and publish one last presence.
+    fn close_fixup(&self) {
+        if self.busy.swap(false, Ordering::Relaxed) {
+            self.broadcast_presence();
+        }
+    }
 }
 
 /// The synthetic presence event (roadmap 9.6). Additive on the wire;
@@ -362,6 +370,9 @@ async fn create_session(
             // no subscribers is fine — the ring keeps the history
             let _ = broadcast.send((seq, evt));
         }
+        // engine death must not wedge /sessions busy forever — the
+        // stream never delivered the trailing Idle
+        session.close_fixup();
     });
     let body = json!({"id": id}).to_string();
     respond(socket, 200, &body).await;
@@ -1085,5 +1096,30 @@ mod tests {
             err.contains("--token"),
             "error must tell the operator to pass --token: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn engine_stream_end_clears_busy_and_broadcasts_presence() {
+        let (commands, _rx) = tokio::sync::mpsc::channel(1);
+        let (broadcast, mut brx) = tokio::sync::broadcast::channel(4);
+        let session = super::Session {
+            commands,
+            broadcast,
+            ring: tokio::sync::Mutex::new(Vec::new()),
+            seq: std::sync::atomic::AtomicU64::new(0),
+            attached: std::sync::atomic::AtomicUsize::new(1),
+            busy: std::sync::atomic::AtomicBool::new(true),
+            title: tokio::sync::Mutex::new(String::new()),
+        };
+        session.close_fixup();
+        let (busy, _) = session.snapshot();
+        assert!(!busy, "engine death must not wedge /sessions busy");
+        match brx.recv().await {
+            Ok((_, ka_protocol::Event::Presence { busy, .. })) => assert!(!busy),
+            other => panic!("expected a presence broadcast, got {other:?}"),
+        }
+        // idempotent: a settled session broadcasts nothing more
+        session.close_fixup();
+        assert!(brx.try_recv().is_err());
     }
 }

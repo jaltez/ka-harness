@@ -671,6 +671,20 @@ impl Voice {
         if self.speculative_in_flight() {
             return false;
         }
+        // a ready candidate whose watermark no longer matches can never
+        // be consumed (take_speculative discards it) — evict it here so a
+        // fresh one can run instead of blocking all speculation until
+        // pressure trips
+        if let Ok(mut slot) = self.speculative.try_lock() {
+            if slot
+                .as_ref()
+                .is_some_and(|(wm, _)| *wm != self.history.len())
+            {
+                slot.take();
+            }
+        } else {
+            return false;
+        }
         let Some(model_id) = fast
             .map(str::to_string)
             .or_else(|| self.model_selector.clone())

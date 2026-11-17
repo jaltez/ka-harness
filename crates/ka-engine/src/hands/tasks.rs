@@ -39,9 +39,9 @@ struct AgentTask {
     task: String,
     started: std::time::Instant,
     state: AgentTaskState,
-    /// The spawned runner (attached right after registration); cancel
-    /// aborts it for real.
-    handle: Option<tokio::task::JoinHandle<()>>,
+    /// The spawned runner's abort handle (attached right after
+    /// registration); cancel aborts the runner for real.
+    abort: Option<tokio::task::AbortHandle>,
     /// Steering channel into the running nested voice: `tasks send`
     /// routes a steer through it. `None` for finished tasks
     /// and when the runner has not started yet.
@@ -89,7 +89,7 @@ impl AgentTaskTable {
             task: task.to_string(),
             started: std::time::Instant::now(),
             state: AgentTaskState::Running,
-            handle: None,
+            abort: None,
             cmds: None,
             cost: 0.0,
             branch: None,
@@ -98,10 +98,11 @@ impl AgentTaskTable {
         id
     }
 
-    /// Attach the spawned runner to a registered task (cancel needs it).
-    pub fn attach(&self, id: u64, handle: tokio::task::JoinHandle<()>) {
+    /// Attach the spawned runner's abort handle to a registered task
+    /// (cancel needs it).
+    pub fn attach(&self, id: u64, abort: tokio::task::AbortHandle) {
         if let Some(e) = self.inner.lock().iter_mut().find(|e| e.id == id) {
-            e.handle = Some(handle);
+            e.abort = Some(abort);
         }
     }
 
@@ -181,8 +182,10 @@ impl AgentTaskTable {
     }
 
     /// Record a task's outcome. First write wins: a cancelled task's
-    /// late runner result never overwrites the cancellation.
-    pub fn finish(&self, id: u64, outcome: Result<String, String>) {
+    /// late runner result never overwrites the cancellation. Returns
+    /// whether it applied — `false` means the task was no longer
+    /// `Running` (cancelled or already finished).
+    pub fn finish(&self, id: u64, outcome: Result<String, String>) -> bool {
         let mut t = self.inner.lock();
         if let Some(entry) = t
             .iter_mut()
@@ -192,6 +195,9 @@ impl AgentTaskTable {
                 Ok(summary) => AgentTaskState::Done(summary),
                 Err(reason) => AgentTaskState::Failed(reason),
             };
+            true
+        } else {
+            false
         }
     }
 
@@ -251,8 +257,8 @@ impl AgentTaskTable {
             .ok_or_else(|| format!("no such task: t-{id}"))?;
         match e.state.clone() {
             AgentTaskState::Running => {
-                if let Some(h) = e.handle.take() {
-                    h.abort();
+                if let Some(a) = e.abort.take() {
+                    a.abort();
                 }
                 e.state = AgentTaskState::Failed("cancelled by request".to_string());
                 Ok(format!("t-{id} cancelled"))
@@ -261,6 +267,48 @@ impl AgentTaskTable {
                 "t-{id} already {} — nothing to cancel",
                 other.label()
             )),
+        }
+    }
+}
+
+/// Watch a spawned background runner: apply its outcome to the table
+/// (first-write-wins — a cancelled task's state stands, no note) and
+/// publish the completion note. A panicked runner FAILS the task
+/// instead of wedging it `Running` forever.
+pub(crate) async fn watch_runner(
+    tasks: Arc<AgentTaskTable>,
+    events: mpsc::Sender<ka_protocol::Event>,
+    id: u64,
+    runner: tokio::task::JoinHandle<Result<String, String>>,
+) {
+    match runner.await {
+        Ok(outcome) => {
+            if !tasks.finish(id, outcome.clone()) {
+                return; // cancelled while running — its state stands
+            }
+            let (label, detail) = match &outcome {
+                Ok(summary) => ("finished", super::delegate::truncate_for_note(summary, 200)),
+                Err(reason) => ("failed", super::delegate::truncate_for_note(reason, 200)),
+            };
+            events
+                .send(ka_protocol::Event::Note {
+                    message: format!(
+                        "background t-{id} {label} — full result via the tasks tool: {detail}"
+                    ),
+                })
+                .await
+                .ok();
+        }
+        Err(e) if e.is_cancelled() => {}
+        Err(_) => {
+            if tasks.finish(id, Err("runner task panicked".to_string())) {
+                events
+                    .send(ka_protocol::Event::Note {
+                        message: format!("background t-{id} failed — runner task panicked"),
+                    })
+                    .await
+                    .ok();
+            }
         }
     }
 }
@@ -786,5 +834,77 @@ mod tests {
             "conflict applies nothing"
         );
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[tokio::test]
+    async fn finish_applies_once_to_running_tasks() {
+        let table = AgentTaskTable::new();
+        let id = table.register("worker", "job");
+        assert!(table.finish(id, Ok("done".to_string())));
+        assert!(
+            !table.finish(id, Ok("again".to_string())),
+            "second finish must not overwrite"
+        );
+        // a cancelled task rejects the late runner result too
+        let id2 = table.register("worker", "job2");
+        table.cancel(id2).unwrap();
+        assert!(!table.finish(id2, Ok("late".to_string())));
+    }
+
+    #[tokio::test]
+    async fn watch_runner_notes_finished_task() {
+        let table = AgentTaskTable::new();
+        let (tx, mut rx) = mpsc::channel(4);
+        let id = table.register("worker", "job");
+        let runner = tokio::spawn(async { Ok("all good".to_string()) });
+        super::watch_runner(table.clone(), tx, id, runner).await;
+        assert_eq!(table.result(id).as_deref(), Some("all good"));
+        match rx.recv().await {
+            Some(ka_protocol::Event::Note { message }) => {
+                assert!(message.contains("background t-1 finished"), "{message}");
+                assert!(message.contains("all good"), "{message}");
+            }
+            other => panic!("expected a note, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn watch_runner_fails_panicking_task_and_notes_it() {
+        let table = AgentTaskTable::new();
+        let (tx, mut rx) = mpsc::channel(4);
+        let id = table.register("worker", "boom");
+        let runner = tokio::spawn(async { panic!("runner exploded") });
+        super::watch_runner(table.clone(), tx, id, runner).await;
+        assert_eq!(
+            table.result(id).as_deref(),
+            Some("t-1 failed: runner task panicked"),
+            "a panicked runner must not wedge the task Running"
+        );
+        match rx.recv().await {
+            Some(ka_protocol::Event::Note { message }) => {
+                assert!(message.contains("runner task panicked"), "{message}");
+            }
+            other => panic!("expected a note, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn watch_runner_silent_on_cancelled_runner() {
+        let table = AgentTaskTable::new();
+        let (tx, mut rx) = mpsc::channel(4);
+        let id = table.register("worker", "job");
+        let runner = tokio::spawn(async {
+            std::future::pending::<()>().await;
+            Ok("never".to_string())
+        });
+        table.attach(id, runner.abort_handle());
+        table.cancel(id).unwrap();
+        super::watch_runner(table.clone(), tx, id, runner).await;
+        assert_eq!(
+            table.result(id).as_deref(),
+            Some("t-1 failed: cancelled by request"),
+            "the cancellation stands — no contradictory finished note"
+        );
+        assert!(rx.try_recv().is_err(), "cancelled tasks emit no note");
     }
 }

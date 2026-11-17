@@ -19,8 +19,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
 /// Pending client permission responses: rpc request id →
-/// (engine ask id, answer channel to the drive task).
-type Pending = Arc<Mutex<HashMap<u64, (String, oneshot::Sender<usize>)>>>;
+/// (engine ask id, session id, answer channel to the drive task).
+type Pending = Arc<Mutex<HashMap<u64, (String, String, oneshot::Sender<usize>)>>>;
 
 type SharedEngine = Arc<Mutex<EngineHandle>>;
 
@@ -59,6 +59,9 @@ where
     let sessions: Arc<Mutex<HashMap<String, SessionHandle>>> = Arc::default();
     let pending: Pending = Arc::default();
     let counter = Arc::new(AtomicU64::new(0));
+    // a counter, not map.len()+1: session ids stay unique even if
+    // entries ever leave the map (same invariant as serve.rs)
+    let mut session_counter = 0u64;
 
     let mut lines = BufReader::new(input).lines();
     while let Some(line) = lines.next_line().await.map_err(|e| format!("stdin: {e}"))? {
@@ -93,7 +96,7 @@ where
                     // persisted to .ka/ka.toml)
                     .unwrap_or(2);
                 let mut pending = pending.lock().await;
-                if let Some((_ask_id, tx)) = pending.remove(&req_id) {
+                if let Some((_ask_id, _session, tx)) = pending.remove(&req_id) {
                     tx.send(option_id).ok();
                 }
             }
@@ -124,7 +127,8 @@ where
                     events,
                 }));
                 let mut sessions = sessions.lock().await;
-                let session = format!("s{}", sessions.len() + 1);
+                session_counter += 1;
+                let session = format!("s{session_counter}");
                 sessions.insert(
                     session.clone(),
                     SessionHandle {
@@ -298,6 +302,9 @@ where
                 if let Some(commands) = commands {
                     commands.send(Command::Abort).await.ok();
                 }
+                // the aborted turn's unanswered asks must not park the
+                // drive task on the engine lock forever — deny them
+                deny_pending(&pending, session).await;
             }
             Some(other) => {
                 out_tx
@@ -307,6 +314,24 @@ where
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Resolve every pending permission request of `session` with a deny
+/// (2): a cancelled turn must not leave its drive task parked on an
+/// answer that will never come while it holds the engine lock.
+async fn deny_pending(pending: &Pending, session: &str) {
+    let stranded: Vec<_> = {
+        let mut pending = pending.lock().await;
+        let ids: Vec<u64> = pending
+            .iter()
+            .filter(|(_, (_, s, _))| s == session)
+            .map(|(k, _)| *k)
+            .collect();
+        ids.into_iter().filter_map(|k| pending.remove(&k)).collect()
+    };
+    for (_ask, _session, tx) in stranded {
+        tx.send(2).ok(); // deny — same default as a garbage client answer
+    }
 }
 
 /// Drive one engine turn: translate events into session/update
@@ -447,7 +472,10 @@ async fn drive_turn(
                     .collect();
                 let req_id = counter.fetch_add(1, Ordering::Relaxed) + 10_000;
                 let (tx, rx) = oneshot::channel();
-                pending.lock().await.insert(req_id, (id.0.clone(), tx));
+                pending
+                    .lock()
+                    .await
+                    .insert(req_id, (id.0.clone(), session.clone(), tx));
                 out.send(json!({
                     "jsonrpc": "2.0",
                     "method": "session/request_permission",
@@ -649,5 +677,29 @@ mod tests {
             "updates must stream: {collected}"
         );
         assert!(stop == "end_turn" || stop == "refusal", "{stop}");
+    }
+
+    #[tokio::test]
+    async fn cancel_denies_stranded_permission_asks() {
+        let pending: Pending = Arc::default();
+        let (tx, rx) = oneshot::channel();
+        pending
+            .lock()
+            .await
+            .insert(10_001, ("ask-1".to_string(), "s1".to_string(), tx));
+        // a different session's ask must survive
+        let (tx2, mut rx2) = oneshot::channel();
+        pending
+            .lock()
+            .await
+            .insert(10_002, ("ask-2".to_string(), "s2".to_string(), tx2));
+        deny_pending(&pending, "s1").await;
+        assert_eq!(
+            pending.lock().await.len(),
+            1,
+            "only the cancelled session's asks drain"
+        );
+        assert_eq!(rx.await.unwrap(), 2, "the stranded ask is denied");
+        assert!(rx2.try_recv().is_err(), "other sessions keep waiting");
     }
 }
