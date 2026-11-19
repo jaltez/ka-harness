@@ -99,10 +99,17 @@ impl AgentTaskTable {
     }
 
     /// Attach the spawned runner's abort handle to a registered task
-    /// (cancel needs it).
+    /// (cancel needs it). If `cancel` already won the race — the task
+    /// is no longer `Running` — abort the runner immediately instead of
+    /// storing a handle nobody will ever take.
     pub fn attach(&self, id: u64, abort: tokio::task::AbortHandle) {
-        if let Some(e) = self.inner.lock().iter_mut().find(|e| e.id == id) {
-            e.abort = Some(abort);
+        let mut t = self.inner.lock();
+        if let Some(e) = t.iter_mut().find(|e| e.id == id) {
+            if e.state == AgentTaskState::Running {
+                e.abort = Some(abort);
+            } else {
+                abort.abort();
+            }
         }
     }
 
@@ -906,5 +913,25 @@ mod tests {
             "the cancellation stands — no contradictory finished note"
         );
         assert!(rx.try_recv().is_err(), "cancelled tasks emit no note");
+    }
+
+    /// cancel winning the race before attach: the runner must be
+    /// aborted immediately, not left running to completion.
+    #[tokio::test]
+    async fn attach_aborts_when_cancel_won_the_race() {
+        let table = AgentTaskTable::new();
+        let id = table.register("worker", "job");
+        table.cancel(id).unwrap(); // cancel wins before attach
+        let runner = tokio::spawn(async {
+            std::future::pending::<()>().await;
+            Ok::<String, String>("never".to_string())
+        });
+        table.attach(id, runner.abort_handle());
+        let err = runner.await.unwrap_err();
+        assert!(err.is_cancelled(), "the runner must be aborted: {err:?}");
+        assert_eq!(
+            table.result(id).as_deref(),
+            Some("t-1 failed: cancelled by request")
+        );
     }
 }

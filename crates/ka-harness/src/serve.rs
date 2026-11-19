@@ -648,6 +648,13 @@ fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+    // NOTE: session creation loads the standard config chain (user <
+    // project < --config < env). CI has no user config, but locally a
+    // broken or feature-restricting ~/.config/ka/ka.toml can change
+    // these tests' outcomes. There is no safe env override to isolate
+    // them: `std::env::set_var` is unsafe in edition 2024 and racy
+    // across parallel tests in one process.
+
     use tokio::io::AsyncReadExt;
 
     use tokio::io::AsyncWriteExt;

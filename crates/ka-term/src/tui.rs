@@ -7456,7 +7456,11 @@ fn apply_event(
             if let Some(q) = questions.first() {
                 // a second ask supersedes the open one: report the
                 // orphan for auto-deny (deny-last, the Esc rule) or
-                // its pose_ask wedges the engine forever
+                // its pose_ask wedges the engine forever. The engine's
+                // ask construction always carries options, so deny-last
+                // is always a real option; an empty list (a protocol
+                // violation) degrades to option 0 — answering beats
+                // wedging pose_ask forever.
                 if let Some(old) = pending.as_ref() {
                     orphaned.push((old.id.0.clone(), old.options.len().saturating_sub(1)));
                 }

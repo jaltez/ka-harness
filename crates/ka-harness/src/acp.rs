@@ -336,9 +336,12 @@ where
     Ok(ExitCode::SUCCESS)
 }
 
-/// Resolve every pending permission request of `session` with a deny
-/// (2): a cancelled turn must not leave its drive task parked on an
-/// answer that will never come while it holds the engine lock.
+/// Resolve every pending permission request of `session` with the
+/// cancel sentinel (`usize::MAX` = "the engine already resolved this
+/// ask via the Abort"): a cancelled turn must not leave its drive task
+/// parked on an answer that will never come while it holds the engine
+/// lock, and the drive task must NOT forward an `Answer` for it — the
+/// engine would emit a spurious "no pending question to answer" error.
 async fn deny_pending(pending: &Pending, session: &str) {
     let stranded: Vec<_> = {
         let mut pending = pending.lock().await;
@@ -350,7 +353,9 @@ async fn deny_pending(pending: &Pending, session: &str) {
         ids.into_iter().filter_map(|k| pending.remove(&k)).collect()
     };
     for (_ask, _session, tx) in stranded {
-        tx.send(2).ok(); // deny — same default as a garbage client answer
+        // a client answer can never produce usize::MAX: option ids are
+        // small integers parsed from the request body
+        tx.send(usize::MAX).ok();
     }
 }
 
@@ -509,14 +514,20 @@ async fn drive_turn(
                 // the main loop resolves us when the client responds
                 // client went away: deny
                 let choice = rx.await.unwrap_or(2);
-                engine
-                    .commands
-                    .send(Command::Answer {
-                        question: id,
-                        choice,
-                    })
-                    .await
-                    .ok();
+                // usize::MAX = cancelled: the engine already resolved the
+                // ask (the Abort resolved pose_ask) — forwarding an
+                // Answer now would land in the engine's "no pending
+                // question to answer" error path
+                if choice != usize::MAX {
+                    engine
+                        .commands
+                        .send(Command::Answer {
+                            question: id,
+                            choice,
+                        })
+                        .await
+                        .ok();
+                }
             }
             Event::Replay { messages } => {
                 // resumed strand: prior rows land on the client as
@@ -622,6 +633,13 @@ fn rpc_error(id: Value, code: i32, message: impl Into<String>) -> Value {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+    // NOTE: session creation loads the standard config chain (user <
+    // project < --config < env). CI has no user config, but locally a
+    // broken or feature-restricting ~/.config/ka/ka.toml can change
+    // these tests' outcomes. There is no safe env override to isolate
+    // them: `std::env::set_var` is unsafe in edition 2024 and racy
+    // across parallel tests in one process.
+
     use super::*;
 
     /// Drive the loop over in-memory duplexes: initialize → session/new →
@@ -719,7 +737,11 @@ mod tests {
             1,
             "only the cancelled session's asks drain"
         );
-        assert_eq!(rx.await.unwrap(), 2, "the stranded ask is denied");
+        assert_eq!(
+            rx.await.unwrap(),
+            usize::MAX,
+            "cancel sends the no-forward sentinel"
+        );
         assert!(rx2.try_recv().is_err(), "other sessions keep waiting");
     }
 

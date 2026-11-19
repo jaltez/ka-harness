@@ -185,6 +185,9 @@ impl JobTable {
             started_epoch_ms,
             spill,
             pid,
+            // best-effort: a pid that dies between spawn and this read
+            // records None (legacy semantics — a later recycled pid can
+            // then read as Running again). The window is one syscall.
             start_ticks: pid.and_then(proc_start_ticks),
         };
         t.jobs.push(entry);
