@@ -27,7 +27,6 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use ka_engine::config::Config;
 use ka_engine::{StrandChoice, spawn_full};
 use ka_protocol::{Command, ErrorClass, Event};
 use serde_json::{Value, json};
@@ -91,7 +90,11 @@ fn presence_event(busy: bool, attached: usize) -> Event {
 }
 
 /// Entry: bind and serve until the process is stopped.
-pub async fn run(addr: &str, token: Option<String>) -> Result<ExitCode, String> {
+pub async fn run(
+    addr: &str,
+    token: Option<String>,
+    configs: &[std::path::PathBuf],
+) -> Result<ExitCode, String> {
     // env fallback, mirroring `ka attach` so KA_SERVE_TOKEN works on
     // both ends of the connection
     let token = token.or_else(|| {
@@ -111,7 +114,7 @@ pub async fn run(addr: &str, token: Option<String>) -> Result<ExitCode, String> 
         .await
         .map_err(|e| format!("bind {addr}: {e}"))?;
     eprintln!("ka serve listening on {addr}");
-    serve(listener, token).await;
+    serve(listener, token, configs.to_vec()).await;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -128,7 +131,12 @@ fn binds_loopback(addr: &str) -> Result<bool, String> {
         })
 }
 
-async fn serve(listener: tokio::net::TcpListener, token: Option<String>) {
+async fn serve(
+    listener: tokio::net::TcpListener,
+    token: Option<String>,
+    configs: Vec<std::path::PathBuf>,
+) {
+    let configs = Arc::new(configs);
     let sessions: Arc<Mutex<std::collections::HashMap<String, Arc<Session>>>> = Arc::default();
     let mut next_id = 0u64;
     loop {
@@ -140,6 +148,7 @@ async fn serve(listener: tokio::net::TcpListener, token: Option<String>) {
             socket,
             Arc::clone(&sessions),
             token.clone(),
+            Arc::clone(&configs),
             next_id,
         ));
     }
@@ -232,6 +241,7 @@ async fn handle_connection(
     mut socket: tokio::net::TcpStream,
     sessions: Arc<Mutex<std::collections::HashMap<String, Arc<Session>>>>,
     token: Option<String>,
+    configs: Arc<Vec<std::path::PathBuf>>,
     _conn_id: u64,
 ) {
     let Some(req) = read_request(&mut socket).await else {
@@ -248,7 +258,7 @@ async fn handle_connection(
 
     if req.path == "/sessions" {
         match req.method.as_str() {
-            "POST" => create_session(&mut socket, &sessions, &req.body).await,
+            "POST" => create_session(&mut socket, &sessions, &req.body, &configs).await,
             "GET" => list_sessions(&mut socket, &sessions).await,
             _ => respond(&mut socket, 404, r#"{"error":"not found"}"#).await,
         }
@@ -290,6 +300,7 @@ async fn create_session(
     socket: &mut tokio::net::TcpStream,
     sessions: &Arc<Mutex<std::collections::HashMap<String, Arc<Session>>>>,
     body: &[u8],
+    configs: &[std::path::PathBuf],
 ) {
     // optional body: {"resume": "latest" | "<strand id/prefix>"}
     // (absent = fresh session, today's behavior)
@@ -321,9 +332,22 @@ async fn create_session(
             }
         },
     };
+    let cfg =
+        match crate::load_surface_config(configs, &std::env::current_dir().unwrap_or_default()) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                respond(
+                    socket,
+                    500,
+                    &json!({"error": format!("config: {e}")}).to_string(),
+                )
+                .await;
+                return;
+            }
+        };
     let ka_engine::EngineHandle {
         commands, events, ..
-    } = spawn_full(Config::default(), ka_dialect::Catalog::embedded(), choice);
+    } = spawn_full(cfg, ka_dialect::Catalog::embedded(), choice);
     let (broadcast, _) = tokio::sync::broadcast::channel::<(u64, Event)>(256);
     let mut sessions = sessions.lock().await;
     let order = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
@@ -795,7 +819,7 @@ mod tests {
     async fn serve_routes_health_sessions_prompt_and_auth() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(super::serve(listener, Some("sekrit".into())));
+        tokio::spawn(super::serve(listener, Some("sekrit".into()), Vec::new()));
 
         // health (token required)
         let (status, _) = http_get(addr, "/health", None).await;
@@ -849,7 +873,7 @@ mod tests {
     async fn concurrent_observers_presence_and_listings() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(super::serve(listener, None));
+        tokio::spawn(super::serve(listener, None, Vec::new()));
 
         let (status, body) = http_post(addr, "/sessions", None, "{}").await;
         assert_eq!(status, 200, "{body}");
@@ -924,7 +948,7 @@ mod tests {
     async fn last_event_id_reconnect_replays_from_next_seq() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(super::serve(listener, None));
+        tokio::spawn(super::serve(listener, None, Vec::new()));
 
         let (status, body) = http_post(addr, "/sessions", None, "{}").await;
         assert_eq!(status, 200, "{body}");
@@ -1011,7 +1035,7 @@ mod tests {
     async fn huge_last_event_id_does_not_wedge_the_stream() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(super::serve(listener, None));
+        tokio::spawn(super::serve(listener, None, Vec::new()));
 
         let (status, body) = http_post(addr, "/sessions", None, "{}").await;
         assert_eq!(status, 200, "{body}");
@@ -1047,7 +1071,7 @@ mod tests {
     async fn invalid_utf8_in_head_is_handled_cleanly() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(super::serve(listener, None));
+        tokio::spawn(super::serve(listener, None, Vec::new()));
 
         // mangled path → clean 404 error, not a panic/reset
         let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -1091,7 +1115,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_loopback_bind_without_token_is_refused() {
-        let err = super::run("0.0.0.0:0", None).await.unwrap_err();
+        let err = super::run("0.0.0.0:0", None, &[]).await.unwrap_err();
         assert!(
             err.contains("--token"),
             "error must tell the operator to pass --token: {err}"
@@ -1121,5 +1145,51 @@ mod tests {
         // idempotent: a settled session broadcasts nothing more
         session.close_fixup();
         assert!(brx.try_recv().is_err());
+    }
+
+    /// Strict TOML rides the surface: a broken --config fails session
+    /// creation with the parse error instead of silently defaulting.
+    #[tokio::test]
+    async fn invalid_config_fails_session_creation() {
+        let dir = std::env::temp_dir().join(format!("ka-serve-cfg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bad = dir.join("bad.toml");
+        std::fs::write(&bad, "[tui]\nunknown_key = 1\n").unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(super::serve(listener, None, vec![bad]));
+        let (status, body) = http_post(addr, "/sessions", None, "{}").await;
+        assert_eq!(status, 500, "{body}");
+        assert!(body.contains("config"), "{body}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The [features] baseline reaches serve sessions: the engine's
+    /// bootstrap Inventory reports the disabled spec.
+    #[tokio::test]
+    async fn config_features_ride_the_inventory() {
+        let dir = std::env::temp_dir().join(format!("ka-serve-feat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let good = dir.join("ka.toml");
+        std::fs::write(&good, "[features]\ndisable = [\"mcp\"]\n").unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(super::serve(listener, None, vec![good]));
+        let (status, body) = http_post(addr, "/sessions", None, "{}").await;
+        assert_eq!(status, 200, "{body}");
+        let id: String = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .into();
+        let (task, collected) = open_stream(addr, &format!("/sessions/{id}/events"), None).await;
+        let text = wait_contains(&collected, "disabled", 5).await;
+        task.abort();
+        assert!(
+            text.contains("\"disabled\":[\"mcp\"]"),
+            "features baseline must ride the inventory: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

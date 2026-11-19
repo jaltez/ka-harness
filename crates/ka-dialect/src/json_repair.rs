@@ -27,6 +27,15 @@ pub fn repair_json(raw: &str) -> Value {
             return v;
         }
     }
+    // A trailing ESCAPED quote means the stream died inside a key string
+    // (`{"a": 1, "b\` + `"`): the quote above cannot be a closing one, so
+    // close the string first, then complete the dangling pair.
+    if s.ends_with('"') && quote_escaped(s, s.len() - 1) {
+        let completed = close_open(&format!("{s}\": null"));
+        if let Ok(v) = serde_json::from_str::<Value>(&completed) {
+            return v;
+        }
+    }
     // Last resort: salvage `key: "value"` pairs by wrapping and closing.
     // A prefix that already opens an object must be closed, not re-wrapped
     // (double-`{` never parses).
@@ -207,5 +216,179 @@ mod tests {
         assert!(!quote_escaped("\\\\\"", 2)); // escaped backslash + real quote
         assert!(quote_escaped("\\\\\\\"", 3)); // three: escapes
         assert!(!quote_escaped("\"", 0)); // bare quote
+    }
+
+    // ---- hand-rolled property/fuzz tests (no new dependencies) ----
+
+    /// Fixed-seed xorshift64* PRNG: deterministic across runs and machines.
+    struct Rng(u64);
+
+    impl Rng {
+        fn new(seed: u64) -> Self {
+            // xorshift cannot escape a zero state.
+            Self(seed | 1)
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next_u64() % n
+        }
+
+        fn pick<T: Copy>(&mut self, xs: &[T]) -> T {
+            xs[self.below(xs.len() as u64) as usize]
+        }
+    }
+
+    const SEEDS: [u64; 3] = [
+        0x9E37_79B9_7F4A_7C15,
+        0xDEAD_BEEF_CAFE_F00D,
+        0x0123_4567_89AB_CDEF,
+    ];
+
+    /// Charset of a JSON-ish stream: structure, quotes, escapes, digits.
+    const JUNK_CHARS: &[char] = &[
+        '{', '}', '[', ']', '"', ':', ',', '\\', ' ', 'a', 'b', 'c', '0', '1', '\n',
+    ];
+
+    fn random_text(rng: &mut Rng, max_len: usize) -> String {
+        let len = rng.below(max_len as u64 + 1) as usize;
+        (0..len).map(|_| rng.pick(JUNK_CHARS)).collect()
+    }
+
+    /// String payloads that stress escaping, including non-ASCII.
+    const STRING_CHARS: &[char] = &[
+        'a', 'Z', '0', ' ', '"', '\\', '\n', '\t', '/', '\u{7f}', 'é', 'ß', '中', '😀',
+    ];
+
+    fn gen_string(rng: &mut Rng) -> String {
+        let len = rng.below(12) as usize;
+        (0..len).map(|_| rng.pick(STRING_CHARS)).collect()
+    }
+
+    fn gen_number(rng: &mut Rng) -> Value {
+        match rng.below(4) {
+            0 => Value::from(rng.below(2_000_001) as i64 - 1_000_000),
+            1 => Value::from(-(rng.below(1_000_000) as i64)),
+            // Short (< 15 significant digit) decimals only: serde_json's
+            // default float parser (feature `float_roundtrip` is off) is not
+            // bit-exact for 17-digit shortest representations.
+            2 => {
+                let magnitude = rng.below(1_000_000) as f64 / 1000.0;
+                Value::from(if rng.below(2) == 0 {
+                    -magnitude
+                } else {
+                    magnitude
+                })
+            }
+            _ => Value::from(rng.next_u64()),
+        }
+    }
+
+    fn gen_value(rng: &mut Rng, depth: u32) -> Value {
+        // Depth <= 4; at the limit only leaves are emitted.
+        let choice = rng.below(if depth >= 4 { 4 } else { 7 });
+        match choice {
+            0 => Value::Null,
+            1 => Value::Bool(rng.below(2) == 0),
+            2 | 3 => gen_number(rng),
+            4 => Value::String(gen_string(rng)),
+            5 => {
+                let len = rng.below(4);
+                Value::Array((0..len).map(|_| gen_value(rng, depth + 1)).collect())
+            }
+            _ => {
+                let len = rng.below(4);
+                let mut map = serde_json::Map::new();
+                for _ in 0..len {
+                    map.insert(gen_string(rng), gen_value(rng, depth + 1));
+                }
+                Value::Object(map)
+            }
+        }
+    }
+
+    #[test]
+    fn identity_on_valid_documents() {
+        for seed in SEEDS {
+            let mut rng = Rng::new(seed);
+            for _ in 0..150 {
+                let v = gen_value(&mut rng, 0);
+                let text = v.to_string();
+                assert_eq!(repair_json(&text), v, "seed={seed} text={text}");
+            }
+        }
+    }
+
+    #[test]
+    fn no_panic_on_every_char_boundary_prefix() {
+        for seed in SEEDS {
+            let mut rng = Rng::new(seed);
+            let mut docs: Vec<String> = (0..18).map(|_| random_text(&mut rng, 200)).collect();
+            for _ in 0..6 {
+                docs.push(gen_value(&mut rng, 0).to_string());
+            }
+            for doc in &docs {
+                // Every char boundary is a valid `&str` slice point.
+                for (i, _) in doc.char_indices().take(200) {
+                    let _ = repair_json(&doc[..i]);
+                }
+                let _ = repair_json(doc);
+            }
+        }
+    }
+
+    #[test]
+    fn escaped_quote_never_collapses_object() {
+        // `{"k":1,"` + n backslashes + `"`: whether the trailing quote is
+        // escaped (odd n) or real (even n), the earlier pair must survive.
+        for n in 1..=8 {
+            let input = format!("{{\"k\":1,\"{}\"", "\\".repeat(n));
+            let v = repair_json(&input);
+            assert_eq!(
+                v.get("k").and_then(Value::as_i64),
+                Some(1),
+                "n={n} input={input:?} repaired={v}"
+            );
+        }
+    }
+
+    #[test]
+    fn escaped_string_values_round_trip() {
+        const CHARS: &[char] = &['a', '"', '\\'];
+        for seed in SEEDS {
+            let mut rng = Rng::new(seed);
+            for _ in 0..150 {
+                let len = rng.below(10);
+                let s: String = (0..len).map(|_| rng.pick(CHARS)).collect();
+                let encoded = serde_json::to_string(&s).unwrap();
+                let inner = &encoded[1..encoded.len() - 1];
+                let doc = format!("{{\"k\":\"{inner}\"}}");
+                let v = repair_json(&doc);
+                assert_eq!(
+                    v.get("k").and_then(Value::as_str),
+                    Some(s.as_str()),
+                    "seed={seed} doc={doc}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn junk_fuzz_never_panics() {
+        for seed in SEEDS {
+            let mut rng = Rng::new(seed);
+            for _ in 0..500 {
+                let s = random_text(&mut rng, 200);
+                let _ = repair_json(&s);
+            }
+        }
     }
 }

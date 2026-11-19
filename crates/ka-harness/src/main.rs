@@ -123,7 +123,11 @@ enum CliCommand {
         review: bool,
     },
     /// Serve the Agent Client Protocol on stdin/stdout
-    Acp,
+    Acp {
+        /// Extra strict-TOML config layer (repeatable, highest file wins)
+        #[arg(long = "config")]
+        configs: Vec<PathBuf>,
+    },
     /// Rebuild the full-text search index over all strands
     #[cfg(feature = "index")]
     Index,
@@ -147,6 +151,9 @@ enum CliCommand {
         /// Require this bearer token on every request (or KA_SERVE_TOKEN)
         #[arg(long)]
         token: Option<String>,
+        /// Extra strict-TOML config layer (repeatable, highest file wins)
+        #[arg(long = "config")]
+        configs: Vec<PathBuf>,
     },
     /// Environment health checks
     Doctor {
@@ -469,12 +476,32 @@ impl FeatureFlags {
     }
 }
 
+/// Project-layer anchor for an interactive trust decision: Some(cwd)
+/// when trusted, else None (no project layer).
+fn trusted_project_cwd(trusted: bool) -> Option<PathBuf> {
+    if trusted {
+        std::env::current_dir().ok()
+    } else {
+        None
+    }
+}
+
+/// Config chain for the non-CLI surfaces (`serve`, `acp`): defaults <
+/// user < project (trusted, non-interactive — a server must never
+/// prompt) < extra `--config` files < env. No CLI model/mode/feature
+/// flags: those belong to the interactive surface.
+fn load_surface_config(configs: &[PathBuf], cwd: &std::path::Path) -> Result<Config, String> {
+    let project =
+        ka_engine::trust::project_trusted(&ka_engine::project_root(cwd)).then(|| cwd.to_path_buf());
+    load_config(configs, None, None, project, &FeatureFlags::default())
+}
+
 /// Defaults < user < project (if trusted) < extra files < env < flags.
 fn load_config(
     configs: &[PathBuf],
     flag_model: Option<String>,
     flag_mode: Option<String>,
-    trust_project: bool,
+    project_cwd: Option<PathBuf>,
     features: &FeatureFlags,
 ) -> Result<Config, String> {
     let mut cfg = Config::default();
@@ -482,12 +509,9 @@ fn load_config(
     let user = Some(ka_engine::config::user_config_path());
     // the project layer anchors at the root project (nearest .git
     // ancestor, else cwd), symmetric with where "always allow" saves it;
-    // an unknowable cwd skips the layer entirely rather than guessing a
-    // relative path the trust gate would not have resolved to the same root
-    let project = trust_project
-        .then(|| std::env::current_dir().ok())
-        .flatten()
-        .map(|cwd| ka_engine::project_root(&cwd).join(".ka/ka.toml"));
+    // the caller owns the trust decision (Some = trusted anchor, None =
+    // no project layer)
+    let project = project_cwd.map(|cwd| ka_engine::project_root(&cwd).join(".ka/ka.toml"));
 
     for path in user.iter().chain(project.iter()).chain(configs.iter()) {
         match std::fs::read_to_string(path) {
@@ -704,7 +728,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             )
             .await
         }
-        Some(CliCommand::Acp) => acp::run().await,
+        Some(CliCommand::Acp { configs }) => acp::run(&configs).await,
         #[cfg(feature = "index")]
         Some(CliCommand::Index) => {
             let db = ka_index::open_db(&ka_index::default_db_path())?;
@@ -733,11 +757,21 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             }
             Ok(ExitCode::SUCCESS)
         }
-        Some(CliCommand::Serve { addr, token }) => serve::run(&addr, token).await,
+        Some(CliCommand::Serve {
+            addr,
+            token,
+            configs,
+        }) => serve::run(&addr, token, &configs).await,
         Some(CliCommand::Doctor { net, json }) => doctor::run(net, json).await,
         Some(CliCommand::Update { channel, check }) => {
             let trust = trust_for_cwd(false);
-            let cfg = load_config(&[], None, None, trust, &FeatureFlags::default())?;
+            let cfg = load_config(
+                &[],
+                None,
+                None,
+                trusted_project_cwd(trust),
+                &FeatureFlags::default(),
+            )?;
             let repo = cfg
                 .update
                 .repo
@@ -822,7 +856,13 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             }
             ConfigCommand::Print { configs } => {
                 let trust = trust_for_cwd(false);
-                let cfg = load_config(&configs, None, None, trust, &FeatureFlags::default())?;
+                let cfg = load_config(
+                    &configs,
+                    None,
+                    None,
+                    trusted_project_cwd(trust),
+                    &FeatureFlags::default(),
+                )?;
                 let text =
                     toml::to_string_pretty(&cfg).map_err(|e| format!("serialize config: {e}"))?;
                 print!("{text}");
@@ -878,7 +918,7 @@ async fn run_headless(
 ) -> Result<ExitCode, String> {
     let trust = trust_for_cwd(force_trust);
     warn_untrusted_conventions(&std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    let cfg = load_config(configs, model, mode, trust, &features)?;
+    let cfg = load_config(configs, model, mode, trusted_project_cwd(trust), &features)?;
     let prompt = match prompt {
         Some(p) => p,
         None => read_stdin()?,
@@ -1214,7 +1254,7 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
         &cli.configs,
         cli.model.clone(),
         cli.mode.clone(),
-        trust,
+        trusted_project_cwd(trust),
         &features,
     )?;
     // the engine resolves its cwd as config cwd else process cwd; the
@@ -1339,7 +1379,7 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
             &cli.configs,
             cli.model.clone(),
             cli.mode.clone(),
-            trust,
+            trusted_project_cwd(trust),
             &features,
         )
         .map(|c| {
@@ -1402,7 +1442,13 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
             // already landed on disk, so the exec picks up whichever
             // binary is current (new on success, old on failure)
             let trust = trust_for_cwd(false);
-            let cfg = load_config(&[], None, None, trust, &FeatureFlags::default())?;
+            let cfg = load_config(
+                &[],
+                None,
+                None,
+                trusted_project_cwd(trust),
+                &FeatureFlags::default(),
+            )?;
             let repo = cfg
                 .update
                 .repo
@@ -1634,7 +1680,13 @@ fn run_agents() -> Result<ExitCode, String> {
 
 async fn run_mcp() -> Result<ExitCode, String> {
     let trust = trust_for_cwd(false);
-    let cfg = load_config(&[], None, None, trust, &FeatureFlags::default())?;
+    let cfg = load_config(
+        &[],
+        None,
+        None,
+        trusted_project_cwd(trust),
+        &FeatureFlags::default(),
+    )?;
     if cfg.mcp.is_empty() {
         println!("no [[mcp]] servers configured (~/.config/ka/ka.toml or .ka/ka.toml)");
         return Ok(ExitCode::SUCCESS);
@@ -1873,7 +1925,7 @@ async fn run_rewind(turns: u32) -> Result<ExitCode, String> {
     };
     // rewind only reads strand files — it must not silently approve the
     // project's .ka layer (trust is a side effect no reader should trip)
-    let cfg = load_config(&[], None, None, false, &FeatureFlags::default())?;
+    let cfg = load_config(&[], None, None, None, &FeatureFlags::default())?;
     let catalog = build_catalog(&[], true).await?;
     let mut handle = ka_engine::spawn_full(cfg, catalog, choice);
     handle

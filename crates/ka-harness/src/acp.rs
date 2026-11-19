@@ -34,13 +34,17 @@ struct SessionHandle {
 }
 
 /// Entry: run the ACP loop over stdin/stdout.
-pub async fn run() -> Result<ExitCode, String> {
+pub async fn run(configs: &[std::path::PathBuf]) -> Result<ExitCode, String> {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
-    run_loop(stdin, stdout).await
+    run_loop(stdin, stdout, configs).await
 }
 
-async fn run_loop<R, W>(input: R, mut output: W) -> Result<ExitCode, String>
+async fn run_loop<R, W>(
+    input: R,
+    mut output: W,
+    configs: &[std::path::PathBuf],
+) -> Result<ExitCode, String>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -117,9 +121,17 @@ where
                     .as_str()
                     .map(std::path::PathBuf::from)
                     .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-                let cfg = Config {
-                    cwd: Some(cwd.display().to_string()),
-                    ..Config::default()
+                let cfg = match crate::load_surface_config(configs, &cwd) {
+                    Ok(cfg) => Config {
+                        cwd: Some(cwd.display().to_string()),
+                        ..cfg
+                    },
+                    Err(e) => {
+                        out_tx
+                            .send(rpc_error(id, -32603, format!("config: {e}")))
+                            .ok();
+                        continue;
+                    }
                 };
                 let ka_engine::EngineHandle { commands, events } = spawn(cfg);
                 let handle = Arc::new(Mutex::new(ka_engine::EngineHandle {
@@ -184,9 +196,17 @@ where
                 let resumed = matched;
                 match resumed {
                     Some(summary) => {
-                        let cfg = Config {
-                            cwd: Some(cwd.display().to_string()),
-                            ..Config::default()
+                        let cfg = match crate::load_surface_config(configs, &cwd) {
+                            Ok(cfg) => Config {
+                                cwd: Some(cwd.display().to_string()),
+                                ..cfg
+                            },
+                            Err(e) => {
+                                out_tx
+                                    .send(rpc_error(id, -32603, format!("config: {e}")))
+                                    .ok();
+                                continue;
+                            }
                         };
                         let ka_engine::EngineHandle {
                             commands,
@@ -615,7 +635,7 @@ mod tests {
         let (mut from_server, server_stdout) = tokio::io::duplex(64 * 1024);
 
         tokio::spawn(async move {
-            let _ = run_loop(server_stdin, server_stdout).await;
+            let _ = run_loop(server_stdin, server_stdout, &[]).await;
         });
 
         let mut buf = vec![0u8; 64 * 1024];
@@ -701,5 +721,67 @@ mod tests {
         );
         assert_eq!(rx.await.unwrap(), 2, "the stranded ask is denied");
         assert!(rx2.try_recv().is_err(), "other sessions keep waiting");
+    }
+
+    /// A broken --config surfaces as an rpc error on session/new instead
+    /// of a silently defaulted engine.
+    #[tokio::test]
+    async fn bad_config_errors_session_new() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = std::env::temp_dir().join(format!("ka-acp-cfg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bad = dir.join("bad.toml");
+        std::fs::write(&bad, "[tui]\nunknown_key = 1\n").unwrap();
+        let configs = vec![bad];
+        let (mut to_server, server_stdin) = tokio::io::duplex(64 * 1024);
+        let (mut from_server, server_stdout) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            let _ = run_loop(server_stdin, server_stdout, &configs).await;
+        });
+        to_server
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/new\",\"params\":{}}\n")
+            .await
+            .unwrap();
+        to_server.flush().await.unwrap();
+        let mut buf = vec![0u8; 64 * 1024];
+        let n = from_server.read(&mut buf).await.unwrap();
+        let text = String::from_utf8_lossy(&buf[..n]).to_string();
+        assert!(text.contains("error"), "{text}");
+        assert!(text.contains("config"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A server never trusts a project implicitly: an untrusted
+    /// project's .ka/ka.toml must not load. A strict-TOML error in it
+    /// would otherwise fail session/new — success proves it was skipped.
+    #[tokio::test]
+    async fn untrusted_project_config_is_skipped() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = std::env::temp_dir().join(format!("ka-acp-trust-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::create_dir_all(dir.join(".ka")).unwrap();
+        std::fs::write(dir.join(".ka/ka.toml"), "[tui]\nunknown_key = 1\n").unwrap();
+        let (mut to_server, server_stdin) = tokio::io::duplex(64 * 1024);
+        let (mut from_server, server_stdout) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            let _ = run_loop(server_stdin, server_stdout, &[]).await;
+        });
+        let msg = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/new\",\"params\":{{\"cwd\":{:?}}}}}\n",
+            dir.display().to_string()
+        );
+        to_server.write_all(msg.as_bytes()).await.unwrap();
+        to_server.flush().await.unwrap();
+        let mut buf = vec![0u8; 64 * 1024];
+        let n = from_server.read(&mut buf).await.unwrap();
+        let text = String::from_utf8_lossy(&buf[..n]).to_string();
+        assert!(
+            text.contains("sessionId"),
+            "an untrusted project config must not load: {text}"
+        );
+        assert!(!text.contains("\"error\""), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

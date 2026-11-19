@@ -216,7 +216,7 @@ Shipped with:
 - **[M]** TUI: `/features` panel (↑↓/⏎/`s`/esc; sections for features, sandbox, tools, MCP servers, skills, agents; a superset of ever-seen tools keeps hidden ones re-enableable), `/sandbox off|fs`, `⊘ N` status badge, transcript card only on the first inventory (re-emits are silent).
 - Tests: `feature_toggle_contract.rs` (hide/deny/restore/resume, config baseline, per-tool, skills prompt block, hooks silenced, sandbox swap, MCP spawn-on-enable with the failure named), bare-mode refusal contract, strand snapshot replay, protocol serde fixtures, `parse_specs` validation, CLI flag merge + clap validation.
 
-Known limitation (pre-existing, out of scope): `ka serve`/`acp` spawn with `Config::default()` and never load the config chain — runtime toggles still work there over the protocol, but the `[features]` baseline does not apply.
+Known limitation — **fixed 2026-11-19:** `ka serve`/`acp` used to spawn with `Config::default()` and never load the config chain (the `[features]` baseline did not apply there). Both surfaces now load the standard chain per session — user < project (behind the non-interactive trust gate; a server never prompts) < `--config` files < env — and a strict-TOML error fails the request loudly (HTTP 500 / ACP rpc error) instead of silently defaulting.
 
 **Exit:** every capability is switchable at start or mid-conversation with one grammar, strand-persisted and fail-closed, at zero new dependencies.
 
