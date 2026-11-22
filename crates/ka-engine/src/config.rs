@@ -505,6 +505,12 @@ pub struct Context {
     /// window — while idle past `idle_minutes`, the digest also fires
     /// when the meter reaches this. `None` disables idle compaction.
     pub idle_compact_pct: Option<u64>,
+    /// CTX-08: run a one-shot repository prewalk on the first prompt
+    /// of a fresh strand — a cheap bounded walk (depth 2, 200 entries)
+    /// plus a fast-role brief (≤5 bullets) injected into the context
+    /// before the first turn. `None`/false = off; `--prewalk` wins
+    /// over the file value (the integrator overlays it).
+    pub prewalk: Option<bool>,
 }
 
 /// Fallback model chain ([fallback]). When a turn fails on the active
@@ -720,6 +726,9 @@ impl Config {
         }
         if other.context.idle_compact_pct.is_some() {
             self.context.idle_compact_pct = other.context.idle_compact_pct;
+        }
+        if other.context.prewalk.is_some() {
+            self.context.prewalk = other.context.prewalk;
         }
         if !other.hooks.is_empty() {
             self.hooks.extend(other.hooks);

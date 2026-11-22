@@ -57,6 +57,11 @@ struct Cli {
     /// stores the decision)
     #[arg(long)]
     trust: bool,
+    /// Resume and RE-SEND the prompt of the last interrupted turn
+    /// (crash recovery: `ka --restore` picks up where the aborted
+    /// turn stopped, re-asking the question that never got answered)
+    #[arg(long)]
+    restore: bool,
     /// Disable all customizations (AGENTS.md, MEMORY.md, skills,
     /// agents, commands, hooks, MCP, LSP) keeping built-ins, config,
     /// and auth
@@ -109,6 +114,10 @@ struct Cli {
     /// file access only — .ka config and trust are not extended)
     #[arg(long = "add-dir", value_name = "DIR")]
     add_dirs: Vec<PathBuf>,
+    /// Brief the model with a cheap repo prewalk before the first turn
+    /// (same as `[context] prewalk = true`)
+    #[arg(long)]
+    prewalk: bool,
 }
 
 /// The Run variant carries the whole headless flag surface and dwarfs
@@ -153,6 +162,9 @@ enum CliCommand {
         /// Resume a session by id (prefix ok) or file path
         #[arg(long, value_name = "ID")]
         session: Option<String>,
+        /// Resume and RE-SEND the prompt of the last interrupted turn
+        #[arg(long)]
+        restore: bool,
         /// Trust the project root's .ka/ka.toml (nearest .git ancestor;
         /// stores the decision)
         #[arg(long)]
@@ -206,6 +218,9 @@ enum CliCommand {
         /// Grant sandbox write access to an additional directory
         #[arg(long = "add-dir", value_name = "DIR")]
         add_dirs: Vec<PathBuf>,
+        /// Brief the model with a cheap repo prewalk first
+        #[arg(long)]
+        prewalk: bool,
         /// Write the final answer to this file instead of stdout
         /// (text mode only)
         #[arg(short = 'o', long, value_name = "FILE")]
@@ -1410,6 +1425,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
         dialects: cli.dialects,
         no_discovery: cli.no_discovery,
         trust: cli.trust,
+        restore: cli.restore,
         safe_mode: cli.safe_mode,
         interactive_prompt: cli.interactive_prompt,
         effort: cli.effort,
@@ -1423,6 +1439,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
         ephemeral: cli.ephemeral,
         profile: cli.profile,
         add_dirs: cli.add_dirs,
+        prewalk: cli.prewalk,
     };
     match cli.command {
         Some(CliCommand::Run {
@@ -1438,6 +1455,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             continue_latest,
             session,
             trust,
+            restore,
             schema,
             print,
             review,
@@ -1453,6 +1471,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             ephemeral: _,
             profile,
             add_dirs,
+            prewalk,
             out,
             max_turns,
             max_budget_usd,
@@ -1509,6 +1528,8 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
                 profile,
                 add_dirs,
                 rpc,
+                restore,
+                prewalk,
             };
             run_headless(
                 prompt,
@@ -1804,6 +1825,8 @@ struct RunOpts {
     profile: Option<String>,
     add_dirs: Vec<PathBuf>,
     rpc: bool,
+    restore: bool,
+    prewalk: bool,
 }
 
 /// Exit code for a cost/time cap breach (distinct from abort=2 and
@@ -1869,7 +1892,7 @@ async fn run_headless(
     let choice = if let Some(id) = session {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         resolve_session(&cwd, &id)?
-    } else if continue_latest {
+    } else if continue_latest || opts.restore {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         match ka_engine::read_waypoint() {
             Some((way_cwd, path)) if same_dir(&way_cwd, &cwd) && path.exists() => {
@@ -1880,12 +1903,40 @@ async fn run_headless(
     } else {
         ka_engine::StrandChoice::New
     };
+    // --restore: resolve the strand file up front (choice is consumed
+    // by spawn below); the pending prompt rides the pre-synthesis file
+    let restore_path = if opts.restore {
+        match &choice {
+            ka_engine::StrandChoice::Path(p) => Some(p.clone()),
+            ka_engine::StrandChoice::Latest => {
+                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                ka_strand::latest(&cwd)
+                    .map_err(|e| format!("listing strands: {e}"))?
+                    .map(|s| s.path)
+            }
+            ka_engine::StrandChoice::New => None,
+        }
+    } else {
+        None
+    };
     let mut handle = spawn_full(cfg, catalog, choice);
     if opts.rpc {
         // the stdin side of the protocol IS the prompt channel: reading
         // a prompt here would swallow the host's command lines
         return rpc_loop(handle).await;
     }
+    let prompt = if opts.restore {
+        let path = restore_path.ok_or("--restore: nothing to restore (no prior session)")?;
+        let strand = ka_strand::StrandFile::open(&path)
+            .map_err(|e| format!("--restore {}: {e}", path.display()))?;
+        Some(
+            strand
+                .pending_user_prompt()
+                .ok_or("--restore: no interrupted turn to restore (the last turn completed)")?,
+        )
+    } else {
+        prompt
+    };
     let prompt = match prompt {
         Some(p) => p,
         None => read_stdin()?,
@@ -2031,6 +2082,9 @@ fn apply_run_opts(cfg: &mut Config, opts: &RunOpts) {
         // conventions both out (the conventions gate is set in main
         // before the runtime spawns); hardstops are untouched
         cfg.rules.clear();
+    }
+    if opts.prewalk {
+        cfg.context.prewalk = Some(true);
     }
     if opts.offline {
         cfg.update.check = Some(ka_engine::config::UpdateCheck::Off);
@@ -2494,8 +2548,31 @@ impl StreamJsonPrinter {
 /// The interactive surface: picker (unless -c/--session) then the TUI.
 async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
     let cwd = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
+    // --restore: crash recovery — resume the newest strand and re-ask
+    // its dangling user turn. Mutually exclusive with --session and -i.
+    let restore_path = if cli.restore {
+        if cli.session.is_some() {
+            return Err("--restore and --session are mutually exclusive".to_string());
+        }
+        if cli.interactive_prompt.is_some() {
+            return Err("--restore and -i are mutually exclusive".to_string());
+        }
+        Some(match ka_engine::read_waypoint() {
+            Some((way_cwd, path)) if same_dir(&way_cwd, &cwd) && path.exists() => path,
+            _ => {
+                ka_strand::latest(&cwd)
+                    .map_err(|e| format!("listing strands: {e}"))?
+                    .ok_or("--restore: no strand to restore")?
+                    .path
+            }
+        })
+    } else {
+        None
+    };
     let choice = if let Some(id) = cli.session.clone() {
         resolve_session(&cwd, &id)?
+    } else if let Some(path) = &restore_path {
+        ka_engine::StrandChoice::Path(path.clone())
     } else if cli.continue_latest {
         // waypoint first, else newest
         match ka_engine::read_waypoint() {
@@ -2509,9 +2586,21 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
         ka_engine::StrandChoice::New
     };
 
+    let interactive = match &restore_path {
+        Some(path) => {
+            let strand = ka_strand::StrandFile::open(path)
+                .map_err(|e| format!("--restore {path:?}: {e}"))?;
+            Some(
+                strand
+                    .pending_user_prompt()
+                    .ok_or("--restore: no interrupted turn to restore (the last turn completed)")?,
+            )
+        }
+        None => cli.interactive_prompt.clone(),
+    };
     let trust = trust_for_cwd(cli.trust);
     warn_untrusted_conventions(&cwd);
-    if !cli.image.is_empty() && cli.interactive_prompt.is_none() {
+    if !cli.image.is_empty() && interactive.is_none() {
         return Err("--image needs a prompt: pass -i \"<prompt>\" with it".to_string());
     }
     let features = feature_flags(
@@ -2549,6 +2638,7 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
         offline: cli.offline,
         ignore_user_config: cli.ignore_user_config,
         ignore_rules: cli.ignore_rules,
+        prewalk: cli.prewalk,
         ..RunOpts::default()
     };
     apply_run_opts(&mut cfg, &run_opts);
@@ -2647,7 +2737,7 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
     // `ka -i "<prompt>"`: one turn runs before the TUI opens — the
     // engine's event channel buffers it, so the TUI streams the turn
     // (and answers any permission ask) live from its first frame
-    if let Some(prompt) = cli.interactive_prompt.clone() {
+    if let Some(prompt) = interactive.clone() {
         commands
             .send(Command::Prompt {
                 allowed_tools: None,

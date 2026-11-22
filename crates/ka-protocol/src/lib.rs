@@ -268,6 +268,43 @@ pub struct AskQuestion {
 /// Surface → engine commands.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
+pub enum GoalAction {
+    /// Set the goal: keep working until the condition holds (a cheap
+    /// model judges each settle) or the optional USD budget runs out.
+    Set {
+        /// The condition, in the model's own words.
+        condition: String,
+        /// Optional spend ceiling for the goal (USD).
+        budget_usd: Option<f64>,
+    },
+    /// Stop judging/continuing, keep the goal for later.
+    Pause,
+    /// Resume a paused goal.
+    Resume,
+    /// Drop the goal entirely.
+    Drop,
+}
+
+/// CTX-06: loop-mode actions (`Command::Loop`).
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum LoopAction {
+    /// (Re-)arm the loop: re-send `task` whenever the session is idle
+    /// and `interval_secs` elapsed since the last settle (None = as
+    /// soon as the engine settles).
+    Set {
+        /// The task to re-run each cycle.
+        task: String,
+        /// Minimum seconds between cycles (None = immediate).
+        interval_secs: Option<u64>,
+    },
+    /// Disarm the loop.
+    Off,
+}
+
+/// Surface → engine commands.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum Command {
     /// Start a turn with a user prompt.
     Prompt {
@@ -428,6 +465,52 @@ pub enum Command {
         /// Strip image parts from non-recent messages.
         images: bool,
     },
+    /// CTX-03: ask a side question with the fast role — tools off, the
+    /// answer never enters the main transcript or context (it arrives
+    /// back as an `Event::Note`).
+    SideQuestion {
+        /// The question text.
+        text: String,
+    },
+    /// CTX-01: rewind the last `turns` user turns AND keep what was
+    /// dropped as a ≤6-sentence fast-role summary pinned after the
+    /// rewind point (rewind + digest fused; `focus` steers the summary).
+    CompactFrom {
+        /// How many user turns back to rewind.
+        turns: u32,
+        /// Optional focus instructions for the summary.
+        focus: Option<String>,
+    },
+    /// SES-09: edit the context view of one message, append-only (the
+    /// strand record never mutates; the replay applies the edit at the
+    /// target's position). `new_content = None` drops the message from
+    /// context; `Some(text)` replaces its content.
+    ContextEdit {
+        /// The message record being edited.
+        target: RecordId,
+        /// The replacement content, or None to drop it from context.
+        new_content: Option<String>,
+    },
+    /// SES-01: compute this session's cumulative file diff (snapshot
+    /// originals vs current disk). The full diff goes to a spill file
+    /// (pointer on the Note); a capped excerpt rides the Note.
+    SessionDiff,
+    /// CTX-05: goal mode — keep working toward a condition.
+    Goal {
+        /// The goal action.
+        action: GoalAction,
+    },
+    /// CTX-06: loop mode — re-run a task on an interval until turned off.
+    Loop {
+        /// The loop action.
+        action: LoopAction,
+    },
+    /// CTX-10: consolidate the memory inbox (`.ka/memory/inbox.md`,
+    /// staged by the `remember` hand) into `MEMORY.md` with the fast
+    /// role: the consolidated text REPLACES the file (≤80 lines), the
+    /// inbox empties. Trust-gated (it writes) and fast-role-gated like
+    /// the other cheap chores; inert in safe mode.
+    MemoryConsolidate,
     /// Copy the current strand into a NEW strand file truncated to drop
     /// the last `turns` user turns (`0` = exact copy) and switch to it.
     ForkStrand {

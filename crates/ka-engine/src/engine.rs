@@ -10,8 +10,8 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 use ka_protocol::{
-    AskId, AskQuestion, Command, ContextMeter, DeltaKind, ErrorClass, Event, McpSummary, Mode,
-    Stop, Usage,
+    AskId, AskQuestion, Command, ContextMeter, DeltaKind, ErrorClass, Event, GoalAction,
+    LoopAction, McpSummary, Mode, Stop, Usage,
 };
 use tokio::sync::mpsc;
 
@@ -265,6 +265,27 @@ fn history_from_records(
                     }
                 }
             }
+            ka_strand::Record::ContextEdit {
+                target,
+                new_content,
+                ..
+            } => {
+                // SES-09 replay: the same resolution rule every fold
+                // shares (ka_strand::resolve_context_edit — last match
+                // scanning backwards). `Some(text)` rewrites the
+                // message's content from here on; `None` removes it
+                // from the window. An out-of-window target is silently
+                // ignored (already retracted or unknown).
+                if let Some(pos) = ka_strand::resolve_context_edit(&ids, target) {
+                    match new_content {
+                        Some(text) => out[pos].content = text.clone(),
+                        None => {
+                            out.remove(pos);
+                            ids.remove(pos);
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -450,6 +471,47 @@ struct EngineState {
     /// `turns_seen` value at the last idle recap; the recap fires only
     /// when `turns_seen` has moved past it.
     last_recap_turns: u64,
+    /// CTX-05: the active goal, when one is set (the fast role judges
+    /// each settle whether the condition holds; the auto-poke prefix
+    /// keeps the model working toward it).
+    goal: Option<GoalRuntime>,
+    /// CTX-06: the armed loop, when set (the tick re-sends the task on
+    /// the interval; never armed in safe mode).
+    loop_mode: Option<LoopRuntime>,
+    /// CTX-08: `[context] prewalk` — the first prompt of a fresh strand
+    /// earns a cheap bounded walk + fast-role orientation brief.
+    prewalk: bool,
+    /// CTX-08: prewalk still owed for the attached strand (fresh
+    /// strands only; cleared once run or on strand switch).
+    prewalk_pending: bool,
+}
+
+/// CTX-05: the live goal runtime.
+#[derive(Debug, Clone)]
+struct GoalRuntime {
+    /// The condition the fast role judges at each settle.
+    condition: String,
+    /// Optional USD ceiling measured from the moment the goal was set.
+    budget_usd: Option<f64>,
+    /// Paused goals are neither judged nor poked (kept for /resume).
+    paused: bool,
+    /// Session spend at `Set` — the budget measures from here.
+    spend_at_set: f64,
+    /// `turns_seen` at `Set` — pause/resume notes report the distance.
+    turns_at_set: u64,
+}
+
+/// CTX-06: the live loop runtime.
+#[derive(Debug, Clone)]
+struct LoopRuntime {
+    /// The task re-sent each cycle.
+    task: String,
+    /// Minimum time between cycles (`Duration::ZERO` = fire as soon as
+    /// the engine settles again).
+    interval: Duration,
+    /// Last settle (turn completion or arm/fire time) the interval
+    /// measures from; refreshed on every completed turn.
+    last_settle: std::time::Instant,
 }
 impl From<Config> for EngineState {
     fn from(c: Config) -> Self {
@@ -480,6 +542,10 @@ impl From<Config> for EngineState {
             last_activity: std::time::Instant::now(),
             turns_seen: 0,
             last_recap_turns: 0,
+            goal: None,
+            loop_mode: None,
+            prewalk: c.context.prewalk.unwrap_or(false),
+            prewalk_pending: false,
         }
     }
 }
@@ -810,6 +876,14 @@ async fn run(
             maybe = commands.recv() => {
                 let Some(cmd) = maybe else { break };
                 handle_command(cmd, &mut commands, &mut ctx).await?;
+                // CTX-06: an armed loop fires at most ONE cycle per
+                // command wakeup, between turn cycles only. A tighter
+                // re-fire loop would starve the command channel (Loop
+                // Off arriving mid-turn is dropped by the voice), so
+                // further cycles wait for the next wakeup or tick.
+                if let Some(task) = loop_prompt_due(&mut ctx.state) {
+                    handle_command(loop_prompt(&task), &mut commands, &mut ctx).await?;
+                }
             }
             maybe = ctx.maintenance.recv() => {
                 if let Some(update) = maybe {
@@ -818,6 +892,9 @@ async fn run(
             }
             _ = idle_tick.tick() => {
                 idle_tick_work(&mut ctx).await;
+                if let Some(task) = loop_prompt_due(&mut ctx.state) {
+                    handle_command(loop_prompt(&task), &mut commands, &mut ctx).await?;
+                }
             }
         }
     }
@@ -1402,6 +1479,13 @@ async fn handle_command(
             ctx.state.verify_round_done = false;
             // and it is surface activity for the idle task (CTX-07)
             ctx.state.last_activity = std::time::Instant::now();
+            // CTX-08: the prewalk runs once, before the first turn of a
+            // fresh strand — a cheap walk + fast-role brief rides the
+            // context as a leading system-note (degrades to a note)
+            if ctx.state.prewalk && ctx.state.prewalk_pending {
+                ctx.state.prewalk_pending = false;
+                run_prewalk(&mut ctx.voice, &ctx.state, &ctx.cwd, &ctx.events).await;
+            }
             // explicit skill invocation (/skill:<name>): fail closed
             // BEFORE the turn — a missing or disabled skill must not
             // run a hollow prompt (same admit-time stance as
@@ -1564,7 +1648,7 @@ async fn handle_command(
                     .map(|t| format!("- {t}"))
                     .collect::<Vec<_>>()
                     .join("\n");
-                let poke = format!(
+                let mut poke = format!(
                     "(ka auto-poke {}/{}) Your todo list still has {} pending item(s):\n{list}\n\
                      Continue the work: finish the remaining items, re-verify anything you \
                      marked done without evidence (a confidence jump is a claim, not a \
@@ -1574,6 +1658,15 @@ async fn handle_command(
                     ctx.state.poke_max,
                     pending.len()
                 );
+                // CTX-05: an active (unpaused) goal steers the poke —
+                // the continue-prompt leads with the condition so the
+                // keep-working round pulls toward it
+                if let Some(goal) = ctx.state.goal.as_ref().filter(|g| !g.paused) {
+                    poke = format!(
+                        "goal: {} — keep working toward it\n\n{poke}",
+                        goal.condition
+                    );
+                }
                 ctx.events
                     .send(Event::Note {
                         message: format!(
@@ -2377,61 +2470,31 @@ async fn handle_command(
             ctx.events.send(Event::Idle).await.ok();
         }
         Command::Rewind { turns } => {
-            // SES-03: capture the doomed branch BEFORE the truncation
-            // — `rewind` cuts it out of the history for good
-            let tail = ctx.voice.rewind_tail(turns);
-            match ctx.voice.rewind(turns) {
-                Some(kept) => {
-                    if kept == 0 {
-                        // the FIRST turn was rewound: nothing survives.
-                        // A Rewind record pointing at the dropped
-                        // record's own id would resurrect it on replay
-                        // (history_from_records truncates to pos+1, so
-                        // the dropped message stays) — a Boundary
-                        // clears the history instead.
-                        let _ = ctx.strand.append(ka_strand::Record::Boundary {
-                            id: ka_strand::new_record_id(),
-                        });
-                        ctx.state.record_ids.clear();
-                        // live/replay parity: Boundary clears the digest
-                        // on replay, so the live session drops it too —
-                        // else requests keep prepending a summary of the
-                        // content the rewind deleted
-                        ctx.voice.clear_digest();
-                    } else {
-                        // kept = index of the dropped user message; keep
-                        // everything strictly before it
-                        let keep_idx = kept - 1;
-                        let kept_from = ctx
-                            .state
-                            .record_ids
-                            .get(keep_idx)
-                            .cloned()
-                            .unwrap_or_else(ka_strand::new_record_id);
-                        let _ = ctx.strand.append(ka_strand::Record::Rewind {
-                            id: ka_strand::new_record_id(),
-                            kept_from,
-                        });
-                        ctx.state.record_ids.truncate(keep_idx + 1);
+            // SES-03/CTX-01 share the rewind bookkeeping (strand records
+            // + live truncation); the abandoned tail summary is the
+            // batch-3 behavior: ≤3 sentences, no focus steer
+            match rewind_records(&mut ctx.voice, &mut ctx.state, &mut ctx.strand, turns).await {
+                Some((kept, Some((idx, view)))) if kept > 0 && idx == kept => {
+                    if !view.trim().is_empty() {
+                        record_branch_summary(
+                            &mut ctx.voice,
+                            &ctx.state,
+                            &mut ctx.strand,
+                            &ctx.events,
+                            view,
+                            None,
+                            3,
+                        )
+                        .await;
                     }
-                    // SES-03: a non-empty abandoned branch earns a
-                    // summary, recorded AFTER the Rewind marker so the
-                    // Custom record stays on the kept tip (replay drops
-                    // only conversation records past `kept_from`).
-                    // kept == 0 rewound to the boundary — no surviving
-                    // tip to annotate, so no summary.
-                    if let Some((idx, view)) = tail {
-                        if kept > 0 && idx == kept && !view.trim().is_empty() {
-                            record_branch_summary(
-                                &mut ctx.voice,
-                                &ctx.state,
-                                &mut ctx.strand,
-                                &ctx.events,
-                                view,
-                            )
-                            .await;
-                        }
-                    }
+                    ctx.events
+                        .send(Event::Note {
+                            message: format!("rewound {turns} turn(s)"),
+                        })
+                        .await
+                        .ok();
+                }
+                Some(_) => {
                     ctx.events
                         .send(Event::Note {
                             message: format!("rewound {turns} turn(s)"),
@@ -2450,6 +2513,277 @@ async fn handle_command(
                         .ok();
                 }
             }
+            ctx.events.send(Event::Idle).await.ok();
+        }
+        // CTX-01: rewind + digest fused. Same strand bookkeeping as
+        // Rewind, but the abandoned branch is NOT discarded: it is
+        // summarized by the fast role (≤6 sentences, `focus` steers)
+        // and pinned AFTER the Rewind record as a `x.ka.branch_summary`
+        // Custom record. kept == 0 rewinds to the boundary — nothing
+        // survives to annotate, so no summary (same rule as Rewind).
+        Command::CompactFrom { turns, focus } => {
+            match rewind_records(&mut ctx.voice, &mut ctx.state, &mut ctx.strand, turns).await {
+                Some((kept, Some((idx, view)))) if kept > 0 && idx == kept => {
+                    let summary = if view.trim().is_empty() {
+                        None
+                    } else {
+                        record_branch_summary(
+                            &mut ctx.voice,
+                            &ctx.state,
+                            &mut ctx.strand,
+                            &ctx.events,
+                            view,
+                            focus.as_deref(),
+                            6,
+                        )
+                        .await
+                    };
+                    let message = match summary {
+                        Some(s) => {
+                            // first lines only — the record carries it all
+                            let head: String = s.lines().take(3).collect::<Vec<_>>().join(" · ");
+                            format!("compact-from: rewound {turns} turn(s) — kept summary: {head}")
+                        }
+                        None => format!("compact-from: rewound {turns} turn(s)"),
+                    };
+                    ctx.events.send(Event::Note { message }).await.ok();
+                }
+                Some(_) => {
+                    ctx.events
+                        .send(Event::Note {
+                            message: format!("compact-from: rewound {turns} turn(s)"),
+                        })
+                        .await
+                        .ok();
+                }
+                None => {
+                    ctx.events
+                        .send(Event::Error {
+                            class: ErrorClass::Protocol,
+                            retryable: false,
+                            message: format!("cannot rewind {turns} turn(s): not enough history"),
+                        })
+                        .await
+                        .ok();
+                }
+            }
+            ctx.events.send(Event::Idle).await.ok();
+        }
+        // SES-09: edit the context view of one message. The target must
+        // be in the current window (record ids align 1:1 with the live
+        // history); the edit applies live AND lands as an append-only
+        // `Record::ContextEdit` — the strand record never mutates, the
+        // replay fold (ka-strand) applies it at the target's position.
+        Command::ContextEdit {
+            target,
+            new_content,
+        } => {
+            match ctx.state.record_ids.iter().position(|r| *r == target) {
+                None => {
+                    ctx.events
+                        .send(Event::Note {
+                            message: format!(
+                                "context edit: {} is not in the current context window — nothing \
+                                 changed",
+                                target.0
+                            ),
+                        })
+                        .await
+                        .ok();
+                }
+                Some(idx) => {
+                    let message = match &new_content {
+                        Some(text) => {
+                            ctx.voice.history[idx].content = text.clone();
+                            format!(
+                                "context edit: {} replaced ({} chars)",
+                                target.0,
+                                text.chars().count()
+                            )
+                        }
+                        None => {
+                            ctx.voice.history.remove(idx);
+                            ctx.state.record_ids.remove(idx);
+                            format!("context edit: {} dropped", target.0)
+                        }
+                    };
+                    let _ = ctx.strand.append(ka_strand::Record::ContextEdit {
+                        id: ka_strand::new_record_id(),
+                        target: target.clone(),
+                        new_content,
+                    });
+                    ctx.events.send(Event::Note { message }).await.ok();
+                }
+            }
+            ctx.events.send(Event::Idle).await.ok();
+        }
+        // SES-01: cumulative session diff — the snapshot journal's
+        // pre-mutation originals vs current disk, rendered as a unified
+        // diff (the workspace has no diff crate; a small Myers lives in
+        // crate::diff). Full diff parked on the spill store; the note
+        // carries the summary line, an 8k-capped excerpt, the pointer.
+        Command::SessionDiff => {
+            session_diff(&ctx.voice, &ctx.cwd, &ctx.strand, &ctx.events).await;
+            ctx.events.send(Event::Idle).await.ok();
+        }
+        // CTX-03: side question — fast role, tools off, the transcript
+        // and context untouched (role_complete builds a fresh
+        // single-message request); the answer arrives as a Note.
+        Command::SideQuestion { text } => {
+            let message = match side_question(&mut ctx.voice, &ctx.state, &ctx.cwd, text).await {
+                Some(answer) => format!("btw: {answer}"),
+                None => "side question unavailable".to_string(),
+            };
+            ctx.events.send(Event::Note { message }).await.ok();
+            ctx.events.send(Event::Idle).await.ok();
+        }
+        // CTX-05: goal mode — keep working toward a condition.
+        Command::Goal { action } => {
+            match action {
+                GoalAction::Set {
+                    condition,
+                    budget_usd,
+                } => {
+                    let condition = condition.trim().to_string();
+                    if condition.is_empty() {
+                        ctx.events
+                            .send(Event::Note {
+                                message: "goal set: empty condition — nothing set".to_string(),
+                            })
+                            .await
+                            .ok();
+                    } else {
+                        ctx.state.goal = Some(GoalRuntime {
+                            condition: condition.clone(),
+                            budget_usd,
+                            paused: false,
+                            spend_at_set: ctx.state.guards.session_spend,
+                            turns_at_set: ctx.state.turns_seen,
+                        });
+                        let message = match budget_usd {
+                            Some(b) => format!("goal set: {condition} (budget ${b:.2})"),
+                            None => format!("goal set: {condition}"),
+                        };
+                        ctx.events.send(Event::Note { message }).await.ok();
+                    }
+                }
+                GoalAction::Pause => match ctx.state.goal.as_mut() {
+                    None => {
+                        ctx.events
+                            .send(Event::Note {
+                                message: "goal paused: no goal active".to_string(),
+                            })
+                            .await
+                            .ok();
+                    }
+                    Some(goal) => {
+                        goal.paused = true;
+                        let turns = ctx.state.turns_seen.saturating_sub(goal.turns_at_set);
+                        ctx.events
+                            .send(Event::Note {
+                                message: format!(
+                                    "goal paused ({} turn(s) since set, ${:.2} spent from the \
+                                     goal budget)",
+                                    turns,
+                                    goal.budget_usd.unwrap_or(0.0)
+                                ),
+                            })
+                            .await
+                            .ok();
+                    }
+                },
+                GoalAction::Resume => match ctx.state.goal.as_mut() {
+                    None => {
+                        ctx.events
+                            .send(Event::Note {
+                                message: "goal resumed: no goal active".to_string(),
+                            })
+                            .await
+                            .ok();
+                    }
+                    Some(goal) => {
+                        goal.paused = false;
+                        ctx.events
+                            .send(Event::Note {
+                                message: format!("goal resumed: {}", goal.condition),
+                            })
+                            .await
+                            .ok();
+                    }
+                },
+                GoalAction::Drop => {
+                    let had = ctx.state.goal.take().is_some();
+                    ctx.events
+                        .send(Event::Note {
+                            message: if had {
+                                "goal dropped".to_string()
+                            } else {
+                                "goal dropped: no goal active".to_string()
+                            },
+                        })
+                        .await
+                        .ok();
+                }
+            }
+            ctx.events.send(Event::Idle).await.ok();
+        }
+        // CTX-06: loop mode — re-run a task on an interval. Never armed
+        // in safe mode: an unattended repeat executor is a
+        // customization-tier risk the bare surface pins off.
+        Command::Loop { action } => {
+            match action {
+                LoopAction::Set {
+                    task,
+                    interval_secs,
+                } => {
+                    if crate::conventions::bare_mode() {
+                        ctx.events
+                            .send(Event::Note {
+                                message: "loop unavailable in safe mode".to_string(),
+                            })
+                            .await
+                            .ok();
+                    } else if task.trim().is_empty() {
+                        ctx.events
+                            .send(Event::Note {
+                                message: "loop armed: empty task — nothing armed".to_string(),
+                            })
+                            .await
+                            .ok();
+                    } else {
+                        let interval = Duration::from_secs(interval_secs.unwrap_or(0));
+                        ctx.state.loop_mode = Some(LoopRuntime {
+                            task: task.clone(),
+                            interval,
+                            last_settle: std::time::Instant::now(),
+                        });
+                        let message = if interval.is_zero() {
+                            format!("loop armed: {task}")
+                        } else {
+                            format!("loop armed: {task} every {}s", interval.as_secs())
+                        };
+                        ctx.events.send(Event::Note { message }).await.ok();
+                    }
+                }
+                LoopAction::Off => {
+                    ctx.state.loop_mode = None;
+                    ctx.events
+                        .send(Event::Note {
+                            message: "loop off".to_string(),
+                        })
+                        .await
+                        .ok();
+                }
+            }
+            ctx.events.send(Event::Idle).await.ok();
+        }
+        // CTX-10: memory consolidation — inbox notes + MEMORY.md → the
+        // fast role produces the consolidated MEMORY.md (≤80 lines),
+        // the file is REWRITTEN (consolidation, not append), the inbox
+        // empties. Trust-gated (it writes), fast-role-gated, and inert
+        // in safe mode like every memory tier.
+        Command::MemoryConsolidate => {
+            memory_consolidate(&mut ctx.voice, &ctx.state, &ctx.cwd, &ctx.events).await;
             ctx.events.send(Event::Idle).await.ok();
         }
         Command::UndoFile => {
@@ -2698,6 +3032,9 @@ async fn attach_strand(
             }
         )
     });
+    // CTX-08: the prewalk is owed once per strand — fresh strands only,
+    // same freshness test as the auto-title
+    state.prewalk_pending = state.needs_title;
     if let Some(path) = strand.path() {
         write_waypoint(cwd, path);
     }
@@ -2906,7 +3243,12 @@ async fn maybe_auto_title(
     let Some(user) = voice
         .history
         .iter()
-        .find(|m| m.role == ka_dialect::speaker::TurnRole::User)
+        // engine-injected system-notes (CTX-08 prewalk) are not the
+        // user's voice: titling off one would name the session after
+        // the orientation brief
+        .find(|m| {
+            m.role == ka_dialect::speaker::TurnRole::User && !m.content.starts_with("<system-note>")
+        })
         .map(|m| side_view(&m.content))
     else {
         return;
@@ -3129,22 +3471,502 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// SES-03: summarize the rewound branch with the fast role and append
-/// it to the strand as a `x.ka.branch_summary` Custom record — it sits
-/// at the tip of the branch you keep, so the abandoned work stays
-/// discoverable (the digest can carry its gist forward). Unconfigured
-/// fast role or a failed call degrades to a note; the rewind itself is
-/// never blocked.
+/// CTX-06: the loop's fire gate, consumed from the run loop (once per
+/// command wakeup and once per idle tick — never re-fired in a loop:
+/// a back-to-back cycle would starve the command channel, and Loop
+/// Off arriving mid-turn is dropped by the voice). Fires only when
+/// armed, the queued-input queue is drained, and the interval elapsed
+/// since the last settle (ZERO interval = as soon as the engine
+/// settles again — i.e. the next wakeup or tick). Never mid-turn:
+/// both call sites run strictly between commands. The fire time
+/// becomes the new settle baseline.
+fn loop_prompt_due(state: &mut EngineState) -> Option<String> {
+    let loop_mode = state.loop_mode.as_mut()?;
+    if !state.queue.is_empty() {
+        return None;
+    }
+    if loop_mode.last_settle.elapsed() < loop_mode.interval {
+        return None;
+    }
+    loop_mode.last_settle = std::time::Instant::now();
+    Some(loop_mode.task.clone())
+}
+
+/// CTX-06: the loop's prompt is a normal full turn (tools on), built
+/// as the protocol command so strands, pokes, and settles behave
+/// exactly as for a typed prompt.
+fn loop_prompt(task: &str) -> Command {
+    Command::Prompt {
+        text: task.to_string(),
+        schema: None,
+        images: Vec::new(),
+        allowed_tools: None,
+        model: None,
+        skills: Vec::new(),
+    }
+}
+
+/// CTX-03: answer a side question with the fast role — tools off and
+/// the transcript/context untouched (role_complete builds a fresh
+/// single-message request). The prompt carries a MINIMAL session hint
+/// (cwd + branch only), never the transcript. Returns the answer
+/// (2k chars max), or None when the fast role is unconfigured or the
+/// call fails/times out.
+async fn side_question(
+    voice: &mut Voice,
+    state: &EngineState,
+    cwd: &std::path::Path,
+    text: String,
+) -> Option<String> {
+    let fast = state.roles.fast.clone()?;
+    let branch = crate::hands::git::RepoSnapshot::capture(cwd).branch;
+    let branch = if branch.is_empty() {
+        "none"
+    } else {
+        branch.as_str()
+    };
+    const SIDE_SYSTEM: &str = "You answer quick side questions about the session or codebase. \
+     You have no tools; answer from the question text and the minimal session hint alone. Be \
+     concise.";
+    let cwd_display = cwd.display();
+    let prompt = format!(
+        "(session: cwd {cwd_display}, git branch {branch})\n\n<question>\n{text}\n</question>"
+    );
+    let answer = voice
+        .role_complete(&fast, SIDE_SYSTEM, &prompt, TITLE_TIMEOUT)
+        .await?;
+    let trimmed = answer.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.chars().take(SIDE_ANSWER_CAP).collect())
+}
+
+/// CTX-03: side-question answer cap (chars).
+const SIDE_ANSWER_CAP: usize = 2_000;
+
+/// SES-01: unified diff of every file this session mutated (the
+/// snapshot journal's pre-mutation originals, first mutation per path)
+/// against current disk. Model-free and git-free. The full diff parks
+/// on the spill store; the note carries the summary line, an 8k-capped
+/// excerpt, and the `spill://<id>` pointer.
+async fn session_diff(
+    voice: &Voice,
+    cwd: &std::path::Path,
+    strand: &ka_strand::StrandFile,
+    events: &mpsc::Sender<Event>,
+) {
+    const DIFF_EXCERPT_CAP: usize = 8_000;
+    let strand_id = strand_id(strand);
+    let originals = voice.snapshot_sink().lock().session_originals(&strand_id);
+    if originals.is_empty() {
+        events
+            .send(Event::Note {
+                message: "session diff: no changes".to_string(),
+            })
+            .await
+            .ok();
+        return;
+    }
+    let mut full = String::new();
+    let mut files = 0usize;
+    let mut stat_total = crate::diff::DiffStat::default();
+    for (path, blob) in originals {
+        let original = match &blob {
+            Some(blob) => std::fs::read_to_string(blob).unwrap_or_default(),
+            None => String::new(), // created this session: no original
+        };
+        let current = std::fs::read_to_string(&path).unwrap_or_default();
+        let rel = path
+            .strip_prefix(cwd)
+            .unwrap_or(&path)
+            .display()
+            .to_string();
+        let text = crate::diff::unified(&rel, &original, &current, 3);
+        if text.is_empty() {
+            continue; // mutated back to its original bytes
+        }
+        files += 1;
+        let file_stat = crate::diff::stat(&original, &current);
+        stat_total = crate::diff::DiffStat {
+            added: stat_total.added + file_stat.added,
+            removed: stat_total.removed + file_stat.removed,
+        };
+        full.push_str(&text);
+    }
+    if files == 0 {
+        events
+            .send(Event::Note {
+                message: "session diff: no changes".to_string(),
+            })
+            .await
+            .ok();
+        return;
+    }
+    let excerpt: String = full.chars().take(DIFF_EXCERPT_CAP).collect();
+    let spill = crate::hands::Spill::new();
+    let message = match spill.park(&full) {
+        Ok(ptr) => format!(
+            "session diff: {files} file(s), {} +/- lines — full: {ptr}\n\n{excerpt}",
+            stat_total.added + stat_total.removed
+        ),
+        Err(e) => format!(
+            "session diff: {files} file(s), {} +/- lines — spilling the full diff failed ({e}); \
+             excerpt only\n\n{excerpt}",
+            stat_total.added + stat_total.removed
+        ),
+    };
+    events.send(Event::Note { message }).await.ok();
+}
+
+/// CTX-08: the prewalk — one cheap bounded repository pass (depth 2,
+/// .gitignore-respected, 200 entries max) turned by the fast role into
+/// a ≤5-bullet orientation brief that rides the context as a leading
+/// system-note (same class as the digest's <context-digest> user
+/// message), so the first real prompt starts oriented. Runs once per
+/// strand, before the first turn; a missing fast role or a failed call
+/// degrades to a note and never blocks.
+async fn run_prewalk(
+    voice: &mut Voice,
+    state: &EngineState,
+    cwd: &std::path::Path,
+    events: &mpsc::Sender<Event>,
+) {
+    const PREWALK_SYSTEM: &str = "You write terse repository orientation briefs. Reply with at \
+     most 5 bullet points (one line each): what this project is, its layout, its build/test \
+     commands, any convention the scan reveals. Reply with only the bullets.";
+    const PREWALK_SCAN_CAP: usize = 6_000;
+    let Some(fast) = state.roles.fast.clone() else {
+        events
+            .send(Event::Note {
+                message: "prewalk unavailable: no [roles] fast configured".to_string(),
+            })
+            .await
+            .ok();
+        return;
+    };
+    let scan = prewalk_scan(cwd);
+    if scan.trim().is_empty() {
+        events
+            .send(Event::Note {
+                message: "prewalk unavailable: empty workspace scan".to_string(),
+            })
+            .await
+            .ok();
+        return;
+    }
+    let scan: String = scan.chars().take(PREWALK_SCAN_CAP).collect();
+    let prompt = format!("<workspace-scan>\n{scan}\n</workspace-scan>");
+    let Some(brief) = voice
+        .role_complete(&fast, PREWALK_SYSTEM, &prompt, TITLE_TIMEOUT)
+        .await
+    else {
+        events
+            .send(Event::Note {
+                message: "prewalk unavailable: fast role failed".to_string(),
+            })
+            .await
+            .ok();
+        return;
+    };
+    let brief = brief.trim();
+    if brief.is_empty() {
+        events
+            .send(Event::Note {
+                message: "prewalk unavailable: fast role failed".to_string(),
+            })
+            .await
+            .ok();
+        return;
+    }
+    // leading system-note: the brief sits at the top of the context for
+    // the whole session (the strand's first user record; the auto-title
+    // skips system-notes when it picks its user side)
+    let note = format!(
+        "<system-note>\nSession prewalk (automated repository orientation):\n{brief}\n</system-note>"
+    );
+    voice
+        .history
+        .insert(0, ka_dialect::speaker::TurnMessage::user(note));
+    events
+        .send(Event::Note {
+            message: "prewalk ready".to_string(),
+        })
+        .await
+        .ok();
+}
+
+/// CTX-08: the bounded walk — depth 2, .gitignore-respected (the
+/// `ignore` walker), hard entry cap, hidden/venv/build dirs skipped.
+/// Emits: the entry list, a per-extension count, and the heads of the
+/// README + the first manifest found.
+fn prewalk_scan(cwd: &std::path::Path) -> String {
+    const MAX_ENTRIES: usize = 200;
+    const HEAD_LINES: usize = 40;
+    const MANIFESTS: [&str; 6] = [
+        "Cargo.toml",
+        "package.json",
+        "pyproject.toml",
+        "go.mod",
+        "pom.xml",
+        "Gemfile",
+    ];
+    const SKIP_DIRS: [&str; 6] = [".git", "node_modules", "target", "dist", "build", ".venv"];
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    for entry in ignore::WalkBuilder::new(cwd)
+        .max_depth(Some(2))
+        .filter_entry(|e| !SKIP_DIRS.contains(&e.file_name().to_string_lossy().as_ref()))
+        .build()
+    {
+        let Ok(entry) = entry else { continue };
+        if entry.file_type().is_some_and(|t| t.is_file()) {
+            files.push(entry.into_path());
+            if files.len() >= MAX_ENTRIES {
+                break;
+            }
+        }
+    }
+    if files.is_empty() {
+        return String::new();
+    }
+    let mut ext_counts: std::collections::BTreeMap<String, usize> = Default::default();
+    for f in &files {
+        if let Some(ext) = f.extension().and_then(|e| e.to_str()) {
+            *ext_counts.entry(ext.to_string()).or_default() += 1;
+        }
+    }
+    let read_head = |path: &std::path::Path| -> Option<String> {
+        let text = std::fs::read_to_string(path).ok()?;
+        let head: Vec<&str> = text.lines().take(HEAD_LINES).collect();
+        (!head.is_empty()).then(|| head.join("\n"))
+    };
+    let readme = files
+        .iter()
+        .find(|f| {
+            f.file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with("README"))
+        })
+        .and_then(|p| read_head(p));
+    let manifest = files
+        .iter()
+        .find(|f| {
+            f.file_name()
+                .is_some_and(|n| MANIFESTS.contains(&n.to_string_lossy().as_ref()))
+        })
+        .and_then(|p| read_head(p));
+    let mut out = String::from("workspace scan (depth 2, first 200 entries):\n");
+    for f in &files {
+        let rel = f.strip_prefix(cwd).unwrap_or(f).display();
+        out.push_str(&format!("- {rel}\n"));
+    }
+    let exts = ext_counts
+        .iter()
+        .map(|(ext, n)| format!("{ext}: {n}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    out.push_str(&format!("\nfile types: {exts}\n"));
+    if let Some(head) = readme {
+        out.push_str(&format!("\nREADME head:\n{head}\n"));
+    }
+    if let Some(head) = manifest {
+        out.push_str(&format!("\nmanifest head:\n{head}\n"));
+    }
+    out
+}
+
+/// CTX-10: memory consolidation — read `.ka/memory/inbox.md` (the
+/// remember hand's staged notes) plus the current MEMORY.md, let the
+/// fast role produce the consolidated file (≤80 lines, enforced), then
+/// REWRITE MEMORY.md (consolidation is a rewrite, not an append),
+/// empty the inbox, and report the line diff. Trust-gated like every
+/// write; fast-role-gated like every cheap chore; inert in safe mode.
+async fn memory_consolidate(
+    voice: &mut Voice,
+    state: &EngineState,
+    cwd: &std::path::Path,
+    events: &mpsc::Sender<Event>,
+) {
+    const MEMORY_SYSTEM: &str = "You consolidate project memory. Produce the new MEMORY.md \
+     content: durable facts, conventions, and preferences — deduplicated, plain markdown, at \
+     most 80 lines. Reply with only the file content.";
+    const MEMORY_SIDE_CAP: usize = 8_000;
+    const MEMORY_MAX_LINES: usize = 80;
+    let root = crate::project_root(cwd);
+    let inbox_path = root.join(".ka/memory/inbox.md");
+    let memory_path = root.join("MEMORY.md");
+    if crate::conventions::bare_mode() {
+        events
+            .send(Event::Note {
+                message: "memory consolidation unavailable in safe mode".to_string(),
+            })
+            .await
+            .ok();
+        return;
+    }
+    if !crate::trust::project_trusted(cwd) {
+        events
+            .send(Event::Note {
+                message: "memory consolidate: project not trusted — nothing written".to_string(),
+            })
+            .await
+            .ok();
+        return;
+    }
+    let inbox = std::fs::read_to_string(&inbox_path).unwrap_or_default();
+    if inbox.trim().is_empty() {
+        events
+            .send(Event::Note {
+                message: "memory consolidate: inbox is empty — nothing to consolidate".to_string(),
+            })
+            .await
+            .ok();
+        return;
+    }
+    let Some(fast) = state.roles.fast.clone() else {
+        events
+            .send(Event::Note {
+                message: "memory consolidation unavailable: no [roles] fast configured".to_string(),
+            })
+            .await
+            .ok();
+        return;
+    };
+    let current = std::fs::read_to_string(&memory_path).unwrap_or_default();
+    let prompt = format!(
+        "<current MEMORY.md>\n{}</current MEMORY.md>\n\n<inbox notes>\n{}</inbox notes>\n\nRewrite \
+         MEMORY.md consolidating the inbox notes into the durable knowledge. Reply with only the \
+         new file content.",
+        current.chars().take(MEMORY_SIDE_CAP).collect::<String>(),
+        inbox.chars().take(MEMORY_SIDE_CAP).collect::<String>(),
+    );
+    let Some(raw) = voice
+        .role_complete(&fast, MEMORY_SYSTEM, &prompt, TITLE_TIMEOUT)
+        .await
+    else {
+        events
+            .send(Event::Note {
+                message: "memory consolidation unavailable: fast role failed".to_string(),
+            })
+            .await
+            .ok();
+        return;
+    };
+    let mut new_text = raw.trim().to_string();
+    if new_text.is_empty() {
+        events
+            .send(Event::Note {
+                message: "memory consolidation unavailable: fast role failed".to_string(),
+            })
+            .await
+            .ok();
+        return;
+    }
+    // enforce the ≤80-line contract even if the model overran
+    {
+        let lines: Vec<&str> = new_text.lines().collect();
+        if lines.len() > MEMORY_MAX_LINES {
+            new_text = lines[..MEMORY_MAX_LINES].join("\n");
+        }
+        new_text.push('\n');
+    }
+    // the same safety net under edit/write: the pre-mutation file
+    // parks on the snapshot journal so /undo can restore it
+    {
+        let sink = voice.snapshot_sink();
+        let _ = sink.lock().snapshot(&memory_path);
+    }
+    let stat = crate::diff::stat(&current, &new_text);
+    let wrote = std::fs::write(&memory_path, &new_text).is_ok();
+    if !wrote {
+        events
+            .send(Event::Note {
+                message: format!(
+                    "memory consolidate failed: could not write {}",
+                    memory_path.display()
+                ),
+            })
+            .await
+            .ok();
+        return;
+    }
+    // the staged notes are now folded in: the inbox empties
+    let _ = std::fs::write(&inbox_path, "");
+    events
+        .send(Event::Note {
+            message: format!(
+                "memory consolidated (+{} -{} lines)",
+                stat.added, stat.removed
+            ),
+        })
+        .await
+        .ok();
+}
+
+/// SES-03 + CTX-01: rewind the live history `turns` user turns and
+/// mirror it on the strand — a Boundary when the session rewinds to
+/// zero (a Rewind record pointing at its own dropped anchor would
+/// resurrect the first message on replay), a Rewind record otherwise.
+/// Returns the kept index (pre-truncation) and the abandoned tail
+/// view (the doomed branch is captured BEFORE the truncation —
+/// `rewind` cuts it out of the history for good), or None when there
+/// is not enough history.
+async fn rewind_records(
+    voice: &mut Voice,
+    state: &mut EngineState,
+    strand: &mut ka_strand::StrandFile,
+    turns: u32,
+) -> Option<(usize, Option<(usize, String)>)> {
+    let tail = voice.rewind_tail(turns);
+    let kept = voice.rewind(turns)?;
+    if kept == 0 {
+        // the FIRST turn was rewound: nothing survives.
+        let _ = strand.append(ka_strand::Record::Boundary {
+            id: ka_strand::new_record_id(),
+        });
+        state.record_ids.clear();
+        // live/replay parity: Boundary clears the digest
+        // on replay, so the live session drops it too —
+        // else requests keep prepending a summary of the
+        // content the rewind deleted
+        voice.clear_digest();
+    } else {
+        // kept = index of the dropped user message; keep
+        // everything strictly before it
+        let keep_idx = kept - 1;
+        let kept_from = state
+            .record_ids
+            .get(keep_idx)
+            .cloned()
+            .unwrap_or_else(ka_strand::new_record_id);
+        let _ = strand.append(ka_strand::Record::Rewind {
+            id: ka_strand::new_record_id(),
+            kept_from,
+        });
+        state.record_ids.truncate(keep_idx + 1);
+    }
+    Some((kept, tail))
+}
+
+/// SES-03 + CTX-01: summarize the abandoned branch with the fast role
+/// and append it to the strand as a `x.ka.branch_summary` Custom
+/// record — it sits at the tip of the branch you keep (AFTER the
+/// Rewind marker, so replay drops only conversation records past
+/// `kept_from`), so the abandoned work stays discoverable. Rewind uses
+/// ≤3 sentences; CompactFrom steers with `focus` and allows 6.
+/// Unconfigured fast role or a failed call degrades to a note; the
+/// rewind itself is never blocked. Returns the summary text.
 async fn record_branch_summary(
     voice: &mut Voice,
     state: &EngineState,
     strand: &mut ka_strand::StrandFile,
     events: &mpsc::Sender<Event>,
     tail: String,
-) {
-    const BRANCH_SYSTEM: &str = "You summarize abandoned conversation branches. Reply with at \
-     most 3 sentences: what the branch was working on, what it accomplished, and what was \
-     left unfinished. Reply with only the summary.";
+    focus: Option<&str>,
+    max_sentences: usize,
+) -> Option<String> {
+    const BRANCH_SYSTEM: &str = "You summarize abandoned conversation branches: what the branch \
+     was working on, what it accomplished, and what was left unfinished. Reply with only the \
+     summary.";
     const BRANCH_TAIL_CAP: usize = 8_000;
     let Some(fast) = state.roles.fast.clone() else {
         events
@@ -3153,12 +3975,15 @@ async fn record_branch_summary(
             })
             .await
             .ok();
-        return;
+        return None;
     };
     let tail: String = tail.chars().take(BRANCH_TAIL_CAP).collect();
+    let focus_line = focus
+        .map(|f| format!("\nFocus the summary on: {f}"))
+        .unwrap_or_default();
     let prompt = format!(
         "The conversation branch below was just rewound (discarded from the live session). \
-         Summarize it in at most 3 sentences. Reply with only the summary.\n\n{tail}"
+         Summarize it in at most {max_sentences} sentences.{focus_line}\n\n{tail}"
     );
     let Some(summary) = voice
         .role_complete(&fast, BRANCH_SYSTEM, &prompt, TITLE_TIMEOUT)
@@ -3170,12 +3995,13 @@ async fn record_branch_summary(
             })
             .await
             .ok();
-        return;
+        return None;
     };
     let summary = summary.trim();
     if summary.is_empty() {
-        return;
+        return None;
     }
+    let summary = summary.to_string();
     let _ = strand.append(ka_strand::Record::Custom {
         id: ka_strand::new_record_id(),
         ns: ka_strand::BRANCH_SUMMARY_NS.to_string(),
@@ -3191,6 +4017,7 @@ async fn record_branch_summary(
         })
         .await
         .ok();
+    Some(summary)
 }
 
 /// Post-turn context maintenance: prune old tool outputs, digest while
@@ -3254,6 +4081,88 @@ async fn settle_context(
             DigestResult::Digested => continue,
             DigestResult::NoModel => break,
         }
+    }
+    // CTX-05: the goal judge runs on Done settles only, once per turn
+    // (settle_context is called exactly once per completed turn, after
+    // the turn fully returned — never in parallel with live work).
+    if voice.last_stop() == Stop::Done {
+        goal_settle(voice, state, events).await;
+    }
+}
+
+/// CTX-05: the settle-time goal judge. Budget first (deterministic —
+/// over the ceiling the goal auto-pauses instead of burning more),
+/// then the fast-role yes/no verdict on "is the condition met with
+/// what the transcript's latest work shows". Met → note + automatic
+/// drop; not met → the auto-poke (goal-prefixed) keeps pushing. A
+/// missing fast role or a failed verdict stays silent — the judge is
+/// best-effort, never a turn blocker.
+async fn goal_settle(voice: &mut Voice, state: &mut EngineState, events: &mpsc::Sender<Event>) {
+    let Some(goal) = state.goal.as_ref() else {
+        return;
+    };
+    if goal.paused {
+        return;
+    }
+    // budget: session spend measured from Set crosses the ceiling
+    if let Some(budget) = goal.budget_usd {
+        let spent = state.guards.session_spend - goal.spend_at_set;
+        if spent >= budget {
+            if let Some(goal) = state.goal.as_mut() {
+                goal.paused = true;
+            }
+            events
+                .send(Event::Note {
+                    message: format!(
+                        "goal budget exhausted — spent ${spent:.2} of the ${budget:.2} ceiling; \
+                         goal paused"
+                    ),
+                })
+                .await
+                .ok();
+            return;
+        }
+    }
+    let Some(fast) = state.roles.fast.clone() else {
+        return;
+    };
+    let condition = state
+        .goal
+        .as_ref()
+        .map(|g| g.condition.clone())
+        .unwrap_or_default();
+    const GOAL_JUDGE_SYSTEM: &str =
+        "You judge whether a goal condition is already met. Reply with only YES or NO.";
+    const GOAL_SIDE_CAP: usize = 4_000;
+    let latest = voice
+        .history
+        .iter()
+        .rev()
+        .find(|m| {
+            m.role == ka_dialect::speaker::TurnRole::Assistant && !m.content.trim().is_empty()
+        })
+        .map(|m| m.content.chars().take(GOAL_SIDE_CAP).collect::<String>());
+    let Some(latest) = latest else {
+        return; // nothing to judge yet
+    };
+    let prompt = format!(
+        "<goal>\n{condition}\n</goal>\n\n<latest>\n{latest}\n</latest>\n\nIs the goal condition \
+         met by this latest work? Reply YES or NO."
+    );
+    let Some(verdict) = voice
+        .role_complete(&fast, GOAL_JUDGE_SYSTEM, &prompt, TITLE_TIMEOUT)
+        .await
+    else {
+        return; // judge failed: the goal stays armed for the next settle
+    };
+    if verdict.trim().to_ascii_uppercase().starts_with("YES") {
+        state.goal = None;
+        events
+            .send(Event::Note {
+                message: format!("goal met: {condition}"),
+            })
+            .await
+            .ok();
     }
 }
 
@@ -3558,9 +4467,13 @@ async fn dispatch_turn(
     }
     // CTX-07 bookkeeping: a completed turn is activity, and the recap
     // gate counts turns monotonically (digest truncation can shrink
-    // the history, never this counter).
+    // the history, never this counter). CTX-06: a settle also anchors
+    // the loop interval.
     state.last_activity = std::time::Instant::now();
     state.turns_seen += 1;
+    if let Some(loop_mode) = &mut state.loop_mode {
+        loop_mode.last_settle = std::time::Instant::now();
+    }
     settle_steers(state);
 }
 
@@ -6345,4 +7258,33 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&work);
     }
+}
+
+/// CTX-06 (unit): the loop fire gate — armed, queue drained, interval
+/// elapsed; a fire consumes the cycle and re-arms the interval.
+#[test]
+fn loop_prompt_due_gates_on_interval_and_queue() {
+    let mut state = EngineState::from(Config::default());
+    // disarmed: nothing due
+    assert!(loop_prompt_due(&mut state).is_none());
+    // armed, interval not elapsed: not due
+    state.loop_mode = Some(LoopRuntime {
+        task: "tick work".into(),
+        interval: Duration::from_secs(60),
+        last_settle: std::time::Instant::now(),
+    });
+    assert!(loop_prompt_due(&mut state).is_none());
+    // queued user input drains first — the loop never interleaves
+    if let Some(l) = state.loop_mode.as_mut() {
+        l.interval = Duration::ZERO;
+    }
+    state.queue.push_back("user input".into());
+    assert!(loop_prompt_due(&mut state).is_none());
+    state.queue.clear();
+    // interval elapsed: due, and the fire consumes the cycle
+    assert_eq!(loop_prompt_due(&mut state).as_deref(), Some("tick work"));
+    if let Some(l) = state.loop_mode.as_mut() {
+        l.interval = Duration::from_secs(60);
+    }
+    assert!(loop_prompt_due(&mut state).is_none());
 }

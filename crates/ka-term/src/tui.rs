@@ -2704,6 +2704,30 @@ pub struct UpdateNotice {
     pub latest: String,
 }
 
+/// Local goal-mode mirror (CTX-05): what the engine's goal Notes last
+/// said. The engine owns the truth — the TUI never flips goal state on
+/// its own send, it only folds the `goal …` Notes back in; the ◎ badge
+/// and `/goal status` read this mirror.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct GoalState {
+    /// The active condition (the engine's own echo).
+    pub condition: String,
+    /// Whether judging/continuing is currently paused.
+    pub paused: bool,
+    /// Spend ceiling when the set note carried one.
+    pub budget_usd: Option<f64>,
+}
+
+/// Local loop-mode mirror (CTX-06), folded from `loop …` Notes the same
+/// way; the ↻ badge reads it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LoopState {
+    /// The task re-run each cycle (the engine's own echo).
+    pub task: String,
+    /// Minimum seconds between cycles (None = as soon as idle).
+    pub interval_secs: Option<u64>,
+}
+
 /// Footer state shown under the editor.
 #[derive(Debug, Clone, Default)]
 pub struct Meters {
@@ -2745,6 +2769,10 @@ pub struct Meters {
     /// Newest release tag when a self-update is pending (the `⤴` badge;
     /// None hides the segment).
     pub update: Option<String>,
+    /// CTX-05: goal-mode mirror (see [`GoalState`]); None = no goal.
+    pub goal: Option<GoalState>,
+    /// CTX-06: loop-mode mirror (see [`LoopState`]); None = disarmed.
+    pub loop_task: Option<LoopState>,
 }
 
 /// Bootstrap inventory for the sidebar (the [`Event::Inventory`] payload,
@@ -5431,6 +5459,24 @@ async fn app(
                                             *selected += 1;
                                         }
                                     }
+                                    KeyCode::Char('s') => {
+                                        // CTX-01: summarize — CompactFrom at
+                                        // the picked point: the engine rewinds
+                                        // these turns and pins a fast-role
+                                        // summary in their place (the
+                                        // `compact-from:` note re-syncs the view)
+                                        let (turns, _) = items[*selected].clone();
+                                        modal = None;
+                                        let _ = commands
+                                            .send(Command::CompactFrom {
+                                                turns: turns as u32,
+                                                focus: None,
+                                            })
+                                            .await;
+                                        transcript.push_separated(Line::Info(format!(
+                                            "compact-from · summarizing −{turns} turn(s) — summary pinned on arrival"
+                                        )));
+                                    }
                                     KeyCode::Enter | KeyCode::Char('r') | KeyCode::Char('e') => {
                                         let edit = key.code == KeyCode::Char('e');
                                         let (turns, prompt) = items[*selected].clone();
@@ -6343,6 +6389,18 @@ async fn app(
                                         session: meters.session.clone(),
                                     });
                                 }
+                                continue;
+                            }
+                            // /goal status (and bare /goal): a local read
+                            // of the goal mirror — no engine roundtrip.
+                            // The mirror is whatever the engine's `goal …`
+                            // notes last said; CTX-05 keeps GoalAction
+                            // free of a Status variant on purpose.
+                            if matches!(text.trim(), "/goal" | "/goal status") {
+                                transcript.push_separated(Line::User(text.clone()));
+                                transcript.push_separated(Line::Info(goal_status_note(
+                                    meters.goal.as_ref(),
+                                )));
                                 continue;
                             }
                             // /skill:<name> [args]: explicit invocation —
@@ -7775,6 +7833,109 @@ fn detab(s: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+/// CTX-05: fold one engine note into the goal mirror. The exact note
+/// spellings are the engine's contract: `goal set: <condition>` (+ an
+/// optional ` (budget $X)` suffix), `goal met: …`, `goal budget
+/// exhausted`, `goal paused`, `goal resumed`, `goal dropped`. Anything
+/// else leaves the mirror alone.
+fn note_goal_state(note: &str, goal: &mut Option<GoalState>) {
+    if let Some(rest) = note.strip_prefix("goal set: ") {
+        let (condition, budget) = split_goal_budget(rest);
+        *goal = Some(GoalState {
+            condition: condition.to_string(),
+            paused: false,
+            budget_usd: budget,
+        });
+    } else if note.starts_with("goal met:") || note == "goal dropped" {
+        // met (auto-drop follows) or dropped outright: the goal is done
+        *goal = None;
+    } else if note == "goal budget exhausted" || note == "goal paused" {
+        if let Some(g) = goal.as_mut() {
+            g.paused = true;
+        }
+    } else if note == "goal resumed" {
+        if let Some(g) = goal.as_mut() {
+            g.paused = false;
+        }
+    }
+}
+
+/// Split `"<condition> (budget $12.5)"` into its parts; no suffix (or
+/// an unparsable amount) reads as no budget.
+fn split_goal_budget(rest: &str) -> (&str, Option<f64>) {
+    if let Some(idx) = rest.find(" (budget $") {
+        let amount = rest[idx + " (budget $".len()..]
+            .strip_suffix(')')
+            .unwrap_or("");
+        if let Ok(usd) = amount.trim().parse::<f64>() {
+            return (&rest[..idx], Some(usd));
+        }
+    }
+    (rest, None)
+}
+
+/// CTX-06: fold one engine note into the loop mirror (`loop armed:
+/// <task>` possibly with a trailing ` every <N>s`, or `loop off`).
+fn note_loop_state(note: &str, loop_task: &mut Option<LoopState>) {
+    if let Some(rest) = note.strip_prefix("loop armed: ") {
+        let (task, interval) = split_loop_interval(rest);
+        *loop_task = Some(LoopState {
+            task: task.to_string(),
+            interval_secs: interval,
+        });
+    } else if note == "loop off" {
+        *loop_task = None;
+    }
+}
+
+/// Split `"<task> every <N>s"` into its parts; the interval suffix is
+/// only taken when the tail parses as a whole number of seconds.
+fn split_loop_interval(rest: &str) -> (&str, Option<u64>) {
+    if let Some(no_s) = rest.strip_suffix('s') {
+        if let Some(idx) = no_s.rfind(" every ") {
+            if let Ok(secs) = no_s[idx + " every ".len()..].trim().parse::<u64>() {
+                return (&rest[..idx], Some(secs));
+            }
+        }
+    }
+    (rest, None)
+}
+
+/// CTX-01: the turn count a `compact-from:` note rewound, when the
+/// note spells it out (`compact-from: rewound N turn(s), …`).
+fn compact_from_note_turns(note: &str) -> Option<u32> {
+    let rest = note.strip_prefix("compact-from: rewound ")?;
+    let digits = rest
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>();
+    if digits.is_empty() {
+        return None;
+    }
+    let turns = digits.parse::<u32>().ok()?;
+    rest.strip_prefix(&digits)?
+        .starts_with(" turn")
+        .then_some(turns)
+}
+
+/// `/goal status` display line from the local mirror (the engine's
+/// goal notes keep it honest; no engine roundtrip here).
+fn goal_status_note(goal: Option<&GoalState>) -> String {
+    match goal {
+        None => "goal · none set — /goal <condition> arms goal mode".to_string(),
+        Some(g) => {
+            let mut line = format!("goal · {}", g.condition);
+            if g.paused {
+                line.push_str(" (paused)");
+            }
+            if let Some(usd) = g.budget_usd {
+                line.push_str(&format!(" · budget ${usd}"));
+            }
+            line
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn apply_event(
     evt: &Event,
@@ -8156,7 +8317,25 @@ fn apply_event(
                 }
             }
         }
-        Event::Note { message } => transcript.push_separated(Line::Info(message.clone())),
+        Event::Note { message } => {
+            // CTX-05/06: the goal/loop mirrors live off the engine's
+            // own notes — fold them in before anything else reads the
+            // state (the badge renders from `meters` every frame)
+            note_goal_state(message, &mut meters.goal);
+            note_loop_state(message, &mut meters.loop_task);
+            // CTX-01: a compact-from note means the engine cut the last
+            // N turns — drop the same rows from the view BEFORE the
+            // note lands, so the confirmation survives the cut
+            if let Some(turns) = compact_from_note_turns(message) {
+                transcript.rewind_user(turns as usize);
+            }
+            transcript.push_separated(Line::Info(message.clone()));
+            // SES-01: a note carrying a spill pointer has a full
+            // rendering parked in a spill file — point at /spills
+            if message.contains("spill://") {
+                transcript.push_separated(Line::Info("  ↳ full output: /spills".into()));
+            }
+        }
         Event::Inventory {
             tools,
             mcp,
@@ -8625,7 +8804,7 @@ fn builtin_slash_commands() -> Vec<(String, String)> {
         ),
         (
             "/memory".to_string(),
-            "show loaded MEMORY.md tiers".to_string(),
+            "show loaded MEMORY.md tiers (/memory consolidate merges the inbox)".to_string(),
         ),
         (
             "/tasks".to_string(),
@@ -8676,6 +8855,26 @@ fn builtin_slash_commands() -> Vec<(String, String)> {
         (
             "/rewind".to_string(),
             "drop the last N exchanges".to_string(),
+        ),
+        (
+            "/compactfrom".to_string(),
+            "rewind N turns, keep a summary: /compactfrom [N] [focus]".to_string(),
+        ),
+        (
+            "/btw".to_string(),
+            "side question on the fast role (answer arrives as a note)".to_string(),
+        ),
+        (
+            "/goal".to_string(),
+            "goal mode: /goal <condition> | off | pause | resume | status".to_string(),
+        ),
+        (
+            "/loop".to_string(),
+            "loop mode: /loop [--every secs] <task> | off".to_string(),
+        ),
+        (
+            "/diff".to_string(),
+            "session file diff (excerpt + spill pointer as a note)".to_string(),
         ),
         (
             "/fork".to_string(),
@@ -9394,6 +9593,11 @@ pub fn slash_command(text: &str) -> Option<Slash> {
             | "/compact"
             | "/shake"
             | "/autocompact"
+            | "/compactfrom"
+            | "/btw"
+            | "/goal"
+            | "/loop"
+            | "/diff"
             | "/session"
             | "/resume"
             | "/new"
@@ -9630,6 +9834,239 @@ blocker > major > minor > nit, each as `file:line — issue — concrete fix`, \
                 })
             }
         }
+        "/btw" => {
+            // CTX-03: a side question on the fast role — tools off, the
+            // answer rides back as a Note and never enters the context
+            match rest {
+                Some(q) if !q.is_empty() => Some(Slash {
+                    note: Some("btw · asked (answer arrives as a note)".to_string()),
+                    event: Some(Command::SideQuestion {
+                        text: q.to_string(),
+                    }),
+                    quit: false,
+                    followup: None,
+                    modal: None,
+                }),
+                _ => Some(Slash {
+                    note: Some("usage: /btw <question> — off-the-record side question".to_string()),
+                    event: None,
+                    quit: false,
+                    followup: None,
+                    modal: None,
+                }),
+            }
+        }
+        "/compactfrom" => {
+            // CTX-01: rewind the last N turns but keep a summary of
+            // what was dropped, pinned after the rewind point. `[N]
+            // [focus…]`: a leading number is the turn count (default
+            // 1); any other words are focus steering for the summary —
+            // `/compactfrom keep the auth findings` summarizes just the
+            // last turn with that focus. `0` turns is refused: there is
+            // nothing to summarize.
+            let parsed = match rest {
+                None => Ok((1, None)),
+                Some(r) => {
+                    let (head, tail) = match r.split_once(' ') {
+                        Some((h, t)) => (h, Some(t.trim())),
+                        None => (r, None),
+                    };
+                    match head.parse::<u32>() {
+                        Ok(n) if n >= 1 => Ok((n, tail.filter(|t| !t.is_empty()))),
+                        Ok(_) => Err(()),
+                        Err(_) => Ok((1, Some(r))),
+                    }
+                }
+            };
+            match parsed {
+                Ok((turns, focus)) => {
+                    let focus = focus.map(str::to_string);
+                    let focus_note = focus
+                        .as_deref()
+                        .map(|f| format!(" · focus: {f}"))
+                        .unwrap_or_default();
+                    Some(Slash {
+                        note: Some(format!(
+                            "compact-from · summarizing last {turns} turn(s){focus_note} — summary pinned on arrival"
+                        )),
+                        event: Some(Command::CompactFrom { turns, focus }),
+                        quit: false,
+                        followup: None,
+                        modal: None,
+                    })
+                }
+                Err(()) => Some(Slash {
+                    note: Some("usage: /compactfrom [N≥1] [focus…]".to_string()),
+                    event: None,
+                    quit: false,
+                    followup: None,
+                    modal: None,
+                }),
+            }
+        }
+        "/goal" => {
+            // CTX-05: goal mode. The engine confirms every action with
+            // a `goal …` note (which also drives the ◎ badge via the
+            // local mirror); bare /goal and /goal status are local
+            // reads — the app loop intercepts them before this table.
+            match rest {
+                Some("off") => Some(Slash {
+                    note: Some("goal · dropped".to_string()),
+                    event: Some(Command::Goal {
+                        action: ka_protocol::GoalAction::Drop,
+                    }),
+                    quit: false,
+                    followup: None,
+                    modal: None,
+                }),
+                Some("pause") => Some(Slash {
+                    note: Some("goal · paused".to_string()),
+                    event: Some(Command::Goal {
+                        action: ka_protocol::GoalAction::Pause,
+                    }),
+                    quit: false,
+                    followup: None,
+                    modal: None,
+                }),
+                Some("resume") => Some(Slash {
+                    note: Some("goal · resumed".to_string()),
+                    event: Some(Command::Goal {
+                        action: ka_protocol::GoalAction::Resume,
+                    }),
+                    quit: false,
+                    followup: None,
+                    modal: None,
+                }),
+                Some("status") => {
+                    // dispatched by the local-status intercept in the
+                    // app loop (the mirror lives on the meters, not here)
+                    Some(Slash {
+                        note: None,
+                        event: None,
+                        quit: false,
+                        followup: None,
+                        modal: None,
+                    })
+                }
+                Some(condition) => Some(Slash {
+                    note: Some("goal · set".to_string()),
+                    event: Some(Command::Goal {
+                        action: ka_protocol::GoalAction::Set {
+                            condition: condition.to_string(),
+                            budget_usd: None,
+                        },
+                    }),
+                    quit: false,
+                    followup: None,
+                    modal: None,
+                }),
+                None => Some(Slash {
+                    note: Some(
+                        "usage: /goal <condition> | off | pause | resume | status".to_string(),
+                    ),
+                    event: None,
+                    quit: false,
+                    followup: None,
+                    modal: None,
+                }),
+            }
+        }
+        "/loop" => {
+            // CTX-06: loop mode — re-run a task whenever the session
+            // settles. `/loop [--every <secs>] <task…>` arms it,
+            // `/loop off` disarms; the ↻ badge reflects the engine's
+            // `loop …` notes.
+            match rest {
+                Some("off") => Some(Slash {
+                    note: Some("loop · off".to_string()),
+                    event: Some(Command::Loop {
+                        action: ka_protocol::LoopAction::Off,
+                    }),
+                    quit: false,
+                    followup: None,
+                    modal: None,
+                }),
+                Some(args) => {
+                    // `[--every <secs>] ` is stripped positionally; the
+                    // task is everything after it, verbatim
+                    let (interval, task) = if let Some(after) = args.strip_prefix("--every") {
+                        let after = after.trim_start();
+                        match after.split_once(char::is_whitespace) {
+                            Some((secs, task)) => match secs.parse::<u64>() {
+                                Ok(s) => (Some(s), task.trim()),
+                                Err(_) => {
+                                    return Some(Slash {
+                                        note: Some(
+                                            "usage: /loop [--every <secs>] <task> | off"
+                                                .to_string(),
+                                        ),
+                                        event: None,
+                                        quit: false,
+                                        followup: None,
+                                        modal: None,
+                                    });
+                                }
+                            },
+                            // `--every 30` with no task, or `--every` alone
+                            None => {
+                                return Some(Slash {
+                                    note: Some(
+                                        "usage: /loop [--every <secs>] <task> | off".to_string(),
+                                    ),
+                                    event: None,
+                                    quit: false,
+                                    followup: None,
+                                    modal: None,
+                                });
+                            }
+                        }
+                    } else {
+                        (None, args)
+                    };
+                    if task.is_empty() {
+                        Some(Slash {
+                            note: Some("usage: /loop [--every <secs>] <task> | off".to_string()),
+                            event: None,
+                            quit: false,
+                            followup: None,
+                            modal: None,
+                        })
+                    } else {
+                        Some(Slash {
+                            note: Some("loop · armed".to_string()),
+                            event: Some(Command::Loop {
+                                action: ka_protocol::LoopAction::Set {
+                                    task: task.to_string(),
+                                    interval_secs: interval,
+                                },
+                            }),
+                            quit: false,
+                            followup: None,
+                            modal: None,
+                        })
+                    }
+                }
+                None => Some(Slash {
+                    note: Some("usage: /loop [--every <secs>] <task> | off".to_string()),
+                    event: None,
+                    quit: false,
+                    followup: None,
+                    modal: None,
+                }),
+            }
+        }
+        "/diff" => {
+            // SES-01: cumulative session diff — the excerpt rides back
+            // as a Note (with a spill:// pointer for the full diff,
+            // browsable from /spills)
+            Some(Slash {
+                note: Some("diff · computing session diff (excerpt arrives as a note)".to_string()),
+                event: Some(Command::SessionDiff),
+                quit: false,
+                followup: None,
+                modal: None,
+            })
+        }
         "/autocompact" => match rest {
             // CTX-12: set the digest trigger as a context-use percent,
             // `off` restores the default. The bare form only displays —
@@ -9828,13 +10265,30 @@ blocker > major > minor > nit, each as `file:line — issue — concrete fix`, \
             followup: None,
             modal: None,
         }),
-        "/memory" => Some(Slash {
-            note: None,
-            event: None,
-            quit: false,
-            followup: None,
-            modal: Some(ModalKind::Memory),
-        }),
+        "/memory" => {
+            // CTX-10 v1: `/memory consolidate` asks the engine to merge
+            // the staged inbox into MEMORY.md (result rides back as a
+            // note); any other form opens the memory viewer
+            match rest {
+                Some("consolidate") => Some(Slash {
+                    note: Some(
+                        "memory · consolidating the inbox into MEMORY.md (result arrives as a note)"
+                            .to_string(),
+                    ),
+                    event: Some(Command::MemoryConsolidate),
+                    quit: false,
+                    followup: None,
+                    modal: None,
+                }),
+                _ => Some(Slash {
+                    note: None,
+                    event: None,
+                    quit: false,
+                    followup: None,
+                    modal: Some(ModalKind::Memory),
+                }),
+            }
+        }
         "/tree" => Some(Slash {
             note: None,
             event: None,
@@ -10283,6 +10737,7 @@ fn modal_hints(open: &Modal) -> &'static [(&'static str, &'static str)] {
             ("↑↓", "choose"),
             ("⏎", "rewind"),
             ("e", "edit"),
+            ("s", "summarize"),
             ("esc", "close"),
         ],
         Modal::Memory { inbox, .. } if inbox.is_empty() => &[("esc", "close")],
@@ -10488,6 +10943,19 @@ fn status_left(meters: &Meters) -> Vec<ratatui::text::Span<'static>> {
         // a newer release is out (the startup check announced it once;
         // the badge persists)
         push(format!("\u{2934} {latest}"), crate::palette::WARN);
+    }
+    if let Some(goal) = &meters.goal {
+        // CTX-05: goal mode armed — the engine keeps working toward the
+        // condition until it holds or the budget runs out
+        if goal.paused {
+            push("◎ goal (paused)".to_string(), crate::palette::WARN);
+        } else {
+            push("◎ goal".to_string(), crate::palette::OK);
+        }
+    }
+    if meters.loop_task.is_some() {
+        // CTX-06: loop mode armed — the task re-runs on every settle
+        push("↻ loop".to_string(), crate::palette::ACCENT);
     }
     segs
 }
@@ -11809,7 +12277,7 @@ fn render(
                 let height = (items.len() as u16 + 5).clamp(6, 22);
                 let width = 76.min(fw);
                 let mut text = vec![TuiLine::styled(
-                    "pick a message — ⏎/r rewind here · e edit & resend · esc close",
+                    "pick a message — ⏎/r rewind here · e edit & resend · s summarize & rewind · esc close",
                     meta,
                 )];
                 let cap = (height as usize).saturating_sub(5);
@@ -12624,6 +13092,8 @@ fn help_modal_rows(width: usize) -> Vec<ratatui::text::Line<'static>> {
             ("/fork", "fork into a copy [turns to drop]"),
             ("/tree", "fork tree — branch from any input"),
             ("/rewind", "drop the last N exchanges"),
+            ("/compactfrom", "rewind N turns, keep a summary [N] [focus]"),
+            ("/btw", "side question — fast role, off the record"),
             ("/undo", "restore the last edited file"),
             ("/checkpoint", "snapshot the working tree (git)"),
             ("/restore", "restore a checkpoint [id | list]"),
@@ -12662,6 +13132,7 @@ fn help_modal_rows(width: usize) -> Vec<ratatui::text::Line<'static>> {
             ("/mcp", "refresh MCP tool lists (/mcp refresh)"),
             ("/prompt", "run an MCP prompt"),
             ("/spills", "browse spilled tool output"),
+            ("/diff", "session file diff (excerpt + spill pointer)"),
             ("/context", "context usage breakdown + tips"),
             ("/shake", "trim stale output now [+ thinking|images]"),
             (
@@ -12686,7 +13157,15 @@ fn help_modal_rows(width: usize) -> Vec<ratatui::text::Line<'static>> {
             ("/build", "implement the plan file"),
             ("/review", "read-only review of changes [base]"),
             ("/approve", "review the plan file, then build"),
-            ("/memory", "show loaded MEMORY.md tiers"),
+            (
+                "/goal",
+                "goal mode: /goal <condition> | off | pause | resume | status",
+            ),
+            ("/loop", "loop mode: /loop [--every secs] <task> | off"),
+            (
+                "/memory",
+                "loaded MEMORY.md tiers (/memory consolidate merges the inbox)",
+            ),
         ],
         key_style,
     );
@@ -15587,6 +16066,264 @@ mod tests {
         );
         sink.publish(AgentReport::Release);
         assert_eq!(sink.wait(), Some(AgentReport::Release));
+    }
+
+    #[test]
+    fn goal_and_loop_notes_reconcile_the_mirrors() {
+        // CTX-05: the exact engine note spellings drive the local mirror
+        let mut goal = None;
+        note_goal_state("goal set: tests pass again", &mut goal);
+        assert_eq!(
+            goal,
+            Some(GoalState {
+                condition: "tests pass again".into(),
+                paused: false,
+                budget_usd: None,
+            })
+        );
+        note_goal_state("goal set: tests pass (budget $12.5)", &mut goal);
+        assert_eq!(
+            goal,
+            Some(GoalState {
+                condition: "tests pass".into(),
+                paused: false,
+                budget_usd: Some(12.5),
+            })
+        );
+        note_goal_state("goal paused", &mut goal);
+        assert!(goal.as_ref().is_some_and(|g| g.paused));
+        note_goal_state("goal budget exhausted", &mut goal);
+        assert!(
+            goal.as_ref().is_some_and(|g| g.paused),
+            "budget exhaustion pauses"
+        );
+        note_goal_state("goal resumed", &mut goal);
+        assert!(goal.as_ref().is_some_and(|g| !g.paused));
+        note_goal_state("goal met: tests pass", &mut goal);
+        assert_eq!(goal, None, "a met goal is done — the mirror clears");
+        note_goal_state("goal dropped", &mut goal);
+        assert_eq!(goal, None);
+        // unrelated notes leave the mirror alone
+        note_goal_state("goal set: ship it", &mut goal);
+        note_goal_state("compact-from: rewound 2 turn(s), kept summary", &mut goal);
+        assert_eq!(
+            goal,
+            Some(GoalState {
+                condition: "ship it".into(),
+                paused: false,
+                budget_usd: None,
+            })
+        );
+        note_goal_state("goal met: ship it (budget $5)", &mut goal);
+        assert_eq!(goal, None);
+
+        // CTX-06: loop notes
+        let mut loop_task = None;
+        note_loop_state("loop armed: rerun the suite every 120s", &mut loop_task);
+        assert_eq!(
+            loop_task,
+            Some(LoopState {
+                task: "rerun the suite".into(),
+                interval_secs: Some(120),
+            })
+        );
+        note_loop_state("loop armed: keep the deploy green", &mut loop_task);
+        assert_eq!(
+            loop_task,
+            Some(LoopState {
+                task: "keep the deploy green".into(),
+                interval_secs: None,
+            })
+        );
+        note_loop_state("loop off", &mut loop_task);
+        assert_eq!(loop_task, None);
+        note_loop_state("goal set: unrelated", &mut loop_task);
+        assert_eq!(loop_task, None);
+    }
+
+    #[test]
+    fn compact_from_note_turns_parses_counts() {
+        assert_eq!(
+            compact_from_note_turns("compact-from: rewound 3 turn(s), kept summary"),
+            Some(3)
+        );
+        assert_eq!(
+            compact_from_note_turns("compact-from: rewound 1 turn(s), kept summary"),
+            Some(1)
+        );
+        assert_eq!(compact_from_note_turns("compact-from: done"), None);
+        assert_eq!(
+            compact_from_note_turns("session diff: 2 file(s) — full: spill://abc"),
+            None
+        );
+        assert_eq!(
+            compact_from_note_turns("rewound 2 turn(s)"),
+            None,
+            "plain rewind notes stay alone"
+        );
+    }
+
+    #[test]
+    fn compact_from_note_rewinds_the_view_and_keeps_the_note() {
+        let mut lines = Transcript::default();
+        for i in 0..3 {
+            lines.push_separated(Line::User(format!("q{i}")));
+            lines.push_separated(Line::Assistant(format!("a{i}")));
+        }
+        let (mut busy, mut busy_since) = (false, None);
+        let mut meters = Meters::default();
+        let mut pending = None;
+        let mut orphaned: Vec<(String, usize)> = Vec::new();
+        let mut usage = None;
+        let (mut a, mut t, mut tool) = (String::new(), String::new(), String::new());
+        let mut live_tool: Option<LiveTool> = None;
+        let mut last_user: Option<String> = None;
+        let mut last_error: Option<String> = None;
+        let mut spills: Vec<String> = Vec::new();
+        let mut sidebar = SidebarState::default();
+        let _ = apply_event(
+            &Event::Note {
+                message: "compact-from: rewound 2 turn(s), kept summary".into(),
+            },
+            &mut lines,
+            &mut busy,
+            &mut busy_since,
+            &mut meters,
+            &mut pending,
+            &mut orphaned,
+            &mut usage,
+            &mut a,
+            &mut t,
+            &mut tool,
+            &mut live_tool,
+            &mut last_user,
+            &mut last_error,
+            &mut spills,
+            &mut sidebar,
+        );
+        let rows: Vec<String> = lines
+            .entries()
+            .iter()
+            .filter_map(|l| match l {
+                Line::User(t) => Some(format!("user:{t}")),
+                Line::Assistant(t) => Some(format!("assistant:{t}")),
+                _ => None,
+            })
+            .collect();
+        // 3 turns in, 2 cut: only the first exchange survives, and the
+        // note rides after it
+        assert_eq!(
+            rows,
+            vec!["user:q0".to_string(), "assistant:a0".to_string()]
+        );
+        let last = lines.entries().last().expect("note row survives");
+        assert!(
+            matches!(last, Line::Info(m) if m.contains("rewound 2 turn(s)")),
+            "{last:?}"
+        );
+    }
+
+    #[test]
+    fn diff_note_appends_a_spill_hint() {
+        let apply = |message: &str| {
+            let mut lines = Transcript::default();
+            let (mut busy, mut busy_since) = (false, None);
+            let mut meters = Meters::default();
+            let mut pending = None;
+            let mut orphaned: Vec<(String, usize)> = Vec::new();
+            let mut usage = None;
+            let (mut a, mut t, mut tool) = (String::new(), String::new(), String::new());
+            let mut live_tool: Option<LiveTool> = None;
+            let mut last_user: Option<String> = None;
+            let mut last_error: Option<String> = None;
+            let mut spills: Vec<String> = Vec::new();
+            let mut sidebar = SidebarState::default();
+            let _ = apply_event(
+                &Event::Note {
+                    message: message.to_string(),
+                },
+                &mut lines,
+                &mut busy,
+                &mut busy_since,
+                &mut meters,
+                &mut pending,
+                &mut orphaned,
+                &mut usage,
+                &mut a,
+                &mut t,
+                &mut tool,
+                &mut live_tool,
+                &mut last_user,
+                &mut last_error,
+                &mut spills,
+                &mut sidebar,
+            );
+            lines
+                .entries()
+                .iter()
+                .filter_map(|l| match l {
+                    Line::Info(m) => Some(m.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        // SES-01: a spill pointer earns the /spills hint
+        let rows = apply("session diff: 4 file(s), 120 +/- lines — full: spill://s3");
+        assert_eq!(rows.len(), 2, "note + hint: {rows:?}");
+        assert!(rows[1].contains("/spills"), "{rows:?}");
+        // …and a plain note stays a single row
+        assert_eq!(apply("goal paused").len(), 1);
+    }
+
+    #[test]
+    fn status_line_badges_goal_and_loop() {
+        let text = |m: &Meters| {
+            status_left(m)
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        };
+        let mut m = Meters::default();
+        assert_eq!(text(&m), "", "no badges when both are off");
+        m.goal = Some(GoalState {
+            condition: "tests pass".into(),
+            paused: false,
+            budget_usd: None,
+        });
+        assert_eq!(text(&m), "◎ goal");
+        m.goal.as_mut().expect("goal").paused = true;
+        assert_eq!(text(&m), "◎ goal (paused)");
+        m.loop_task = Some(LoopState {
+            task: "rerun suite".into(),
+            interval_secs: Some(60),
+        });
+        assert_eq!(text(&m), "◎ goal (paused) ↻ loop");
+        m.goal = None;
+        assert_eq!(text(&m), "↻ loop");
+    }
+
+    #[test]
+    fn goal_status_note_reads_the_mirror() {
+        assert_eq!(
+            goal_status_note(None),
+            "goal · none set — /goal <condition> arms goal mode"
+        );
+        assert_eq!(
+            goal_status_note(Some(&GoalState {
+                condition: "tests pass".into(),
+                paused: false,
+                budget_usd: Some(5.0),
+            })),
+            "goal · tests pass · budget $5"
+        );
+        assert_eq!(
+            goal_status_note(Some(&GoalState {
+                condition: "tests pass".into(),
+                paused: true,
+                budget_usd: None,
+            })),
+            "goal · tests pass (paused)"
+        );
     }
 
     #[test]

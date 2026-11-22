@@ -7,6 +7,7 @@ pub mod checkpoint;
 pub mod config;
 pub mod conventions;
 pub mod dap;
+mod diff;
 mod engine;
 pub mod features;
 mod fshooks;

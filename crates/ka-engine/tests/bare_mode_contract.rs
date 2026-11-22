@@ -184,3 +184,65 @@ async fn safe_mode_pins_feature_toggles_off() {
     conventions::set_bare_mode(false);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// CTX-06: the loop never arms in safe mode — an unattended repeat
+/// executor is a customization-tier risk the bare surface pins off.
+/// Set is refused with a note, no cycle ever fires.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn safe_mode_never_arms_the_loop() {
+    let _guard = FLAG_LOCK.lock();
+    use ka_protocol::{Command, Event};
+    let dir = std::env::temp_dir().join(format!("ka-bare-loop-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg = ka_engine::Config {
+        cwd: Some(dir.to_string_lossy().into_owned()),
+        ..Default::default()
+    };
+    let catalog = ka_dialect::Catalog::parse(
+        "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000000\n",
+    )
+    .unwrap();
+    conventions::set_bare_mode(true);
+    let mut handle = ka_engine::spawn_with(cfg, catalog);
+    handle
+        .commands
+        .send(Command::Loop {
+            action: ka_protocol::LoopAction::Set {
+                task: "run the checks".into(),
+                interval_secs: None,
+            },
+        })
+        .await
+        .expect("engine alive");
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), handle.events.recv()).await {
+            Ok(Some(Event::Note { message, .. })) => {
+                if message.contains("loop unavailable in safe mode") {
+                    break;
+                }
+            }
+            Ok(Some(_)) => continue,
+            _ => panic!("loop Set refusal never arrived"),
+        }
+    }
+    // and no cycle ever fires: drain trailing events (Idle etc.) and
+    // watch for turn events over a 1.5s quiet window
+    let mut fired = false;
+    for _ in 0..10 {
+        match tokio::time::timeout(std::time::Duration::from_millis(150), handle.events.recv())
+            .await
+        {
+            Ok(Some(Event::TurnFinished { .. })) => {
+                fired = true;
+                break;
+            }
+            Ok(Some(_)) => continue,
+            _ => break,
+        }
+    }
+    assert!(!fired, "loop fired despite safe mode");
+    conventions::set_bare_mode(false);
+    let _ = std::fs::remove_dir_all(&dir);
+}

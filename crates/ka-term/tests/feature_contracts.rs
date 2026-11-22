@@ -32,6 +32,11 @@ fn every_documented_slash_command_parses() {
         "/tasks",
         "/approve",
         "/rewind",
+        "/compactfrom",
+        "/btw",
+        "/goal",
+        "/loop",
+        "/diff",
         "/fork",
         "/checkpoint",
         "/restore",
@@ -69,11 +74,13 @@ fn every_documented_slash_command_parses() {
     // /copy /clip, and the /skill:<name> family (validated
     // against the inventory, dispatched as a scoped Prompt — see
     // skill_invocation_scopes_the_turn), plus the local faces of
-    // /focus (view toggle) and bare /autocompact (display; the
-    // session's trigger value lives in the app loop). Mouse capture
-    // toggles with Ctrl+M, not a slash command. They are covered by
-    // the input-layer unit tests in src; if you move one into
-    // slash_command, add it above.
+    // /focus (view toggle), bare /autocompact (display; the
+    // session's trigger value lives in the app loop), and
+    // /goal [/goal status] (a local read of the goal mirror the
+    // engine's goal notes keep; CTX-05 has no Status action).
+    // Mouse capture toggles with Ctrl+M, not a slash command. They are
+    // covered by the input-layer unit tests in src; if you move one
+    // into slash_command, add it above.
 }
 
 /// CTX-02: /shake parses bare (stale-output-only trim) and with modes
@@ -111,7 +118,196 @@ fn shake_parses_modes_and_refuses_unknown_words() {
     );
 }
 
-/// CTX-12: /autocompact <1-100|off> carries SetAutoCompact; out-of-range
+/// CTX-03: /btw <question> dispatches a SideQuestion (fast role, tools
+/// off) and confirms in the transcript; a bare /btw refuses with a
+/// usage note instead of asking nothing.
+#[test]
+fn btw_sends_side_question_and_confirms() {
+    let s = slash_command("/btw why does the retry loop spin?").expect("/btw parses");
+    match s.event {
+        Some(ka_protocol::Command::SideQuestion { text }) => {
+            assert_eq!(text, "why does the retry loop spin?");
+        }
+        other => panic!("/btw carried {other:?}"),
+    }
+    assert_eq!(
+        s.note.as_deref(),
+        Some("btw · asked (answer arrives as a note)")
+    );
+    let bare = slash_command("/btw").expect("usage row still parses");
+    assert!(bare.event.is_none(), "no question, no side trip");
+    assert!(
+        bare.note
+            .as_deref()
+            .is_some_and(|n| n.starts_with("usage:")),
+        "{:?}",
+        bare.note
+    );
+}
+
+/// CTX-01: /compactfrom [N] [focus…] — a leading number is the turn
+/// count (default 1), remaining words steer the summary; prose-only
+/// input reads as focus on the last turn; 0 turns is refused.
+#[test]
+fn compactfrom_parses_turns_focus_and_refuses_zero() {
+    let parse = |input: &str| match slash_command(input) {
+        Some(s) => match s.event {
+            Some(ka_protocol::Command::CompactFrom { turns, focus }) => (turns, focus),
+            other => panic!("{input} carried {other:?}"),
+        },
+        None => panic!("{input} must parse"),
+    };
+    assert_eq!(parse("/compactfrom"), (1, None), "default is the last turn");
+    assert_eq!(parse("/compactfrom 3"), (3, None));
+    assert_eq!(
+        parse("/compactfrom 2 keep the auth findings"),
+        (2, Some("keep the auth findings".to_string()))
+    );
+    assert_eq!(
+        parse("/compactfrom keep the auth findings"),
+        (1, Some("keep the auth findings".to_string())),
+        "prose without a count steers the summary of the last turn"
+    );
+    for bad in ["/compactfrom 0", "/compactfrom 0 focus"] {
+        let s = slash_command(bad).expect("usage row still parses");
+        assert!(s.event.is_none(), "{bad} must not carry an event");
+        assert!(
+            s.note.as_deref().is_some_and(|n| n.starts_with("usage:")),
+            "{bad}: {:?}",
+            s.note
+        );
+    }
+}
+
+/// CTX-05: /goal carries the exact GoalAction variants the protocol
+/// ships (Set/Pause/Resume/Drop — status is a local read of the goal
+/// mirror, intercepted in the app loop, so the parser returns a no-op
+/// for it); bare /goal is a usage row here.
+#[test]
+fn goal_parses_actions_and_leaves_status_to_the_local_mirror() {
+    let s = slash_command("/goal all tests stay green").expect("/goal parses");
+    match s.event {
+        Some(ka_protocol::Command::Goal {
+            action:
+                ka_protocol::GoalAction::Set {
+                    condition,
+                    budget_usd,
+                },
+        }) => {
+            assert_eq!(condition, "all tests stay green");
+            assert_eq!(budget_usd, None, "the simple form carries no budget");
+        }
+        other => panic!("/goal <cond> carried {other:?}"),
+    }
+    let action = |input: &str| match slash_command(input).expect(input).event {
+        Some(ka_protocol::Command::Goal { action }) => Some(action),
+        other => panic!("{input} carried {other:?}"),
+    };
+    assert!(matches!(
+        action("/goal off"),
+        Some(ka_protocol::GoalAction::Drop)
+    ));
+    assert!(matches!(
+        action("/goal pause"),
+        Some(ka_protocol::GoalAction::Pause)
+    ));
+    assert!(matches!(
+        action("/goal resume"),
+        Some(ka_protocol::GoalAction::Resume)
+    ));
+    // status is local: no GoalAction::Status exists, the app loop owns it
+    let s = slash_command("/goal status").expect("/goal status parses");
+    assert!(s.event.is_none() && s.note.is_none());
+    let bare = slash_command("/goal").expect("usage row still parses");
+    assert!(bare.event.is_none());
+    assert!(
+        bare.note
+            .as_deref()
+            .is_some_and(|n| n.starts_with("usage:")),
+        "{:?}",
+        bare.note
+    );
+}
+
+/// CTX-06: /loop [--every <secs>] <task> arms LoopAction::Set,
+/// /loop off disarms; a bare /loop, an interval without a task, or a
+/// non-numeric interval refuse with usage notes.
+#[test]
+fn loop_parses_task_every_and_off() {
+    let s = slash_command("/loop rerun the test suite").expect("/loop parses");
+    match s.event {
+        Some(ka_protocol::Command::Loop {
+            action:
+                ka_protocol::LoopAction::Set {
+                    task,
+                    interval_secs,
+                },
+        }) => {
+            assert_eq!(task, "rerun the test suite");
+            assert_eq!(interval_secs, None, "bare task fires on the next settle");
+        }
+        other => panic!("/loop <task> carried {other:?}"),
+    }
+    let s = slash_command("/loop --every 120 rerun the test suite").expect("/loop --every parses");
+    match s.event {
+        Some(ka_protocol::Command::Loop {
+            action:
+                ka_protocol::LoopAction::Set {
+                    task,
+                    interval_secs,
+                },
+        }) => {
+            assert_eq!(task, "rerun the test suite");
+            assert_eq!(interval_secs, Some(120));
+        }
+        other => panic!("/loop --every carried {other:?}"),
+    }
+    let s = slash_command("/loop off").expect("/loop off parses");
+    assert!(matches!(
+        s.event,
+        Some(ka_protocol::Command::Loop {
+            action: ka_protocol::LoopAction::Off
+        })
+    ));
+    for bad in ["/loop", "/loop --every 120", "/loop --every soon rerun"] {
+        let s = slash_command(bad).expect("usage row still parses");
+        assert!(s.event.is_none(), "{bad} must not carry an event");
+        assert!(
+            s.note.as_deref().is_some_and(|n| n.starts_with("usage:")),
+            "{bad}: {:?}",
+            s.note
+        );
+    }
+}
+
+/// SES-01: /diff dispatches SessionDiff; the excerpt + spill pointer
+/// come back as a Note (rendered with a /spills hint).
+#[test]
+fn diff_sends_session_diff() {
+    let s = slash_command("/diff").expect("/diff parses");
+    assert!(matches!(s.event, Some(ka_protocol::Command::SessionDiff)));
+    assert!(s.note.as_deref().is_some_and(|n| n.contains("note")));
+}
+
+/// CTX-10 v1: /memory consolidate dispatches MemoryConsolidate (the
+/// engine merges the staged inbox into MEMORY.md and reports by note);
+/// the bare form still opens the memory viewer.
+#[test]
+fn memory_consolidate_dispatches_and_bare_opens_the_viewer() {
+    let s = slash_command("/memory consolidate").expect("/memory consolidate parses");
+    assert!(matches!(
+        s.event,
+        Some(ka_protocol::Command::MemoryConsolidate)
+    ));
+    assert!(s.modal.is_none(), "consolidate must not open the viewer");
+    let bare = slash_command("/memory").expect("/memory parses");
+    assert!(bare.event.is_none());
+    assert!(matches!(bare.modal, Some(ka_term::tui::ModalKind::Memory)));
+}
+
+/// CTX-05/06: the goal/loop mirrors fold the engine's notes — covered
+/// by goal_and_loop_notes_reconcile_the_mirrors in src/tui.rs. CTX-12:
+/// /autocompact <1-100|off> carries SetAutoCompact; out-of-range
 /// or non-numeric values refuse with a usage note; the bare form is a
 /// display-only parse (the app loop prints the session's value).
 #[test]

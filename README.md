@@ -73,6 +73,11 @@ Handy extras, all strict-TOML like everything else:
 - **Recaps & branch summaries** — on idle (if `[context] recap_minutes` is set) a cheap model writes a one-line session recap (surfaced by `ka sessions`); rewinding a non-empty branch pins a ≤3-sentence summary of the abandoned tail onto the branch you keep.
 - **Idle compaction (off by default)** — `[context] idle_minutes` + `idle_compact_pct` compact an idle session once its context crosses the threshold; `[context] autocompact_pct` sets that threshold explicitly, and `/autocompact N|off` changes it live.
 - **`/shake [thinking|images]`** — run the deterministic context trim on demand; `/context` renders optimization hints from the breakdown; `/focus` collapses older turns; `Ctrl+S` stashes the draft.
+- **Context surgery** — `/compactfrom [N] [focus]` rewinds N turns and pins a ≤6-sentence summary of what was dropped onto the branch you keep; `ka session` history stays append-only while `Command::ContextEdit` (for protocol hosts) edits/drops one message's context view; `ka --restore` resumes the newest session and re-asks its dangling user turn (crash recovery).
+- **`/diff`** — the session's cumulative file diff (snapshot originals vs current disk; full diff to a spill file, excerpt on the transcript).
+- **`/btw <question>`** — side-channel answer from the fast role: tools off, never enters the transcript or context.
+- **Goals & loops** — `/goal <condition>` keeps the session working toward a condition (cheap-model judge per turn, optional USD budget, pause/resume/drop, ◎ badge); `/loop <task>` re-runs a task whenever the engine settles idle (↻ badge, `/loop off` stops).
+- **Prewalk & memory consolidation** — `[context] prewalk = true` (or `--prewalk`) briefs the model with a ≤5-bullet repo overview before the first turn; `Command::MemoryConsolidate` (protocol hosts; TUI command lands with the memory UX) rewrites `MEMORY.md` from the remember inbox with a printed diff.
 
 ## Safety
 

@@ -146,6 +146,23 @@ pub enum Record {
         /// Last kept message record; everything after it is discarded.
         kept_from: RecordId,
     },
+    /// SES-09 context-view edit, append-only (like every record, the
+    /// line itself never mutates): replay applies `new_content` onto the
+    /// target message's slot in the live window — `Some(text)`
+    /// replaces its content, `None` drops the message from the window.
+    /// The underlying [`Record::Message`] line stays in the file either
+    /// way. Edits are never retracted (a later Rewind leaves them, like
+    /// [`Record::Custom`]); they replay positionally, so an edit only
+    /// affects the window while the target survives in it.
+    ContextEdit {
+        /// Record identifier.
+        id: RecordId,
+        /// The message record being edited.
+        target: RecordId,
+        /// The replacement content, or None to drop it from context.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        new_content: Option<String>,
+    },
     /// Extension-owned opaque record (namespaced; engine reserves `x.ka.*`).
     Custom {
         /// Record identifier.
@@ -200,6 +217,7 @@ impl Record {
             | Record::Digest { id, .. }
             | Record::Boundary { id, .. }
             | Record::Rewind { id, .. }
+            | Record::ContextEdit { id, .. }
             | Record::Title { id, .. }
             | Record::Name { id, .. }
             | Record::Usage { id, .. }
@@ -614,6 +632,31 @@ impl StrandFile {
         self.append(record)?;
         self.settings.dangling = false;
         Ok(true)
+    }
+
+    /// SES-04: the stranded user prompt of a dangling turn — the content
+    /// of the LAST User message in the live context window (see
+    /// [`context_window`]) when the session ended on a hung turn
+    /// (`settings().dangling`, true right after `open()` of a file whose
+    /// last record is a user message). `ka --restore` re-sends this
+    /// prompt to resume the interrupted turn. `None` when the session is
+    /// not dangling, or when the window holds no User message (e.g. the
+    /// dangling prompt was itself dropped by a
+    /// [`Record::ContextEdit`]); in that case there is nothing to
+    /// re-send.
+    pub fn pending_user_prompt(&self) -> Option<String> {
+        if !self.settings.dangling {
+            return None;
+        }
+        let (live, edited) = window_slots(&self.records);
+        live.iter().rev().find_map(|&idx| match &self.records[idx] {
+            Record::Message {
+                role: Role::User,
+                content,
+                ..
+            } => Some(edited.get(&idx).cloned().unwrap_or_else(|| content.clone())),
+            _ => None,
+        })
     }
 
     /// Append a record (writes through to disk; memory-only when
@@ -1694,6 +1737,106 @@ pub fn read(path: &Path) -> std::io::Result<Vec<Record>> {
     Ok(out)
 }
 
+/// Resolve a SES-09 [`Record::ContextEdit`] target against the live
+/// window's message ids: the LAST match scanning backwards from the
+/// window tip (ids are unique in practice; a duplicate resolves to the
+/// copy closest to the tip). `None` when the target is not in the
+/// window — already retracted by a Rewind/Boundary/Digest, or unknown —
+/// and the edit is silently ignored, like the engine's unknown rewind
+/// anchor rule. The single resolution rule every fold shares (this
+/// crate's [`context_window`] and the engine's `history_from_records`).
+pub fn resolve_context_edit(ids: &[RecordId], target: &RecordId) -> Option<usize> {
+    ids.iter().rposition(|i| i == target)
+}
+
+/// The live context window of a record slice: the message records a
+/// resumed session puts back in front of the model, in order, after
+/// replay applies the view records. Shared fold core with the engine's
+/// `history_from_records` (`window_slots` carries the same retract and
+/// edit rules over record indices). Edits surface as the message's
+/// content; the slice itself is never mutated.
+///
+/// Replay semantics (strictly positional — each record folds onto the
+/// window as it is at that point in the stream):
+/// - [`Record::Message`] joins the window.
+/// - [`Record::Digest`] empties it (the summary carries the past) and
+///   [`Record::Boundary`] empties it (rewind-to-zero).
+/// - [`Record::Rewind`] truncates after `kept_from`; an unknown anchor
+///   empties the window (never keeps an abandoned tail logically live).
+/// - [`Record::ContextEdit`] resolves its target with
+///   [`resolve_context_edit`]: `Some(text)` replaces the message's
+///   content from that point on, `None` removes it. An edit whose
+///   target is out of the window is silently ignored, and a later
+///   Rewind never retracts the edit RECORD — the edit simply stops
+///   having an effect once its target leaves the window.
+pub fn context_window(records: &[Record]) -> Vec<Record> {
+    let (live, edited) = window_slots(records);
+    live.into_iter()
+        .map(|idx| {
+            let mut record = records[idx].clone();
+            if let (Record::Message { content, .. }, Some(text)) = (&mut record, edited.get(&idx)) {
+                *content = text.clone();
+            }
+            record
+        })
+        .collect()
+}
+
+/// Fold core behind [`context_window`]: the surviving message record
+/// indices in window order plus their content overrides (record index →
+/// replacement text), so callers that only need positions or one lookup
+/// (e.g. [`StrandFile::pending_user_prompt`]) skip cloning messages.
+fn window_slots(records: &[Record]) -> (Vec<usize>, HashMap<usize, String>) {
+    let mut live: Vec<usize> = Vec::new();
+    let mut ids: Vec<RecordId> = Vec::new();
+    let mut edited: HashMap<usize, String> = HashMap::new();
+    for (idx, record) in records.iter().enumerate() {
+        match record {
+            Record::Message { id, .. } => {
+                live.push(idx);
+                ids.push(id.clone());
+            }
+            Record::Digest { .. } | Record::Boundary { .. } => {
+                live.clear();
+                ids.clear();
+                edited.clear();
+            }
+            Record::Rewind { kept_from, .. } => match ids.iter().position(|i| i == kept_from) {
+                Some(pos) => {
+                    live.truncate(pos + 1);
+                    ids.truncate(pos + 1);
+                }
+                None => {
+                    live.clear();
+                    ids.clear();
+                    edited.clear();
+                }
+            },
+            Record::ContextEdit {
+                target,
+                new_content,
+                ..
+            } => {
+                if let Some(pos) = resolve_context_edit(&ids, target) {
+                    let idx = live[pos];
+                    match new_content {
+                        Some(text) => {
+                            edited.insert(idx, text.clone());
+                        }
+                        None => {
+                            live.remove(pos);
+                            ids.remove(pos);
+                            edited.remove(&idx);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    (live, edited)
+}
+
 /// Render records as markdown — the exact shape the CLI's `ka export`
 /// writes to a file or stdout (shared with the TUI's `/export`).
 pub fn render_markdown(records: &[Record]) -> String {
@@ -2439,6 +2582,23 @@ mod tests {
                         ids.clear();
                     }
                 },
+                // SES-09: the same resolution rule as
+                // `resolve_context_edit` — backwards scan, miss ignores.
+                Record::ContextEdit {
+                    target,
+                    new_content,
+                    ..
+                } => {
+                    if let Some(pos) = ids.iter().rposition(|i| i == target) {
+                        match new_content {
+                            Some(text) => out[pos] = text.clone(),
+                            None => {
+                                out.remove(pos);
+                                ids.remove(pos);
+                            }
+                        }
+                    }
+                }
                 _ => {}
             }
         }

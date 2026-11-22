@@ -53,5 +53,10 @@ required-features = ["test-util"]
 name = "feature_toggle_contract"
 required-features = ["test-util"]
 
+# context_contracts drives the same trust + data-dir redirection.
+[[test]]
+name = "context_contracts"
+required-features = ["test-util"]
+
 [lints]
 workspace = true

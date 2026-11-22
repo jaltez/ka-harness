@@ -189,6 +189,35 @@ impl Snapshots {
         &self.manifest
     }
 
+    /// SES-01: what this strand mutated, first mutation per path, with
+    /// the stored pre-mutation blob path (`None` for creations — the
+    /// original did not exist — and for inert stores). The session
+    /// diff diffs these originals against current disk.
+    pub fn session_originals(&self, strand: &str) -> Vec<(PathBuf, Option<PathBuf>)> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for e in &self.manifest {
+            if e.strand != strand || !seen.insert(e.path.clone()) {
+                continue;
+            }
+            let blob = if e.existed {
+                self.root.as_ref().map(|root| {
+                    // legacy journals (no recorded name) keep the
+                    // pre-pid `{seq}.blob` spelling, same as undo
+                    if e.blob.is_empty() {
+                        root.join(format!("{}.blob", e.seq))
+                    } else {
+                        root.join(&e.blob)
+                    }
+                })
+            } else {
+                None
+            };
+            out.push((e.path.clone(), blob));
+        }
+        out
+    }
+
     fn append_journal(&mut self, root: &Path, entry: &SnapEntry) -> io::Result<()> {
         use std::io::Write;
         std::fs::create_dir_all(root)?;

@@ -896,3 +896,374 @@ fn gc_dry_run_matches_apply_and_never_touches_strands() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// SES-09 replace: a ContextEdit rewrites the target message's content
+/// in the live window, the message line itself never mutates, and the
+/// fold reproduces the same window from the reopened file. The serde
+/// shape is pinned byte-for-byte (one line, `"record"` tag, fields in
+/// declaration order).
+#[test]
+fn context_edit_replace_rewrites_the_window_and_replays() {
+    let _guard = DATA_DIR_LOCK.lock().unwrap();
+    let dir = temp_data_dir("ctx-replace");
+    let cwd = dir.join("proj");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut strand = StrandFile::create(&cwd, None).unwrap();
+
+    let id_of = |r: &Record| match r {
+        Record::Message { id, .. } | Record::ContextEdit { id, .. } => id.clone(),
+        _ => unreachable!("test records are messages or edits"),
+    };
+    let m1 = user_msg("original question");
+    let m2 = Record::Message {
+        images: Vec::new(),
+        id: ka_strand::new_record_id(),
+        role: Role::Assistant,
+        content: "an answer".into(),
+        calls: Vec::new(),
+        results: Vec::new(),
+        thinking: None,
+    };
+    let m3 = user_msg("follow-up");
+    let (m1_id, m2_id, m3_id) = (id_of(&m1), id_of(&m2), id_of(&m3));
+    for r in [m1, m2, m3] {
+        strand.append(r).unwrap();
+    }
+
+    let edit = Record::ContextEdit {
+        id: ka_strand::new_record_id(),
+        target: m1_id.clone(),
+        new_content: Some("edited question".into()),
+    };
+    let edit_id = id_of(&edit);
+    assert_eq!(
+        serde_json::to_string(&edit).unwrap(),
+        format!(
+            r#"{{"record":"context_edit","id":"{}","target":"{}","new_content":"edited question"}}"#,
+            edit_id.0, m1_id.0
+        ),
+        "exact serde shape: tag first, then id/target/new_content"
+    );
+    strand.append(edit).unwrap();
+
+    let window = ka_strand::context_window(strand.records());
+    let contents: Vec<&str> = window
+        .iter()
+        .map(|r| match r {
+            Record::Message { content, .. } => content.as_str(),
+            _ => unreachable!("the window is messages only"),
+        })
+        .collect();
+    assert_eq!(contents, ["edited question", "an answer", "follow-up"]);
+    assert_eq!(
+        window.iter().map(Record::id).collect::<Vec<_>>(),
+        [Some(&m1_id), Some(&m2_id), Some(&m3_id)],
+        "ids survive: the window keeps the original message identity"
+    );
+
+    // append-only: the original Message line and the edit line coexist
+    let path = strand.path().unwrap().to_path_buf();
+    let file = std::fs::read_to_string(&path).unwrap();
+    assert!(file.contains(r#""content":"original question""#));
+    assert!(file.contains(r#""record":"context_edit""#));
+
+    // the fold reproduces the same window from the reopened file
+    drop(strand);
+    let reopened = StrandFile::open(&path).unwrap();
+    assert_eq!(
+        ka_strand::context_window(reopened.records()),
+        window,
+        "replay of the file must reproduce the live window"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// SES-09 drop: `new_content = None` removes the target from the window
+/// while settings and the surviving messages are untouched. The drop
+/// line serializes without the `new_content` key.
+#[test]
+fn context_edit_drop_removes_the_message_and_keeps_settings() {
+    let _guard = DATA_DIR_LOCK.lock().unwrap();
+    let dir = temp_data_dir("ctx-drop");
+    let cwd = dir.join("proj");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut strand = StrandFile::create(&cwd, None).unwrap();
+
+    let id_of = |r: &Record| match r {
+        Record::Message { id, .. } | Record::ContextEdit { id, .. } => id.clone(),
+        _ => unreachable!("test records are messages or edits"),
+    };
+    let m1 = user_msg("question one");
+    let m2 = Record::Message {
+        images: Vec::new(),
+        id: ka_strand::new_record_id(),
+        role: Role::Assistant,
+        content: "to be dropped".into(),
+        calls: Vec::new(),
+        results: Vec::new(),
+        thinking: None,
+    };
+    let m3 = user_msg("keep me");
+    let m2_id = id_of(&m2);
+    for r in [
+        m1,
+        m2,
+        m3,
+        Record::Change {
+            id: ka_strand::new_record_id(),
+            model: Some("openai/gpt-5.1@high".into()),
+            effort: None,
+            mode: None,
+            features: None,
+            sandbox: None,
+        },
+    ] {
+        strand.append(r).unwrap();
+    }
+
+    let edit = Record::ContextEdit {
+        id: ka_strand::new_record_id(),
+        target: m2_id.clone(),
+        new_content: None,
+    };
+    let edit_id = id_of(&edit);
+    assert_eq!(
+        serde_json::to_string(&edit).unwrap(),
+        format!(
+            r#"{{"record":"context_edit","id":"{}","target":"{}"}}"#,
+            edit_id.0, m2_id.0
+        ),
+        "None drops serialize without the new_content key"
+    );
+    strand.append(edit).unwrap();
+
+    let contents: Vec<String> = ka_strand::context_window(strand.records())
+        .iter()
+        .map(|r| match r {
+            Record::Message { content, .. } => content.clone(),
+            _ => unreachable!("the window is messages only"),
+        })
+        .collect();
+    assert_eq!(contents, ["question one", "keep me"]);
+
+    let path = strand.path().unwrap().to_path_buf();
+    drop(strand);
+    let reopened = StrandFile::open(&path).unwrap();
+    let contents: Vec<String> = ka_strand::context_window(reopened.records())
+        .iter()
+        .map(|r| match r {
+            Record::Message { content, .. } => content.clone(),
+            _ => unreachable!("the window is messages only"),
+        })
+        .collect();
+    assert_eq!(contents, ["question one", "keep me"]);
+    // edits are view records: settings replay is untouched
+    assert_eq!(
+        reopened.settings().model.as_deref(),
+        Some("openai/gpt-5.1@high")
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An edit whose target is not in the live window is silently ignored —
+/// retracted by a rewind, behind a digest, or unknown. Never an error,
+/// never a partial effect.
+#[test]
+fn context_edit_target_out_of_window_is_silently_ignored() {
+    let id_of = |r: &Record| match r {
+        Record::Message { id, .. } => id.clone(),
+        _ => unreachable!("test records are messages"),
+    };
+    let m0 = user_msg("kept");
+    let m1 = user_msg("kept too");
+    let m2 = user_msg("abandoned");
+    let (m0_id, m1_id, m2_id) = (id_of(&m0), id_of(&m1), id_of(&m2));
+    // `target`'s type comes off the message ids themselves
+    let edit = |target: _| Record::ContextEdit {
+        id: ka_strand::new_record_id(),
+        target,
+        new_content: Some("ghost".into()),
+    };
+    let contents = |records: &[Record]| -> Vec<String> {
+        ka_strand::context_window(records)
+            .iter()
+            .map(|r| match r {
+                Record::Message { content, .. } => content.clone(),
+                _ => unreachable!("the window is messages only"),
+            })
+            .collect()
+    };
+
+    // the rewind retracted m2: an edit naming it does nothing
+    let records = vec![
+        m0.clone(),
+        m1.clone(),
+        m2,
+        Record::Rewind {
+            id: ka_strand::new_record_id(),
+            kept_from: m1_id.clone(),
+        },
+        edit(m2_id),
+    ];
+    assert_eq!(contents(&records), ["kept", "kept too"]);
+
+    // unknown ids miss the same way (an id captured off a decoy message
+    // that never joins the window)
+    let decoy = user_msg("never appended");
+    let records = vec![m0.clone(), edit(id_of(&decoy))];
+    assert_eq!(contents(&records), ["kept"]);
+
+    // a digest empties the anchor set: even once-live targets miss
+    let records = vec![
+        m0,
+        m1,
+        Record::Digest {
+            id: ka_strand::new_record_id(),
+            summary: "compacted".into(),
+            kept_from: m0_id,
+        },
+        edit(m1_id),
+    ];
+    assert!(contents(&records).is_empty());
+}
+
+/// Edits are never retracted: a later Rewind leaves the edit record in
+/// the chain, and replay is strictly positional — the edit still shows
+/// while its target survives the rewind (case A: the edit landed before
+/// the rewind and the target is kept), and stops having any effect once
+/// the target leaves the window (case B: the rewind rewinds PAST the
+/// target). The edit line itself always stays in the file/render.
+#[test]
+fn context_edit_survives_a_later_rewind_positionally() {
+    let id_of = |r: &Record| match r {
+        Record::Message { id, .. } => id.clone(),
+        _ => unreachable!("test records are messages"),
+    };
+    let contents = |records: &[Record]| -> Vec<String> {
+        ka_strand::context_window(records)
+            .iter()
+            .map(|r| match r {
+                Record::Message { content, .. } => content.clone(),
+                _ => unreachable!("the window is messages only"),
+            })
+            .collect()
+    };
+
+    // case A: m1 m2 m3, edit(m1), rewind(kept_from=m2) — m3 is the
+    // abandoned sibling, m1 keeps its edited content
+    let m1 = user_msg("first");
+    let m2 = user_msg("second");
+    let m3 = user_msg("third");
+    let (m1_id, m2_id) = (id_of(&m1), id_of(&m2));
+    let records = vec![
+        m1.clone(),
+        m2.clone(),
+        m3,
+        Record::ContextEdit {
+            id: ka_strand::new_record_id(),
+            target: m1_id.clone(),
+            new_content: Some("first (edited)".into()),
+        },
+        Record::Rewind {
+            id: ka_strand::new_record_id(),
+            kept_from: m2_id,
+        },
+    ];
+    assert_eq!(contents(&records), ["first (edited)", "second"]);
+    let rendered = ka_strand::render_jsonl(&records).unwrap();
+    assert!(
+        rendered.contains(r#""record":"context_edit""#),
+        "the edit record is never retracted from the chain"
+    );
+
+    // case B: the rewind truncates past the target — the edit record
+    // stays in the chain but no longer affects the window
+    let m0 = user_msg("anchor");
+    let m0_id = id_of(&m0);
+    let records = vec![
+        m0,
+        m1,
+        m2,
+        Record::ContextEdit {
+            id: ka_strand::new_record_id(),
+            target: m1_id,
+            new_content: Some("first (edited)".into()),
+        },
+        Record::Rewind {
+            id: ka_strand::new_record_id(),
+            kept_from: m0_id,
+        },
+    ];
+    assert_eq!(contents(&records), ["anchor"]);
+    // the edit line survives the render; the retracted sibling messages
+    // do not (they are the rewind's abandoned branch, and re-parsing
+    // the render leaves the edit with a missing target — ignored)
+    let rendered = ka_strand::render_jsonl(&records).unwrap();
+    assert!(rendered.contains(r#""record":"context_edit""#));
+    assert!(!rendered.contains(r#""content":"first""#), "{rendered}");
+}
+
+/// SES-04: the stranded prompt a `ka --restore` re-sends. Some while
+/// the turn is dangling (user appended, no assistant yet — live and on
+/// reopen), None after the pair completes, and an applied edit decides
+/// what restore would re-send.
+#[test]
+fn pending_user_prompt_tracks_the_dangling_turn() {
+    let _guard = DATA_DIR_LOCK.lock().unwrap();
+    let dir = temp_data_dir("pending-prompt");
+    let cwd = dir.join("proj");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut strand = StrandFile::create(&cwd, None).unwrap();
+
+    // nothing yet: no dangling turn, no prompt
+    assert_eq!(strand.pending_user_prompt(), None);
+
+    // user appended, assistant missing: the turn hangs
+    strand.append(user_msg("half-finished prompt")).unwrap();
+    assert_eq!(
+        strand.pending_user_prompt().as_deref(),
+        Some("half-finished prompt")
+    );
+
+    // the pair completes: nothing pending
+    strand
+        .append(Record::Message {
+            images: Vec::new(),
+            id: ka_strand::new_record_id(),
+            role: Role::Assistant,
+            content: "done".into(),
+            calls: Vec::new(),
+            results: Vec::new(),
+            thinking: None,
+        })
+        .unwrap();
+    assert_eq!(strand.pending_user_prompt(), None);
+
+    // a NEW dangling user turn is the pending prompt after the reopen
+    strand.append(user_msg("new dangling prompt")).unwrap();
+    let path = strand.path().unwrap().to_path_buf();
+    drop(strand);
+    let reopened = StrandFile::open(&path).unwrap();
+    assert!(reopened.settings().dangling);
+    assert_eq!(
+        reopened.pending_user_prompt().as_deref(),
+        Some("new dangling prompt")
+    );
+
+    // the window view decides: an applied edit to the pending prompt
+    // changes what restore re-sends
+    let pending_id = match reopened.records().last() {
+        Some(Record::Message { id, .. }) => id.clone(),
+        other => unreachable!("expected the dangling message, got {other:?}"),
+    };
+    let mut edited = StrandFile::open(&path).unwrap();
+    edited
+        .append(Record::ContextEdit {
+            id: ka_strand::new_record_id(),
+            target: pending_id,
+            new_content: Some("rewritten".into()),
+        })
+        .unwrap();
+    assert_eq!(edited.pending_user_prompt().as_deref(), Some("rewritten"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
