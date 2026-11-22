@@ -66,9 +66,13 @@ Handy extras, all strict-TOML like everything else:
 - `project_doc_fallback_filenames = ["CLAUDE.md", ...]` — extra instruction-file names where a directory has no `AGENTS.md`; `AGENTS.override.md` replaces a directory's layer entirely.
 - `[prompt] identity_inline` — replace ka's built-in identity sentence inline (`identity_file` still wins); also `--system-prompt "…"` per run.
 - `[features] allow = [...]` — positive hand allowlist: unlisted hands are hidden from the model and rejected at admit time (disable still wins).
-- `ka session rename|delete|archive|unarchive` — rename (retitle), delete with child-fork cascade, and an archive tree (`ka sessions --archived` lists it).
+- `ka session rename|delete|archive|unarchive|pin|unpin` — rename (retitle), delete with child-fork cascade, an archive tree (`ka sessions --archived`), and pins (`★` in the picker, sorted first; `ka sessions` shows them too).
 - `ka import codex|gemini` — permission rules from another agent's config into `[[rules]]` (untranslatable settings are printed as notes, never dropped silently; `cursor` rules are instructions, not permissions — ka points at the right homes instead).
 - `ka import-session claude|codex <file>` — import a foreign session as a ka strand (text, tool calls, thinking best-effort; the source is never modified).
+- `ka gc [--dry-run] [--max-age-days N]` — reclaim expired spills, orphaned/aged snapshots and empty directories (strands are only reported).
+- **Recaps & branch summaries** — on idle (if `[context] recap_minutes` is set) a cheap model writes a one-line session recap (surfaced by `ka sessions`); rewinding a non-empty branch pins a ≤3-sentence summary of the abandoned tail onto the branch you keep.
+- **Idle compaction (off by default)** — `[context] idle_minutes` + `idle_compact_pct` compact an idle session once its context crosses the threshold; `[context] autocompact_pct` sets that threshold explicitly, and `/autocompact N|off` changes it live.
+- **`/shake [thinking|images]`** — run the deterministic context trim on demand; `/context` renders optimization hints from the breakdown; `/focus` collapses older turns; `Ctrl+S` stashes the draft.
 
 ## Safety
 

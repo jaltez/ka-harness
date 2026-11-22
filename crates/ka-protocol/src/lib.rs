@@ -409,6 +409,25 @@ pub enum Command {
         /// How many user turns back (1 = erase the last exchange).
         turns: u32,
     },
+    /// CTX-12: set the auto-compact trigger as a context-use percent
+    /// (the digest fires when the meter reaches it). `None` returns to
+    /// the reserve-based default. Local-trust command: only the local
+    /// TUI may send it.
+    SetAutoCompact {
+        /// Trigger percent of the context window (1-100), or None for
+        /// the default reserve-based trigger.
+        pct: Option<u64>,
+    },
+    /// CTX-02: run the deterministic context trim now — stale tool
+    /// arguments and old tool outputs always trim; `thinking`/`images`
+    /// additionally strip those parts from every message but the most
+    /// recent turn.
+    Shake {
+        /// Strip thinking parts from non-recent messages.
+        thinking: bool,
+        /// Strip image parts from non-recent messages.
+        images: bool,
+    },
     /// Copy the current strand into a NEW strand file truncated to drop
     /// the last `turns` user turns (`0` = exact copy) and switch to it.
     ForkStrand {

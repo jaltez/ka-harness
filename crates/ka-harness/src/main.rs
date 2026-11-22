@@ -341,6 +341,17 @@ enum CliCommand {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Reclaim session storage: expired spills, orphaned or aged
+    /// snapshots, empty directories (strands are only reported —
+    /// `ka session delete` removes those)
+    Gc {
+        /// Report what would be removed without removing anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Age threshold in days (default 7)
+        #[arg(long, default_value_t = 7)]
+        max_age_days: u64,
+    },
     /// Run a command under ka's sandbox policy
     /// (bwrap / firejail / landlock — the same policy bash children get)
     Sandbox {
@@ -495,6 +506,16 @@ enum SessionCmd {
     /// Move an archived session back into the active list
     Unarchive {
         /// Session id prefix (searched in the archive)
+        id: String,
+    },
+    /// Pin a session: `★` in the picker, sorted first
+    Pin {
+        /// Session id prefix
+        id: String,
+    },
+    /// Remove a session's pin
+    Unpin {
+        /// Session id prefix
         id: String,
     },
 }
@@ -1067,6 +1088,22 @@ are file-edited only"
         "guards.context_pct" => cfg.guards.context_pct = Some(parse_value(key, value)?),
         "guards.auto_review" => cfg.guards.auto_review = Some(parse_bool(key, value)?),
         "context.promote" => cfg.context.promote = Some(parse_bool(key, value)?),
+        "context.autocompact_pct"
+        | "context.idle_minutes"
+        | "context.idle_compact_pct"
+        | "context.recap_minutes" => {
+            let parsed: Option<u64> = match value {
+                "off" | "unset" | "" => None,
+                other => Some(parse_value(key, other)?),
+            };
+            match key {
+                "context.autocompact_pct" => cfg.context.autocompact_pct = parsed,
+                "context.idle_minutes" => cfg.context.idle_minutes = parsed,
+                "context.idle_compact_pct" => cfg.context.idle_compact_pct = parsed,
+                "context.recap_minutes" => cfg.context.recap_minutes = parsed,
+                _ => unreachable!("matched arm"),
+            }
+        }
         "pokes.max" => cfg.pokes.max = Some(parse_value(key, value)?),
         "update.repo" => cfg.update.repo = Some(value.to_string()),
         "update.check" => {
@@ -1130,6 +1167,10 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "guards.context_pct",
     "guards.auto_review",
     "context.promote",
+    "context.autocompact_pct",
+    "context.idle_minutes",
+    "context.idle_compact_pct",
+    "context.recap_minutes",
     "pokes.max",
     "update.repo",
     "update.check",
@@ -1218,6 +1259,26 @@ fn config_get(cfg: &Config, key: &str) -> Result<String, String> {
             .unwrap_or_else(|| "(unset)".into())),
         "guards.auto_review" => Ok(cfg.guards.auto_review.unwrap_or(false).to_string()),
         "context.promote" => Ok(cfg.effective_context_promote().to_string()),
+        "context.autocompact_pct" => Ok(cfg
+            .context
+            .autocompact_pct
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "default".into())),
+        "context.idle_minutes" => Ok(cfg
+            .context
+            .idle_minutes
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "off".into())),
+        "context.idle_compact_pct" => Ok(cfg
+            .context
+            .idle_compact_pct
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "off".into())),
+        "context.recap_minutes" => Ok(cfg
+            .context
+            .recap_minutes
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "off".into())),
         "pokes.max" => Ok(cfg.pokes.max.unwrap_or(3).to_string()),
         "update.repo" => Ok(s(&cfg.update.repo)),
         "update.check" => Ok(match cfg.update.effective_check() {
@@ -1566,6 +1627,10 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
         Some(CliCommand::Providers) => run_providers(),
         Some(CliCommand::Init) => run_init(),
         Some(CliCommand::Sessions { json, archived }) => run_sessions_archived(json, archived),
+        Some(CliCommand::Gc {
+            dry_run,
+            max_age_days,
+        }) => run_gc(dry_run, max_age_days),
         Some(CliCommand::Session { cmd }) => run_session_mgmt(cmd),
         Some(CliCommand::Rewind { turns }) => run_rewind(turns).await,
         Some(CliCommand::Export {
@@ -2811,6 +2876,36 @@ fn resolve_session(cwd: &std::path::Path, id: &str) -> Result<ka_engine::StrandC
     }
 }
 
+/// `ka gc`: reclaim spills/snapshots/empty dirs older than the age
+/// threshold via the strand store's gc API; strands are only reported.
+fn run_gc(dry_run: bool, max_age_days: u64) -> Result<ExitCode, String> {
+    let root = ka_strand::data_dir();
+    let spills_roots = [root.join("spills"), ka_engine::hands::spills_root()];
+    let report = ka_strand::gc(&root, &spills_roots, max_age_days, dry_run)
+        .map_err(|e| format!("gc: {e}"))?;
+    let verb = if dry_run {
+        "would reclaim"
+    } else {
+        "reclaimed"
+    };
+    println!(
+        "gc ({}) [{}]: {} spill file(s), {} snapshot dir(s), {} empty dir(s) {}",
+        if dry_run { "dry-run" } else { "apply" },
+        root.display(),
+        report.spills_removed,
+        report.snapshots_removed,
+        report.empty_dirs_removed,
+        verb
+    );
+    if report.strand_bytes_reported > 0 {
+        println!(
+            "strands (reported only — `ka session delete` removes those): {:.1} MB",
+            report.strand_bytes_reported as f64 / (1024.0 * 1024.0)
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 /// `ka sessions`: list strands for this cwd with resolvable ids.
 fn run_sessions_archived(json: bool, archived: bool) -> Result<ExitCode, String> {
     let cwd = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
@@ -2855,20 +2950,35 @@ fn run_sessions_archived(json: bool, archived: bool) -> Result<ExitCode, String>
         first_message = "first message"
     );
     for s in strands.iter().take(30) {
-        // a set name rides beside the title: `fox · fix the pump`
+        // a set name rides beside the title: `fox · fix the pump`;
+        // pinned sessions carry a ★ prefix
         let label = match &s.name {
             Some(n) => format!("{n} · {}", s.title),
             None => s.title.clone(),
         };
+        let star = if s.pinned { "★ " } else { "" };
         println!(
-            "{:<26} {:>5} {:>10}  {}",
+            "{:<26} {:>5} {:>10}  {}{}",
             s.id,
             s.messages,
             format!("${:.4}", s.cost),
+            star,
             label
         );
+        if let Some(recap) = &s.recap {
+            println!("    └ recap: {}", truncate_str(recap, 100));
+        }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Ellipsize a single line to `max` chars (newlines collapsed).
+fn truncate_str(s: &str, max: usize) -> String {
+    let mut line = s.lines().next().unwrap_or_default().to_string();
+    if line.chars().count() > max {
+        line = line.chars().take(max).collect::<String>() + "…";
+    }
+    line
 }
 
 /// `ka session …` — rename / delete (cascade) / archive / unarchive,
@@ -2894,6 +3004,16 @@ fn run_session_mgmt(cmd: SessionCmd) -> Result<ExitCode, String> {
             let path = resolve_session_path(&cwd, &id, false)?;
             let new = ka_strand::archive(&path, true).map_err(|e| format!("archive: {e}"))?;
             println!("archived → {}", new.display());
+        }
+        SessionCmd::Unpin { id } => {
+            let path = resolve_session_path(&cwd, &id, false)?;
+            ka_strand::set_pinned(&path, false).map_err(|e| format!("unpin: {e}"))?;
+            println!("unpinned {}", path.display());
+        }
+        SessionCmd::Pin { id } => {
+            let path = resolve_session_path(&cwd, &id, false)?;
+            ka_strand::set_pinned(&path, true).map_err(|e| format!("pin: {e}"))?;
+            println!("pinned ★ {}", path.display());
         }
         SessionCmd::Unarchive { id } => {
             let list = ka_strand::list_archived(&cwd);

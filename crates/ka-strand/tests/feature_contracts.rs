@@ -580,3 +580,319 @@ fn session_management_refuses_missing_or_non_strand_paths() {
     assert!(junk.exists(), "refused operations must not touch the file");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The engine-reserved session flags ride namespaced custom records
+/// inside the strand itself (no sidecar files): the LAST pin record
+/// decides, the LAST recap is the recap, and branch summaries just
+/// accumulate (the `x.ka.*` contract).
+#[test]
+fn session_flags_ride_last_wins_custom_records() {
+    let _guard = DATA_DIR_LOCK.lock().unwrap();
+    let dir = temp_data_dir("flags");
+    let cwd = dir.join("proj");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut strand = StrandFile::create(&cwd, None).unwrap();
+    strand.append(user_msg("flagged session")).unwrap();
+    let path = strand.path().unwrap().to_path_buf();
+    let id = header_id(&strand);
+    drop(strand);
+
+    // fresh strand: unpinned, no recap
+    let summary = ka_strand::list(&cwd).unwrap();
+    let summary = summary.iter().find(|s| s.id == id).unwrap();
+    assert!(!summary.pinned);
+    assert_eq!(summary.recap, None);
+
+    // pin → unpin → pin: the LAST record wins, and listing/latest agree
+    ka_strand::set_pinned(&path, true).unwrap();
+    ka_strand::set_pinned(&path, false).unwrap();
+    ka_strand::set_pinned(&path, true).unwrap();
+    let pinned = ka_strand::list(&cwd)
+        .unwrap()
+        .into_iter()
+        .find(|s| s.id == id)
+        .unwrap();
+    assert!(pinned.pinned, "the last pin record (true) must win");
+    assert!(ka_strand::latest(&cwd).unwrap().unwrap().pinned);
+
+    // recaps accumulate; the most recent one surfaces
+    ka_strand::append_recap(&path, "first recap").unwrap();
+    ka_strand::append_recap(&path, "second recap").unwrap();
+    let recapped = ka_strand::list(&cwd)
+        .unwrap()
+        .into_iter()
+        .find(|s| s.id == id)
+        .unwrap();
+    assert!(recapped.pinned, "recaps must not disturb the pin state");
+    assert_eq!(recapped.recap.as_deref(), Some("second recap"));
+
+    // branch summaries append after a rewind; they touch nothing else
+    ka_strand::append_branch_summary(&path, "kept: header, first turn").unwrap();
+    let flagged = ka_strand::list(&cwd)
+        .unwrap()
+        .into_iter()
+        .find(|s| s.id == id)
+        .unwrap();
+    assert!(flagged.pinned);
+    assert_eq!(flagged.recap.as_deref(), Some("second recap"));
+    assert_eq!(flagged.messages, 1);
+
+    // everything replayable: the strand carries exactly the appends
+    let reopened = StrandFile::open(&path).unwrap();
+    let customs: Vec<&Record> = reopened
+        .records()
+        .iter()
+        .filter(|r| matches!(r, Record::Custom { .. }))
+        .collect();
+    assert_eq!(
+        customs.len(),
+        6,
+        "3 pins + 2 recaps + 1 branch summary, append-only"
+    );
+    let pins = customs
+        .iter()
+        .filter(|r| matches!(r, Record::Custom { ns, .. } if ns == ka_strand::PIN_NS))
+        .count();
+    assert_eq!(pins, 3);
+    match customs.last() {
+        Some(Record::Custom { ns, data, .. }) => {
+            assert_eq!(ns, ka_strand::BRANCH_SUMMARY_NS);
+            assert_eq!(data["text"], "kept: header, first turn");
+        }
+        other => panic!("expected a custom record, got {other:?}"),
+    }
+    match customs[customs.len() - 2] {
+        Record::Custom { ns, data, .. } => {
+            assert_eq!(ns, ka_strand::RECAP_NS);
+            assert_eq!(data["text"], "second recap");
+        }
+        other => panic!("expected a recap record, got {other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Session-flag appenders refuse missing files and headerless .jsonl
+/// like every other session-management operation.
+#[test]
+fn session_flag_appenders_refuse_missing_or_non_strand_paths() {
+    let _guard = DATA_DIR_LOCK.lock().unwrap();
+    let dir = temp_data_dir("flag-refuse");
+    let cwd = dir.join("proj");
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    let missing = cwd.join("nope.jsonl");
+    assert!(ka_strand::set_pinned(&missing, true).is_err());
+    assert!(ka_strand::append_recap(&missing, "x").is_err());
+    assert!(ka_strand::append_branch_summary(&missing, "x").is_err());
+
+    let junk = cwd.join("junk.jsonl");
+    std::fs::write(
+        &junk,
+        "{\"record\":\"message\",\"id\":\"r1\",\"role\":\"user\",\"content\":\"hi\"}\n",
+    )
+    .unwrap();
+    assert!(ka_strand::set_pinned(&junk, true).is_err());
+    assert!(ka_strand::append_recap(&junk, "x").is_err());
+    assert!(ka_strand::append_branch_summary(&junk, "x").is_err());
+    assert!(junk.exists(), "refused operations must not touch the file");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Engine-written flag records carry richer payloads than the harness
+/// appenders (`{"text", "at", "turns"}` instead of `{"text"}`), and a
+/// branch summary lands after its Rewind anchor — the summary scan must
+/// read them the same way, last record winning regardless of writer.
+#[test]
+fn summary_reads_engine_shaped_flag_payloads() {
+    let _guard = DATA_DIR_LOCK.lock().unwrap();
+    let dir = temp_data_dir("engine-flags");
+    let cwd = dir.join("proj");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut strand = StrandFile::create(&cwd, None).unwrap();
+    strand.append(user_msg("engine-flagged session")).unwrap();
+    let path = strand.path().unwrap().to_path_buf();
+    let id = header_id(&strand);
+    drop(strand);
+
+    // the engine's exact wire shapes (text + at + turns), one written
+    // before a harness recap and one after — record order decides
+    let engine_recap = format!(
+        "{{\"record\":\"custom\",\"id\":\"{}\",\"ns\":\"x.ka.recap\",\"data\":{{\"text\":\"engine recap\",\"at\":1700000000,\"turns\":7}}}}\n",
+        ka_strand::new_record_id().0
+    );
+    let engine_branch = format!(
+        "{{\"record\":\"custom\",\"id\":\"{}\",\"ns\":\"x.ka.branch_summary\",\"data\":{{\"text\":\"pre-rewind branch\",\"at\":1700000001,\"turns\":9}}}}\n",
+        ka_strand::new_record_id().0
+    );
+    {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        write!(file, "{engine_branch}").unwrap();
+        write!(file, "{engine_recap}").unwrap();
+    }
+    ka_strand::append_recap(&path, "harness recap").unwrap();
+
+    let summary = ka_strand::list(&cwd)
+        .unwrap()
+        .into_iter()
+        .find(|s| s.id == id)
+        .unwrap();
+    assert_eq!(
+        summary.recap.as_deref(),
+        Some("harness recap"),
+        "last record wins across engine- and harness-shaped payloads"
+    );
+    assert!(!summary.pinned, "engine recaps must not look like pins");
+
+    // without the harness tail, the engine recap itself surfaces
+    let reopened = StrandFile::open(&path).unwrap();
+    assert_eq!(
+        ka_strand::read(&path).unwrap().len(),
+        reopened.records().len()
+    );
+    ka_strand::set_pinned(&path, true).unwrap();
+    let pinned = ka_strand::list(&cwd)
+        .unwrap()
+        .into_iter()
+        .find(|s| s.id == id)
+        .unwrap();
+    assert!(pinned.pinned);
+    assert_eq!(pinned.recap.as_deref(), Some("harness recap"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Set a file's (or directory's) mtime `days` back — gc tests age store
+/// entries without extra dependencies.
+fn age_mtime(path: &std::path::Path, days: u64) {
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(days * 24 * 60 * 60);
+    let file = std::fs::File::open(path).unwrap();
+    file.set_times(std::fs::FileTimes::new().set_modified(old))
+        .unwrap();
+}
+
+/// gc reclaims spills past the threshold, orphaned snapshot dirs, and
+/// aged-or-orphaned snapshot dirs, drops empty strand dirs, reports
+/// strand bytes without ever deleting a strand — and a dry run counts
+/// exactly what the real pass removes (the `ka gc` contract).
+#[test]
+fn gc_dry_run_matches_apply_and_never_touches_strands() {
+    let _guard = DATA_DIR_LOCK.lock().unwrap();
+    let root = temp_data_dir("gc");
+    std::fs::create_dir_all(root.join("spills")).unwrap();
+    std::fs::create_dir_all(root.join("snapshots")).unwrap();
+
+    // a live session for /code/rust (aged past the threshold — gc must
+    // still keep it) and one for /code/old (fresh)
+    let mut rust_strand = StrandFile::create(std::path::Path::new("/code/rust"), None).unwrap();
+    rust_strand.append(user_msg("rust session")).unwrap();
+    let rust_path = rust_strand.path().unwrap().to_path_buf();
+    drop(rust_strand);
+    let mut old_strand = StrandFile::create(std::path::Path::new("/code/old"), None).unwrap();
+    old_strand.append(user_msg("old session")).unwrap();
+    let old_path = old_strand.path().unwrap().to_path_buf();
+    drop(old_strand);
+
+    // snapshot dirs: snapshots.rs keys cwds by the legacy encoding
+    // ("-<cwd with '/' flattened to '-'>"), so /code/rust → "--code-rust"
+    let snapshots = root.join("snapshots");
+    // live + fresh → kept
+    let live_snap = snapshots.join("--code-rust");
+    std::fs::create_dir_all(&live_snap).unwrap();
+    std::fs::write(live_snap.join("manifest.jsonl"), "{\"seq\":1}\n").unwrap();
+    std::fs::write(live_snap.join("1-424242.blob"), "bytes").unwrap();
+    // live but aged → removed by age
+    let aged_snap = snapshots.join("--code-old");
+    std::fs::create_dir_all(&aged_snap).unwrap();
+    std::fs::write(aged_snap.join("manifest.jsonl"), "{\"seq\":1}\n").unwrap();
+    // orphan (no strand anywhere) → removed even when fresh
+    let orphan_snap = snapshots.join("-ghost");
+    std::fs::create_dir_all(&orphan_snap).unwrap();
+    std::fs::write(orphan_snap.join("manifest.jsonl"), "{\"seq\":9}\n").unwrap();
+
+    // spills: one old, one fresh, one fresh subdirectory (untouched —
+    // only regular files sweep) under the data-root convention, plus
+    // one old and one fresh spill under a scratch extra root standing
+    // in for the engine's real spill store ($XDG_STATE_HOME/ka/spills)
+    // — gc sweeps every dir the caller hands it via `spills_roots`.
+    std::fs::write(root.join("spills").join("old-out"), "x").unwrap();
+    std::fs::write(root.join("spills").join("new-out"), "x").unwrap();
+    std::fs::create_dir_all(root.join("spills").join("subdir")).unwrap();
+    let extra_spills = root.join("state").join("ka").join("spills");
+    std::fs::create_dir_all(&extra_spills).unwrap();
+    std::fs::write(extra_spills.join("state-old"), "x").unwrap();
+    std::fs::write(extra_spills.join("state-new"), "x").unwrap();
+    let spills_roots = [root.join("spills"), extra_spills];
+
+    // empty strand dirs go; a fresh strand in the archive tree keeps
+    // its snapshot dir non-orphaned
+    std::fs::create_dir_all(root.join("strands").join("-emptydir")).unwrap();
+    std::fs::create_dir_all(root.join("strands-archived").join("-archived-cwd")).unwrap();
+    std::fs::write(
+        root.join("strands-archived")
+            .join("-archived-cwd")
+            .join("t_s.jsonl"),
+        "{\"record\":\"header\",\"id\":\"sarch\",\"ts\":\"t\",\"cwd\":\"/archived/cwd\",\"version\":1,\"repo\":null}\n",
+    )
+    .unwrap();
+
+    // age AFTER the appends so the thresholds bite: the /code/rust
+    // strand file and its spill siblings are the old generation
+    age_mtime(&rust_path, 30);
+    age_mtime(&root.join("spills").join("old-out"), 30);
+    age_mtime(&spills_roots[1].join("state-old"), 30);
+    age_mtime(&aged_snap, 30);
+    let aged_strand_bytes = std::fs::metadata(&rust_path).unwrap().len();
+
+    let expected = ka_strand::GcReport {
+        spills_removed: 2,     // old-out + state-old
+        snapshots_removed: 2,  // --code-old (aged) + -ghost (orphan)
+        empty_dirs_removed: 1, // strands/-emptydir
+        strand_bytes_reported: aged_strand_bytes,
+    };
+
+    // dry run: the same report, nothing touched
+    let dry = ka_strand::gc(&root, &spills_roots, 7, true).unwrap();
+    assert_eq!(dry, expected, "{dry:?}");
+    assert!(root.join("spills").join("old-out").exists());
+    assert!(spills_roots[1].join("state-old").exists());
+    assert!(aged_snap.exists());
+    assert!(orphan_snap.exists());
+    assert!(root.join("strands").join("-emptydir").exists());
+
+    // the real pass reports exactly the same and does the work
+    let applied = ka_strand::gc(&root, &spills_roots, 7, false).unwrap();
+    assert_eq!(applied, dry, "apply must match the dry run");
+    assert!(!root.join("spills").join("old-out").exists());
+    assert!(root.join("spills").join("new-out").exists());
+    assert!(root.join("spills").join("subdir").is_dir());
+    assert!(!spills_roots[1].join("state-old").exists());
+    assert!(spills_roots[1].join("state-new").exists());
+    assert!(!aged_snap.exists(), "aged snapshot dir must go");
+    assert!(!orphan_snap.exists(), "orphan snapshot dir must go");
+    assert!(
+        live_snap.join("manifest.jsonl").exists(),
+        "live fresh snapshot dir must survive"
+    );
+    assert!(!root.join("strands").join("-emptydir").exists());
+    assert!(
+        root.join("strands-archived").join("-archived-cwd").is_dir(),
+        "non-empty archive dirs stay"
+    );
+
+    // strands are never gc'd — old ones survive byte-for-byte readable
+    assert!(
+        rust_path.exists(),
+        "an aged strand is reported, not deleted"
+    );
+    assert!(old_path.exists());
+    let records = ka_strand::read(&rust_path).unwrap();
+    assert!(matches!(records.first(), Some(Record::Header { .. })));
+    assert_eq!(
+        std::fs::metadata(&rust_path).unwrap().len(),
+        aged_strand_bytes
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

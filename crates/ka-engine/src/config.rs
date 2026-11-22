@@ -487,6 +487,24 @@ pub struct Context {
     /// Auto-promote to a bigger-context sibling on overflow
     /// (None = default true; false opts out).
     pub promote: Option<bool>,
+    /// CTX-12: auto-compact trigger as a percent of the context window —
+    /// the digest fires once the meter reaches it (1–100). `None` keeps
+    /// the reserve-based default: digest when the free space drops below
+    /// max(15% of the window, 16k tokens). Settable live for the session
+    /// through the protocol's `SetAutoCompact` command.
+    pub autocompact_pct: Option<u64>,
+    /// CTX-07: minutes of surface inactivity after which the idle task
+    /// runs (recap + optional compaction). `None` (default) disables the
+    /// idle task entirely.
+    pub idle_minutes: Option<u64>,
+    /// CTX-07: minimum idle minutes before the idle recap fires. `None`
+    /// inherits `idle_minutes` (the recap fires on the first idle tick
+    /// past the idle threshold). Ignored when `idle_minutes` is unset.
+    pub recap_minutes: Option<u64>,
+    /// CTX-07: idle compaction threshold, as a percent of the context
+    /// window — while idle past `idle_minutes`, the digest also fires
+    /// when the meter reaches this. `None` disables idle compaction.
+    pub idle_compact_pct: Option<u64>,
 }
 
 /// Fallback model chain ([fallback]). When a turn fails on the active
@@ -690,6 +708,18 @@ impl Config {
         }
         if other.context.promote.is_some() {
             self.context.promote = other.context.promote;
+        }
+        if other.context.autocompact_pct.is_some() {
+            self.context.autocompact_pct = other.context.autocompact_pct;
+        }
+        if other.context.idle_minutes.is_some() {
+            self.context.idle_minutes = other.context.idle_minutes;
+        }
+        if other.context.recap_minutes.is_some() {
+            self.context.recap_minutes = other.context.recap_minutes;
+        }
+        if other.context.idle_compact_pct.is_some() {
+            self.context.idle_compact_pct = other.context.idle_compact_pct;
         }
         if !other.hooks.is_empty() {
             self.hooks.extend(other.hooks);
@@ -1135,6 +1165,47 @@ impl std::error::Error for ConfigError {}
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    #[test]
+    fn context_keys_parse_and_overlay() {
+        let base = Config::parse_layer(
+            "[context]\nautocompact_pct = 80\nidle_minutes = 10\nidle_compact_pct = 90\n",
+            "user",
+        )
+        .unwrap();
+        assert_eq!(base.context.autocompact_pct, Some(80));
+        assert_eq!(base.context.idle_minutes, Some(10));
+        assert_eq!(base.context.idle_compact_pct, Some(90));
+        // recap_minutes absent → None (inherits idle_minutes at runtime)
+        assert_eq!(base.context.recap_minutes, None);
+
+        // a more specific layer overrides only what it sets
+        let mut merged = base.clone();
+        merged.overlay(
+            Config::parse_layer(
+                "[context]\nautocompact_pct = 65\nrecap_minutes = 3\n",
+                "project",
+            )
+            .unwrap(),
+        );
+        assert_eq!(merged.context.autocompact_pct, Some(65));
+        assert_eq!(merged.context.recap_minutes, Some(3));
+        assert_eq!(
+            merged.context.idle_minutes,
+            Some(10),
+            "unset keys keep the lower layer"
+        );
+
+        // defaults: everything off
+        let defaults = Config::default();
+        assert_eq!(defaults.context.autocompact_pct, None);
+        assert_eq!(defaults.context.idle_minutes, None);
+        assert_eq!(defaults.context.recap_minutes, None);
+        assert_eq!(defaults.context.idle_compact_pct, None);
+
+        // out-of-band keys stay a parse error (deny_unknown_fields)
+        assert!(Config::parse_layer("[context]\nnonsense = 1\n", "x").is_err());
+    }
 
     #[test]
     fn project_layer_parse_failure_is_never_overwritten() {

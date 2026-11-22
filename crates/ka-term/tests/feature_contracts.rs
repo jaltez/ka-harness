@@ -6,7 +6,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use ka_protocol::Command;
 use ka_term::tui::{
-    Inventory, ModalKind, NotifySettings, SKILLS, Transcript, accept_memory_note,
+    Inventory, ModalKind, NotifySettings, SKILLS, SessionPicker, Transcript, accept_memory_note,
     memory_modal_rows, read_memory_inbox, skill_invocation, slash_command, update_suggestions,
     write_memory_inbox,
 };
@@ -36,6 +36,8 @@ fn every_documented_slash_command_parses() {
         "/checkpoint",
         "/restore",
         "/compact",
+        "/shake",
+        "/autocompact",
         "/session",
         "/resume",
         "/new",
@@ -66,10 +68,75 @@ fn every_documented_slash_command_parses() {
     // transcript/copy state, no engine roundtrip): /find /retry
     // /copy /clip, and the /skill:<name> family (validated
     // against the inventory, dispatched as a scoped Prompt — see
-    // skill_invocation_scopes_the_turn). Mouse capture toggles with
-    // Ctrl+M, not a slash command. They are covered by the
-    // input-layer unit tests in src; if you move one into
+    // skill_invocation_scopes_the_turn), plus the local faces of
+    // /focus (view toggle) and bare /autocompact (display; the
+    // session's trigger value lives in the app loop). Mouse capture
+    // toggles with Ctrl+M, not a slash command. They are covered by
+    // the input-layer unit tests in src; if you move one into
     // slash_command, add it above.
+}
+
+/// CTX-02: /shake parses bare (stale-output-only trim) and with modes
+/// that ADD to it; unknown words are refused with a usage note rather
+/// than silently read as a bare shake.
+#[test]
+fn shake_parses_modes_and_refuses_unknown_words() {
+    let bare = slash_command("/shake").expect("/shake");
+    assert!(matches!(
+        bare.event,
+        Some(ka_protocol::Command::Shake {
+            thinking: false,
+            images: false
+        })
+    ));
+    assert!(bare.note.is_some(), "the transcript confirms the shake");
+
+    let modes = |args: &str| match slash_command(&format!("/shake {args}")) {
+        Some(s) => match s.event {
+            Some(ka_protocol::Command::Shake { thinking, images }) => (thinking, images),
+            other => panic!("/shake {args} carried {other:?}"),
+        },
+        None => panic!("/shake {args} must parse"),
+    };
+    assert_eq!(modes("thinking"), (true, false));
+    assert_eq!(modes("images"), (false, true));
+    assert_eq!(modes("thinking images"), (true, true));
+
+    let bad = slash_command("/shake bogus").expect("usage row still parses");
+    assert!(bad.event.is_none(), "an unknown mode must not shake");
+    assert!(
+        bad.note.as_deref().is_some_and(|n| n.starts_with("usage:")),
+        "{:?}",
+        bad.note
+    );
+}
+
+/// CTX-12: /autocompact <1-100|off> carries SetAutoCompact; out-of-range
+/// or non-numeric values refuse with a usage note; the bare form is a
+/// display-only parse (the app loop prints the session's value).
+#[test]
+fn autocompact_parses_percent_off_and_usage() {
+    let s = slash_command("/autocompact 80").expect("/autocompact N");
+    assert!(matches!(
+        s.event,
+        Some(ka_protocol::Command::SetAutoCompact { pct: Some(80) })
+    ));
+    let s = slash_command("/autocompact off").expect("/autocompact off");
+    assert!(matches!(
+        s.event,
+        Some(ka_protocol::Command::SetAutoCompact { pct: None })
+    ));
+    for bad in ["/autocompact 0", "/autocompact 101", "/autocompact abc"] {
+        let s = slash_command(bad).expect("usage row still parses");
+        assert!(s.event.is_none(), "{bad} must not carry an event");
+        assert!(
+            s.note.as_deref().is_some_and(|n| n.starts_with("usage:")),
+            "{bad}: {:?}",
+            s.note
+        );
+    }
+    let bare = slash_command("/autocompact").expect("/autocompact");
+    assert!(bare.event.is_none(), "bare /autocompact only displays");
 }
 
 /// Argument-bearing forms parse the way the docs show.
@@ -448,4 +515,127 @@ fn skill_popup_completes_from_inventory() {
     // unrelated prefixes stay quiet
     assert!(update_suggestions("/sx").is_none());
     *SKILLS.write().unwrap() = Vec::new();
+}
+
+/// CTX-11: /focus collapses everything before the turn in progress to
+/// one `· <first words>` digest row per turn; the current turn renders
+/// in full. Toggling (or Esc in the app) restores the exact full view —
+/// no entry is ever lost by the view. Session-scoped: nothing persists.
+#[test]
+fn focus_collapses_finished_turns_and_restores() {
+    use ka_term::tui::Line;
+    let mut t = Transcript::default();
+    t.set_width(80);
+    t.push(Line::User("first prompt about the parser".into()));
+    t.push(Line::Assistant("reply one".into()));
+    t.push(Line::Thought("musing".into()));
+    t.push(Line::User("second prompt".into()));
+    t.push(Line::Assistant("reply two".into()));
+    let full = t.total_rows();
+
+    t.set_focus(true);
+    let focused = t.total_rows();
+    assert!(
+        focused < full,
+        "focus must collapse something ({focused} vs {full})"
+    );
+    // row 0 is turn one's digest; the rest is the live turn, whole
+    let digest = t.row(0).expect("digest row first");
+    let text: String = digest.spans.iter().map(|s| s.content.to_string()).collect();
+    assert!(text.starts_with("· "), "digest row: {text:?}");
+    assert!(text.contains("first prompt"), "digest: {text:?}");
+    assert!(t.row(focused).is_none(), "no rows past the focused view");
+
+    // digest rows carry no click target; live-turn rows still map
+    assert_eq!(t.row_ref_at(0), None, "a digest is not a toggle target");
+    assert!(t.row_ref_at(1).is_some(), "live rows keep their mapping");
+
+    // the ▲▼ jump anchors: turn one on its digest, turn two on its rows
+    let jumps = t.user_entry_rows();
+    assert_eq!(jumps.len(), 2, "one anchor per turn: {jumps:?}");
+    assert_eq!(jumps[0], 0, "turn one anchors on its digest row");
+
+    // search reports in focus rows and finds the collapsed prompt
+    let (entry, at) = t.find_from(0, "parser").expect("digest text is searchable");
+    assert_eq!(at, 0, "the hit lands on the digest row");
+
+    // nothing hidden is lost: unfocus restores the exact view
+    t.set_focus(false);
+    assert_eq!(t.total_rows(), full);
+    assert_eq!(t.entries().len(), 5);
+    let _ = (entry, jumps);
+}
+
+/// SES-02+08: the session picker matches the memorable name in the live
+/// filter, floats pinned strands (★) above the recency order, and shows
+/// a stored recap (truncated) on the detail line.
+#[test]
+fn session_picker_pins_names_and_recaps() {
+    let summary = |id: &str, title: &str| ka_strand::StrandSummary {
+        path: std::path::PathBuf::from(format!("/tmp/{id}.jsonl")),
+        id: id.to_string(),
+        ts: "2026-01-01T00:00:00Z".to_string(),
+        title: title.to_string(),
+        messages: 2,
+        cost: 0.0,
+        tokens: 0,
+        parent: None,
+        name: None,
+        pinned: false,
+        recap: None,
+    };
+    let mut pinned = summary("s1-old", "pinned work");
+    pinned.pinned = true;
+    pinned.recap = Some("a very long recap that keeps going and should be cut off".into());
+    let mut named = summary("s2-mid", "untitled work");
+    named.name = Some("fox".into());
+    let newest = summary("s3-new", "brand new session");
+
+    let picker = SessionPicker {
+        // engine order: newest first — the pin must still float up
+        sessions: vec![newest, named, pinned],
+        selected: 0,
+        filter: String::new(),
+        current: None,
+    };
+    let rows = picker.rows();
+    assert!(
+        rows[1].0.contains("★ ") && rows[1].0.contains("pinned work"),
+        "pinned floats first with a star: {:?}",
+        rows[1].0
+    );
+    assert!(picker.pick().is_none(), "row 0 stays new-session");
+    let mut first = picker.clone();
+    first.selected = 1;
+    assert_eq!(
+        first.pick().as_deref(),
+        Some("s1-old"),
+        "Enter targets the pinned row"
+    );
+    // the recap rides the detail line, truncated to one line
+    assert!(
+        rows[1].1.contains("a very long recap"),
+        "recap shown: {:?}",
+        rows[1].1
+    );
+    assert!(
+        !rows[1].1.contains("cut off"),
+        "long recaps truncate: {:?}",
+        rows[1].1
+    );
+
+    // the live filter matches title, memorable name and id
+    let mut by_name = picker.clone();
+    by_name.filter_typed("FOX");
+    assert_eq!(
+        by_name.pick().as_deref(),
+        Some("s2-mid"),
+        "name match is case-insensitive"
+    );
+    let mut by_id = picker.clone();
+    by_id.filter_typed("s3-new");
+    assert_eq!(by_id.pick().as_deref(), Some("s3-new"));
+    let mut miss = picker.clone();
+    miss.filter_typed("zzz");
+    assert_eq!(miss.pick(), None, "no match leaves only new-session");
 }

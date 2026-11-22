@@ -443,7 +443,7 @@ impl Spill {
 static SPILL_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The spill directory under the state root.
-pub(crate) fn spills_root() -> PathBuf {
+pub fn spills_root() -> PathBuf {
     std::env::var("XDG_STATE_HOME")
         .map(PathBuf::from)
         .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".local/state")))

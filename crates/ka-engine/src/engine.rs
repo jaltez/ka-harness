@@ -426,6 +426,30 @@ struct EngineState {
     poke_pending: Option<Vec<String>>,
     /// `!` passthrough outputs waiting to ride the next user prompt.
     shell_context: Vec<String>,
+    /// CTX-12: live auto-compact trigger as a percent of the window
+    /// (1-100). `None` = the reserve-based default trigger
+    /// (max(15% of window, 16k) of free space). Set from
+    /// `[context] autocompact_pct` and the `SetAutoCompact` command.
+    autocompact_pct: Option<u64>,
+    /// CTX-07: `[context] idle_minutes` — idle-task gate in minutes.
+    /// `None` = idle task off.
+    idle_minutes: Option<u64>,
+    /// CTX-07: `[context] recap_minutes` — extra gate for the idle
+    /// recap. `None` inherits `idle_minutes`.
+    recap_minutes: Option<u64>,
+    /// CTX-07: `[context] idle_compact_pct` — while idle, digest when
+    /// the meter reaches this percent. `None` = no idle compaction.
+    idle_compact_pct: Option<u64>,
+    /// Last surface activity (prompt received / turn finished). The
+    /// idle task measures from here.
+    last_activity: std::time::Instant,
+    /// Total turns completed this session (monotonic; survives digest
+    /// truncation, unlike history indices). Drives the recap
+    /// "new turns since the last recap" gate.
+    turns_seen: u64,
+    /// `turns_seen` value at the last idle recap; the recap fires only
+    /// when `turns_seen` has moved past it.
+    last_recap_turns: u64,
 }
 impl From<Config> for EngineState {
     fn from(c: Config) -> Self {
@@ -449,6 +473,13 @@ impl From<Config> for EngineState {
             poke_pending: None,
             verify_round_done: false,
             shell_context: Vec::new(),
+            autocompact_pct: c.context.autocompact_pct,
+            idle_minutes: c.context.idle_minutes,
+            recap_minutes: c.context.recap_minutes,
+            idle_compact_pct: c.context.idle_compact_pct,
+            last_activity: std::time::Instant::now(),
+            turns_seen: 0,
+            last_recap_turns: 0,
         }
     }
 }
@@ -764,6 +795,16 @@ async fn run(
     // opportunistic spill-dir GC: detached-job spill files older than
     // the retention window are deleted once per engine start
     crate::hands::gc_spills(&crate::hands::spills_root());
+    // CTX-07: the idle task polls at a fixed 30s cadence between
+    // commands. `interval_at` (not `interval`) skips the immediate
+    // first tick, and `Delay` collapses any tick bursts the turn
+    // processing caused into one overdue tick.
+    let idle_tick_period = idle_tick_period();
+    let mut idle_tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + idle_tick_period,
+        idle_tick_period,
+    );
+    idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             maybe = commands.recv() => {
@@ -774,6 +815,9 @@ async fn run(
                 if let Some(update) = maybe {
                     handle_maintenance(update, &mut ctx).await;
                 }
+            }
+            _ = idle_tick.tick() => {
+                idle_tick_work(&mut ctx).await;
             }
         }
     }
@@ -1356,6 +1400,8 @@ async fn handle_command(
         } => {
             // a fresh user prompt earns a fresh verify-fix round
             ctx.state.verify_round_done = false;
+            // and it is surface activity for the idle task (CTX-07)
+            ctx.state.last_activity = std::time::Instant::now();
             // explicit skill invocation (/skill:<name>): fail closed
             // BEFORE the turn — a missing or disabled skill must not
             // run a hollow prompt (same admit-time stance as
@@ -1735,8 +1781,133 @@ async fn handle_command(
             apply_sandbox_mode(ctx, &mode).await;
             ctx.events.send(Event::Idle).await.ok();
         }
+        // CTX-12: live auto-compact trigger. Session-scoped (like the
+        // model/mode commands it mirrors); `[context] autocompact_pct`
+        // is the durable path. Fail-closed: out-of-range percents are
+        // rejected with a note, the live setting untouched.
+        Command::SetAutoCompact { pct } => {
+            match pct {
+                Some(p) if !(1..=100).contains(&p) => {
+                    let current = match ctx.state.autocompact_pct {
+                        Some(p) => format!("{p}%"),
+                        None => "default".to_string(),
+                    };
+                    ctx.events
+                        .send(Event::Note {
+                            message: format!(
+                                "auto-compact trigger: {p}% is out of range (1-100) — keeping \
+                                 {current}"
+                            ),
+                        })
+                        .await
+                        .ok();
+                }
+                Some(p) => {
+                    ctx.state.autocompact_pct = Some(p);
+                    ctx.events
+                        .send(Event::Note {
+                            message: format!("auto-compact trigger: {p}%"),
+                        })
+                        .await
+                        .ok();
+                }
+                None => {
+                    ctx.state.autocompact_pct = None;
+                    ctx.events
+                        .send(Event::Note {
+                            message: "auto-compact trigger: default".to_string(),
+                        })
+                        .await
+                        .ok();
+                }
+            }
+            ctx.events.send(Event::Idle).await.ok();
+        }
+        // CTX-02: deterministic context trim, on demand. Stale tool
+        // args and old tool outputs always trim (manual shake: no
+        // minimum-savings gate on outputs); `thinking`/`images`
+        // additionally strip those parts from everything but the most
+        // recent turn. In-memory, like the settle-time ladder — the
+        // strand keeps the originals.
+        Command::Shake { thinking, images } => {
+            let ratio = voice_ratio(&ctx.voice);
+            let to_tok = |bytes: u64| (bytes as f64 / ratio.max(0.1)) as u64;
+            // one note per applied trim: args → outputs → thinking → images
+            let mut trimmed_any = false;
+            let (shaken, arg_bytes) = ctx.voice.shake(crate::voice::SHAKE_ARG_CAP);
+            if shaken > 0 {
+                trimmed_any = true;
+                ctx.events
+                    .send(Event::Note {
+                        message: format!(
+                            "shake: truncated {shaken} stale tool call arg(s) (~{} / ~{} tok)",
+                            crate::voice::fmt_bytes(arg_bytes),
+                            to_tok(arg_bytes),
+                        ),
+                    })
+                    .await
+                    .ok();
+            }
+            let pruned = ctx.voice.prune_tool_outputs_with(ratio, 0);
+            if pruned > 0 {
+                trimmed_any = true;
+                ctx.events
+                    .send(Event::Note {
+                        message: format!(
+                            "shake: pruned old tool output (~{pruned} tok, full text spilled)"
+                        ),
+                    })
+                    .await
+                    .ok();
+            }
+            if thinking {
+                let (msgs, bytes) = ctx.voice.strip_old_thinking();
+                if msgs > 0 {
+                    trimmed_any = true;
+                    ctx.events
+                        .send(Event::Note {
+                            message: format!(
+                                "shake: stripped thinking from {msgs} message(s) (~{} / ~{} tok)",
+                                crate::voice::fmt_bytes(bytes),
+                                to_tok(bytes),
+                            ),
+                        })
+                        .await
+                        .ok();
+                }
+            }
+            if images {
+                let (n, bytes) = ctx.voice.strip_old_images();
+                if n > 0 {
+                    trimmed_any = true;
+                    ctx.events
+                        .send(Event::Note {
+                            message: format!(
+                                "shake: stripped {n} old image(s) (~{} / ~{} tok)",
+                                crate::voice::fmt_bytes(bytes),
+                                to_tok(bytes),
+                            ),
+                        })
+                        .await
+                        .ok();
+                }
+            }
+            if !trimmed_any {
+                ctx.events
+                    .send(Event::Note {
+                        message: "shake: nothing to trim".to_string(),
+                    })
+                    .await
+                    .ok();
+            }
+            ctx.events.send(Event::Idle).await.ok();
+        }
         Command::ContextBreakdown => {
-            let parts = ctx.voice.context_breakdown();
+            // CTX-09: the regular buckets, then the trim-opportunity
+            // hints (`hint:`-prefixed; surfaces exclude them from
+            // used/free totals).
+            let mut parts = ctx.voice.context_breakdown();
+            parts.extend(ctx.voice.context_hint_parts());
             let window = ctx.voice.window_tokens();
             ctx.events
                 .send(Event::ContextBreakdown { parts, window })
@@ -2206,6 +2377,9 @@ async fn handle_command(
             ctx.events.send(Event::Idle).await.ok();
         }
         Command::Rewind { turns } => {
+            // SES-03: capture the doomed branch BEFORE the truncation
+            // — `rewind` cuts it out of the history for good
+            let tail = ctx.voice.rewind_tail(turns);
             match ctx.voice.rewind(turns) {
                 Some(kept) => {
                     if kept == 0 {
@@ -2239,6 +2413,24 @@ async fn handle_command(
                             kept_from,
                         });
                         ctx.state.record_ids.truncate(keep_idx + 1);
+                    }
+                    // SES-03: a non-empty abandoned branch earns a
+                    // summary, recorded AFTER the Rewind marker so the
+                    // Custom record stays on the kept tip (replay drops
+                    // only conversation records past `kept_from`).
+                    // kept == 0 rewound to the boundary — no surviving
+                    // tip to annotate, so no summary.
+                    if let Some((idx, view)) = tail {
+                        if kept > 0 && idx == kept && !view.trim().is_empty() {
+                            record_branch_summary(
+                                &mut ctx.voice,
+                                &ctx.state,
+                                &mut ctx.strand,
+                                &ctx.events,
+                                view,
+                            )
+                            .await;
+                        }
                     }
                     ctx.events
                         .send(Event::Note {
@@ -2762,6 +2954,245 @@ fn clean_title(raw: &str) -> String {
     line.chars().take(60).collect()
 }
 
+/// Test factor (engine tests only): seconds per configured idle
+/// "minute", so `[context] idle_minutes = 1` gates in seconds instead
+/// of a real minute. Production code reads the default (60) — only
+/// `mod tests` in this file writes it.
+static IDLE_UNIT_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(60);
+/// Test factor (engine tests only): the tick period in seconds
+/// (production: 30).
+static IDLE_TICK_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(30);
+
+fn idle_unit_secs() -> u64 {
+    IDLE_UNIT_SECS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn idle_tick_period() -> Duration {
+    Duration::from_secs(IDLE_TICK_SECS.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Fast-role ask that summarizes where the session stands (CTX-07).
+const RECAP_SYSTEM: &str = "You write 1-2 sentence session-state recaps: what the session is working on and where \
+     it stands. Reply with only the recap.";
+
+/// The idle tick (CTX-07): runs only between commands (the turn runs
+/// inside the command arm, so ticks never race live work). When
+/// `[context] idle_minutes` is configured and the surface has been
+/// quiet that long:
+/// (a) recap — with `[roles] fast`, ≤2 sentences of session state go
+///     to the strand as a `x.ka.recap` Custom record (reachable from
+///     the tip) and surface as a note; only when turns happened since
+///     the last recap;
+/// (b) compaction — when `[context] idle_compact_pct` is set and the
+///     meter reached it, the standard digest runs.
+/// Either action resets the activity baseline: one idle action per
+/// quiet span, retried only after another `idle_minutes` pass.
+async fn idle_tick_work(ctx: &mut Ctx) {
+    let Some(idle_minutes) = ctx.state.idle_minutes else {
+        return; // idle task off
+    };
+    let idle_for = last_activity_for(&ctx.state);
+    if idle_for < Duration::from_secs(idle_minutes * idle_unit_secs()) {
+        return; // not quiet long enough yet
+    }
+    // (a) recap: fast role, new turns only
+    if recap_due(idle_for, ctx.state.recap_minutes)
+        && ctx.state.turns_seen > ctx.state.last_recap_turns
+    {
+        ctx.state.last_recap_turns = ctx.state.turns_seen;
+        idle_recap(&mut ctx.voice, &ctx.state, &mut ctx.strand, &ctx.events).await;
+    }
+    // (b) compaction: the standard digest, threshold-gated
+    if compact_due(
+        ctx.state.idle_compact_pct,
+        ctx.voice.used_pct(ctx.voice.window_tokens()),
+    ) {
+        ctx.events
+            .send(Event::Note {
+                message: format!(
+                    "idle compaction: context at {}% >= {}% threshold",
+                    ctx.voice.used_pct(ctx.voice.window_tokens()),
+                    ctx.state.idle_compact_pct.unwrap_or(0),
+                ),
+            })
+            .await
+            .ok();
+        run_digest(
+            &mut ctx.voice,
+            &mut ctx.state,
+            &mut ctx.strand,
+            &ctx.events,
+            None,
+        )
+        .await;
+    }
+    // one idle action per quiet span
+    ctx.state.last_activity = std::time::Instant::now();
+}
+
+/// Idle duration of the current state (injectable seam for tests).
+fn last_activity_for(state: &EngineState) -> Duration {
+    state.last_activity.elapsed()
+}
+
+/// Pure recap gate (time injected for tests): the extra
+/// `recap_minutes` wait (None = fire on the first idle tick past the
+/// idle gate).
+fn recap_due(idle_for: Duration, recap_minutes: Option<u64>) -> bool {
+    idle_for >= Duration::from_secs(recap_minutes.unwrap_or(0) * idle_unit_secs())
+}
+
+/// Pure compaction gate (meter injected for tests); the caller has
+/// already established the idle elapsed time.
+fn compact_due(threshold_pct: Option<u64>, used_pct: u64) -> bool {
+    threshold_pct.is_some_and(|pct| used_pct >= pct)
+}
+
+/// Generate the idle recap with the fast role and persist it as a
+/// `x.ka.recap` Custom record at the strand tip. Unconfigured fast role
+/// or a failed call degrades to a note — idle work never blocks.
+async fn idle_recap(
+    voice: &mut Voice,
+    state: &EngineState,
+    strand: &mut ka_strand::StrandFile,
+    events: &mpsc::Sender<Event>,
+) {
+    let Some(fast) = state.roles.fast.clone() else {
+        events
+            .send(Event::Note {
+                message: "idle recap unavailable: no [roles] fast configured".to_string(),
+            })
+            .await
+            .ok();
+        return;
+    };
+    let state_view = voice
+        .history
+        .iter()
+        .rev()
+        .find(|m| {
+            m.role == ka_dialect::speaker::TurnRole::Assistant && !m.content.trim().is_empty()
+        })
+        .map(|m| side_view(&m.content));
+    let last_user = voice
+        .history
+        .iter()
+        .rev()
+        .find(|m| m.role == ka_dialect::speaker::TurnRole::User)
+        .map(|m| side_view(&m.content));
+    let (Some(last_user), Some(state_view)) = (last_user, state_view) else {
+        return; // nothing to recap yet
+    };
+    let prompt = format!(
+        "Summarize the current state of this session in at most 2 sentences (what is being \
+         worked on and where it stands). Reply with only the recap.\n\n\
+         <last_user>\n{last_user}\n</last_user>\n\n<latest_state>\n{state_view}\n</latest_state>"
+    );
+    let Some(recap) = voice
+        .role_complete(&fast, RECAP_SYSTEM, &prompt, TITLE_TIMEOUT)
+        .await
+    else {
+        events
+            .send(Event::Note {
+                message: "idle recap unavailable: fast role failed".to_string(),
+            })
+            .await
+            .ok();
+        return;
+    };
+    let recap = recap.trim();
+    if recap.is_empty() {
+        return;
+    }
+    let _ = strand.append(ka_strand::Record::Custom {
+        id: ka_strand::new_record_id(),
+        ns: ka_strand::RECAP_NS.to_string(),
+        data: serde_json::json!({
+            "text": recap,
+            "at": unix_now(),
+            "turns": state.turns_seen,
+        }),
+    });
+    events
+        .send(Event::Note {
+            message: format!("idle recap: {recap}"),
+        })
+        .await
+        .ok();
+}
+
+/// Unix seconds now (0 when the clock is before the epoch — never fails).
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// SES-03: summarize the rewound branch with the fast role and append
+/// it to the strand as a `x.ka.branch_summary` Custom record — it sits
+/// at the tip of the branch you keep, so the abandoned work stays
+/// discoverable (the digest can carry its gist forward). Unconfigured
+/// fast role or a failed call degrades to a note; the rewind itself is
+/// never blocked.
+async fn record_branch_summary(
+    voice: &mut Voice,
+    state: &EngineState,
+    strand: &mut ka_strand::StrandFile,
+    events: &mpsc::Sender<Event>,
+    tail: String,
+) {
+    const BRANCH_SYSTEM: &str = "You summarize abandoned conversation branches. Reply with at \
+     most 3 sentences: what the branch was working on, what it accomplished, and what was \
+     left unfinished. Reply with only the summary.";
+    const BRANCH_TAIL_CAP: usize = 8_000;
+    let Some(fast) = state.roles.fast.clone() else {
+        events
+            .send(Event::Note {
+                message: "branch summary unavailable: no [roles] fast configured".to_string(),
+            })
+            .await
+            .ok();
+        return;
+    };
+    let tail: String = tail.chars().take(BRANCH_TAIL_CAP).collect();
+    let prompt = format!(
+        "The conversation branch below was just rewound (discarded from the live session). \
+         Summarize it in at most 3 sentences. Reply with only the summary.\n\n{tail}"
+    );
+    let Some(summary) = voice
+        .role_complete(&fast, BRANCH_SYSTEM, &prompt, TITLE_TIMEOUT)
+        .await
+    else {
+        events
+            .send(Event::Note {
+                message: "branch summary unavailable: fast role failed".to_string(),
+            })
+            .await
+            .ok();
+        return;
+    };
+    let summary = summary.trim();
+    if summary.is_empty() {
+        return;
+    }
+    let _ = strand.append(ka_strand::Record::Custom {
+        id: ka_strand::new_record_id(),
+        ns: ka_strand::BRANCH_SUMMARY_NS.to_string(),
+        data: serde_json::json!({
+            "text": summary,
+            "at": unix_now(),
+            "turns": state.turns_seen,
+        }),
+    });
+    events
+        .send(Event::Note {
+            message: "branch summary saved to the strand".to_string(),
+        })
+        .await
+        .ok();
+}
+
 /// Post-turn context maintenance: prune old tool outputs, digest while
 /// the window is under pressure.
 async fn settle_context(
@@ -2775,7 +3206,7 @@ async fn settle_context(
     // the ladder: shake (deterministic stale-arg truncation) → prune
     // (spill oversized outputs) → digest (summarize + cut) later in the
     // caller if pressure still holds
-    let shaken = voice.shake(240);
+    let (shaken, _) = voice.shake(crate::voice::SHAKE_ARG_CAP);
     let saved = voice.prune_tool_outputs(ratio);
     if shaken > 0 {
         events
@@ -2803,12 +3234,21 @@ async fn settle_context(
             .ok();
     }
     // speculative zone: pressure ≥80% but not yet tripping — fire the
-    // background candidate so the next real digest is instant
+    // background candidate so the next real digest is instant (always
+    // reserve-based: it is a warm-up, not a trigger)
     if !voice.context_pressure(window) && voice.context_pressure_frac(window, 80) {
         voice.start_speculative(state.roles.fast.as_deref());
     }
+    // CTX-12: the configured percent replaces the reserve rule when
+    // set — digest once the meter reaches `autocompact_pct` of the
+    // window. Unknown window never trips either trigger.
+    let trigger_pct = state.autocompact_pct;
+    let tripped = |v: &Voice| match trigger_pct {
+        Some(pct) => v.used_pct(window) >= pct,
+        None => v.context_pressure(window),
+    };
     let mut digests = 0;
-    while voice.context_pressure(window) && digests < 3 {
+    while tripped(voice) && digests < 3 {
         digests += 1;
         match run_digest(voice, state, strand, events, None).await {
             DigestResult::Digested => continue,
@@ -3116,6 +3556,11 @@ async fn dispatch_turn(
             }
         }
     }
+    // CTX-07 bookkeeping: a completed turn is activity, and the recap
+    // gate counts turns monotonically (digest truncation can shrink
+    // the history, never this counter).
+    state.last_activity = std::time::Instant::now();
+    state.turns_seen += 1;
     settle_steers(state);
 }
 
@@ -5497,5 +5942,407 @@ mod tests {
         let (history, _, _) = super::history_from_records(&[record], false);
         assert!(history[0].images.is_empty());
         assert!(history[0].results[0].images.is_empty());
+    }
+
+    // ── CTX-12 · SetAutoCompact ──────────────────────────────────────
+
+    fn notes_of(events: &[Event]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Note { message } => Some(message.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn set_autocompact_notes_percent_and_default() {
+        let mut handle = spawn(Config::default());
+        for (pct, expected) in [
+            (Some(70u64), "auto-compact trigger: 70%"),
+            (Some(0u64), "out of range"),
+            (Some(150u64), "out of range"),
+            (None, "auto-compact trigger: default"),
+        ] {
+            handle
+                .commands
+                .send(Command::SetAutoCompact { pct })
+                .await
+                .unwrap();
+            let seen = drain_to_idle(&mut handle).await;
+            let notes = notes_of(&seen);
+            assert!(
+                notes.iter().any(|n| n.contains(expected)),
+                "expected {expected:?} in {notes:?}"
+            );
+            if pct.is_some_and(|p| !(1..=100).contains(&p)) {
+                // fail-closed: exactly one note, the rejection — the
+                // live setting is kept, never applied
+                assert_eq!(notes.len(), 1, "only the rejection note: {notes:?}");
+                assert!(
+                    notes[0].contains("keeping"),
+                    "the previous setting is preserved: {notes:?}"
+                );
+            } else {
+                assert_eq!(notes, vec![expected], "single note: {notes:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn idle_gates_are_time_and_meter_injected() {
+        // production unit: 60 s per configured minute
+        assert!(
+            super::recap_due(Duration::from_secs(0), None),
+            "None = no extra wait"
+        );
+        assert!(!super::recap_due(Duration::from_secs(59), Some(1)));
+        assert!(super::recap_due(Duration::from_secs(60), Some(1)));
+        assert!(!super::compact_due(None, 99), "None = idle compaction off");
+        assert!(!super::compact_due(Some(50), 49));
+        assert!(super::compact_due(Some(50), 50));
+    }
+
+    // ── CTX-02 · manual shake ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn shake_command_trims_and_notes() {
+        let mut handle = spawn(Config::default());
+        // a canned turn: no tools/thinking/images, so nothing can trim —
+        // the command still answers with one note and goes idle
+        handle
+            .commands
+            .send(Command::Prompt {
+                allowed_tools: None,
+                model: None,
+                text: "hello".into(),
+                schema: None,
+                images: Vec::new(),
+                skills: Vec::new(),
+            })
+            .await
+            .unwrap();
+        drain_to_idle(&mut handle).await;
+        handle
+            .commands
+            .send(Command::Shake {
+                thinking: true,
+                images: true,
+            })
+            .await
+            .unwrap();
+        let seen = drain_to_idle(&mut handle).await;
+        let notes = notes_of(&seen);
+        assert_eq!(
+            notes,
+            vec!["shake: nothing to trim"],
+            "empty history reports no trim: {notes:?}"
+        );
+    }
+
+    // ── SES-03 · branch summaries on rewind ──────────────────────────
+
+    const RECAP_SSE: &str = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"Recap: fixing the parser; build is \
+         green.\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    const BRANCH_SSE: &str = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"The branch was fixing the parser; type \
+         checks were left unfinished.\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    const DIGEST_SSE: &str = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"Earlier: the user asked to fix the \
+         parser.\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    /// A turn whose usage pushes the meter to ~5% of the 100k window.
+    const TURN_BIG_SSE: &str = concat!(
+        "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"Sure thing.\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5000,\"completion_tokens\":2}}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    fn custom_records(work: &std::path::Path, ns: &str) -> Vec<serde_json::Value> {
+        ka_strand::list(work)
+            .unwrap()
+            .first()
+            .map(|s| {
+                ka_strand::read(&s.path)
+                    .unwrap()
+                    .into_iter()
+                    .filter_map(|r| match r {
+                        ka_strand::Record::Custom { ns: n, data, .. } if n == ns => Some(data),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn rewind_without_fast_notes_unavailable_but_rewinds() {
+        let mut handle = spawn(Config::default());
+        for text in ["first question", "second question"] {
+            handle
+                .commands
+                .send(Command::Prompt {
+                    allowed_tools: None,
+                    model: None,
+                    text: text.into(),
+                    schema: None,
+                    images: Vec::new(),
+                    skills: Vec::new(),
+                })
+                .await
+                .unwrap();
+            drain_to_idle(&mut handle).await;
+        }
+        handle
+            .commands
+            .send(Command::Rewind { turns: 1 })
+            .await
+            .unwrap();
+        let seen = drain_to_idle(&mut handle).await;
+        let notes = notes_of(&seen);
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.starts_with("branch summary unavailable")),
+            "unconfigured fast degrades to a note: {notes:?}"
+        );
+        assert!(notes.contains(&"rewound 1 turn(s)"));
+    }
+
+    #[tokio::test]
+    async fn rewind_to_boundary_records_no_branch_summary() {
+        let mut handle = spawn(Config::default());
+        handle
+            .commands
+            .send(Command::Prompt {
+                allowed_tools: None,
+                model: None,
+                text: "only turn".into(),
+                schema: None,
+                images: Vec::new(),
+                skills: Vec::new(),
+            })
+            .await
+            .unwrap();
+        drain_to_idle(&mut handle).await;
+        handle
+            .commands
+            .send(Command::Rewind { turns: 1 })
+            .await
+            .unwrap();
+        let seen = drain_to_idle(&mut handle).await;
+        let notes = notes_of(&seen);
+        assert_eq!(notes, vec!["rewound 1 turn(s)"], "boundary, no summary");
+    }
+
+    #[tokio::test]
+    async fn rewind_records_branch_summary_reachable_from_tip() {
+        use crate::engine::{StrandChoice, spawn_full};
+        let captured = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        // call order: turn 1 → auto-title → turn 2 → branch summary
+        let addr = serve_sse(
+            vec![TURN_SSE, TITLE_SSE, TURN_SSE, BRANCH_SSE],
+            captured.clone(),
+        );
+        let work = title_workdir("branch");
+        let mut h = spawn_full(
+            title_cfg(&work, Some("test/fast")),
+            live_catalog(addr, Some(addr)),
+            StrandChoice::New,
+        );
+        for text in ["fix the parser in src/x.rs", "also rename the module"] {
+            h.commands
+                .send(Command::Prompt {
+                    allowed_tools: None,
+                    model: None,
+                    text: text.into(),
+                    schema: None,
+                    images: Vec::new(),
+                    skills: Vec::new(),
+                })
+                .await
+                .unwrap();
+            drain_to_idle(&mut h).await;
+        }
+        h.commands.send(Command::Rewind { turns: 1 }).await.unwrap();
+        let seen = drain_to_idle(&mut h).await;
+        let notes = notes_of(&seen);
+        assert!(notes.contains(&"branch summary saved to the strand"));
+        // exactly 4 wire calls: two turns, one title, one summary
+        assert_eq!(captured.lock().len(), 4, "requests: {:?}", captured.lock());
+        // the record carries the summarized text
+        let records = custom_records(&work, ka_strand::BRANCH_SUMMARY_NS);
+        assert_eq!(records.len(), 1, "one branch summary record: {records:?}");
+        assert!(
+            records[0]["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("parser")),
+            "summary text: {records:?}"
+        );
+        // reachable from the tip: replay the strand's live chain (the
+        // rewind retracts the abandoned conversation records; Custom
+        // records survive) — the summary must still be there
+        let sessions = ka_strand::list(&work).unwrap();
+        let live = ka_strand::read(&sessions[0].path).unwrap();
+        let rendered = ka_strand::render_jsonl(&live).unwrap();
+        let tip_records = parse_records(&rendered);
+        let reachable = tip_records
+            .iter()
+            .filter(|r| {
+                matches!(r, ka_strand::Record::Custom { ns, .. } if ns == ka_strand::BRANCH_SUMMARY_NS)
+            })
+            .count();
+        assert_eq!(reachable, 1, "summary survives tip replay");
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    fn parse_records(jsonl: &str) -> Vec<ka_strand::Record> {
+        jsonl
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect()
+    }
+
+    // ── CTX-07 · idle task ───────────────────────────────────────────
+
+    /// The idle-test factors are process-global; idle tests serialize
+    /// on this and restore the defaults when done.
+    static IDLE_SER: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    /// Shrink the idle factors (1 unit second, 1s ticks) for the
+    /// holding test; the process-global defaults are restored on drop.
+    /// The guard is held, never read — its lock IS the serialization.
+    #[allow(dead_code)]
+    struct IdleFactors(parking_lot::MutexGuard<'static, ()>);
+    impl IdleFactors {
+        fn shrink() -> Self {
+            let guard = IDLE_SER.lock();
+            use std::sync::atomic::Ordering::Relaxed;
+            super::IDLE_UNIT_SECS.store(1, Relaxed);
+            super::IDLE_TICK_SECS.store(1, Relaxed);
+            Self(guard)
+        }
+    }
+    impl Drop for IdleFactors {
+        fn drop(&mut self) {
+            use std::sync::atomic::Ordering::Relaxed;
+            super::IDLE_UNIT_SECS.store(60, Relaxed);
+            super::IDLE_TICK_SECS.store(30, Relaxed);
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_task_recaps_and_compacts_once_per_quiet_span() {
+        use crate::engine::{StrandChoice, spawn_full};
+        let _guard = IdleFactors::shrink();
+        let captured = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        // call order: turn → auto-title → idle recap → idle digest
+        let addr = serve_sse(
+            vec![TURN_BIG_SSE, TITLE_SSE, RECAP_SSE, DIGEST_SSE],
+            captured.clone(),
+        );
+        let work = title_workdir("idle");
+        let cfg = Config {
+            model: Some("test/main".into()),
+            roles: crate::config::Roles {
+                default: None,
+                fast: Some("test/fast".into()),
+            },
+            cwd: Some(work.display().to_string()),
+            context: crate::config::Context {
+                idle_minutes: Some(1),
+                recap_minutes: None,       // inherits idle_minutes
+                idle_compact_pct: Some(1), // meter at ~5% >= 1%
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        let mut h = spawn_full(cfg, live_catalog(addr, Some(addr)), StrandChoice::New);
+        h.commands
+            .send(Command::Prompt {
+                allowed_tools: None,
+                model: None,
+                text: "fix the parser".into(),
+                schema: None,
+                images: Vec::new(),
+                skills: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let first = drain_to_idle(&mut h).await;
+        assert!(
+            notes_of(&first).iter().all(|n| !n.contains("idle recap")),
+            "no recap before the idle span: {:?}",
+            notes_of(&first)
+        );
+        // quiet past the idle gate: recap + idle compaction fire. Tick
+        // work never emits Idle (headless surfaces would exit), so the
+        // phase ends at the digest's own events.
+        let mut idle_events = Vec::new();
+        loop {
+            let evt = tokio::time::timeout(Duration::from_secs(10), h.events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            // tick work never emits Idle (headless surfaces would
+            // exit); the digest's completion note ends the phase
+            let done = matches!(&evt, Event::Note { message } if message == "context digested");
+            idle_events.push(evt);
+            if done {
+                break;
+            }
+        }
+        let idle_notes = notes_of(&idle_events);
+        assert!(
+            idle_notes
+                .iter()
+                .any(|n| n.starts_with("idle recap: Recap: fixing the parser")),
+            "recap note: {idle_notes:?}"
+        );
+        assert!(
+            idle_notes
+                .iter()
+                .any(|n| n.starts_with("idle compaction: context at 5% >= 1% threshold")),
+            "compaction note: {idle_notes:?}"
+        );
+        assert!(
+            idle_events
+                .iter()
+                .any(|e| matches!(e, Event::DigestStarted)),
+            "idle digest ran: {idle_events:?}"
+        );
+        // the recap persists as a x.ka.recap Custom record
+        let records = custom_records(&work, ka_strand::RECAP_NS);
+        assert_eq!(records.len(), 1, "one recap record: {records:?}");
+        assert_eq!(
+            records[0]["text"], "Recap: fixing the parser; build is green.",
+            "recap text: {records:?}"
+        );
+        // one idle action per quiet span: a second quiet window brings
+        // ticks, but with no new turns nothing re-fires
+        let requests_after_first_span = captured.lock().len();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(
+            custom_records(&work, ka_strand::RECAP_NS).len(),
+            1,
+            "no recap without new turns"
+        );
+        assert_eq!(
+            captured.lock().len(),
+            requests_after_first_span,
+            "no extra wire calls in the second quiet span"
+        );
+        let _ = std::fs::remove_dir_all(&work);
     }
 }

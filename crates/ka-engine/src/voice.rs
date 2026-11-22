@@ -92,6 +92,29 @@ const KEEP_TAIL_TOKENS: u64 = 20_000;
 const RESERVE_FLOOR: u64 = 16_384;
 /// Digest reserve fraction of the window (15%).
 const RESERVE_PCT: u64 = 15;
+/// Tool-call arguments above this many bytes count as trimmable for
+/// the /context hints; the shake truncates to this cap.
+pub(crate) const SHAKE_ARG_CAP: usize = 240;
+/// Chars of each abandoned-branch message fed to the branch-summary
+/// prompt (SES-03).
+const BRANCH_SIDE_CAP: usize = 1_200;
+
+/// Human-readable byte size (`12.3 kB`, `1.2 MB`) for notes and hints.
+pub(crate) fn fmt_bytes(bytes: u64) -> String {
+    let b = bytes as f64;
+    if b >= 1_000_000.0 {
+        format!("{:.1} MB", b / 1_000_000.0)
+    } else if b >= 1_000.0 {
+        format!("{:.1} kB", b / 1_000.0)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// Cap a string to `cap` chars (prompt side views).
+fn side_cap(s: &str, cap: usize) -> String {
+    s.chars().take(cap).collect()
+}
 
 const DIGEST_SYSTEM: &str = "You are a context digester. Summarize the conversation so a \
 continuing agent can pick up exactly where it left off. Preserve: the \
@@ -1107,6 +1130,14 @@ impl Voice {
     /// window. In-memory only — strands keep the full originals, so
     /// pruning re-applies deterministically after resume.
     pub fn prune_tool_outputs(&mut self, ratio: f64) -> u64 {
+        self.prune_tool_outputs_with(ratio, MIN_PRUNE_SAVINGS)
+    }
+
+    /// [`Self::prune_tool_outputs`] with an explicit minimum-savings
+    /// gate: the ladder keeps a high gate (pruning is only worth a note
+    /// when it frees real space), while the manual shake passes `0` —
+    /// the user asked for the trim, so even small outputs go.
+    pub fn prune_tool_outputs_with(&mut self, ratio: f64, min_savings: u64) -> u64 {
         let sizes: Vec<u64> = self.history_sizes(ratio);
         let total: u64 = sizes.iter().sum();
         let mut cut = self.history.len();
@@ -1137,7 +1168,7 @@ impl Voice {
                 }
             }
         }
-        if savings < MIN_PRUNE_SAVINGS {
+        if savings < min_savings {
             return 0;
         }
         for (i, j, original) in replacements.iter().map(|(i, j, o)| (*i, *j, o.clone())) {
@@ -1161,13 +1192,14 @@ impl Voice {
     /// arguments of every call that predates the last user message —
     /// by then the call is stale (its result is already in the
     /// transcript) and only the giant argument payloads linger in the
-    /// resent context. Returns the number of calls truncated.
-    /// Idempotent: already-shaken calls are left alone.
-    pub fn shake(&mut self, arg_cap: usize) -> usize {
-        let Some(last_user) = self.history.iter().rposition(|m| m.role == TurnRole::User) else {
-            return 0;
+    /// resent context. Returns `(calls truncated, argument bytes
+    /// saved)`. Idempotent: already-shaken calls are left alone.
+    pub fn shake(&mut self, arg_cap: usize) -> (usize, u64) {
+        let Some(last_user) = self.last_user_idx() else {
+            return (0, 0);
         };
         let mut n = 0;
+        let mut bytes = 0u64;
         for m in self.history[..last_user].iter_mut() {
             for call in m.calls.iter_mut() {
                 let compact = call.arguments.to_string();
@@ -1187,12 +1219,187 @@ impl Voice {
                         .collect();
                     let mut kept: String = flat.chars().take(budget).collect();
                     kept.push_str(MARKER);
+                    bytes += compact.len() as u64;
                     call.arguments = serde_json::Value::String(kept);
                     n += 1;
                 }
             }
         }
-        n
+        (n, bytes)
+    }
+
+    /// Strip assistant thinking from every message before the last user
+    /// message (the manual shake's `thinking` mode: the current turn's
+    /// reasoning stays). Returns `(messages stripped, bytes freed)`.
+    pub fn strip_old_thinking(&mut self) -> (usize, u64) {
+        let Some(last_user) = self.last_user_idx() else {
+            return (0, 0);
+        };
+        let mut msgs = 0;
+        let mut bytes = 0u64;
+        for m in self.history[..last_user].iter_mut() {
+            if let Some(thinking) = m.thinking.take() {
+                let n = thinking.len() as u64;
+                if n > 0 {
+                    bytes += n;
+                    msgs += 1;
+                }
+            }
+        }
+        (msgs, bytes)
+    }
+
+    /// Remove image parts (prompt attachments and tool-output images)
+    /// from every message before the last user message (the manual
+    /// shake's `images` mode). Returns `(images dropped, base64 bytes
+    /// freed)`.
+    pub fn strip_old_images(&mut self) -> (usize, u64) {
+        let Some(last_user) = self.last_user_idx() else {
+            return (0, 0);
+        };
+        let mut n = 0;
+        let mut bytes = 0u64;
+        for m in self.history[..last_user].iter_mut() {
+            for image in m.images.drain(..) {
+                bytes += image.data.len() as u64;
+                n += 1;
+            }
+            for result in m.results.iter_mut() {
+                for image in result.images.drain(..) {
+                    bytes += image.data.len() as u64;
+                    n += 1;
+                }
+            }
+        }
+        (n, bytes)
+    }
+
+    /// Index of the last user message — the boundary the trim ladder
+    /// (shake/strip/prune hints) treats as "the current turn". `None`
+    /// when there is no user message yet.
+    fn last_user_idx(&self) -> Option<usize> {
+        self.history.iter().rposition(|m| m.role == TurnRole::User)
+    }
+
+    /// What a rewind by `turns` would cut, without cutting it:
+    /// `(kept index, text view of the abandoned tail)`. The view folds
+    /// the user/assistant prose of the doomed branch (tool noise
+    /// skipped), capped for the summarizer. `None` when there aren't
+    /// that many user turns.
+    pub fn rewind_tail(&self, turns: u32) -> Option<(usize, String)> {
+        if turns == 0 {
+            return None;
+        }
+        let mut seen = 0u32;
+        for idx in (0..self.history.len()).rev() {
+            if self.history[idx].role == TurnRole::User {
+                seen += 1;
+                if seen == turns {
+                    let tail = self
+                        .history
+                        .get(idx..)
+                        .unwrap_or(&[])
+                        .iter()
+                        .filter(|m| matches!(m.role, TurnRole::User | TurnRole::Assistant))
+                        .map(|m| {
+                            let who = match m.role {
+                                TurnRole::User => "user",
+                                _ => "assistant",
+                            };
+                            format!(
+                                "<{who}>\n{}\n</{who}>",
+                                side_cap(&m.content, BRANCH_SIDE_CAP)
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    return Some((idx, tail));
+                }
+            }
+        }
+        None
+    }
+
+    /// Last measured context consumption (tokens).
+    pub fn used_tokens(&self) -> u64 {
+        self.last_context
+    }
+
+    /// Context consumption as a percent of the window (0 when the
+    /// window is unknown). The percent-based auto-compact trigger
+    /// (CTX-12) reads this.
+    pub fn used_pct(&self, window: u64) -> u64 {
+        self.last_context
+            .saturating_mul(100)
+            .checked_div(window)
+            .unwrap_or(0)
+    }
+
+    /// CTX-09: trim-opportunity hints for the /context modal, as
+    /// additive [`ka_protocol::ContextPart`] rows. Names carry the
+    /// `hint:` prefix plus a human byte figure; `tokens` is the
+    /// estimated token saving. Surfaces must EXCLUDE `hint:`-prefixed
+    /// parts from used/free totals — the amounts already sit inside the
+    /// regular buckets (thinking rides `assistant`, args/outputs ride
+    /// `tools`). Zero-token rows render harmlessly on surfaces that
+    /// ignore them.
+    pub fn context_hint_parts(&self) -> Vec<ka_protocol::ContextPart> {
+        let ratio = if self.ratio > 0.0 { self.ratio } else { 4.0 };
+        let to_tok = |bytes: u64| (bytes as f64 / ratio.max(0.1)) as u64;
+        let Some(last_user) = self.last_user_idx() else {
+            return Vec::new();
+        };
+        let mut think_bytes = 0u64;
+        let mut image_bytes = 0u64;
+        let mut arg_bytes = 0u64;
+        let mut out_tokens = 0u64;
+        for m in &self.history[..last_user] {
+            think_bytes += m.thinking.as_deref().map_or(0, |t: &str| t.len() as u64);
+            for image in m.images.iter() {
+                image_bytes += image.data.len() as u64;
+            }
+            for call in m.calls.iter() {
+                let size = call.arguments.to_string().len() as u64;
+                arg_bytes += size.saturating_sub(SHAKE_ARG_CAP as u64);
+            }
+            for result in m.results.iter() {
+                for image in result.images.iter() {
+                    image_bytes += image.data.len() as u64;
+                }
+                let tokens = (result.content.chars().count() as f64 / ratio.max(0.1)) as u64;
+                if tokens > 8 {
+                    // prunable at the manual threshold; the ladder's
+                    // 20k savings gate may keep it — still a hint
+                    out_tokens += tokens;
+                }
+            }
+        }
+        let mut parts = Vec::new();
+        if think_bytes > 0 {
+            parts.push(ka_protocol::ContextPart {
+                name: format!("hint:thinking {}", fmt_bytes(think_bytes)),
+                tokens: to_tok(think_bytes),
+            });
+        }
+        if image_bytes > 0 {
+            parts.push(ka_protocol::ContextPart {
+                name: format!("hint:images {}", fmt_bytes(image_bytes)),
+                tokens: to_tok(image_bytes),
+            });
+        }
+        if arg_bytes > 0 {
+            parts.push(ka_protocol::ContextPart {
+                name: format!("hint:args {}", fmt_bytes(arg_bytes)),
+                tokens: to_tok(arg_bytes),
+            });
+        }
+        if out_tokens > 0 {
+            parts.push(ka_protocol::ContextPart {
+                name: format!("hint:outputs ~{out_tokens} tok"),
+                tokens: out_tokens,
+            });
+        }
+        parts
     }
 
     fn history_sizes(&self, ratio: f64) -> Vec<u64> {
@@ -5284,8 +5491,12 @@ mod tests {
             }],
         ));
 
-        let n = voice.shake(240);
+        let (n, bytes) = voice.shake(240);
         assert_eq!(n, 1, "only the stale call is shaken");
+        assert!(
+            bytes > 240,
+            "the saved-bytes estimate reflects the truncated payload: {bytes}"
+        );
         assert!(
             voice.history[0].calls[0]
                 .arguments
@@ -5297,7 +5508,188 @@ mod tests {
             voice.history[3].calls[0].arguments, big_args,
             "the fresh call keeps its arguments"
         );
-        assert_eq!(voice.shake(240), 0, "shaking is idempotent");
+        assert_eq!(voice.shake(240), (0, 0), "shaking is idempotent");
+    }
+
+    /// Voice with a 1:1 chars-per-token catalog for trim tests.
+    fn trim_voice() -> Voice {
+        let catalog = Catalog::parse(
+            "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000\nratio = 1.0\n",
+        )
+        .unwrap();
+        Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Ask, 5)
+    }
+
+    #[test]
+    fn strip_old_thinking_keeps_the_current_turn() {
+        use ka_dialect::speaker::TurnMessage;
+        let mut voice = trim_voice();
+        let old = "deep thought ".repeat(20);
+        voice.history.push(TurnMessage::user("q1"));
+        let mut stale = TurnMessage::assistant("working");
+        stale.thinking = Some(old.clone());
+        voice.history.push(stale);
+        voice.history.push(TurnMessage::user("q2"));
+        let mut fresh = TurnMessage::assistant("done");
+        fresh.thinking = Some("fresh".to_string());
+        voice.history.push(fresh);
+
+        let (msgs, bytes) = voice.strip_old_thinking();
+        assert_eq!(msgs, 1, "only the stale message is stripped");
+        assert_eq!(bytes, old.len() as u64, "bytes freed match the payload");
+        assert!(voice.history[1].thinking.is_none(), "stale thinking gone");
+        assert_eq!(
+            voice.history[3].thinking.as_deref(),
+            Some("fresh"),
+            "the current turn keeps its thinking"
+        );
+        // idempotent
+        assert_eq!(voice.strip_old_thinking(), (0, 0));
+    }
+
+    #[test]
+    fn strip_old_images_drops_prompt_and_tool_images() {
+        use ka_dialect::speaker::{ToolResult, TurnMessage};
+        let img = |data: &str| ka_dialect::ImagePart {
+            data: data.to_string(),
+            media_type: "image/png".into(),
+        };
+        let mut voice = trim_voice();
+        voice
+            .history
+            .push(TurnMessage::user_with_images("look", vec![img("AAAA")]));
+        voice.history.push(TurnMessage::assistant("seeing"));
+        voice.history.push(TurnMessage::tool(vec![ToolResult {
+            call_id: "c1".into(),
+            content: "screenshot".into(),
+            is_error: false,
+            images: vec![img("BBBB")],
+        }]));
+        voice.history.push(TurnMessage::user("next"));
+        voice.history.push(TurnMessage::assistant("done"));
+
+        let (n, bytes) = voice.strip_old_images();
+        assert_eq!(n, 2, "prompt + tool images dropped");
+        assert_eq!(bytes, 8, "base64 bytes freed");
+        assert!(voice.history[0].images.is_empty());
+        assert!(voice.history[2].results[0].images.is_empty());
+        // the tool output text survives — only images go
+        assert_eq!(voice.history[2].results[0].content, "screenshot");
+        assert_eq!(voice.strip_old_images(), (0, 0), "idempotent");
+    }
+
+    #[test]
+    fn prune_zero_gate_catches_small_outputs_the_ladder_skips() {
+        use ka_dialect::speaker::{ToolCall, ToolResult, TurnMessage, TurnRole};
+        let mut voice = trim_voice();
+        voice.history.push(TurnMessage::user("start"));
+        voice.history.push(TurnMessage::assistant_with_calls(
+            "working",
+            vec![ToolCall {
+                id: "c1".into(),
+                tool: "bash".into(),
+                arguments: Default::default(),
+            }],
+        ));
+        voice.history.push(TurnMessage::tool(vec![ToolResult {
+            call_id: "c1".into(),
+            content: "x".repeat(50), // 50 tok — real but far below the 20k ladder gate
+            is_error: false,
+            images: Vec::new(),
+        }]));
+        // fill the 40k protect window so the old result becomes prunable
+        voice
+            .history
+            .push(TurnMessage::user(format!("recent {}", "r".repeat(45_000))));
+        voice.history.push(TurnMessage::assistant("tail"));
+
+        assert_eq!(
+            voice.prune_tool_outputs(1.0),
+            0,
+            "the ladder gate skips small savings"
+        );
+        let saved = voice.prune_tool_outputs_with(1.0, 0);
+        assert_eq!(saved, 50, "manual shake (gate 0) prunes them");
+        let tool = voice
+            .history
+            .iter()
+            .find(|m| m.role == TurnRole::Tool)
+            .unwrap();
+        assert!(tool.results[0].content.starts_with("[pruned output"));
+    }
+
+    #[test]
+    fn context_hints_report_trim_opportunities() {
+        use ka_dialect::speaker::{ToolCall, ToolResult, TurnMessage};
+        let mut voice = trim_voice();
+        voice.history.push(TurnMessage::user("q1"));
+        let mut stale = TurnMessage::assistant_with_calls(
+            "working",
+            vec![ToolCall {
+                id: "c1".into(),
+                tool: "write".into(),
+                arguments: serde_json::json!({ "content": "y".repeat(500) }),
+            }],
+        );
+        stale.thinking = Some("z".repeat(120));
+        voice.history.push(stale);
+        voice.history.push(TurnMessage::tool(vec![ToolResult {
+            call_id: "c1".into(),
+            content: "o".repeat(1_000),
+            is_error: false,
+            images: Vec::new(),
+        }]));
+        voice.history.push(TurnMessage::user("q2"));
+
+        let hints = voice.context_hint_parts();
+        assert_eq!(
+            hints.len(),
+            3,
+            "thinking + args + outputs, no images: {hints:?}"
+        );
+        for part in &hints {
+            assert!(part.name.starts_with("hint:"), "hint prefix: {part:?}");
+            assert!(part.tokens > 0, "token estimate: {part:?}");
+        }
+        assert!(hints.iter().any(|p| p.name.starts_with("hint:thinking")));
+        assert!(hints.iter().any(|p| p.name.starts_with("hint:args")));
+        assert!(hints.iter().any(|p| p.name.starts_with("hint:outputs")));
+        // a fresh conversation has nothing to hint
+        let mut fresh = trim_voice();
+        fresh.history.push(TurnMessage::user("only"));
+        assert!(fresh.context_hint_parts().is_empty());
+    }
+
+    #[test]
+    fn rewind_tail_previews_the_doomed_branch_without_cutting() {
+        use ka_dialect::speaker::TurnMessage;
+        let voice_like = || {
+            let mut voice = trim_voice();
+            for (q, a) in [("q1", "a1"), ("q2", "a2"), ("q3", "a3")] {
+                voice.history.push(TurnMessage::user(q));
+                voice.history.push(TurnMessage::assistant(a));
+            }
+            voice
+        };
+        let voice = voice_like();
+        let len = voice.history.len();
+        let (idx, view) = voice.rewind_tail(2).expect("two turns back exist");
+        assert_eq!(idx, 2, "index of the 2nd-last user message");
+        assert!(view.contains("q2") && view.contains("a2"));
+        assert!(
+            view.contains("q3") && view.contains("a3"),
+            "whole tail: {view}"
+        );
+        assert_eq!(
+            voice.history.len(),
+            len,
+            "rewind_tail must not touch the history"
+        );
+        assert!(voice_like().rewind_tail(0).is_none(), "zero is no rewind");
+        assert!(
+            voice_like().rewind_tail(4).is_none(),
+            "more turns than exist"
+        );
     }
 
     #[test]

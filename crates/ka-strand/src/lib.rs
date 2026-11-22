@@ -809,6 +809,14 @@ pub struct StrandSummary {
     /// Summed tokens (input + output + cache reads/writes) across the
     /// strand's Usage records; 0 for strands without usage accounting.
     pub tokens: u64,
+    /// Whether the session is pinned: the state carried by the LAST
+    /// `x.ka.pin` record wins (see [`set_pinned`]). Pickers star/sort
+    /// pinned sessions first.
+    pub pinned: bool,
+    /// The most recent recap text (last `x.ka.recap` record wins, see
+    /// [`append_recap`]); `None` until the first recap. Surfaces in
+    /// session columns and search.
+    pub recap: Option<String>,
 }
 
 /// List strands for a working directory, newest first. Scans cheaply:
@@ -831,6 +839,27 @@ struct UsageProbe {
     output: u64,
     cache_read: u64,
     cache_write: u64,
+}
+
+/// Just the fields a summary needs off a namespaced custom line (the
+/// engine-reserved `x.ka.*` session flags: pins, recaps). Payloads that
+/// are not objects with these optional keys fail the probe harmlessly —
+/// the record is simply not a pin or a recap.
+#[derive(serde::Deserialize)]
+struct CustomProbe {
+    ns: String,
+    data: CustomDataProbe,
+}
+
+/// The payload keys a summary reads off a custom record; both are
+/// optional because the three namespaces carry different shapes.
+#[derive(serde::Deserialize, Default)]
+#[serde(default)]
+struct CustomDataProbe {
+    /// `x.ka.pin`: the session pin state.
+    pinned: bool,
+    /// `x.ka.recap`: the recap text.
+    text: Option<String>,
 }
 
 /// Summarize every .jsonl strand under `dir`, newest first (shared by
@@ -901,6 +930,8 @@ fn summarize(path: &Path) -> Option<StrandSummary> {
     let mut messages = 0usize;
     let mut cost = 0.0f64;
     let mut tokens = 0u64;
+    let mut pinned = false;
+    let mut recap: Option<String> = None;
     while let Some(line) = read_line_lossy(&mut reader, &mut buf) {
         if line.starts_with("{\"record\":\"message\"") {
             messages += 1;
@@ -933,6 +964,16 @@ fn summarize(path: &Path) -> Option<StrandSummary> {
             if let Ok(Record::Name { name: n, .. }) = serde_json::from_str(line) {
                 name = Some(n);
             }
+        } else if line.starts_with("{\"record\":\"custom\"") {
+            // engine-reserved session flags (`x.ka.*`): the last pin
+            // record decides the state, the last recap is the recap
+            if let Ok(probe) = serde_json::from_str::<CustomProbe>(line) {
+                match probe.ns.as_str() {
+                    ns if ns == PIN_NS => pinned = probe.data.pinned,
+                    ns if ns == RECAP_NS => recap = probe.data.text,
+                    _ => {}
+                }
+            }
         } else if line.starts_with("{\"record\":\"usage\"") {
             if let Ok(probe) = serde_json::from_str::<UsageProbe>(line) {
                 cost += probe.cost;
@@ -953,6 +994,8 @@ fn summarize(path: &Path) -> Option<StrandSummary> {
         parent,
         name,
         tokens,
+        pinned,
+        recap,
     })
 }
 
@@ -1021,6 +1064,62 @@ pub fn retitle(path: &Path, title: &str) -> std::io::Result<()> {
         id: new_record_id(),
         title: title.to_string(),
     })
+}
+
+/// Namespace of the session pin flag (`set_pinned`): the LAST record
+/// in the strand decides. Engine-reserved `x.ka.*` prefix.
+pub const PIN_NS: &str = "x.ka.pin";
+
+/// Namespace of session recaps (`append_recap`): the LAST record is
+/// the current recap. Engine-reserved `x.ka.*` prefix.
+pub const RECAP_NS: &str = "x.ka.recap";
+
+/// Namespace of post-rewind branch summaries
+/// (`append_branch_summary`). Engine-reserved `x.ka.*` prefix.
+pub const BRANCH_SUMMARY_NS: &str = "x.ka.branch_summary";
+
+/// Append one engine-namespaced custom record to the strand at `path`.
+/// Shared by the session-flag appenders below; validation matches
+/// [`retitle`] (a real file carrying a strand header).
+fn append_custom(path: &Path, ns: &str, data: serde_json::Value) -> std::io::Result<()> {
+    if !path.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("no strand file at {}", path.display()),
+        ));
+    }
+    let mut strand = StrandFile::open(path)?;
+    strand.append(Record::Custom {
+        id: new_record_id(),
+        ns: ns.to_string(),
+        data,
+    })
+}
+
+/// Pin or unpin the session at `path` by appending a [`Record::Custom`]
+/// under [`PIN_NS`] with payload `{"pinned": <bool>}`. The strand stays
+/// append-only: pinning twice appends twice, and the LAST pin record
+/// wins everywhere the state is read (replay, [`list`], [`latest`]).
+/// Errors when the file is missing or is not a strand.
+pub fn set_pinned(path: &Path, pinned: bool) -> std::io::Result<()> {
+    append_custom(path, PIN_NS, serde_json::json!({ "pinned": pinned }))
+}
+
+/// Append a session recap (`x.ka.recap`, payload `{"text": <text>}`):
+/// a short "where we left off" note the session columns and search
+/// surface. [`StrandSummary::recap`] reports the most recent one.
+/// Errors when the file is missing or is not a strand.
+pub fn append_recap(path: &Path, text: &str) -> std::io::Result<()> {
+    append_custom(path, RECAP_NS, serde_json::json!({ "text": text }))
+}
+
+/// Append a branch summary (`x.ka.branch_summary`, payload
+/// `{"text": <text>}`) — the engine calls this after a rewind whose
+/// retracted tail was not empty, so the abandoned branch stays
+/// discoverable from the strand itself. Errors when the file is
+/// missing or is not a strand.
+pub fn append_branch_summary(path: &Path, text: &str) -> std::io::Result<()> {
+    append_custom(path, BRANCH_SUMMARY_NS, serde_json::json!({ "text": text }))
 }
 
 /// Delete the strand at `path` and, in cascade, every sibling strand
@@ -1147,6 +1246,228 @@ pub fn archive(path: &Path, archived: bool) -> std::io::Result<PathBuf> {
     Ok(dest)
 }
 
+/// What one [`gc`] pass found. Removed counts are identical between a
+/// dry run and the real pass (the same items are counted; only the
+/// deletion is skipped).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GcReport {
+    /// Spill files removed (or counted, dry-run) under
+    /// `<data_root>/spills/` because their mtime passed the threshold.
+    pub spills_removed: u64,
+    /// Snapshot directories removed (or counted, dry-run): orphaned
+    /// ones — no strand left for their cwd — and those past the age
+    /// threshold.
+    pub snapshots_removed: u64,
+    /// Empty strand directories removed (or counted, dry-run).
+    pub empty_dirs_removed: u64,
+    /// Total bytes of strand files older than the threshold. Reported
+    /// only — `gc` never deletes strands; `ka session delete` does.
+    pub strand_bytes_reported: u64,
+}
+
+/// A strand's header-declared creation cwd (first line only, like
+/// [`header_of`]).
+fn header_cwd(path: &Path) -> Option<String> {
+    let file = File::open(path).ok()?;
+    let first = BufReader::new(file).lines().next()?.ok()?;
+    let Ok(Record::Header { cwd, .. }) = serde_json::from_str(&first) else {
+        return None;
+    };
+    Some(cwd)
+}
+
+/// The snapshot store's cwd encoding (the engine's
+/// `hands/snapshots.rs::encode`): `-` plus the cwd with every `/`
+/// flattened to `-`. Snapshot directory names are keyed by THIS lossy
+/// encoding while strand directories use the injective [`encode_cwd`],
+/// so orphan detection has to speak both.
+fn encode_cwd_snapshots(cwd: &Path) -> String {
+    format!("-{}", cwd.to_string_lossy().replace('/', "-"))
+}
+
+/// Read a directory's entries; a missing directory is empty (nothing
+/// stored there yet), other read failures propagate.
+fn dir_entries(dir: &Path) -> std::io::Result<Vec<std::fs::DirEntry>> {
+    let entries = match std::fs::read_dir(store_path(dir)) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    Ok(entries.flatten().collect())
+}
+
+/// Whether `mtime` is strictly older than `threshold` before `now`
+/// (future mtimes are never old). Mirrors the engine's spill sweep.
+fn is_older(now: SystemTime, mtime: SystemTime, threshold: std::time::Duration) -> bool {
+    now.duration_since(mtime).is_ok_and(|age| age > threshold)
+}
+
+/// Reclaim session storage under `data_root` (the strand store's
+/// `data_dir()`): spill files, snapshot directories and empty strand
+/// directories past `max_age_days` (or orphaned) are deleted — unless
+/// `dry_run`, which counts the same items without touching them.
+/// Strands themselves are NEVER deleted here: only the bytes of files
+/// past the threshold are reported in `GcReport::strand_bytes_reported`;
+/// `ka session delete` owns strand removal.
+///
+/// Areas: spill files (streamed outputs and `.done` markers) are swept
+/// flat from every directory in `spills_roots` — the engine passes its
+/// real spill store (`$XDG_STATE_HOME/ka/spills`, see ka-engine
+/// `hands::spills_root`); the harness convention adds
+/// `<data_dir>/spills/`. `<data_root>/snapshots/<cwd-key>/` holds the
+/// per-cwd undo journals and blobs; `<data_root>/strands/` (and its
+/// `strands-archived/` mirror) hold the strand files. A snapshot
+/// directory is orphaned when neither strand tree has a strand left for
+/// its cwd — matched across the snapshot store's legacy cwd encoding
+/// ([`encode_cwd_snapshots`]) and the strand store's injective one. The
+/// scan is tolerant of entries vanishing mid-pass; deletion failures
+/// propagate.
+pub fn gc(
+    data_root: &Path,
+    spills_roots: &[PathBuf],
+    max_age_days: u64,
+    dry_run: bool,
+) -> std::io::Result<GcReport> {
+    let threshold = std::time::Duration::from_secs(max_age_days.saturating_mul(24 * 60 * 60));
+    let now = SystemTime::now();
+    let mut report = GcReport::default();
+    let strands = data_root.join("strands");
+    let archived = data_root.join("strands-archived");
+
+    // (c) empty strand dirs first: they carry no sessions, and keeping
+    // them out of the live-key set before orphan detection keeps a
+    // dry run and the real pass in exact agreement.
+    for tree in [&strands, &archived] {
+        for entry in dir_entries(tree)? {
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if !meta.is_dir() {
+                continue;
+            }
+            if dir_entries(&entry.path())?.is_empty() {
+                report.empty_dirs_removed += 1;
+                if !dry_run {
+                    std::fs::remove_dir(store_path(&entry.path()))?;
+                }
+            }
+        }
+    }
+
+    // The keys that still own strands: every strand directory holding
+    // at least one header-bearing file, plus all three encodings of
+    // each strand's header cwd — snapshot dirs are keyed by the legacy
+    // snapshot encoding, strand dirs by the injective (or legacy)
+    // strand encoding, and a strand resumed under a different cwd
+    // still declares its original one in the header.
+    let mut live_keys: HashSet<String> = HashSet::new();
+    for tree in [&strands, &archived] {
+        for entry in dir_entries(tree)? {
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if !meta.is_dir() {
+                continue;
+            }
+            let mut has_strand = false;
+            for strand in dir_entries(&entry.path())? {
+                let path = strand.path();
+                if path.extension().is_none_or(|e| e != "jsonl") {
+                    continue;
+                }
+                let Some(cwd) = header_cwd(&path) else {
+                    continue;
+                };
+                has_strand = true;
+                let cwd = PathBuf::from(cwd);
+                live_keys.insert(encode_cwd(&cwd));
+                live_keys.insert(encode_cwd_legacy(&cwd));
+                live_keys.insert(encode_cwd_snapshots(&cwd));
+            }
+            if has_strand {
+                live_keys.insert(entry.file_name().to_string_lossy().into_owned());
+            }
+        }
+    }
+
+    // (b) snapshot dirs: orphaned (their cwd has no strands anywhere)
+    // or past the age threshold go — journal and blobs together.
+    for entry in dir_entries(&data_root.join("snapshots"))? {
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.is_dir() {
+            continue;
+        }
+        let key = entry.file_name().to_string_lossy().into_owned();
+        let aged = meta
+            .modified()
+            .ok()
+            .is_some_and(|m| is_older(now, m, threshold));
+        if live_keys.contains(&key) && !aged {
+            continue;
+        }
+        report.snapshots_removed += 1;
+        if !dry_run {
+            std::fs::remove_dir_all(store_path(&entry.path()))?;
+        }
+    }
+
+    // (a) spill files: age-based sweep, like the engine's startup one.
+    // spills live wherever the caller says: the engine's real spill
+    // store ($XDG_STATE_HOME/ka/spills, see ka-engine hands::spills_root)
+    // plus any harness-written convention roots. All scan; the union
+    // covers engine-written spills and harness-written ones.
+    for spills_dir in spills_roots {
+        for entry in dir_entries(spills_dir)? {
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if !meta.is_file() {
+                continue;
+            }
+            if meta
+                .modified()
+                .ok()
+                .is_some_and(|m| is_older(now, m, threshold))
+            {
+                report.spills_removed += 1;
+                if !dry_run {
+                    std::fs::remove_file(store_path(&entry.path()))?;
+                }
+            }
+        }
+    }
+
+    // (d) strands: report-only — bytes of files past the threshold.
+    for entry in dir_entries(&strands)? {
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.is_dir() {
+            continue;
+        }
+        for strand in dir_entries(&entry.path())? {
+            let path = strand.path();
+            if path.extension().is_none_or(|e| e != "jsonl") {
+                continue;
+            }
+            let Ok(meta) = strand.metadata() else {
+                continue;
+            };
+            if meta
+                .modified()
+                .ok()
+                .is_some_and(|m| is_older(now, m, threshold))
+            {
+                report.strand_bytes_reported += meta.len();
+            }
+        }
+    }
+
+    Ok(report)
+}
+
 /// Outcome of resolving a user-supplied session reference.
 #[derive(Debug, Clone, PartialEq)]
 pub enum IdMatch {
@@ -1178,6 +1499,8 @@ pub fn resolve_id(cwd: &Path, needle: &str) -> std::io::Result<IdMatch> {
             tokens: 0,
             name: None,
             parent: None,
+            pinned: false,
+            recap: None,
         }));
     }
     let mut matches: Vec<StrandSummary> = strands_filter(cwd, needle)?;

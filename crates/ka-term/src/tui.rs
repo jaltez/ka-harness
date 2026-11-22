@@ -710,6 +710,11 @@ pub struct Transcript {
     /// live — they collapse once fully out of view or at the next
     /// turn's boundary (see [`Transcript::collapse_streamed_above`]).
     streamed_open: Vec<usize>,
+    /// `/focus` view (session-scoped, never persisted): everything
+    /// before the turn in progress collapses to one `· prompt` digest
+    /// row per turn; `/focus` again or Esc restores. Pure view state —
+    /// the cache below keeps the full rendering either way.
+    focus: bool,
     /// Render passes issued (cache-audit in tests).
     renders: usize,
 }
@@ -847,8 +852,16 @@ impl Transcript {
     /// (thought-toggle target) or one specific call inside a tool
     /// block (expand target, `(entry, call)`). Every row of a call —
     /// header and threaded body alike — maps to that call; calls stack
-    /// with no rows between them.
+    /// with no rows between them. `/focus` digest rows map to nothing.
     pub fn row_ref_at(&self, row: usize) -> Option<RowRef> {
+        if let Some(full) = self.focus_to_full_row(row) {
+            return self.row_ref_at_full(full);
+        }
+        None
+    }
+
+    /// Click mapping over full-view rows ([`row_ref_at`]'s engine).
+    fn row_ref_at_full(&self, row: usize) -> Option<RowRef> {
         let mut acc = 0usize;
         for (i, (line, rows)) in self.lines.iter().zip(&self.rendered).enumerate() {
             let next = acc + rows.len();
@@ -879,19 +892,12 @@ impl Transcript {
     /// Plain text of one rendered row (the drag-selection copy source):
     /// the row's spans concatenated verbatim. `None` past the end.
     pub fn row_text(&self, row: usize) -> Option<String> {
-        let mut acc = 0usize;
-        for rows in &self.rendered {
-            let next = acc + rows.len();
-            if row < next {
-                let mut s = String::new();
-                for span in &rows[row - acc].spans {
-                    s.push_str(span.content.as_ref());
-                }
-                return Some(s);
-            }
-            acc = next;
+        let line = self.row(row)?;
+        let mut s = String::new();
+        for span in &line.spans {
+            s.push_str(span.content.as_ref());
         }
-        None
+        Some(s)
     }
 
     /// One tool call by `(entry, call)` index (click-to-expand source).
@@ -1062,7 +1068,106 @@ impl Transcript {
     }
 
     pub fn total_rows(&self) -> usize {
+        if self.focus {
+            return self.focus_total();
+        }
         self.rendered.iter().map(Vec::len).sum()
+    }
+
+    /// `/focus` view state: on = finished turns render as one digest
+    /// row each. Toggling re-shapes the view without touching the cache.
+    pub fn focused(&self) -> bool {
+        self.focus
+    }
+
+    pub fn set_focus(&mut self, on: bool) {
+        self.focus = on;
+    }
+
+    /// Row count of the `/focus` view: one per finished turn plus the
+    /// full rendering of the turn in progress.
+    fn focus_total(&self) -> usize {
+        let mut rows = 0usize;
+        for group in self.focus_groups() {
+            rows += match &group {
+                FocusGroup::Full(i) => self.rendered.get(*i).map(Vec::len).unwrap_or(0),
+                FocusGroup::Digest(_) => 1,
+            };
+        }
+        rows
+    }
+
+    /// The `/focus` grouping: every entry from the LAST user prompt on
+    /// renders in full; each earlier turn — its prompt plus everything
+    /// up to the next prompt — collapses to one digest. Entries before
+    /// the first prompt belong to no turn and collapse away with it.
+    fn focus_groups(&self) -> Vec<FocusGroup> {
+        let Some(cut) = self.focus_cut() else {
+            // no turn has started: nothing to collapse
+            return (0..self.lines.len()).map(FocusGroup::Full).collect();
+        };
+        let mut groups = Vec::new();
+        let mut i = 0usize;
+        while i < cut {
+            if let Line::User(prompt) = &self.lines[i] {
+                groups.push(FocusGroup::Digest(focus_digest(prompt)));
+                i += 1;
+                // the turn body runs to the next prompt (or the cut)
+                while i < cut && !matches!(self.lines[i], Line::User(_)) {
+                    i += 1;
+                }
+            } else {
+                i += 1;
+            }
+        }
+        groups.extend((cut..self.lines.len()).map(FocusGroup::Full));
+        groups
+    }
+
+    /// Entry index where `/focus` stops collapsing: the last user
+    /// prompt (None = no turn yet, the view is the plain transcript).
+    fn focus_cut(&self) -> Option<usize> {
+        self.lines.iter().rposition(|l| matches!(l, Line::User(_)))
+    }
+
+    /// Digest rows the `/focus` head carries for entries before `cut`
+    /// (one per finished turn's prompt).
+    fn focus_head_rows(&self, cut: usize) -> usize {
+        self.lines[..cut]
+            .iter()
+            .filter(|l| matches!(l, Line::User(_)))
+            .count()
+    }
+
+    /// Full-view row where entry `entry` starts.
+    fn full_row_of_entry(&self, entry: usize) -> usize {
+        self.rendered.iter().take(entry).map(Vec::len).sum()
+    }
+
+    /// Focus-view row of a full-view row: None when the row belongs to
+    /// a collapsed head entry — only digest rows render from the head.
+    fn full_to_focus_row(&self, row: usize) -> Option<usize> {
+        let Some(cut) = self.focus_cut() else {
+            return Some(row);
+        };
+        let tail_base = self.full_row_of_entry(cut);
+        if row < tail_base {
+            return None;
+        }
+        Some(self.focus_head_rows(cut) + (row - tail_base))
+    }
+
+    /// Full-view row behind a focus-view row: None for head digest
+    /// rows (they have no single underlying row).
+    fn focus_to_full_row(&self, row: usize) -> Option<usize> {
+        let Some(cut) = self.focus_cut() else {
+            return Some(row);
+        };
+        let head = self.focus_head_rows(cut);
+        if row < head {
+            return None;
+        }
+        Some(self.full_row_of_entry(cut) + (row - head))
     }
 
     /// Whether one entry is a thinking block that collapsing would
@@ -1083,8 +1188,20 @@ impl Transcript {
         )
     }
 
-    /// Rendered row span of one entry: `(first_row, row_count)`.
+    /// Rendered row span of one entry: `(first_row, row_count)`. In
+    /// the `/focus` view head entries have no visible span (their rows
+    /// collapsed); tail entries count from after the digest rows.
     pub fn entry_row_span(&self, entry: usize) -> Option<(usize, usize)> {
+        if let Some(cut) = (self.focus).then(|| self.focus_cut()).flatten() {
+            if entry < cut {
+                return None;
+            }
+            let mut at = self.focus_head_rows(cut);
+            for idx in cut..entry.min(self.lines.len()) {
+                at += self.rendered.get(idx).map(Vec::len).unwrap_or(0);
+            }
+            return Some((at, self.rendered.get(entry).map(Vec::len).unwrap_or(0)));
+        }
         let mut at = 0usize;
         for (i, rows) in self.rendered.iter().enumerate() {
             if i == entry {
@@ -1096,9 +1213,27 @@ impl Transcript {
     }
 
     /// Rendered row index where each user entry starts, in transcript
-    /// order (▲▼ title-arrow jump targets).
+    /// order (▲▼ title-arrow jump targets). `/focus` view: finished
+    /// turns anchor on their digest row, the current turn on its rows.
     pub fn user_entry_rows(&self) -> Vec<usize> {
         let mut rows = Vec::new();
+        if let Some(cut) = (self.focus).then(|| self.focus_cut()).flatten() {
+            let mut at = 0usize;
+            for (i, line) in self.lines.iter().enumerate() {
+                if i < cut {
+                    if matches!(line, Line::User(_)) {
+                        rows.push(at);
+                        at += 1;
+                    }
+                } else {
+                    if matches!(line, Line::User(_)) {
+                        rows.push(at);
+                    }
+                    at += self.rendered.get(i).map(Vec::len).unwrap_or(0);
+                }
+            }
+            return rows;
+        }
         let mut at = 0usize;
         for (line, rendered) in self.lines.iter().zip(&self.rendered) {
             if matches!(line, Line::User(_)) {
@@ -1109,12 +1244,42 @@ impl Transcript {
         rows
     }
 
-    /// One rendered row by absolute index.
-    pub fn row(&self, i: usize) -> Option<&ratatui::text::Line<'static>> {
+    /// One rendered row by absolute index. In the `/focus` view the
+    /// index walks digest rows first, then the current turn's rows;
+    /// digest rows are built (owned), tail rows borrow the cache.
+    pub fn row(&self, i: usize) -> Option<std::borrow::Cow<'_, ratatui::text::Line<'static>>> {
+        if let Some(cut) = (self.focus).then(|| self.focus_cut()).flatten() {
+            let mut i = i;
+            for (idx, line) in self.lines.iter().enumerate() {
+                if idx < cut {
+                    if matches!(line, Line::User(_)) {
+                        if i == 0 {
+                            if let Line::User(prompt) = line {
+                                return Some(std::borrow::Cow::Owned(focus_digest_row(
+                                    focus_digest(prompt),
+                                )));
+                            }
+                        }
+                        i -= 1;
+                    }
+                } else {
+                    let len = self.rendered.get(idx).map(Vec::len).unwrap_or(0);
+                    if i < len {
+                        return self
+                            .rendered
+                            .get(idx)
+                            .and_then(|rows| rows.get(i))
+                            .map(std::borrow::Cow::Borrowed);
+                    }
+                    i -= len;
+                }
+            }
+            return None;
+        }
         let mut i = i;
         for entry in &self.rendered {
             if i < entry.len() {
-                return entry.get(i);
+                return entry.get(i).map(std::borrow::Cow::Borrowed);
             }
             i -= entry.len();
         }
@@ -1137,13 +1302,59 @@ impl Transcript {
         if lower.is_empty() {
             return None;
         }
+        // `/focus` view: the anchor and the hit both report in focus
+        // rows. Head entries only surface through their digest row (a
+        // first-words needle matches it); collapsed non-prompt entries
+        // can match but have no visible row, so the search moves on.
+        let focused = self.focus;
+        let cut = self.focus_cut();
+        let from_full = match (focused, cut) {
+            (true, Some(cut)) => match self.focus_to_full_row(from_row) {
+                Some(full) => full,
+                None => {
+                    self.full_row_of_entry(self.focus_digest_entry(from_row, cut).unwrap_or(cut))
+                }
+            },
+            _ => from_row,
+        };
         let mut offset = 0usize;
+        let mut digest = 0usize;
         for (i, line) in self.lines.iter().enumerate() {
             let len = self.rendered.get(i).map(Vec::len).unwrap_or(0);
-            if offset >= from_row && line_text(line).to_lowercase().contains(&lower) {
-                return Some((i, offset));
+            if offset >= from_full && line_text(line).to_lowercase().contains(&lower) {
+                let at = match (focused, cut) {
+                    (true, Some(cut)) if i < cut => match line {
+                        Line::User(_) => Some(digest),
+                        _ => None,
+                    },
+                    (true, Some(_)) => self.full_to_focus_row(offset),
+                    _ => Some(offset),
+                };
+                if let Some(at) = at {
+                    return Some((i, at));
+                }
+            }
+            if let (true, Some(cut)) = (focused, cut) {
+                if i < cut && matches!(line, Line::User(_)) {
+                    digest += 1;
+                }
             }
             offset += len;
+        }
+        None
+    }
+
+    /// The user entry whose digest row sits at head row `row` of the
+    /// `/focus` view (None = past the head).
+    fn focus_digest_entry(&self, row: usize, cut: usize) -> Option<usize> {
+        let mut seen = 0usize;
+        for (idx, line) in self.lines[..cut].iter().enumerate() {
+            if matches!(line, Line::User(_)) {
+                if seen == row {
+                    return Some(idx);
+                }
+                seen += 1;
+            }
         }
         None
     }
@@ -1151,6 +1362,50 @@ impl Transcript {
     pub fn render_passes(&self) -> usize {
         self.renders
     }
+}
+
+/// The searchable text of a transcript entry. Tool blocks expose their
+/// heads and notes (excerpts stay out of transcript search).
+/// One group of the `/focus` collapsed view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FocusGroup {
+    /// Entry index rendered in full (the turn in progress).
+    Full(usize),
+    /// A finished turn collapsed to its digest text.
+    Digest(String),
+}
+
+/// One `/focus` digest row: `· <first words of the prompt>`, quiet.
+fn focus_digest_row(text: String) -> ratatui::text::Line<'static> {
+    ratatui::text::Line::styled(
+        format!("· {text}"),
+        ratatui::style::Style::new().fg(crate::palette::META),
+    )
+}
+
+/// The digest text for one collapsed turn: the prompt's first words,
+/// capped so the row stays one quiet line.
+fn focus_digest(prompt: &str) -> String {
+    const MAX_WORDS: usize = 8;
+    const MAX_CHARS: usize = 60;
+    let mut out = String::new();
+    let mut chars = 0usize;
+    for word in prompt.split_whitespace().take(MAX_WORDS) {
+        let add = word.chars().count() + usize::from(!out.is_empty());
+        if chars + add > MAX_CHARS {
+            break;
+        }
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(word);
+        chars += add;
+    }
+    if out.is_empty() {
+        // whitespace-only or one over-long word: fall back to a char cap
+        out = prompt.trim().chars().take(MAX_CHARS).collect();
+    }
+    out
 }
 
 /// The searchable text of a transcript entry. Tool blocks expose their
@@ -2007,6 +2262,22 @@ fn pop_queue_head(queue: &mut Vec<String>) -> Option<String> {
     (!queue.is_empty()).then(|| queue.remove(0))
 }
 
+/// Ctrl+S draft stash: a non-empty draft parks into the single slot
+/// (the input clears); an empty draft recalls what was parked. `None`
+/// = nothing to do (empty input, empty slot). Session-scoped by
+/// design — the parked draft dies with the session.
+fn stash_draft(stash: &mut Option<String>, input: &mut InputBuffer) -> Option<&'static str> {
+    if input.text.is_empty() {
+        let parked = stash.take()?;
+        input.text = parked;
+        input.cursor = input.text.chars().count();
+        Some("draft recalled")
+    } else {
+        *stash = Some(input.take());
+        Some("draft parked — ctrl+s recalls it")
+    }
+}
+
 /// Queue one draft for after the current turn — the `+` prefix and
 /// alt+q share this path. Blank drafts never queue; slash drafts that
 /// cannot run from a queue refuse with a visible reason (see
@@ -2644,6 +2915,9 @@ fn detect_branch() -> Option<String> {
 /// double-press on an empty idle input opens the rewind menu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EscAction {
+    /// Leave the /focus collapsed view (first in line: the /focus note
+    /// promises 'esc', in every other state).
+    Unfocus,
     /// Release the pinned viewport back to the tail.
     UnpinScroll,
     /// Abort the running turn.
@@ -2657,6 +2931,7 @@ enum EscAction {
 }
 
 fn esc_action(
+    focus_on: bool,
     scrolled: bool,
     busy: bool,
     input_empty: bool,
@@ -2664,7 +2939,9 @@ fn esc_action(
     last_esc: Option<Instant>,
     now: Instant,
 ) -> EscAction {
-    if scrolled {
+    if focus_on {
+        EscAction::Unfocus
+    } else if scrolled {
         EscAction::UnpinScroll
     } else if busy {
         EscAction::Abort
@@ -2749,13 +3026,14 @@ fn rewind_items_from(
 }
 
 /// The Esc arm of the key loop, extracted so its precedence is testable
-/// against the command channel: unpin first, abort only unscrolled,
-/// rewind on the double-press. `rewind` is computed lazily — only the
-/// rewind arm reads the strand.
+/// against the command channel: unfocus first, unpin, abort only
+/// unscrolled, rewind on the double-press. `rewind` is computed
+/// lazily — only the rewind arm reads the strand.
 #[allow(clippy::too_many_arguments)]
 async fn handle_esc(
     commands: &mut mpsc::Sender<Command>,
     scroll: &mut Option<usize>,
+    focus: &mut bool,
     busy: bool,
     input_empty: bool,
     ask_open: bool,
@@ -2765,6 +3043,7 @@ async fn handle_esc(
     now: Instant,
 ) {
     match esc_action(
+        *focus,
         scroll.is_some(),
         busy,
         input_empty,
@@ -2772,6 +3051,7 @@ async fn handle_esc(
         *last_esc,
         now,
     ) {
+        EscAction::Unfocus => *focus = false,
         EscAction::UnpinScroll => *scroll = None,
         EscAction::Abort => {
             let _ = commands.send(Command::Abort).await;
@@ -3285,12 +3565,20 @@ fn usage_rows(meters: &Meters, summaries: &[ka_strand::StrandSummary]) -> Vec<St
 }
 
 /// Rows for the `/context` popup: one bar per component scaled to the
-/// window, plus a used/free footer.
-fn context_rows(parts: &[ka_protocol::ContextPart], window: u64) -> Vec<String> {
+/// window, plus a used/free footer and a tips section (CTX-09) when
+/// there is anything worth acting on. `hint:`-prefixed parts (CTX-09
+/// trim opportunities from the engine) ride in `parts` but stay OUT of
+/// the bars and the used/free footer — their amounts already sit
+/// inside the regular buckets; they surface as tips instead.
+fn context_rows(parts: &[ka_protocol::ContextPart], window: u64, hints: &[String]) -> Vec<String> {
     const BAR_W: usize = 20;
-    let used: u64 = parts.iter().map(|p| p.tokens).sum();
+    let regular: Vec<_> = parts
+        .iter()
+        .filter(|p| !p.name.starts_with("hint:"))
+        .collect();
+    let used: u64 = regular.iter().map(|p| p.tokens).sum();
     let mut rows = vec!["▸ context".to_string()];
-    for p in parts {
+    for p in regular {
         let filled = if window > 0 {
             ((p.tokens as f64 / window as f64) * BAR_W as f64).round() as usize
         } else {
@@ -3314,7 +3602,113 @@ fn context_rows(parts: &[ka_protocol::ContextPart], window: u64) -> Vec<String> 
         fmt_tok(window),
         fmt_tok(free)
     ));
+    if !hints.is_empty() {
+        rows.push(String::new());
+        rows.push("▸ tips".to_string());
+        rows.extend(hints.iter().map(|h| format!("· {h}")));
+    }
     rows
+}
+
+/// CTX-09 advice for the `/context` modal: only what the breakdown and
+/// the local transcript can actually see — nothing invented. The
+/// engine's `hint:`-prefixed parts (bytes/tok of trimmable thinking,
+/// images, stale args, old outputs) come first as the authoritative
+/// figures; local counts fill the gaps when a category is missing from
+/// the breakdown, and `images_sent` is what this surface attached
+/// (replayed sessions undercount and simply stay quiet about images).
+fn context_hints(
+    parts: &[ka_protocol::ContextPart],
+    window: u64,
+    lines: &[Line],
+    images_sent: usize,
+) -> Vec<String> {
+    let regular: Vec<_> = parts
+        .iter()
+        .filter(|p| !p.name.starts_with("hint:"))
+        .collect();
+    let mut hints: Vec<String> = parts.iter().filter_map(engine_hint_line).collect();
+    let reported = |kind: &str| {
+        parts.iter().any(|p| {
+            p.name
+                .strip_prefix("hint:")
+                .is_some_and(|n| n.starts_with(kind))
+        })
+    };
+    let Some(cut) = lines.iter().rposition(|l| matches!(l, Line::User(_))) else {
+        // no turn has started: nothing finished to advise about
+        if hints.is_empty() {
+            hints.push("transcript looks lean — /shake only trims stale tool args".into());
+        }
+        return hints;
+    };
+    let head = &lines[..cut];
+    let old_thoughts = head
+        .iter()
+        .filter(|l| matches!(l, Line::Thought(_)))
+        .count();
+    let old_tool_calls: usize = head
+        .iter()
+        .filter_map(|l| match l {
+            Line::ToolBlock(calls) => Some(calls.len()),
+            _ => None,
+        })
+        .sum();
+    let used: u64 = regular.iter().map(|p| p.tokens).sum();
+    let pct = used
+        .checked_mul(100)
+        .and_then(|v| v.checked_div(window))
+        .unwrap_or(0) as usize;
+    // the engine's figures win; the local counts only fill a hole
+    if images_sent > 0 && !reported("images") {
+        hints.push(format!(
+            "/shake images strips {images_sent} attached image part{} from older turns",
+            if images_sent == 1 { "" } else { "s" }
+        ));
+    }
+    if old_thoughts > 0 && !reported("thinking") {
+        hints.push(format!(
+            "/shake thinking trims {old_thoughts} older thinking block{}",
+            if old_thoughts == 1 { "" } else { "s" }
+        ));
+    }
+    if old_tool_calls > 0 && !reported("args") && !reported("outputs") {
+        hints.push(format!(
+            "/shake prunes stale args/outputs of {old_tool_calls} older tool call{}",
+            if old_tool_calls == 1 { "" } else { "s" }
+        ));
+    }
+    if window > 0 && pct >= 60 {
+        hints.push(format!(
+            "at {pct}% of the window — /compact <focus> digests around a topic"
+        ));
+    }
+    if hints.is_empty() {
+        hints.push("transcript looks lean — /shake only trims stale tool args".to_string());
+    }
+    hints
+}
+
+/// One engine hint part as a tips row: `hint:<kind> <size>` names carry
+/// the human size, `tokens` the estimated saving. Unknown kinds pass
+/// through honestly instead of being guessed into a category.
+fn engine_hint_line(p: &ka_protocol::ContextPart) -> Option<String> {
+    let rest = p.name.strip_prefix("hint:")?;
+    let (kind, size) = match rest.split_once(' ') {
+        Some((kind, size)) => (kind, size.trim()),
+        None => (rest, ""),
+    };
+    let saving = fmt_tok(p.tokens);
+    let line = match kind {
+        "thinking" => {
+            format!("/shake thinking frees ~{saving} tok ({size} of thinking in older turns)")
+        }
+        "images" => format!("/shake images frees ~{saving} tok ({size} of images in older turns)"),
+        "args" => format!("/shake trims stale tool arguments — ~{saving} tok ({size})"),
+        "outputs" => format!("/shake prunes old tool outputs — ~{saving} tok ({size})"),
+        _ => format!("{rest} is trimmable — ~{saving} tok"),
+    };
+    Some(line)
 }
 
 /// The session cwd handed to [`run`]: the plan path must anchor where
@@ -3363,7 +3757,9 @@ fn plan_drafted(plan_started: Option<std::time::SystemTime>, plan_path: &std::pa
 }
 
 /// Session picker (/session, /resume): newest strands + a fresh-session
-/// row, filtered by the typed substring.
+/// row, filtered live by the typed substring (title, memorable name or
+/// id, case-insensitive). Pinned strands float to the top with a ★ and
+/// carry their recap on the detail line.
 #[derive(Debug, Clone)]
 pub struct SessionPicker {
     /// Newest-first sessions for the cwd.
@@ -3378,17 +3774,13 @@ pub struct SessionPicker {
 
 impl SessionPicker {
     /// Rows after filtering: (label, detail). Row 0 is always new-session.
+    /// Pinned sessions float to the top with a ★; a stored recap rides
+    /// the detail line, truncated.
     pub fn rows(&self) -> Vec<(String, String)> {
         let mut rows = vec![("(new session)".to_string(), "start fresh".to_string())];
-        let f = self.filter.to_lowercase();
-        for s in &self.sessions {
-            if !f.is_empty()
-                && !s.title.to_lowercase().contains(&f)
-                && !s.id.to_lowercase().contains(&f)
-            {
-                continue;
-            }
+        for s in self.visible_sessions() {
             let tag = short_session(&s.id).unwrap_or("?");
+            let pin = if s.pinned { "★ " } else { "" };
             let here = if self.current.as_ref() == Some(&s.id) {
                 " · current"
             } else {
@@ -3403,22 +3795,34 @@ impl SessionPicker {
             if s.tokens > 0 {
                 detail.push_str(&format!(" · {} tok", fmt_tok(s.tokens)));
             }
-            rows.push((format!("#{tag}  {}{here}", s.title), detail));
+            if let Some(recap) = s.recap.as_deref().map(str::trim).filter(|r| !r.is_empty()) {
+                detail.push_str(&format!(" · {}", trunc_cols(recap, 36)));
+            }
+            rows.push((format!("#{tag}  {pin}{}{here}", s.title), detail));
         }
         rows
     }
 
-    /// Sessions surviving the current filter, oldest-listed first.
+    /// Sessions surviving the current filter, pinned first (stable:
+    /// newest-first within each group), oldest-listed rendering order
+    /// otherwise. The filter is a live case-insensitive substring over
+    /// title, memorable name and id.
     fn visible_sessions(&self) -> Vec<&ka_strand::StrandSummary> {
         let f = self.filter.to_lowercase();
-        self.sessions
+        let mut out: Vec<&ka_strand::StrandSummary> = self
+            .sessions
             .iter()
             .filter(|s| {
                 f.is_empty()
                     || s.title.to_lowercase().contains(&f)
                     || s.id.to_lowercase().contains(&f)
+                    || s.name
+                        .as_ref()
+                        .is_some_and(|n| n.to_lowercase().contains(&f))
             })
-            .collect()
+            .collect();
+        out.sort_by_key(|s| !s.pinned);
+        out
     }
 
     /// The session id the selected row switches to (None = new session).
@@ -4289,6 +4693,15 @@ async fn app(
     }
     let mut busy = false;
     let mut busy_since: Option<Instant> = None;
+    // Ctrl+S draft stash (single slot): a non-empty draft parks here,
+    // an empty draft recalls it. Session-scoped, never persisted.
+    let mut stash: Option<String> = None;
+    // /autocompact trigger, as the session knows it: outer None =
+    // never set here (engine default), inner None = off, Some(p) = pct.
+    let mut auto_compact: Option<Option<u64>> = None;
+    // Image parts this surface attached to prompts this session (the
+    // /context hints use the count; replays undercount and say less).
+    let mut images_sent: usize = 0;
     let mut quit_armed: Option<Instant> = None;
     // double-Esc (rewind menu) tracking
     let mut last_esc: Option<Instant> = None;
@@ -5625,6 +6038,7 @@ async fn app(
                             handle_esc(
                                 commands,
                                 &mut scroll,
+                                &mut transcript.focus,
                                 busy,
                                 input.text.is_empty(),
                                 pending.is_some(),
@@ -5684,6 +6098,35 @@ async fn app(
                                         find_last = Some((q, from));
                                     }
                                 }
+                                continue;
+                            }
+                            // /focus: view-only collapse of finished turns —
+                            // purely local render state, no engine roundtrip
+                            if text.trim() == "/focus" {
+                                let on = !transcript.focused();
+                                transcript.set_focus(on);
+                                // the view changed shape: a pinned scroll
+                                // would point at the wrong rows now
+                                scroll = None;
+                                transcript.push_separated(Line::Info(if on {
+                                    "focus · older turns collapsed — /focus or esc restores".into()
+                                } else {
+                                    "focus off".into()
+                                }));
+                                continue;
+                            }
+                            // bare /autocompact: display-only form — the
+                            // trigger value lives in this loop's session
+                            // state, so it never reaches the slash table
+                            if text.trim() == "/autocompact" {
+                                let shown = match auto_compact {
+                                    Some(None) => "off — only /compact digests".to_string(),
+                                    Some(Some(pct)) => format!("{pct}% of the context window"),
+                                    None => "engine default (reserve-based trigger)".to_string(),
+                                };
+                                transcript.push_separated(Line::Info(format!(
+                                    "auto-compact: {shown}"
+                                )));
                                 continue;
                             }
                             if text.trim() == "/features" || text.trim().starts_with("/features ") {
@@ -6201,6 +6644,11 @@ async fn app(
                                         is_switch = true;
                                         fresh = id == "new";
                                     }
+                                    // the session's trigger record keeps
+                                    // bare /autocompact truthful
+                                    if let Command::SetAutoCompact { pct } = &evt {
+                                        auto_compact = Some(*pct);
+                                    }
                                     let _ = commands.send(evt).await;
                                     if is_switch {
                                         busy = true;
@@ -6260,6 +6708,7 @@ async fn app(
                                         img.media_type
                                     )));
                                 }
+                                images_sent += pending_image.iter().count();
                                 Command::Prompt {
                                     allowed_tools: None,
                                     model: None,
@@ -6477,6 +6926,15 @@ async fn app(
                                 input.text = item;
                                 input.cursor = input.text.chars().count();
                                 slash_popup = update_suggestions(&input.text);
+                            }
+                        }
+                        (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
+                            // draft stash: a non-empty draft parks (the
+                            // single slot swaps it for a clean input), an
+                            // empty draft recalls what was parked
+                            if let Some(msg) = stash_draft(&mut stash, &mut input) {
+                                slash_popup = update_suggestions(&input.text);
+                                pop_toast(&mut toast, msg);
                             }
                         }
                         (KeyCode::Char('q'), KeyModifiers::ALT) => {
@@ -7143,6 +7601,11 @@ async fn app(
                                                 plan_started =
                                                     Some(std::time::SystemTime::now());
                                             }
+                                            // queued /autocompact keeps the
+                                            // session's trigger record truthful
+                                            if let Command::SetAutoCompact { pct } = &event {
+                                                auto_compact = Some(*pct);
+                                            }
                                             if starts_turn {
                                                 busy = true;
                                             }
@@ -7183,8 +7646,9 @@ async fn app(
                             )));
                         }
                         if let Event::ContextBreakdown { parts, window } = &evt {
+                            let hints = context_hints(parts, *window, transcript.entries(), images_sent);
                             modal = Some(Modal::Context {
-                                rows: context_rows(parts, *window),
+                                rows: context_rows(parts, *window, &hints),
                             });
                         }
                         if replayed {
@@ -8227,6 +8691,14 @@ fn builtin_slash_commands() -> Vec<(String, String)> {
         ),
         ("/compact".to_string(), "digest the context now".to_string()),
         (
+            "/shake".to_string(),
+            "trim stale output now [+ thinking|images]".to_string(),
+        ),
+        (
+            "/autocompact".to_string(),
+            "auto-digest trigger: /autocompact <1-100|off>".to_string(),
+        ),
+        (
             "/name".to_string(),
             "name this session (ka --session <name>)".to_string(),
         ),
@@ -8255,6 +8727,10 @@ fn builtin_slash_commands() -> Vec<(String, String)> {
         (
             "/find".to_string(),
             "search the transcript: /find <text>, bare repeats".to_string(),
+        ),
+        (
+            "/focus".to_string(),
+            "collapse old turns to one line each (/focus or esc restores)".to_string(),
         ),
         (
             "/spills".to_string(),
@@ -8916,6 +9392,8 @@ pub fn slash_command(text: &str) -> Option<Slash> {
             | "/mode"
             | "/thinking"
             | "/compact"
+            | "/shake"
+            | "/autocompact"
             | "/session"
             | "/resume"
             | "/new"
@@ -9110,6 +9588,84 @@ blocker > major > minor > nit, each as `file:line — issue — concrete fix`, \
                 modal: None,
             })
         }
+        "/shake" => {
+            // CTX-02: the deterministic trim now. Bare shakes off stale
+            // tool args/outputs only; naming modes adds them (both at
+            // once: `/shake thinking images`). Anything else is refused
+            // — a typo must not silently read as a bare shake.
+            let mut thinking = false;
+            let mut images = false;
+            let mut unknown: Vec<&str> = Vec::new();
+            for word in rest.into_iter().flat_map(|r| r.split_whitespace()) {
+                match word {
+                    "thinking" => thinking = true,
+                    "images" => images = true,
+                    other => unknown.push(other),
+                }
+            }
+            if !unknown.is_empty() {
+                Some(Slash {
+                    note: Some(format!(
+                        "usage: /shake [thinking|images] — unknown {unknown:?}"
+                    )),
+                    event: None,
+                    quit: false,
+                    followup: None,
+                    modal: None,
+                })
+            } else {
+                let mut modes = vec!["stale output"];
+                if thinking {
+                    modes.push("thinking");
+                }
+                if images {
+                    modes.push("images");
+                }
+                Some(Slash {
+                    note: Some(format!("shake · trimming {}", modes.join(" + "))),
+                    event: Some(Command::Shake { thinking, images }),
+                    quit: false,
+                    followup: None,
+                    modal: None,
+                })
+            }
+        }
+        "/autocompact" => match rest {
+            // CTX-12: set the digest trigger as a context-use percent,
+            // `off` restores the default. The bare form only displays —
+            // the trigger state lives in the app loop (intercepted
+            // there before this table runs).
+            None => Some(Slash {
+                note: None,
+                event: None,
+                quit: false,
+                followup: None,
+                modal: None,
+            }),
+            Some("off") => Some(Slash {
+                note: Some("auto-compact off — only /compact digests".into()),
+                event: Some(Command::SetAutoCompact { pct: None }),
+                quit: false,
+                followup: None,
+                modal: None,
+            }),
+            Some(n) => match n.parse::<u64>() {
+                Ok(pct) if (1..=100).contains(&pct) => Some(Slash {
+                    note: Some(format!("auto-compact at {pct}% of the context window")),
+                    event: Some(Command::SetAutoCompact { pct: Some(pct) }),
+                    quit: false,
+                    followup: None,
+                    modal: None,
+                }),
+                _ => Some(Slash {
+                    note: Some("usage: /autocompact <1-100|off>".into()),
+                    event: None,
+                    quit: false,
+                    followup: None,
+                    modal: None,
+                }),
+            },
+        },
         "/name" => {
             // a memorable alias for THIS session: `ka --session fox`
             // resolves on it (exact, then unique prefix)
@@ -10342,7 +10898,7 @@ fn render(
     for i in start..end {
         if i < cached {
             if let Some(row) = transcript.row(i) {
-                window.push(row.clone());
+                window.push(row.into_owned());
             }
         } else if let Some(row) = live_rows.get(i - cached) {
             window.push(row.clone());
@@ -12042,6 +12598,7 @@ fn help_modal_rows(width: usize) -> Vec<ratatui::text::Line<'static>> {
         ("↑ ↓", "prompt history · navigate pickers"),
         ("ctrl+p / ctrl+n", "prompt history"),
         ("ctrl+q", "recall the last queued item"),
+        ("ctrl+s", "park/recall the draft (stash)"),
         ("ctrl+r", "search the transcript"),
         ("ctrl+o", "expand/collapse the last tool call"),
         ("ctrl+m", "toggle mouse capture ⇄ native"),
@@ -12105,7 +12662,13 @@ fn help_modal_rows(width: usize) -> Vec<ratatui::text::Line<'static>> {
             ("/mcp", "refresh MCP tool lists (/mcp refresh)"),
             ("/prompt", "run an MCP prompt"),
             ("/spills", "browse spilled tool output"),
-            ("/context", "context usage breakdown"),
+            ("/context", "context usage breakdown + tips"),
+            ("/shake", "trim stale output now [+ thinking|images]"),
+            (
+                "/autocompact",
+                "auto-digest trigger: /autocompact <1-100|off>",
+            ),
+            ("/focus", "collapse old turns to one line each"),
             ("/usage", "usage & cost: session + recent"),
             ("/find", "search the transcript: /find <text>"),
             ("/copy", "copy the last reply (OSC52)"),
@@ -13978,6 +14541,67 @@ mod tests {
     }
 
     #[test]
+    fn focus_view_shapes_rows_and_totals() {
+        let mut t = Transcript::default();
+        t.set_width(60);
+        t.push(Line::Info("welcome note".into()));
+        t.push(Line::User(
+            "fix the widget widget widget widget widget widget overflow".into(),
+        ));
+        t.push(Line::Assistant("reply one".into()));
+        t.push(Line::User("second prompt".into()));
+        t.push(Line::Assistant("reply two".into()));
+        let full = t.total_rows();
+
+        // pre-prompt rows belong to no turn (dropped) and the first
+        // turn is finished (one digest); the second prompt is the turn
+        // in progress and keeps its full rows
+        t.set_focus(true);
+        let tail = t.rendered_rows_of(3) + t.rendered_rows_of(4);
+        assert_eq!(
+            t.total_rows(),
+            1 + tail,
+            "one digest + the live turn, welcome note gone"
+        );
+        t.set_focus(false);
+        assert_eq!(t.total_rows(), full);
+
+        // a finished turn: head collapses to one digest row
+        t.push(Line::User("third prompt".into()));
+        t.push(Line::Assistant("reply three".into()));
+        let full = t.total_rows();
+        t.set_focus(true);
+        let focused = t.total_rows();
+        assert!(focused < full, "{focused} vs {full}");
+        // rows: digest(turn1) + full rows of turn2's head? no — turn 2
+        // also finished (a newer prompt exists): digest + digest + full
+        // rows of the current turn
+        let first = t.row_text(0).expect("digest one");
+        assert!(first.starts_with("· "), "{first:?}");
+        // the digest caps at one quiet line of first words
+        assert!(first.chars().count() <= 62, "{first:?}");
+        assert!(first.contains("fix the widget"), "{first:?}");
+        let second = t.row_text(1).expect("digest two");
+        assert_eq!(second, "· second prompt", "{second:?}");
+        // tail: the current turn in full, mapped rows stay consistent
+        assert!(t.row_text(focused).is_none());
+        // welcome notes belong to no turn: collapsed away entirely
+        assert!(
+            t.find_from(0, "welcome note").is_none(),
+            "pre-prompt rows stay out of the focus view"
+        );
+
+        // full view restored: same rows, same order
+        t.set_focus(false);
+        assert_eq!(t.total_rows(), full);
+        assert!(
+            t.row_text(0).is_some_and(|s| s.contains("welcome note")),
+            "{:?}",
+            t.row_text(0)
+        );
+    }
+
+    #[test]
     fn session_picker_marks_the_current_session() {
         let picker = SessionPicker {
             current: Some("s1-bbbb22221111".to_string()),
@@ -13992,6 +14616,8 @@ mod tests {
                     tokens: 0,
                     parent: None,
                     name: None,
+                    pinned: false,
+                    recap: None,
                 },
                 ka_strand::StrandSummary {
                     path: std::path::PathBuf::from("/tmp/b.jsonl"),
@@ -14003,6 +14629,8 @@ mod tests {
                     tokens: 0,
                     parent: None,
                     name: None,
+                    pinned: false,
+                    recap: None,
                 },
             ],
             selected: 0,
@@ -14027,6 +14655,8 @@ mod tests {
                 tokens: 0,
                 parent: None,
                 name: None,
+                pinned: false,
+                recap: None,
             }],
             selected: 1,
             filter: "parser".to_string(),
@@ -14059,6 +14689,8 @@ mod tests {
             tokens: 0,
             parent: None,
             name: None,
+            pinned: false,
+            recap: None,
         });
         narrowed.filter.clear();
         narrowed.selected = 2; // moved down onto the second session
@@ -14082,19 +14714,25 @@ mod tests {
 
     #[tokio::test]
     async fn esc_unpins_scroll_before_abort_and_rewind() {
-        // the pure decision: scrolled wins over busy, busy over rewind
+        // the pure decision: focus first, then scrolled wins over busy,
+        // busy over rewind
         let now = Instant::now();
         assert_eq!(
-            esc_action(true, true, true, false, None, now),
+            esc_action(true, false, false, true, false, None, now),
+            EscAction::Unfocus,
+            "focus view owns Esc in every state"
+        );
+        assert_eq!(
+            esc_action(false, true, true, true, false, None, now),
             EscAction::UnpinScroll,
             "a pinned scroll owns Esc even mid-turn"
         );
         assert_eq!(
-            esc_action(false, true, true, false, None, now),
+            esc_action(false, false, true, true, false, None, now),
             EscAction::Abort
         );
         assert_eq!(
-            esc_action(false, false, true, false, None, now),
+            esc_action(false, false, false, true, false, None, now),
             EscAction::ArmRewind
         );
         // through the command-sender seam: busy + scrolled sends NO
@@ -14104,9 +14742,11 @@ mod tests {
         let mut scroll = Some(3usize);
         let mut modal = None;
         let mut last_esc = None;
+        let mut focus = false;
         handle_esc(
             &mut commands,
             &mut scroll,
+            &mut focus,
             true,
             true,
             false,
@@ -14118,10 +14758,32 @@ mod tests {
         .await;
         assert_eq!(scroll, None, "the pin released");
         assert!(rx.try_recv().is_err(), "no Abort was sent");
-        // unscrolled: the same busy turn now aborts
+        // focus owns Esc even before the scroll pin: the /focus note
+        // promises 'esc restores' in every state
+        scroll = Some(3usize);
+        focus = true;
         handle_esc(
             &mut commands,
             &mut scroll,
+            &mut focus,
+            true,
+            true,
+            false,
+            &mut last_esc,
+            &mut modal,
+            || unreachable!("no strand read while focused"),
+            now,
+        )
+        .await;
+        assert!(!focus, "focus restored");
+        assert_eq!(scroll, Some(3), "the pin outlives the unfocus");
+        assert!(rx.try_recv().is_err(), "no Abort was sent");
+        // unscrolled: the same busy turn now aborts
+        scroll = None;
+        handle_esc(
+            &mut commands,
+            &mut scroll,
+            &mut focus,
             true,
             true,
             false,
@@ -14136,6 +14798,7 @@ mod tests {
         handle_esc(
             &mut commands,
             &mut scroll,
+            &mut focus,
             false,
             true,
             false,
@@ -14250,6 +14913,7 @@ mod tests {
             "ctrl+r",
             "ctrl+p / ctrl+n",
             "ctrl+q",
+            "ctrl+s",
             "ctrl+o",
             "ctrl+m",
             "ctrl+t / alt+o / alt+i",
@@ -14260,6 +14924,10 @@ mod tests {
             "esc esc",
         ] {
             assert!(text.contains(key), "help lacks {key}");
+        }
+        // the context-trim commands and the focus view are taught too
+        for cmd in ["/shake", "/autocompact", "/focus"] {
+            assert!(text.contains(cmd), "help lacks {cmd}");
         }
         // command groups in order
         for group in [
@@ -14339,6 +15007,8 @@ mod tests {
                 cost: 0.5,
                 parent: None,
                 name: None,
+                pinned: false,
+                recap: None,
                 tokens: 1234,
             },
             ka_strand::StrandSummary {
@@ -14350,6 +15020,8 @@ mod tests {
                 cost: 0.003,
                 parent: None,
                 name: None,
+                pinned: false,
+                recap: None,
                 tokens: 0,
             },
         ];
@@ -14433,7 +15105,7 @@ mod tests {
                 tokens: 200,
             },
         ];
-        let rows = context_rows(&parts, 10_000);
+        let rows = context_rows(&parts, 10_000, &[]);
         let joined = rows.join("\n");
         assert!(joined.contains("system"), "{joined}");
         assert!(joined.contains("█"), "{joined}");
@@ -14442,8 +15114,198 @@ mod tests {
             joined.contains("used 1k of 10k (10%) · free 9k"),
             "{joined}"
         );
-        let rows = context_rows(&parts, 0);
+        let rows = context_rows(&parts, 0, &[]);
         assert!(rows.join("\n").contains("free 0"), "{rows:?}");
+
+        // CTX-09 hint parts stay out of the bars and the footer: their
+        // amounts already sit inside the regular buckets
+        let with_hint = vec![
+            parts[0].clone(),
+            parts[1].clone(),
+            ka_protocol::ContextPart {
+                name: "hint:thinking 12 kB".into(),
+                tokens: 3_000,
+            },
+        ];
+        let joined = context_rows(&with_hint, 10_000, &[]).join("\n");
+        assert!(!joined.contains("hint:"), "hints are not bars: {joined}");
+        assert!(
+            joined.contains("used 1k of 10k (10%) · free 9k"),
+            "footer excludes hint tokens: {joined}"
+        );
+    }
+
+    #[test]
+    fn context_rows_renders_the_tips_section() {
+        let parts: Vec<ka_protocol::ContextPart> = Vec::new();
+        let hints = vec!["/shake prunes stale args".to_string()];
+        let rows = context_rows(&parts, 10_000, &hints);
+        let joined = rows.join("\n");
+        assert!(joined.contains("▸ tips"), "{joined}");
+        assert!(joined.contains("· /shake prunes stale args"), "{joined}");
+        // no hints, no section — the footer stays the last row
+        let rows = context_rows(&parts, 10_000, &[]);
+        assert!(!rows.join("\n").contains("▸ tips"));
+    }
+
+    #[test]
+    fn context_hints_only_claim_what_the_transcript_shows() {
+        use Line as L;
+        // two finished turns, one thought each, one old tool call;
+        // images only exist because this surface attached one
+        let lines = vec![
+            L::User("fix the parser".into()),
+            L::Assistant("on it".into()),
+            L::Thought("read the grammar".into()),
+            L::ToolBlock(vec![ToolCall {
+                head: "→ grep · pattern".into(),
+                ok: true,
+                note: String::new(),
+                excerpt: String::new(),
+                spill: None,
+                dur: None,
+                expanded: false,
+            }]),
+            L::User("now the tests".into()),
+            L::Assistant("done".into()),
+        ];
+        let hints = context_hints(&[], 10_000, &lines, 2);
+        let joined = hints.join("\n");
+        assert!(joined.contains("/shake images"), "{joined}");
+        assert!(joined.contains("1 older thinking block"), "{joined}");
+        assert!(joined.contains("1 older tool call"), "{joined}");
+        assert!(
+            !joined.contains("/compact"),
+            "10% used is below the compact nudge: {joined}"
+        );
+
+        // a packed window nudges toward /compact <focus>
+        let parts = vec![ka_protocol::ContextPart {
+            name: "messages".into(),
+            tokens: 8_000,
+        }];
+        let hints = context_hints(&parts, 10_000, &lines, 0);
+        assert!(
+            hints.iter().any(|h| h.contains("/compact <focus>")),
+            "{hints:?}"
+        );
+
+        // nothing to act on: one honest lean row, no invented counts
+        let lean = vec![L::User("hi".into()), L::Assistant("hello".into())];
+        let hints = context_hints(&[], 10_000, &lean, 0);
+        assert_eq!(hints.len(), 1, "{hints:?}");
+        assert!(hints[0].contains("lean"), "{hints:?}");
+
+        // pre-first-prompt rows belong to no turn: never counted
+        let head_only = vec![L::Info("welcome".into()), L::Thought("boot".into())];
+        let hints = context_hints(&[], 10_000, &head_only, 0);
+        assert_eq!(hints.len(), 1, "{hints:?}");
+        assert!(hints[0].contains("lean"), "{hints:?}");
+
+        // CTX-09: the engine's hint parts are the authoritative figures
+        // and win over the local counts (thinking reported → no count row)
+        let engine = vec![
+            ka_protocol::ContextPart {
+                name: "hint:thinking 12 kB".into(),
+                tokens: 3_000,
+            },
+            ka_protocol::ContextPart {
+                name: "hint:outputs ~12k tok".into(),
+                tokens: 12_000,
+            },
+        ];
+        let hints = context_hints(&engine, 10_000, &lines, 2);
+        assert!(
+            hints
+                .iter()
+                .any(|h| h.contains("/shake thinking frees ~3k tok (12 kB")),
+            "{hints:?}"
+        );
+        assert!(
+            hints
+                .iter()
+                .any(|h| h.contains("/shake prunes old tool outputs — ~12k tok")),
+            "{hints:?}"
+        );
+        assert!(
+            !hints.iter().any(|h| h.contains("older thinking block")),
+            "engine figures suppress the local fallback: {hints:?}"
+        );
+        assert!(
+            !hints.iter().any(|h| h.contains("older tool call")),
+            "args/outputs reported → no local tool row: {hints:?}"
+        );
+        // the surface knows images were attached but the engine didn't
+        // report an images hint: the local count fills the gap
+        assert!(
+            hints.iter().any(|h| h.contains("/shake images strips 2")),
+            "{hints:?}"
+        );
+
+        // the /compact nudge reads REGULAR tokens only: hint tokens sit
+        // inside the regular buckets already
+        let packed = vec![
+            ka_protocol::ContextPart {
+                name: "messages".into(),
+                tokens: 6_500,
+            },
+            ka_protocol::ContextPart {
+                name: "hint:args 40 kB".into(),
+                tokens: 9_000,
+            },
+        ];
+        let hints = context_hints(&packed, 10_000, &lines, 0);
+        assert!(
+            hints.iter().any(|h| h.contains("at 65% of the window")),
+            "hint tokens must not inflate pct: {hints:?}"
+        );
+
+        // unknown hint kinds pass through honestly
+        let odd = vec![ka_protocol::ContextPart {
+            name: "hint:manifests 2 kB".into(),
+            tokens: 500,
+        }];
+        let hints = context_hints(&odd, 10_000, &lines, 0);
+        assert!(
+            hints
+                .iter()
+                .any(|h| h.contains("manifests 2 kB is trimmable — ~500 tok")),
+            "{hints:?}"
+        );
+
+        // engine hints survive even with no local turn history
+        let hints = context_hints(&engine, 10_000, &[], 0);
+        assert!(
+            hints.iter().any(|h| h.contains("/shake thinking")),
+            "{hints:?}"
+        );
+        assert!(!hints.iter().any(|h| h.contains("lean")), "{hints:?}");
+    }
+
+    #[test]
+    fn stash_draft_parks_and_recalls() {
+        let mut slot: Option<String> = None;
+        let mut input = InputBuffer::default();
+        // nothing parked, nothing drafted: a no-op
+        assert_eq!(stash_draft(&mut slot, &mut input), None);
+        // a draft parks and clears the input
+        for c in "write the changelog".chars() {
+            input.insert(c);
+        }
+        assert_eq!(
+            stash_draft(&mut slot, &mut input),
+            Some("draft parked — ctrl+s recalls it")
+        );
+        assert!(input.text.is_empty());
+        assert_eq!(slot.as_deref(), Some("write the changelog"));
+        // an empty draft recalls and drains the slot
+        assert_eq!(stash_draft(&mut slot, &mut input), Some("draft recalled"));
+        assert_eq!(input.text, "write the changelog");
+        assert_eq!(input.cursor, input.text.chars().count());
+        assert_eq!(slot, None);
+        // the slot is spent: another recall is a no-op
+        input.take();
+        assert_eq!(stash_draft(&mut slot, &mut input), None);
     }
 
     #[test]
@@ -16277,6 +17139,8 @@ mod tests {
             tokens: 0,
             parent: None,
             name: None,
+            pinned: false,
+            recap: None,
         };
         let picker = SessionPicker {
             sessions: vec![s],
@@ -16680,6 +17544,8 @@ mod tests {
                 tokens: 12_345,
                 parent: None,
                 name: None,
+                pinned: false,
+                recap: None,
             }],
             selected: 0,
             filter: String::new(),
@@ -16703,6 +17569,8 @@ mod tests {
                 tokens: 0,
                 parent: None,
                 name: None,
+                pinned: false,
+                recap: None,
             }],
             selected: 0,
             filter: String::new(),
@@ -20283,6 +21151,8 @@ mod tests {
                 cost: 0.0,
                 parent: None,
                 name: None,
+                pinned: false,
+                recap: None,
                 tokens: 0,
             },
             ka_strand::StrandSummary {
@@ -20294,6 +21164,8 @@ mod tests {
                 cost: 0.0,
                 parent: None,
                 name: None,
+                pinned: false,
+                recap: None,
                 tokens: 0,
             },
             ka_strand::StrandSummary {
@@ -20305,6 +21177,8 @@ mod tests {
                 cost: 0.0,
                 parent: Some("root".into()),
                 name: None,
+                pinned: false,
+                recap: None,
                 tokens: 0,
             },
             ka_strand::StrandSummary {
@@ -20316,6 +21190,8 @@ mod tests {
                 cost: 0.0,
                 parent: Some("kid".into()),
                 name: None,
+                pinned: false,
+                recap: None,
                 tokens: 0,
             },
         ];
@@ -20420,6 +21296,8 @@ mod tests {
                 cost: 0.0,
                 parent: None,
                 name: None,
+                pinned: false,
+                recap: None,
                 tokens: 0,
             },
             ka_strand::StrandSummary {
@@ -20431,6 +21309,8 @@ mod tests {
                 cost: 0.0,
                 parent: Some("root".into()),
                 name: None,
+                pinned: false,
+                recap: None,
                 tokens: 0,
             },
             ka_strand::StrandSummary {
@@ -20442,6 +21322,8 @@ mod tests {
                 cost: 0.0,
                 parent: Some("root".into()),
                 name: None,
+                pinned: false,
+                recap: None,
                 tokens: 0,
             },
         ];
@@ -20522,6 +21404,8 @@ mod tests {
             tokens: 0,
             parent: None,
             name: None,
+            pinned: false,
+            recap: None,
         }];
         // the transcript only ever saw ONE of the user rows
         let mut transcript = Transcript::default();
