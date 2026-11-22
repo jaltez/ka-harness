@@ -566,6 +566,38 @@ fn main() -> ExitCode {
     if cli.safe_mode {
         ka_engine::conventions::set_bare_mode(true);
     }
+    if cli.ignore_rules {
+        ka_engine::conventions::set_rules_disabled(true);
+    }
+    // --ephemeral: session state lands in a fresh temp data dir that is
+    // removed when the process exits — nothing persists, including
+    // spills and snapshots. Only the session-producing surfaces make
+    // sense; resuming contradicts the whole point.
+    let mut ephemeral_dir: Option<PathBuf> = None;
+    if cli.ephemeral {
+        match cli.command {
+            None | Some(CliCommand::Run { .. }) => {}
+            Some(_) => {
+                eprintln!("ka: --ephemeral applies to the TUI and `ka run` only");
+                return ExitCode::FAILURE;
+            }
+        }
+        if cli.continue_latest || cli.session.is_some() {
+            eprintln!("ka: --ephemeral cannot resume a session (--continue/--session)");
+            return ExitCode::FAILURE;
+        }
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("ka-ephemeral-{}-{stamp}", std::process::id()));
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            eprintln!("ka: --ephemeral: {e}");
+            return ExitCode::FAILURE;
+        }
+        ka_strand::set_data_dir_override(Some(dir.clone()));
+        ephemeral_dir = Some(dir);
+    }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -659,7 +691,14 @@ fn trusted_project_cwd(trusted: bool) -> Option<PathBuf> {
 fn load_surface_config(configs: &[PathBuf], cwd: &std::path::Path) -> Result<Config, String> {
     let project =
         ka_engine::trust::project_trusted(&ka_engine::project_root(cwd)).then(|| cwd.to_path_buf());
-    load_config(configs, None, None, project, &FeatureFlags::default())
+    load_config(
+        configs,
+        None,
+        None,
+        project,
+        &FeatureFlags::default(),
+        false,
+    )
 }
 
 /// Defaults < user (unless skipped) < project (if trusted) < extra files
@@ -724,6 +763,293 @@ fn parse_mode(s: &str) -> Result<ka_protocol::Mode, String> {
         other => Err(format!(
             "unknown mode {other:?} (expected \
 ask|accept_edits|allow|readonly — guarded/free/plan still parse as aliases)"
+        )),
+    }
+}
+
+/// `--effort <LEVEL>`: same spelling as `/thinking` and the selector's
+/// `@effort` suffix.
+fn parse_effort(s: Option<&str>) -> Result<Option<ka_protocol::Effort>, String> {
+    match s {
+        None => Ok(None),
+        Some("off") => Ok(Some(ka_protocol::Effort::Off)),
+        Some("low") => Ok(Some(ka_protocol::Effort::Low)),
+        Some("medium") => Ok(Some(ka_protocol::Effort::Medium)),
+        Some("high") => Ok(Some(ka_protocol::Effort::High)),
+        Some("max") => Ok(Some(ka_protocol::Effort::Max)),
+        Some(other) => Err(format!(
+            "unknown effort {other:?} (expected off|low|medium|high|max)"
+        )),
+    }
+}
+
+/// Detect an image file by magic bytes (png/jpeg/gif/webp) — the same
+/// table the TUI's `/image` uses, kept byte-identical.
+fn sniff_image_bytes(head: &[u8]) -> Option<&'static str> {
+    if head.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        Some("image/png")
+    } else if head.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("image/jpeg")
+    } else if head.starts_with(b"GIF87a") || head.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if head.len() >= 12 && head.starts_with(b"RIFF") && &head[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+/// `--image <PATH>`: load each file into an attachment part (magic-byte
+/// sniff, 5 MB cap per image — same caps as the TUI's paste path).
+fn image_parts(paths: &[PathBuf]) -> Result<Vec<ka_protocol::ImagePart>, String> {
+    const MAX_BYTES: usize = 5 * 1024 * 1024;
+    paths
+        .iter()
+        .map(|path| {
+            let bytes =
+                std::fs::read(path).map_err(|e| format!("image {}: {e}", path.display()))?;
+            if bytes.len() > MAX_BYTES {
+                return Err(format!(
+                    "image {} is {:.1} MB, over the 5 MB cap",
+                    path.display(),
+                    bytes.len() as f64 / (1024.0 * 1024.0)
+                ));
+            }
+            let media_type = sniff_image_bytes(&bytes).ok_or_else(|| {
+                format!(
+                    "image {}: unsupported type (png/jpg/webp/gif only)",
+                    path.display()
+                )
+            })?;
+            Ok(ka_protocol::ImagePart {
+                data: ka_term::tui::b64encode(&bytes),
+                media_type: media_type.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// Parse a scalar value for `ka config set` by target type.
+fn parse_value<T: std::str::FromStr>(key: &str, value: &str) -> Result<T, String> {
+    value
+        .parse::<T>()
+        .map_err(|_| format!("-- {key}: {value:?} is not a valid value for this key"))
+}
+
+fn parse_bool(key: &str, value: &str) -> Result<bool, String> {
+    match value {
+        "true" | "1" | "yes" => Ok(true),
+        "false" | "0" | "no" => Ok(false),
+        other => Err(format!("-- {key}: expected true|false, got {other:?}")),
+    }
+}
+
+/// Set one scalar key in the user config layer (~/.config/ka/ka.toml).
+/// The layer is re-serialized (strict-parsed first: an already-broken
+/// file is refused, never silently rewritten). List keys take
+/// comma-separated values. Table/vec-of-table keys ([[rules]],
+/// [[hooks]], [[mcp]], [[search]], [[verify.lints]], [[model_pins]])
+/// are deliberately not settable here — edit the file for those.
+fn config_set(key: &str, value: &str) -> Result<PathBuf, String> {
+    let path = ka_engine::config::user_config_path();
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    // strip a previous `#:schema` directive so it is not duplicated by
+    // the re-serialization below (the writer re-prepends it)
+    let body = text
+        .lines()
+        .skip_while(|l| l.trim_start().starts_with("#:"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut layer = if body.trim().is_empty() {
+        Config::default()
+    } else {
+        Config::parse_layer(&body, &path.display().to_string()).map_err(|e| e.to_string())?
+    };
+    apply_config_key(&mut layer, key, value)?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+    }
+    // the `#:schema` pointer gives editors (taplo and friends)
+    // autocomplete against the emitted schema file
+    let schema_path = path.with_extension("schema.json");
+    std::fs::write(
+        &schema_path,
+        Config::schema_json().map_err(|e| format!("schema: {e}"))?,
+    )
+    .map_err(|e| format!("{}: {e}", schema_path.display()))?;
+    let mut out = String::from("#:schema ka.schema.json\n\n");
+    out.push_str(&toml::to_string_pretty(&layer).map_err(|e| format!("serialize: {e}"))?);
+    std::fs::write(&path, out).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(path)
+}
+
+/// Apply one `ka config set` key onto a config layer. The match IS the
+/// key table: adding a key here is the whole change.
+fn apply_config_key(cfg: &mut Config, key: &str, value: &str) -> Result<(), String> {
+    let list = |v: &str| -> Vec<String> {
+        v.split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect()
+    };
+    match key {
+        "model" => cfg.model = Some(value.to_string()),
+        "effort" => {
+            cfg.effort = parse_effort(Some(value))?;
+        }
+        "mode" => cfg.mode = Some(parse_mode(value)?),
+        "roles.default" => cfg.roles.default = Some(value.to_string()),
+        "roles.fast" => cfg.roles.fast = Some(value.to_string()),
+        "tui.header_glyph" => cfg.tui.header_glyph = Some(value.to_string()),
+        "tui.bell" => cfg.tui.bell = Some(parse_bool(key, value)?),
+        "tui.notify" => cfg.tui.notify = Some(value.to_string()),
+        "tui.mouse" => {
+            cfg.tui.mouse = Some(match value {
+                "capture" => ka_engine::config::MouseMode::Capture,
+                "native" => ka_engine::config::MouseMode::Native,
+                other => {
+                    return Err(format!(
+                        "-- tui.mouse: expected capture|native, got {other:?}"
+                    ));
+                }
+            });
+        }
+        "tui.herdr" => cfg.tui.herdr = Some(parse_bool(key, value)?),
+        "tools.bash.background_after_ms" => {
+            cfg.tools.bash.background_after_ms = Some(parse_value(key, value)?)
+        }
+        "tools.read.max_image_mb" => cfg.tools.read.max_image_mb = Some(parse_value(key, value)?),
+        "tools.web.allow_private_hosts" => {
+            cfg.tools.web.allow_private_hosts = Some(parse_bool(key, value)?)
+        }
+        "tools.mcp.discovery" => {
+            cfg.tools.mcp.discovery = Some(match value {
+                "eager" => ka_engine::config::McpDiscovery::Eager,
+                "lazy" => ka_engine::config::McpDiscovery::Lazy,
+                other => {
+                    return Err(format!(
+                        "-- tools.mcp.discovery: expected eager|lazy, got {other:?}"
+                    ));
+                }
+            });
+        }
+        "git.auto_commit" => cfg.git.auto_commit = Some(parse_bool(key, value)?),
+        "guards.spend_usd" => cfg.guards.spend_usd = Some(parse_value(key, value)?),
+        "guards.context_pct" => cfg.guards.context_pct = Some(parse_value(key, value)?),
+        "guards.auto_review" => cfg.guards.auto_review = Some(parse_bool(key, value)?),
+        "context.promote" => cfg.context.promote = Some(parse_bool(key, value)?),
+        "pokes.max" => cfg.pokes.max = Some(parse_value(key, value)?),
+        "update.repo" => cfg.update.repo = Some(value.to_string()),
+        "update.check" => {
+            cfg.update.check = Some(match value {
+                "startup" => ka_engine::config::UpdateCheck::Startup,
+                "off" => ka_engine::config::UpdateCheck::Off,
+                other => {
+                    return Err(format!(
+                        "-- update.check: expected startup|off, got {other:?}"
+                    ));
+                }
+            });
+        }
+        "sandbox.mode" => {
+            if value != "off" && value != "fs" {
+                return Err(format!("-- sandbox.mode: expected off|fs, got {value:?}"));
+            }
+            cfg.sandbox.mode = Some(value.to_string());
+        }
+        "lsp.enable" => cfg.lsp.enable = Some(parse_bool(key, value)?),
+        "lsp.write_through" => cfg.lsp.write_through = Some(parse_bool(key, value)?),
+        "debug.enable" => cfg.debug.enable = Some(parse_bool(key, value)?),
+        "verify.test" => cfg.verify.test = Some(value.to_string()),
+        "prompt.identity_file" => cfg.prompt.identity_file = Some(value.to_string()),
+        "features.disable" => cfg.features.disable = list(value),
+        "features.allow" => cfg.features.allow = list(value),
+        "project_doc_fallback_filenames" => cfg.project_doc_fallback_filenames = list(value),
+        "fallback.models" => cfg.fallback.models = list(value),
+        "sandbox.allow_write" => cfg.sandbox.allow_write = list(value),
+        other => {
+            return Err(format!(
+                "unknown key {other:?} — see `ka config schema`; list-of-table keys \
+([[rules]], [[hooks]], [[mcp]], [[search]], [[verify.lints]], [[model_pins]]) \
+are file-edited only"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Print one key's effective value from the resolved config chain —
+/// the same table as [`apply_config_key`].
+fn config_get(cfg: &Config, key: &str) -> Result<String, String> {
+    let s = |v: &Option<String>| v.clone().unwrap_or_else(|| "(unset)".into());
+    match key {
+        "model" => Ok(s(&cfg.model)),
+        "effort" => Ok(cfg
+            .effort
+            .map(|e| format!("{e:?}").to_lowercase())
+            .unwrap_or_else(|| "(unset)".into())),
+        "mode" => Ok(format!("{:?}", cfg.effective_mode()).to_lowercase()),
+        "roles.default" => Ok(s(&cfg.roles.default)),
+        "roles.fast" => Ok(s(&cfg.roles.fast)),
+        "tui.header_glyph" => Ok(s(&cfg.tui.header_glyph)),
+        "tui.bell" => Ok(cfg.effective_bell().to_string()),
+        "tui.notify" => Ok(s(&cfg.tui.notify)),
+        "tui.mouse" => Ok(if cfg.effective_mouse_capture() {
+            "capture"
+        } else {
+            "native"
+        }
+        .to_string()),
+        "tui.herdr" => Ok(cfg.tui.herdr.unwrap_or(false).to_string()),
+        "tools.bash.background_after_ms" => {
+            Ok(cfg.effective_bash_background_after_ms().to_string())
+        }
+        "tools.read.max_image_mb" => Ok(cfg.effective_max_image_mb().to_string()),
+        "tools.web.allow_private_hosts" => Ok(cfg.effective_web_allow_private().to_string()),
+        "tools.mcp.discovery" => Ok(if cfg.effective_mcp_lazy() {
+            "lazy"
+        } else {
+            "eager"
+        }
+        .to_string()),
+        "git.auto_commit" => Ok(cfg.git.auto_commit.unwrap_or(false).to_string()),
+        "guards.spend_usd" => Ok(cfg
+            .guards
+            .spend_usd
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "(unset)".into())),
+        "guards.context_pct" => Ok(cfg
+            .guards
+            .context_pct
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "(unset)".into())),
+        "guards.auto_review" => Ok(cfg.guards.auto_review.unwrap_or(false).to_string()),
+        "context.promote" => Ok(cfg.effective_context_promote().to_string()),
+        "pokes.max" => Ok(cfg.pokes.max.unwrap_or(3).to_string()),
+        "update.repo" => Ok(s(&cfg.update.repo)),
+        "update.check" => Ok(match cfg.update.effective_check() {
+            ka_engine::config::UpdateCheck::Startup => "startup".into(),
+            ka_engine::config::UpdateCheck::Off => "off".into(),
+        }),
+        "sandbox.mode" => Ok(s(&cfg.sandbox.mode)),
+        "lsp.enable" => Ok(cfg.lsp.enable.unwrap_or(false).to_string()),
+        "lsp.write_through" => Ok(cfg.lsp.write_through.unwrap_or(false).to_string()),
+        "debug.enable" => Ok(cfg.debug.enable.unwrap_or(false).to_string()),
+        "verify.test" => Ok(s(&cfg.verify.test)),
+        "prompt.identity_file" => Ok(s(&cfg.prompt.identity_file)),
+        "features.disable" => Ok(cfg.features.disable.join(",")),
+        "features.allow" => Ok(if cfg.features.allow.is_empty() {
+            "(all tools)".into()
+        } else {
+            cfg.features.allow.join(",")
+        }),
+        "project_doc_fallback_filenames" => Ok(cfg.project_doc_fallback_filenames.join(",")),
+        "fallback.models" => Ok(cfg.fallback.models.join(",")),
+        "sandbox.allow_write" => Ok(cfg.sandbox.allow_write.join(",")),
+        other => Err(format!(
+            "unknown key {other:?} — the settable table matches `ka config set`; \
+list-of-table keys are file-edited only"
         )),
     }
 }
@@ -1097,6 +1423,40 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
                 print!("{text}");
                 Ok(ExitCode::SUCCESS)
             }
+            ConfigCommand::Set { key, value } => {
+                let path = config_set(&key, &value)?;
+                println!("{} — set {key} = {value}", path.display());
+                Ok(ExitCode::SUCCESS)
+            }
+            ConfigCommand::Get { key, configs } => {
+                let trust = trust_for_cwd(false);
+                let cfg = load_config(
+                    &configs,
+                    None,
+                    None,
+                    trusted_project_cwd(trust),
+                    &FeatureFlags::default(),
+                    false,
+                )?;
+                let text = config_get(&cfg, &key)?;
+                println!("{text}");
+                Ok(ExitCode::SUCCESS)
+            }
+            ConfigCommand::Path => {
+                println!(
+                    "user:    {}",
+                    ka_engine::config::user_config_path().display()
+                );
+                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                let project = ka_engine::project_root(&cwd).join(".ka/ka.toml");
+                let trusted = ka_engine::trust::project_trusted(&ka_engine::project_root(&cwd));
+                println!(
+                    "project: {} ({})",
+                    project.display(),
+                    if trusted { "trusted" } else { "untrusted" }
+                );
+                Ok(ExitCode::SUCCESS)
+            }
         },
         #[cfg(target_os = "linux")]
         Some(CliCommand::KaSandboxExec { policy, argv }) => {
@@ -1227,7 +1587,19 @@ async fn run_headless(
     let mut final_text = String::new();
     let mut total_cost = 0.0f64;
     let mut sj = StreamJsonPrinter::with_model(cfg_model.clone());
-    while let Some(event) = handle.events.recv().await {
+    // wall-clock cap: on elapse the turn is aborted and the run exits
+    // with the cap code, distinct from a user abort
+    let deadline = opts.max_time.map(|s| {
+        tokio::time::Instant::from_std(
+            std::time::Instant::now() + std::time::Duration::from_secs(s),
+        )
+    });
+    while let Some(event) = match deadline {
+        Some(d) => tokio::time::timeout_at(d, handle.events.recv())
+            .await
+            .unwrap_or(None),
+        None => handle.events.recv().await,
+    } {
         // headless policy: permission asks auto-deny (last option = deny)
         if let Event::Ask { id, questions } = &event {
             handle
@@ -2322,6 +2694,20 @@ fn run_export(
         },
     };
     let records = ka_strand::read(&target).map_err(|e| format!("{}: {e}", target.display()))?;
+    if jsonl {
+        let text = ka_strand::render_jsonl(&records).map_err(|e| format!("render jsonl: {e}"))?;
+        return match out {
+            Some(path) => {
+                std::fs::write(&path, &text).map_err(|e| format!("{}: {e}", path.display()))?;
+                println!("wrote {}", path.display());
+                Ok(ExitCode::SUCCESS)
+            }
+            None => {
+                print!("{text}");
+                Ok(ExitCode::SUCCESS)
+            }
+        };
+    }
     let md = ka_strand::render_markdown(&records);
     // the html path derives its output name from the strand when -o is
     // omitted, so `ka export --html` just works
@@ -2693,6 +3079,188 @@ mod completions_tests {
         .unwrap();
         assert_eq!(cli.interactive_prompt.as_deref(), Some("review this"));
         assert_eq!(cli.session.as_deref(), Some("abc"));
+    }
+
+    /// Batch 1: the new session-shaping globals parse onto the CLI.
+    #[test]
+    fn session_shaping_globals_parse() {
+        let cli = Cli::try_parse_from([
+            "ka",
+            "--effort",
+            "high",
+            "--offline",
+            "--system-prompt",
+            "be terse",
+            "--tools",
+            "read,edit,bash",
+            "--ignore-rules",
+            "--ephemeral",
+            "-i",
+            "go",
+        ])
+        .unwrap();
+        assert_eq!(cli.effort.as_deref(), Some("high"));
+        assert!(cli.offline);
+        assert_eq!(cli.system_prompt.as_deref(), Some("be terse"));
+        assert_eq!(cli.tools, vec!["read", "edit", "bash"]);
+        assert!(cli.ignore_rules && cli.ephemeral);
+        assert!(cli.command.is_none());
+        let cli = Cli::try_parse_from([
+            "ka",
+            "run",
+            "--max-turns",
+            "4",
+            "--max-budget-usd",
+            "0.5",
+            "--max-cost",
+            "1",
+            "--warn-cost",
+            "0.25",
+            "--max-time",
+            "120",
+            "-o",
+            "out.txt",
+            "--image",
+            "a.png",
+            "--image",
+            "b.jpg",
+            "do it",
+        ])
+        .unwrap();
+        let Some(CliCommand::Run {
+            max_turns,
+            max_budget_usd,
+            max_cost,
+            warn_cost,
+            max_time,
+            out,
+            image,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected run");
+        };
+        assert_eq!(max_turns, Some(4));
+        assert_eq!(max_budget_usd, Some(0.5));
+        assert_eq!(max_cost, Some(1.0));
+        assert_eq!(warn_cost, Some(0.25));
+        assert_eq!(max_time, Some(120));
+        assert_eq!(out.as_deref(), Some(std::path::Path::new("out.txt")));
+        assert_eq!(image.len(), 2);
+    }
+
+    /// `--effort` rejects unknown levels with the documented spelling.
+    #[test]
+    fn parse_effort_matches_the_thinking_spelling() {
+        assert_eq!(
+            parse_effort(Some("max")).unwrap(),
+            Some(ka_protocol::Effort::Max)
+        );
+        assert_eq!(parse_effort(None).unwrap(), None);
+        assert!(parse_effort(Some("ultra")).is_err());
+    }
+
+    /// `--exclude-tools <name>` maps onto the `tool:<name>` disable
+    /// grammar (same shape as `--disable`).
+    #[test]
+    fn exclude_tools_maps_onto_tool_disable_specs() {
+        let flags = feature_flags(
+            Vec::new(),
+            Vec::new(),
+            None,
+            &["bash".into(), "web_search".into()],
+        )
+        .unwrap();
+        let mut cfg = Config::default();
+        flags.apply(&mut cfg);
+        assert!(cfg.features.disable.contains(&"tool:bash".to_string()));
+        assert!(
+            cfg.features
+                .disable
+                .contains(&"tool:web_search".to_string())
+        );
+    }
+
+    /// `--offline` composes: web hands disabled, update check off —
+    /// nothing but the model call reaches the network.
+    #[test]
+    fn run_opts_offline_drop_the_web_and_the_update_check() {
+        let mut cfg = Config::default();
+        apply_run_opts(
+            &mut cfg,
+            &RunOpts {
+                offline: true,
+                ..RunOpts::default()
+            },
+        );
+        assert!(cfg.features.disable.iter().any(|s| s == "web"));
+        assert_eq!(cfg.update.check, Some(ka_engine::config::UpdateCheck::Off));
+    }
+
+    /// `--ignore-rules` clears `[[rules]]` for the run (the rule-file
+    /// conventions gate is set in main; hardstops are config-free).
+    #[test]
+    fn run_opts_ignore_rules_clears_rule_tables() {
+        let mut cfg =
+            Config::parse_layer("[[rules]]\ntool = \"bash\"\nverdict = \"ask\"\n", "t").unwrap();
+        assert_eq!(cfg.rules.len(), 1);
+        apply_run_opts(
+            &mut cfg,
+            &RunOpts {
+                ignore_rules: true,
+                ..RunOpts::default()
+            },
+        );
+        assert!(cfg.rules.is_empty());
+    }
+
+    /// `ka config set` key table: typed values round-trip through the
+    /// pure applier and the reader answers from the resolved config.
+    #[test]
+    fn config_set_get_roundtrip_on_the_pure_table() {
+        let mut cfg = Config::default();
+        apply_config_key(&mut cfg, "model", "anthropic/claude-sonnet-5@high").unwrap();
+        apply_config_key(&mut cfg, "tui.bell", "false").unwrap();
+        apply_config_key(&mut cfg, "guards.spend_usd", "2.5").unwrap();
+        apply_config_key(&mut cfg, "features.disable", "agents, mcp:github").unwrap();
+        apply_config_key(&mut cfg, "tools.mcp.discovery", "lazy").unwrap();
+        apply_config_key(&mut cfg, "tui.mouse", "native").unwrap();
+        assert_eq!(
+            config_get(&cfg, "model").unwrap(),
+            "anthropic/claude-sonnet-5@high"
+        );
+        assert_eq!(config_get(&cfg, "tui.bell").unwrap(), "false");
+        assert_eq!(config_get(&cfg, "guards.spend_usd").unwrap(), "2.5");
+        assert_eq!(
+            config_get(&cfg, "features.disable").unwrap(),
+            "agents,mcp:github"
+        );
+        assert_eq!(config_get(&cfg, "tools.mcp.discovery").unwrap(), "lazy");
+        assert_eq!(config_get(&cfg, "tui.mouse").unwrap(), "native");
+        assert!(apply_config_key(&mut cfg, "tui.bell", "maybe").is_err());
+        assert!(apply_config_key(&mut cfg, "tui.mouse", "sideways").is_err());
+        assert!(apply_config_key(&mut cfg, "[[rules]]", "x").is_err());
+        assert!(config_get(&cfg, "nope.key").is_err());
+    }
+
+    /// `--image` builds attachment parts: magic-byte sniff, 5 MB cap.
+    #[test]
+    fn image_parts_sniff_and_cap() {
+        let dir = std::env::temp_dir().join(format!("ka-cli-img-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("a.png");
+        let png_bytes: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3];
+        std::fs::write(&png, png_bytes).unwrap();
+        let parts = image_parts(&[png]).unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].media_type, "image/png");
+        let txt = dir.join("b.txt");
+        std::fs::write(&txt, b"not an image").unwrap();
+        assert!(image_parts(&[txt]).is_err());
+        let big = dir.join("c.png");
+        std::fs::write(&big, vec![0u8; 6 * 1024 * 1024]).unwrap();
+        assert!(image_parts(&[big]).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

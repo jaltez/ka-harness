@@ -479,7 +479,9 @@ impl Voice {
         allow: Vec<String>,
         sandbox: Option<String>,
     ) {
-        self.features.write().replace_snapshot(disabled, sandbox);
+        self.features
+            .write()
+            .replace_snapshot(disabled, allow, sandbox);
         self.specs_cache.lock().take();
     }
 

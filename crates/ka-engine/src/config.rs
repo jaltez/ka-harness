@@ -379,6 +379,54 @@ pub struct PromptSettings {
     pub identity_inline: Option<String>,
 }
 
+/// Model pins ([[model_pins]]): a per-directory model override. The
+/// FIRST pin whose `path` glob matches the session cwd wins and
+/// overwrites the effective `model`; when nothing matches the
+/// configured model stands.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ModelPin {
+    /// Glob matched against the session working directory — the full
+    /// path, or any `/`-boundary suffix of it (`projects/ka/*` matches
+    /// `/home/me/projects/ka/sub`). `*` spans path separators, like
+    /// everywhere else in ka.
+    pub path: String,
+    /// Model selector (`vendor/model[@effort]`) applied when the glob
+    /// matches.
+    pub model: String,
+}
+
+/// Strand persistence policy ([history]).
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(deny_unknown_fields, default)]
+pub struct History {
+    /// Whether the session persists at all: `"all"` (default) keeps
+    /// the normal record-by-record strand file; `"none"` = the session
+    /// leaves no persistent trace — nothing is written for the
+    /// strand's lifetime, resume/digest persistence included.
+    pub persistence: Option<HistoryPersistence>,
+    /// Byte ceiling for the strand: once the persisted strand exceeds
+    /// it, persistence stops for the rest of the session (the session
+    /// keeps working in memory). `None` = unlimited.
+    pub max_bytes: Option<u64>,
+}
+
+/// `[history] persistence` values.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum HistoryPersistence {
+    /// Persist every record as usual (the default).
+    #[default]
+    All,
+    /// The session leaves no persistent trace: the strand is kept in
+    /// memory only.
+    None,
+}
+
 /// DAP debugging probe ([debug]): off by default — spawning debug
 /// adapters is the same trust class as stdio MCP. Inert in --safe-mode.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1539,5 +1587,240 @@ mod tests {
         // strict [pokes] lands in the JSON schema
         let schema = Config::schema_json().unwrap();
         assert!(schema.contains("pokes"), "got: {schema}");
+    }
+
+    #[test]
+    fn model_pins_parse_first_match_suffix_and_overlay() {
+        // no pins: no pin model anywhere
+        assert_eq!(
+            Config::default().effective_model_for(std::path::Path::new("/")),
+            None
+        );
+        let c = Config::parse_layer(
+            "[[model_pins]]\npath = \"projects/ka/*\"\nmodel = \"openai/gpt-5.1@high\"\n\n[[model_pins]]\npath = \"/home/me/work/*\"\nmodel = \"anthropic/claude-opus-4\"\n",
+            "user",
+        )
+        .unwrap();
+        assert_eq!(c.model_pins.len(), 2);
+        // first match wins: `/home/me/work/x` matches the second pin —
+        // and would match a suffix view of the first? no: `projects/ka/*`
+        // can never suffix-match `work/x`
+        assert_eq!(
+            c.effective_model_for(std::path::Path::new("/home/me/work/x")),
+            Some("anthropic/claude-opus-4".to_string())
+        );
+        // suffix match: `projects/ka/*` matches a subdirectory path
+        assert_eq!(
+            c.effective_model_for(std::path::Path::new("/home/me/projects/ka/sub/dir")),
+            Some("openai/gpt-5.1@high".to_string())
+        );
+        // listed order decides when both globs match
+        let both = Config::parse_layer(
+            "[[model_pins]]\npath = \"*ka*\"\nmodel = \"a/first\"\n\n[[model_pins]]\npath = \"projects/*\"\nmodel = \"b/second\"\n",
+            "user",
+        )
+        .unwrap();
+        assert_eq!(
+            both.effective_model_for(std::path::Path::new("/home/me/projects/ka")),
+            Some("a/first".to_string()),
+            "the FIRST matching pin wins"
+        );
+        // nothing matches → None (the configured model stands)
+        assert_eq!(
+            c.effective_model_for(std::path::Path::new("/opt/other")),
+            None
+        );
+        // a pin row missing either key is a strict error
+        assert!(Config::parse_layer("[[model_pins]]\npath = \"x\"\n", "u").is_err());
+        assert!(Config::parse_layer("[[model_pins]]\nmodel = \"a/x\"\n", "u").is_err());
+        // unknown keys hard-error
+        let err = Config::parse_layer(
+            "[[model_pins]]\npath = \"x\"\nmodel = \"a/x\"\nglob = \"y\"\n",
+            "u",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("glob"), "{err}");
+        // overlay: a non-empty upper layer replaces the whole list, an
+        // empty layer keeps the lower one
+        let mut base = c;
+        base.overlay(Config::default());
+        assert_eq!(base.model_pins.len(), 2, "empty layer keeps pins");
+        base.overlay(
+            Config::parse_layer(
+                "[[model_pins]]\npath = \"sandbox/*\"\nmodel = \"c/third\"\n",
+                "o",
+            )
+            .unwrap(),
+        );
+        assert_eq!(base.model_pins.len(), 1, "non-empty layer replaces");
+        assert_eq!(
+            base.effective_model_for(std::path::Path::new("sandbox/deep")),
+            Some("c/third".to_string())
+        );
+        // the schema documents the table
+        let schema = Config::schema_json().unwrap();
+        assert!(
+            schema.contains("ModelPin") && schema.contains("model_pins"),
+            "{schema}"
+        );
+    }
+
+    #[test]
+    fn history_table_parses_strictly_and_overlays() {
+        // defaults: persist everything, no byte ceiling
+        assert_eq!(
+            Config::default().effective_history_persistence(),
+            HistoryPersistence::All
+        );
+        assert_eq!(Config::default().effective_history_max_bytes(), None);
+        // both spellings parse
+        let c = Config::parse_layer(
+            "[history]\npersistence = \"none\"\nmax_bytes = 1048576\n",
+            "u",
+        )
+        .unwrap();
+        assert_eq!(c.effective_history_persistence(), HistoryPersistence::None);
+        assert_eq!(c.effective_history_max_bytes(), Some(1048576));
+        assert_eq!(
+            Config::parse_layer("[history]\npersistence = \"all\"\n", "u")
+                .unwrap()
+                .effective_history_persistence(),
+            HistoryPersistence::All
+        );
+        // a bare [history] header is valid (serde default on the table)
+        let empty = Config::parse_layer("[history]\n", "u").unwrap();
+        assert_eq!(empty.history, History::default());
+        // typo'd value and unknown keys are hard errors (strict TOML)
+        assert!(Config::parse_layer("[history]\npersistence = \"off\"\n", "u").is_err());
+        let err = Config::parse_layer("[history]\npersist = \"none\"\n", "u")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("persist"), "{err}");
+        // layering: explicit values survive an unset layer, upper layers win
+        let mut base = c;
+        base.overlay(Config::default());
+        assert_eq!(
+            base.effective_history_persistence(),
+            HistoryPersistence::None,
+            "explicit none survives an unset layer"
+        );
+        base.overlay(Config::parse_layer("[history]\nmax_bytes = 10\n", "proj").unwrap());
+        assert_eq!(
+            base.effective_history_persistence(),
+            HistoryPersistence::None,
+            "unset upper field keeps the lower value"
+        );
+        assert_eq!(
+            base.effective_history_max_bytes(),
+            Some(10),
+            "upper layer wins"
+        );
+        // documented in the schema
+        let schema = Config::schema_json().unwrap();
+        assert!(
+            schema.contains("HistoryPersistence") && schema.contains("max_bytes"),
+            "{schema}"
+        );
+    }
+
+    #[test]
+    fn fallback_filenames_parse_overlay_and_schema() {
+        // default empty
+        assert!(Config::default().project_doc_fallback_filenames.is_empty());
+        let c = Config::parse_layer(
+            "project_doc_fallback_filenames = [\"CONTEXT.md\", \".cursorrules\"]\n",
+            "u",
+        )
+        .unwrap();
+        assert_eq!(
+            c.project_doc_fallback_filenames,
+            vec!["CONTEXT.md".to_string(), ".cursorrules".to_string()]
+        );
+        // overlay: a non-empty upper layer replaces, an empty one keeps
+        let mut base = c;
+        base.overlay(Config::default());
+        assert_eq!(base.project_doc_fallback_filenames.len(), 2);
+        base.overlay(
+            Config::parse_layer("project_doc_fallback_filenames = [\"NOTES.md\"]\n", "p").unwrap(),
+        );
+        assert_eq!(
+            base.project_doc_fallback_filenames,
+            vec!["NOTES.md".to_string()]
+        );
+        // wrong type is a hard error
+        assert!(
+            Config::parse_layer("project_doc_fallback_filenames = \"CONTEXT.md\"\n", "u").is_err()
+        );
+        // documented in the schema
+        let schema = Config::schema_json().unwrap();
+        assert!(
+            schema.contains("project_doc_fallback_filenames"),
+            "got: {schema}"
+        );
+    }
+
+    #[test]
+    fn identity_inline_parses_and_overlays() {
+        // set + layered overlay (set fields win)
+        let c = Config::parse_layer("[prompt]\nidentity_inline = \"You are Ka.\"\n", "u").unwrap();
+        assert_eq!(c.prompt.identity_inline.as_deref(), Some("You are Ka."));
+        let mut base = c;
+        base.overlay(Config::parse_layer("[prompt]\nidentity_inline = \"Other.\"\n", "o").unwrap());
+        assert_eq!(base.prompt.identity_inline.as_deref(), Some("Other."));
+        // unset upper layer keeps the lower value
+        base.overlay(
+            Config::parse_layer("[prompt]\nidentity_file = \"/tmp/ID.md\"\n", "o2").unwrap(),
+        );
+        assert_eq!(base.prompt.identity_inline.as_deref(), Some("Other."));
+        // unknown keys under [prompt] hard-error
+        let err = Config::parse_layer("[prompt]\nidentity_text = \"x\"\n", "u")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("identity_text"), "{err}");
+        // documented in the schema
+        assert!(Config::schema_json().unwrap().contains("identity_inline"));
+    }
+
+    #[test]
+    fn save_settings_writes_schema_sidecar_and_directive() {
+        let dir = std::env::temp_dir().join(format!("ka-cfg-schema-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ka.toml");
+        save_settings_to(&path, Some("a/x"), None, None, None, None).unwrap();
+        // the directive is the first line and the sidecar exists
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.starts_with("#:schema ka.schema.json\n"),
+            "directive prepended as line one: {text:?}"
+        );
+        let schema_path = dir.join("ka.schema.json");
+        let schema = std::fs::read_to_string(&schema_path).unwrap();
+        serde_json::from_str::<serde_json::Value>(&schema)
+            .expect("the sidecar is valid JSON schema");
+        // the directive is a plain TOML comment: strict parse round-trips
+        let layer = Config::parse_layer(&text, "roundtrip").unwrap();
+        assert_eq!(layer.model.as_deref(), Some("a/x"));
+        // a second save rewrites from scratch: still exactly one directive
+        save_settings_to(&path, Some("b/y"), None, None, None, None).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            text.matches("#:schema").count(),
+            1,
+            "no directive duplication across saves: {text:?}"
+        );
+        let layer = Config::parse_layer(&text, "roundtrip2").unwrap();
+        assert_eq!(layer.model.as_deref(), Some("b/y"));
+        // a differently-named toml gets its own stem in the directive
+        let other = dir.join("custom.toml");
+        save_settings_to(&other, None, None, None, None, None).unwrap();
+        let text = std::fs::read_to_string(&other).unwrap();
+        assert!(
+            text.starts_with("#:schema custom.schema.json\n"),
+            "{text:?}"
+        );
+        assert!(dir.join("custom.schema.json").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -201,6 +201,38 @@ impl FeatureToggles {
             .iter()
             .any(|s| tool.starts_with(&crate::mcp::wire_prefix(s)))
     }
+
+    /// Whether the positive allowlist admits this tool (`[features]
+    /// allow`; empty = everything). Server entries admit the whole
+    /// server: `mcp:<name>` admits that server's eager `server__tool`
+    /// hands plus the lazy `mcp_call`/meta front hands (their
+    /// per-call server validation stays with the dynamic hands), bare
+    /// `mcp` admits all of MCP.
+    pub fn tool_allowed(&self, tool: &str) -> bool {
+        if self.allow.is_empty() {
+            return true;
+        }
+        self.allow
+            .iter()
+            .any(|entry| match entry.strip_prefix("mcp:") {
+                Some(server) => {
+                    tool == "mcp"
+                        || tool == "mcp_call"
+                        || tool.starts_with(&crate::mcp::wire_prefix(server))
+                }
+                None if entry == "mcp" => {
+                    tool == "mcp" || tool == "mcp_call" || self.is_eager_mcp(tool)
+                }
+                None => entry == tool,
+            })
+    }
+
+    /// Whether the model may see this hand at all: not feature-toggled
+    /// away and admitted by the allowlist. `disable` wins over
+    /// `allow` (a tool in both is hidden).
+    pub fn tool_visible(&self, tool: &str) -> bool {
+        self.hidden_reason(tool).is_none() && self.tool_allowed(tool)
+    }
 }
 
 /// Snapshot strings for the strand `Change` record: disabled specs
@@ -249,6 +281,110 @@ mod tests {
             live_mcp: vec!["github".into(), "jira".into()],
             sandbox: None,
         }
+    }
+
+    #[test]
+    fn allowlist_gates_visibility_and_disable_wins() {
+        // empty allow = no restriction at all
+        let none = toggles(&[]);
+        for tool in ["read", "bash", "delegate"] {
+            assert!(none.tool_visible(tool), "{tool} visible without allow");
+            assert!(none.tool_allowed(tool));
+        }
+        // non-empty allow: only listed hands survive
+        let t = allowed(&[], &["read"]);
+        assert!(t.tool_visible("read"));
+        for tool in ["bash", "edit", "grep", "delegate", "web_search"] {
+            assert!(!t.tool_visible(tool), "{tool} hidden outside the allowlist");
+            assert!(!t.tool_allowed(tool));
+        }
+        // disable wins over allow: `read` listed but disabled → hidden
+        let t = allowed(&[FeatureSpec::Tool("read".into())], &["read"]);
+        assert!(
+            !t.tool_visible("read"),
+            "disabled tool stays hidden despite allow"
+        );
+        assert!(!t.tool_visible("grep"), "unlisted tools stay hidden too");
+        // a listed+enabled hand shows next to a listed+disabled one
+        let t = allowed(&[FeatureSpec::Tool("read".into())], &["read", "grep"]);
+        assert!(t.tool_visible("grep"));
+        assert!(!t.tool_visible("read"), "disable wins over allow per tool");
+    }
+
+    #[test]
+    fn allow_with_mcp_server_entries() {
+        let github = crate::mcp::wire_name("github", "create_issue");
+        let jira = crate::mcp::wire_name("jira", "search");
+        // `mcp:github` admits github's eager hands + the meta fronts,
+        // nothing else
+        let t = allowed(&[], &["mcp:github"]);
+        assert!(t.tool_allowed(&github));
+        assert!(t.tool_allowed("mcp_call"));
+        assert!(t.tool_allowed("mcp"));
+        assert!(!t.tool_allowed(&jira), "other servers stay rejected");
+        assert!(!t.tool_allowed("read"));
+        assert!(t.tool_visible(&github));
+        // bare `mcp` admits every live server's hands
+        let t = allowed(&[], &["mcp"]);
+        assert!(t.tool_allowed(&github));
+        assert!(t.tool_allowed(&jira));
+        assert!(t.tool_allowed("mcp_call"));
+        assert!(!t.tool_allowed("read"));
+        // disable wins: `mcp:github` allowed but the server disabled
+        let t = allowed(&[FeatureSpec::McpServer("github".into())], &["mcp:github"]);
+        assert!(
+            !t.tool_visible(&github),
+            "disabled server stays hidden despite allow"
+        );
+        // and FeatureSpec::Mcp disabled hides the meta fronts
+        let t = allowed(&[FeatureSpec::Mcp], &["mcp:github"]);
+        assert!(!t.tool_visible("mcp_call"));
+    }
+
+    #[test]
+    fn allow_covers_conditional_hands() {
+        // conditional hands follow the same name rules: exact entry for
+        // `debug`, exact or `mcp:`-style entries for lsp_* hands
+        let t = allowed(&[], &["debug", "lsp_symbols"]);
+        assert!(t.tool_visible("debug"));
+        assert!(t.tool_visible("lsp_symbols"));
+        assert!(!t.tool_visible("lsp_rename"), "only listed hands show");
+        // the lsp feature word disabled: the whole lsp family hides,
+        // even hands the allowlist names
+        let t = allowed(&[FeatureSpec::Lsp], &["lsp_symbols", "debug"]);
+        assert!(!t.tool_visible("lsp_symbols"), "disable wins over allow");
+        assert!(
+            t.tool_visible("debug"),
+            "unrelated listed hands keep showing"
+        );
+    }
+
+    #[test]
+    fn snapshot_roundtrip_carries_allow() {
+        let mut t = allowed(&[FeatureSpec::Agents], &["read", "mcp:github"]);
+        t.set_live_mcp(vec!["github".into()]);
+        let snap = t.snapshot_specs();
+        assert!(snap.contains(&"agents".to_string()));
+        assert!(snap.contains(&"allow:read".to_string()));
+        assert!(snap.contains(&"allow:mcp:github".to_string()));
+        // `allow:` is not spec grammar: it can't be confused with a
+        // disabled spec on decode
+        assert!("allow:read".parse::<FeatureSpec>().is_err());
+        let (specs, allow) = split_snapshot(&snap);
+        assert_eq!(specs, vec!["agents".to_string()]);
+        assert_eq!(allow, vec!["read".to_string(), "mcp:github".to_string()]);
+        // replace_snapshot restores both halves
+        let parsed: Vec<FeatureSpec> = specs.iter().map(|s| s.parse().unwrap()).collect();
+        let mut restored = FeatureToggles::default();
+        restored.set_live_mcp(vec!["github".into()]);
+        restored.replace_snapshot(parsed, allow, None);
+        assert!(restored.tool_visible("read"));
+        assert!(!restored.tool_visible("bash"));
+        assert!(!restored.tool_visible("delegate"), "agents toggle restored");
+        // a legacy snapshot without allow entries restores empty (all-on)
+        let (specs, allow) = split_snapshot(&["tool:bash".to_string()]);
+        assert!(allow.is_empty());
+        assert_eq!(specs, vec!["tool:bash".to_string()]);
     }
 
     #[test]

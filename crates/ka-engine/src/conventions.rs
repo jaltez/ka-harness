@@ -22,6 +22,10 @@ pub struct AgentsFile {
 /// forbids `unsafe`).
 static BARE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Rule-file conventions disabled (`ka --ignore-rules`): process-global
+/// like [`BARE`], flipped before any runtime threads spawn.
+static RULES_DISABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Enable safe mode for this process (CLI `--safe-mode`).
 pub fn set_bare_mode(on: bool) {
     BARE.store(on, std::sync::atomic::Ordering::Relaxed);
@@ -373,6 +377,95 @@ mod tests {
         assert_eq!(found[0].content, "root rules");
         assert_eq!(found[1].content, "mid rules (compat)");
         assert_eq!(found[2].content, "deep rules");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn override_md_replaces_the_directory_layer() {
+        let root = temp_tree("override");
+        let deep = root.join("sub");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(root.join("AGENTS.md"), "root rules").unwrap();
+        std::fs::write(deep.join("AGENTS.md"), "deep base").unwrap();
+        std::fs::write(deep.join("AGENTS.override.md"), "deep override").unwrap();
+
+        // the override replaces its directory's AGENTS.md; the parent
+        // layer survives (override scope is exactly one directory)
+        let found = discover_agents(&deep);
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].content, "root rules");
+        assert_eq!(found[1].content, "deep override");
+        assert!(found[1].path.ends_with("AGENTS.override.md"));
+
+        // an override alone also counts as the directory's layer
+        std::fs::remove_file(deep.join("AGENTS.md")).unwrap();
+        let found = discover_agents(&deep);
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[1].content, "deep override");
+
+        // the override beats the CLAUDE.md compat fallback too
+        std::fs::remove_file(deep.join("AGENTS.override.md")).unwrap();
+        std::fs::write(deep.join("CLAUDE.md"), "deep compat").unwrap();
+        std::fs::write(deep.join("AGENTS.override.md"), "deep override").unwrap();
+        let found = discover_agents(&deep);
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[1].content, "deep override");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fallback_filenames_apply_only_without_agents_md() {
+        let root = temp_tree("fallbacks");
+        let mid = root.join("pkg");
+        let deep = mid.join("src");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(mid.join("AGENTS.md"), "mid agents").unwrap();
+        std::fs::write(mid.join("CONTEXT.md"), "mid fallback").unwrap();
+        std::fs::write(deep.join("CONTEXT.md"), "deep fallback").unwrap();
+
+        // with fallbacks: the deep directory contributes its CONTEXT.md
+        let found = discover_agents_with(&deep, &["CONTEXT.md".to_string()]);
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert_eq!(found[0].content, "mid agents");
+        assert_eq!(found[1].content, "deep fallback");
+        assert!(found[1].path.ends_with("CONTEXT.md"));
+
+        // without fallbacks: the deep directory contributes nothing
+        let found = discover_agents(&deep);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].content, "mid agents");
+
+        // AGENTS.md still beats a configured fallback in the same dir
+        std::fs::write(deep.join("AGENTS.md"), "deep agents").unwrap();
+        let found = discover_agents_with(&deep, &["CONTEXT.md".to_string()]);
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[1].content, "deep agents");
+
+        // fallback names are tried in the configured order
+        std::fs::remove_file(deep.join("AGENTS.md")).unwrap();
+        std::fs::write(deep.join("NOTES.md"), "deep notes").unwrap();
+        let found =
+            discover_agents_with(&deep, &["NOTES.md".to_string(), "CONTEXT.md".to_string()]);
+        assert_eq!(
+            found[1].content, "deep notes",
+            "first configured fallback wins"
+        );
+
+        // fallbacks lose to the override too
+        std::fs::write(deep.join("AGENTS.override.md"), "deep override").unwrap();
+        let found = discover_agents_with(&deep, &["NOTES.md".to_string()]);
+        assert_eq!(found[1].content, "deep override");
+
+        // empty fallback files never count as found
+        std::fs::remove_file(deep.join("AGENTS.override.md")).unwrap();
+        std::fs::remove_file(deep.join("NOTES.md")).unwrap();
+        std::fs::write(deep.join("CONTEXT.md"), "   \n").unwrap();
+        let found = discover_agents_with(&deep, &["CONTEXT.md".to_string()]);
+        assert_eq!(
+            found.len(),
+            1,
+            "whitespace-only fallback skipped: {found:?}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

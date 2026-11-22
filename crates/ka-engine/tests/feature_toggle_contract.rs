@@ -745,3 +745,259 @@ async fn mcp_server_enable_attempts_spawn() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `[features] allow`: a positive allowlist gates the session — only
+/// listed hands reach the model, everything else is invisible AND a
+/// stray call is rejected by name (fail-closed, like disable).
+#[tokio::test]
+async fn allowlist_hides_unlisted_hands_and_rejects_strays() {
+    let dir = tmp_dir("allow");
+    let parsed =
+        ka_engine::Config::parse_layer("[features]\nallow = [\"read\"]\n", "project").unwrap();
+    let cfg = ka_engine::Config {
+        cwd: Some(dir.to_string_lossy().into_owned()),
+        ..parsed
+    };
+    let rec = Rec::new();
+    let mut handle = ka_engine::spawn_with_speaker(
+        cfg,
+        test_catalog(),
+        ka_engine::StrandChoice::New,
+        ka_dialect::Wire::OpenaiChat,
+        rec.clone(),
+    );
+    let events = settle(&mut handle, prompt("hi"), on_idle).await;
+    let inventory = events
+        .iter()
+        .find_map(|e| match e {
+            Event::Inventory { tools, .. } => Some(tools.clone()),
+            _ => None,
+        })
+        .expect("bootstrap inventory");
+    assert!(
+        inventory.contains(&"read".to_string()),
+        "the listed hand is offered: {inventory:?}"
+    );
+    assert!(
+        !inventory.contains(&"bash".to_string()),
+        "unlisted hands are invisible: {inventory:?}"
+    );
+    assert!(
+        !inventory.contains(&"edit".to_string()),
+        "unlisted hands are invisible: {inventory:?}"
+    );
+    assert!(
+        rec.tool_names
+            .lock()
+            .last()
+            .is_some_and(|names| !names.is_empty()),
+        "the model sees at least the listed hand"
+    );
+    assert!(
+        rec.tool_names
+            .lock()
+            .last()
+            .unwrap()
+            .iter()
+            .all(|t| t == "read"),
+        "only the listed hand reaches the model: {:?}",
+        rec.tool_names.lock().last().unwrap()
+    );
+
+    // stray call to an unlisted hand: rejected by name, fail-closed
+    rec.arm(vec![("bash", serde_json::json!({"command": "echo hi"}))]);
+    let events = settle(&mut handle, prompt("again"), on_idle).await;
+    assert!(
+        !rec.tool_names
+            .lock()
+            .last()
+            .unwrap()
+            .contains(&"bash".to_string()),
+        "bash stays hidden"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            Event::CallOutput { is_error: true, excerpt, .. }
+                if excerpt.contains("bash") && excerpt.contains("[features] allow")
+        )),
+        "stray bash rejected naming the allowlist: {events:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `disable` wins over `allow`: a hand in both lists stays hidden, and
+/// the recorded snapshot carries the allowlist (`allow:<entry>` rows)
+/// so a resume restores it — a re-enable via `/features` then shows
+/// the hand again (runtime toggles and the allowlist coexist).
+#[tokio::test]
+async fn allow_and_disable_coexist_and_resume_restores_allow() {
+    let dir = tmp_dir("allow-resume");
+    let parsed = ka_engine::Config::parse_layer(
+        "[features]\nallow = [\"read\", \"bash\"]\ndisable = [\"tool:bash\"]\n",
+        "project",
+    )
+    .unwrap();
+    let cfg = ka_engine::Config {
+        cwd: Some(dir.to_string_lossy().into_owned()),
+        ..parsed
+    };
+    let rec = Rec::new();
+    let mut handle = ka_engine::spawn_with_speaker(
+        cfg,
+        test_catalog(),
+        ka_engine::StrandChoice::New,
+        ka_dialect::Wire::OpenaiChat,
+        rec.clone(),
+    );
+    let events = settle(&mut handle, prompt("hi"), on_idle).await;
+    let inventory = events
+        .iter()
+        .find_map(|e| match e {
+            Event::Inventory { tools, .. } => Some(tools.clone()),
+            _ => None,
+        })
+        .expect("bootstrap inventory");
+    assert!(
+        inventory.contains(&"read".to_string()),
+        "allowed+enabled hand shows: {inventory:?}"
+    );
+    assert!(
+        !inventory.contains(&"bash".to_string()),
+        "disable wins over allow: {inventory:?}"
+    );
+    assert!(
+        !inventory.contains(&"edit".to_string()),
+        "unlisted hands stay hidden: {inventory:?}"
+    );
+    // a stray bash call names the toggle (disable won the visibility
+    // fight, so the disable guard fires, not the allowlist one)
+    rec.arm(vec![("bash", serde_json::json!({"command": "echo hi"}))]);
+    let events = settle(&mut handle, prompt("stray"), on_idle).await;
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            Event::CallOutput { is_error: true, excerpt, .. }
+                if excerpt.contains("disabled by a session feature toggle")
+        )),
+        "disable guard fires for allow∩disable: {events:?}"
+    );
+
+    // re-enable bash via /features (runtime toggle over the baseline):
+    // now bash is allowed AND enabled → it shows up
+    settle(&mut handle, set_feature("tool:bash", true), on_idle).await;
+    settle(&mut handle, prompt("with bash"), on_idle).await;
+    let names = rec.tool_names.lock().last().cloned().unwrap();
+    assert!(
+        names.contains(&"bash".to_string()),
+        "re-enabled allowed hand shows: {names:?}"
+    );
+    assert!(
+        names.iter().all(|t| t == "read" || t == "bash"),
+        "the allowlist still gates everything else: {names:?}"
+    );
+
+    // resume the strand: the recorded snapshot restores the allowlist —
+    // read + bash visible, edit invisible again
+    let newest = ka_strand::list(&dir)
+        .expect("strand list")
+        .into_iter()
+        .map(|s| s.path)
+        .max()
+        .expect("one strand for this cwd");
+    let rec2 = Rec::new();
+    let mut handle2 = ka_engine::spawn_with_speaker(
+        ka_engine::Config {
+            cwd: Some(dir.to_string_lossy().into_owned()),
+            ..Default::default()
+        },
+        test_catalog(),
+        ka_engine::StrandChoice::Path(newest),
+        ka_dialect::Wire::OpenaiChat,
+        rec2.clone(),
+    );
+    let mut inventory: Option<Vec<String>> = None;
+    while let Ok(Some(e)) =
+        tokio::time::timeout(Duration::from_secs(5), handle2.events.recv()).await
+    {
+        if let Event::Inventory { tools, .. } = &e {
+            inventory = Some(tools.clone());
+        }
+        if matches!(e, Event::Idle | Event::Replay { .. }) && inventory.is_some() {
+            break;
+        }
+    }
+    let inventory = inventory.expect("resume inventory");
+    assert!(
+        inventory.contains(&"read".to_string()) && inventory.contains(&"bash".to_string()),
+        "resume restores the allowlist over a config-less baseline: {inventory:?}"
+    );
+    assert!(
+        !inventory.contains(&"edit".to_string()),
+        "resume keeps unlisted hands hidden: {inventory:?}"
+    );
+    rec2.arm(vec![(
+        "edit",
+        serde_json::json!({"path": "x", "old": "a", "new": "b"}),
+    )]);
+    let events = settle(&mut handle2, prompt("post-resume"), on_idle).await;
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            Event::CallOutput { is_error: true, excerpt, .. }
+                if excerpt.contains("edit") && excerpt.contains("[features] allow")
+        )),
+        "stray edit rejected after resume: {events:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `mcp:<server>` allow entries gate MCP traffic: base tools stay
+/// hidden and stray calls are rejected by name. (The configured server
+/// fails to spawn — a live server's `server__tool` hands inherit the
+/// same gating through `tool_allowed`, covered at unit level; the
+/// meta `mcp`/`mcp_call` hands only register once a server connects.)
+#[tokio::test]
+async fn allow_mcp_server_entry_gates_the_session() {
+    let dir = tmp_dir("allow-mcp");
+    let parsed = ka_engine::Config::parse_layer(
+        "[[mcp]]\nname = \"ghost\"\ncommand = \"definitely-not-a-real-binary-ka-test\"\n\n[features]\nallow = [\"mcp:ghost\"]\n",
+        "project",
+    )
+    .unwrap();
+    let cfg = ka_engine::Config {
+        cwd: Some(dir.to_string_lossy().into_owned()),
+        ..parsed
+    };
+    let rec = Rec::new();
+    let mut handle = ka_engine::spawn_with_speaker(
+        cfg,
+        test_catalog(),
+        ka_engine::StrandChoice::New,
+        ka_dialect::Wire::OpenaiChat,
+        rec.clone(),
+    );
+    let events = settle(&mut handle, prompt("hi"), on_idle).await;
+    let inventory = events
+        .iter()
+        .find_map(|e| match e {
+            Event::Inventory { tools, .. } => Some(tools.clone()),
+            _ => None,
+        })
+        .expect("bootstrap inventory");
+    assert!(
+        !inventory.contains(&"read".to_string()) && !inventory.contains(&"bash".to_string()),
+        "base tools stay hidden outside the allowlist: {inventory:?}"
+    );
+    rec.arm(vec![("read", serde_json::json!({"path": "x"}))]);
+    let events = settle(&mut handle, prompt("again"), on_idle).await;
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            Event::CallOutput { is_error: true, excerpt, .. }
+                if excerpt.contains("read") && excerpt.contains("[features] allow")
+        )),
+        "stray read rejected: {events:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

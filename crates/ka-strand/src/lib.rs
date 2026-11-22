@@ -1880,6 +1880,54 @@ mod tests {
         assert!(!md.contains("*tool*"), "blank tool content is skipped");
     }
 
+    /// Mirror of the engine's replay fold (`history_from_records`): the
+    /// conversation contents a strand replays with. Shared by the JSONL
+    /// render tests to pin "re-parse reproduces the same state".
+    fn fold_contents(records: &[Record]) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut ids: Vec<RecordId> = Vec::new();
+        for r in records {
+            match r {
+                Record::Message { id, content, .. } => {
+                    ids.push(id.clone());
+                    out.push(content.clone());
+                }
+                Record::Digest { .. } | Record::Boundary { .. } => {
+                    out.clear();
+                    ids.clear();
+                }
+                Record::Rewind { kept_from, .. } => match ids.iter().position(|i| i == kept_from) {
+                    Some(pos) => {
+                        out.truncate(pos + 1);
+                        ids.truncate(pos + 1);
+                    }
+                    None => {
+                        out.clear();
+                        ids.clear();
+                    }
+                },
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// Short tag per record so re-parsed chains compare by order and
+    /// identity without cloning constructors around.
+    fn outline(r: &Record) -> String {
+        match r {
+            Record::Header { id, .. } => format!("header:{}", id.0),
+            Record::Message { id, content, .. } => format!("message:{}:{content}", id.0),
+            Record::Change { id, model, .. } => {
+                format!("change:{}:{}", id.0, model.clone().unwrap_or_default())
+            }
+            Record::Rewind { id, kept_from } => format!("rewind:{}:{}", id.0, kept_from.0),
+            Record::Usage { id, cost, .. } => format!("usage:{}:{cost}", id.0),
+            Record::Boundary { id } => format!("boundary:{}", id.0),
+            _ => format!("other:{}", r.id().map(|i| i.0.clone()).unwrap_or_default()),
+        }
+    }
+
     #[test]
     fn render_jsonl_renders_file_lines_and_reparses_the_tip() {
         let data = temp_data("jsonl-file");
