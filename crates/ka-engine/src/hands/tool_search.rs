@@ -229,6 +229,7 @@ mod tests {
                 raw_name: raw.to_string(),
                 description: description.to_string(),
                 schema: json!({}),
+                read_only_hint: false,
             })
             .collect();
         let shared = crate::mcp::McpShared::placeholder(
@@ -239,6 +240,11 @@ mod tests {
                 env: Default::default(),
                 url: None,
                 headers: Vec::new(),
+                enabled_tools: Vec::new(),
+                disabled_tools: Vec::new(),
+                approval: None,
+                tool_timeout_secs: None,
+                output_limit: None,
             },
             tools,
         );

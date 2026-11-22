@@ -57,10 +57,13 @@ const FEEDBACK_CHARS: usize = 2000;
 /// `post_tool_use` hook may additionally return `feedback`: the string
 /// is appended to that call's tool result for the model to read
 /// (formatters, linters, policy echoes) — pre_tool_use feedback has no
-/// result to ride and is ignored. Anything else — invalid JSON,
-/// unknown keys, non-objects — is ignored silently; hook output never
-/// fails a turn. This is deliberately the whole action language (no
-/// rule mutation, no directory adds).
+/// result to ride and is ignored. `decision: "block"` (EXT-02) is the
+/// stdout/HTTP-body spelling of the exit-2 block: on a pre_tool_use
+/// hook it refuses the call with `reason` (default "blocked by hook");
+/// a command hook keeps reaching for exit 2 — both spellings coexist.
+/// Anything else — invalid JSON, unknown keys, non-objects — is ignored
+/// silently; hook output never fails a turn. This is deliberately the
+/// whole action language (no rule mutation, no directory adds).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct Steering {
     pub mode: Option<ka_protocol::Mode>,
@@ -75,6 +78,9 @@ pub(crate) struct Steering {
     /// Post-tool feedback (post_tool_use only): appended to the tool
     /// result the model reads, capped at [`FEEDBACK_CHARS`] chars.
     pub feedback: Option<String>,
+    /// Hook veto (EXT-02): `decision: "block"` (any ASCII case) with an
+    /// optional `reason` — the pre_tool_use spelling of exit 2.
+    pub block: Option<String>,
 }
 
 /// Parse steering off a successful hook's trimmed stdout.
@@ -107,10 +113,22 @@ pub(crate) fn parse_steering(stdout: &str) -> Steering {
         .filter(|m| !m.is_empty());
     // case-insensitive by design: hooks are shell scripts, and "ALLOW"
     // carries the same intent as "allow"
-    let allow = v
+    let decision = v
         .get("decision")
         .and_then(|d| d.as_str())
-        .is_some_and(|d| d.eq_ignore_ascii_case("allow"));
+        .map(|d| d.to_ascii_lowercase());
+    let allow = decision.as_deref().is_some_and(|d| d == "allow");
+    let block = if decision.as_deref().is_some_and(|d| d == "block") {
+        Some(
+            v.get("reason")
+                .and_then(|r| r.as_str())
+                .filter(|r| !r.trim().is_empty())
+                .map(|r| r.trim().chars().take(TAIL_CHARS).collect::<String>())
+                .unwrap_or_else(|| "blocked by hook".to_string()),
+        )
+    } else {
+        None
+    };
     let feedback = v
         .get("feedback")
         .and_then(|f| f.as_str())
@@ -122,6 +140,7 @@ pub(crate) fn parse_steering(stdout: &str) -> Steering {
         updated_input,
         allow,
         feedback,
+        block,
     }
 }
 

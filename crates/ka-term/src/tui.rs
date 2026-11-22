@@ -2811,6 +2811,10 @@ pub struct Meters {
     pub goal: Option<GoalState>,
     /// CTX-06: loop-mode mirror (see [`LoopState`]); None = disarmed.
     pub loop_task: Option<LoopState>,
+    /// EXT-09: the active output style (`¶ <name>` badge; None hides
+    /// it). Local mirror — the surface only arms resolvable names, the
+    /// engine owns the truth.
+    pub style: Option<String>,
     /// TUI-15: active background work, counted from the last /tasks
     /// roster snapshot — `(running tasks, running jobs, dap sessions)`.
     /// All zero = the pill disappears from the status line.
@@ -4498,6 +4502,14 @@ pub enum Modal {
         /// Available theme names (the default palette is selected 0).
         names: Vec<String>,
         /// Selected row index (0 = Nocturne default).
+        selected: usize,
+    },
+    /// Style picker (/style, EXT-09): "built-in" plus every discovered
+    /// output style; ⏎ switches the session's identity prose live.
+    Style {
+        /// Available style names (built-in identity is selected 0).
+        names: Vec<String>,
+        /// Selected row index (0 = built-in identity).
         selected: usize,
     },
     /// Copy picker (/copy, alt+y): the transcript's text blocks, newest
@@ -6333,6 +6345,70 @@ async fn app(
                                 }
                                 _ => {}
                             },
+                            Modal::Style { names, selected } => match key.code {
+                                KeyCode::Esc => modal = None,
+                                KeyCode::Up => {
+                                    *selected = selected.saturating_sub(1);
+                                }
+                                KeyCode::Down => {
+                                    if *selected + 1 < names.len() + 1 {
+                                        *selected += 1;
+                                    }
+                                }
+                                KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
+                                    let n = c.to_digit(10).unwrap_or(1) as usize - 1;
+                                    if n < names.len() + 1 {
+                                        *selected = n;
+                                    }
+                                }
+                                // 0 / "built-in" restores ka's identity; n
+                                // picks a style. Resolution is engine-side:
+                                // an unresolvable name changes nothing and
+                                // the engine's note says so.
+                                KeyCode::Enter => {
+                                    let picked = if *selected == 0 {
+                                        None
+                                    } else {
+                                        names.get(*selected - 1).cloned()
+                                    };
+                                    modal = None;
+                                    match picked {
+                                        None => {
+                                            meters.style = None;
+                                            let _ = commands
+                                                .send(ka_protocol::Command::SetStyle {
+                                                    style: None,
+                                                })
+                                                .await;
+                                            pop_toast(
+                                                &mut toast,
+                                                "style · off (built-in identity)",
+                                            );
+                                        }
+                                        Some(name) => {
+                                            let cwd =
+                                                PLAN_CWD.get().cloned().unwrap_or_default();
+                                            if ka_engine::conventions::resolve_style(&name, &cwd)
+                                                .is_some()
+                                            {
+                                                meters.style = Some(name.clone());
+                                                let _ = commands
+                                                    .send(ka_protocol::Command::SetStyle {
+                                                        style: Some(name.clone()),
+                                                    })
+                                                    .await;
+                                                pop_toast(&mut toast, format!("style · {name}"));
+                                            } else {
+                                                transcript.push_separated(Line::Warn(format!(
+                                                    "style {name} not found — \
+                                                     .ka/styles/ or ~/.config/ka/styles/"
+                                                )));
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            },
                             Modal::CopyPick {
                                 blocks,
                                 selected,
@@ -7123,6 +7199,54 @@ async fn app(
                                                 pop_toast(&mut toast, format!("theme · {name}"));
                                             }
                                             Err(e) => transcript.push_separated(Line::Warn(e)),
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
+                            // /style [name|off]: the picker, or a direct
+                            // session-scoped switch (EXT-09). Resolution is
+                            // engine-side: a resolvable name sends
+                            // SetStyle (the voice replaces the built-in
+                            // identity when no file/inline identity
+                            // applies); `off` restores it.
+                            if text.trim() == "/style" || text.trim().starts_with("/style ") {
+                                let name = text
+                                    .trim()
+                                    .strip_prefix("/style")
+                                    .map(str::trim)
+                                    .filter(|n| !n.is_empty());
+                                let cwd = PLAN_CWD.get().cloned().unwrap_or_default();
+                                match name {
+                                    None => {
+                                        modal = Some(Modal::Style {
+                                            names: ka_engine::conventions::available_styles(&cwd),
+                                            selected: 0,
+                                        });
+                                    }
+                                    Some("off") => {
+                                        meters.style = None;
+                                        let _ = commands
+                                            .send(ka_protocol::Command::SetStyle { style: None })
+                                            .await;
+                                        pop_toast(&mut toast, "style · off (built-in identity)");
+                                    }
+                                    Some(name) => {
+                                        if ka_engine::conventions::resolve_style(name, &cwd)
+                                            .is_some()
+                                        {
+                                            meters.style = Some(name.to_string());
+                                            let _ = commands
+                                                .send(ka_protocol::Command::SetStyle {
+                                                    style: Some(name.to_string()),
+                                                })
+                                                .await;
+                                            pop_toast(&mut toast, format!("style · {name}"));
+                                        } else {
+                                            transcript.push_separated(Line::Warn(format!(
+                                                "style {name} not found — .ka/styles/ or \
+                                                 ~/.config/ka/styles/"
+                                            )));
                                         }
                                     }
                                 }
@@ -8233,6 +8357,7 @@ async fn app(
                             | Modal::Skills { .. }
                             | Modal::Info { .. }
                             | Modal::Theme { .. }
+                            | Modal::Style { .. }
                             | Modal::CopyPick { .. }
                             | Modal::Search { .. }
                             | Modal::Changelog { .. }
@@ -10354,6 +10479,10 @@ fn builtin_slash_commands() -> Vec<(String, String)> {
             "switch the theme live: /theme [name|default]".to_string(),
         ),
         (
+            "/style".to_string(),
+            "switch the output style live: /style [name|off]".to_string(),
+        ),
+        (
             "/changelog".to_string(),
             "what's new in this build (vendored CHANGELOG)".to_string(),
         ),
@@ -10911,12 +11040,113 @@ pub struct CommandFrontmatter {
     pub allowed_tools: Vec<String>,
     /// `model`: per-turn model selector override.
     pub model: Option<String>,
+    /// EXT-08 `side: true`: dispatch as a side question
+    /// (`Command::SideQuestion`) — the answer arrives as a note, the
+    /// transcript and context stay untouched.
+    pub side: bool,
+    /// EXT-08 `shell`: run when the command is invoked; its output is
+    /// prepended to the prompt (capped at 8 KiB, failures inline).
+    pub shell: Option<String>,
+}
+
+/// Cap for one custom-command `shell:` capture (EXT-08).
+const COMMAND_SHELL_CAP: usize = 8192;
+/// Wall-clock budget for one custom-command `shell:` run.
+const COMMAND_SHELL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Run a custom command's `shell:` snippet (EXT-08) and return its
+/// output for prepending to the prompt: capped at 8 KiB with a note,
+/// failures inline as `[error: …]` — a broken snippet never blocks the
+/// command.
+pub fn run_command_shell(command: &str, cwd: &std::path::Path) -> String {
+    let mut cmd = std::process::Command::new("sh");
+    cmd.arg("-c")
+        .arg(command)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return format!("[error: {e}]"),
+    };
+    // drain both pipes on threads so a chatty snippet cannot fill the
+    // pipe buffer and deadlock against the wait loop
+    let stdout = drain_pipe(child.stdout.take());
+    let stderr = drain_pipe(child.stderr.take());
+    let started = std::time::Instant::now();
+    let mut timed_out = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {
+                if started.elapsed() >= COMMAND_SHELL_TIMEOUT {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    timed_out = true;
+                    break None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(_) => break None,
+        }
+    };
+    let stdout = stdout.join().unwrap_or_default();
+    let stderr = stderr.join().unwrap_or_default();
+    let text = match status {
+        Some(status) if !status.success() => {
+            let mut text = String::from_utf8_lossy(&stdout).to_string();
+            let err = String::from_utf8_lossy(&stderr).trim().to_string();
+            if text.trim().is_empty() {
+                text = err;
+            }
+            let code = status
+                .code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "signal".to_string());
+            format!("{}\n[error: exit {code}]", text.trim_end())
+        }
+        Some(_) => String::from_utf8_lossy(&stdout).to_string(),
+        None => {
+            let mut text = String::from_utf8_lossy(&stdout).trim_end().to_string();
+            if timed_out {
+                text = format!(
+                    "{}\n[error: shell snippet timed out after {}s]",
+                    text,
+                    COMMAND_SHELL_TIMEOUT.as_secs()
+                );
+            } else if text.is_empty() {
+                text = "[error: shell snippet failed]".to_string();
+            }
+            text
+        }
+    };
+    let text = text.trim_end().to_string();
+    if text.chars().count() > COMMAND_SHELL_CAP {
+        let cut: String = text.chars().take(COMMAND_SHELL_CAP).collect();
+        format!("{cut}\n[shell output truncated at 8 KiB]")
+    } else {
+        text
+    }
+}
+
+/// Read one pipe to end on a plain thread → bytes.
+fn drain_pipe<R: std::io::Read + Send + 'static>(
+    pipe: Option<R>,
+) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = pipe {
+            let _ = std::io::Read::read_to_end(&mut pipe, &mut buf);
+        }
+        buf
+    })
 }
 
 /// Split frontmatter (`description`, `argument-hint`,
-/// `allowed-tools`, `model`) off a command markdown body. Unknown keys
-/// are tolerated (agentskills.io convention). Public for contract
-/// tests.
+/// `allowed-tools`, `model`, `side`, `shell`) off a command markdown
+/// body. Unknown keys are tolerated (agentskills.io convention).
+/// Public for contract tests.
 pub fn parse_command_md(text: &str) -> (CommandFrontmatter, String) {
     let mut fm = CommandFrontmatter::default();
     let mut body = text.trim().to_string();
@@ -10942,6 +11172,13 @@ pub fn parse_command_md(text: &str) -> (CommandFrontmatter, String) {
                         }
                         "model" => {
                             fm.model = Some(value.trim().to_string()).filter(|m| !m.is_empty());
+                        }
+                        "side" => {
+                            fm.side = value.trim().eq_ignore_ascii_case("true");
+                        }
+                        "shell" => {
+                            let v = value.trim().trim_matches('"').trim_matches('\'').trim();
+                            fm.shell = Some(v.to_string()).filter(|s| !s.is_empty());
                         }
                         _ => {}
                     }
@@ -11134,16 +11371,37 @@ pub fn slash_command(text: &str) -> Option<Slash> {
             | "/doctor"
     ) {
         if let Some((fm, body)) = custom_command(head, rest) {
-            return Some(Slash {
-                note: None,
-                event: Some(Command::Prompt {
+            // EXT-08: `shell:` output rides ahead of the prompt body
+            // (capped, failures inline); `side: true` dispatches as a
+            // side question — tools off, answer by note, transcript
+            // untouched (allowed-tools/model do not apply there)
+            let body = match &fm.shell {
+                Some(shell) => {
+                    let out =
+                        run_command_shell(shell, &std::env::current_dir().unwrap_or_default());
+                    if out.is_empty() {
+                        body
+                    } else {
+                        format!("{out}\n\n{body}")
+                    }
+                }
+                None => body,
+            };
+            let event = if fm.side {
+                Command::SideQuestion { text: body }
+            } else {
+                Command::Prompt {
                     text: body,
                     schema: None,
                     images: Vec::new(),
                     skills: Vec::new(),
                     allowed_tools: (!fm.allowed_tools.is_empty()).then_some(fm.allowed_tools),
                     model: fm.model,
-                }),
+                }
+            };
+            return Some(Slash {
+                note: None,
+                event: Some(event),
                 quit: false,
                 followup: None,
                 modal: None,
@@ -12327,6 +12585,7 @@ fn modal_hints(open: &Modal) -> &'static [(&'static str, &'static str)] {
         Modal::Key(_) => &[("type", "value"), ("⏎", "save"), ("esc", "cancel")],
         Modal::Help { .. } => &[("↑↓/pgup/pgdn", "scroll"), ("⏎", "close")],
         Modal::Theme { .. } => &[("↑↓", "choose"), ("⏎", "apply live"), ("esc", "close")],
+        Modal::Style { .. } => &[("↑↓", "choose"), ("⏎", "apply"), ("esc", "close")],
         Modal::CopyPick { save: Some(_), .. } => {
             &[("type", "path"), ("⏎", "write"), ("esc", "back")]
         }
@@ -12536,6 +12795,10 @@ fn status_left(meters: &Meters) -> Vec<ratatui::text::Span<'static>> {
     if meters.loop_task.is_some() {
         // CTX-06: loop mode armed — the task re-runs on every settle
         push("↻ loop".to_string(), crate::palette::ACCENT);
+    }
+    if let Some(style) = &meters.style {
+        // EXT-09: an output style replaced the built-in identity
+        push(format!("\u{00b6} {style}"), crate::palette::META);
     }
     if let Some(pill) = job_pill(meters) {
         // TUI-15: live background work (tasks · jobs · dap), fed by the
@@ -12785,6 +13048,11 @@ pub fn status_segments(meters: &Meters, order: &[String]) -> Vec<ratatui::text::
     }
     if meters.loop_task.is_some() {
         push(&mut segs, "↻ loop".to_string(), crate::palette::ACCENT);
+    }
+    if let Some(style) = &meters.style {
+        // EXT-09: state badge like goal/loop — an armed style never
+        // hides behind a custom segment order
+        push(&mut segs, format!("\u{00b6} {style}"), crate::palette::META);
     }
     segs
 }
@@ -14649,6 +14917,33 @@ fn render(
                 }
                 (width, height, modal_title("theme"), text)
             }
+            Modal::Style { names, selected } => {
+                // "built-in" + one row per style; same shape as the
+                // theme picker
+                let height = ((names.len() + 1) as u16 + 4).clamp(6, 20);
+                let width = 60.min(fw);
+                let cap = (height as usize).saturating_sub(4);
+                let offset = window_of(*selected, names.len() + 1, cap);
+                let mut text = Vec::new();
+                let row = |label: String, on: bool| -> TuiLine<'static> {
+                    list_row(label, on, inner(width), Style::new())
+                };
+                for i in offset..(names.len() + 1).min(offset + cap) {
+                    let label = if i == 0 {
+                        "built-in identity".to_string()
+                    } else {
+                        names[i - 1].clone()
+                    };
+                    text.push(row(label, i == *selected));
+                }
+                if names.is_empty() {
+                    text.push(TuiLine::styled(
+                        "no styles found — drop .md files in .ka/styles/ or ~/.config/ka/styles/",
+                        meta,
+                    ));
+                }
+                (width, height, modal_title("style"), text)
+            }
             Modal::CopyPick {
                 blocks,
                 selected,
@@ -15546,6 +15841,7 @@ pub(crate) fn help_modal_rows(width: usize) -> Vec<ratatui::text::Line<'static>>
         &mut text,
         &[
             ("/theme", "switch the theme live: /theme [name|default]"),
+            ("/style", "switch the output style: /style [name|off]"),
             ("/changelog", "what's new in this build"),
             ("/queue", "pending follow-ups — ⏎/d dequeues"),
             ("/screen", "dump the transcript to the scrollback on leave"),

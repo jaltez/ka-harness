@@ -6,9 +6,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use ka_protocol::Command;
 use ka_term::tui::{
-    Inventory, ModalKind, NotifySettings, SKILLS, SessionPicker, Transcript, accept_memory_note,
-    memory_modal_rows, read_memory_inbox, skill_invocation, slash_command, update_suggestions,
-    write_memory_inbox,
+    Inventory, Meters, ModalKind, NotifySettings, SKILLS, SessionPicker, Transcript,
+    accept_memory_note, available_slash_commands, memory_modal_rows, read_memory_inbox,
+    skill_invocation, slash_command, status_segments, update_suggestions, write_memory_inbox,
 };
 
 /// Every built-in slash command documented in the README parses. A
@@ -1460,4 +1460,126 @@ fn panel_rows_render_configured_facts() {
     assert!(joined.contains("ka "), "{joined}");
     assert!(joined.contains("fs (config)"), "{joined}");
     assert!(joined.contains("doctor CLI"), "{joined}");
+}
+
+// ------------------------------------------------------------ EXT-08
+
+/// EXT-08: `side: true` dispatches a custom command as a side question
+/// (`Command::SideQuestion`, body rendered with $ARGUMENTS) and
+/// `shell:` output is captured and PREPENDED to the prompt. KNOWN
+/// COUPLING: writes real ~/.config/ka/commands fixtures (user-dir
+/// commands are ungated — the established contract-test pattern) and
+/// removes them after.
+#[test]
+fn ext08_side_and_shell_commands_dispatch() {
+    use ka_term::tui::{parse_command_md, run_command_shell, slash_command};
+    // frontmatter parses both new keys
+    let (fm, body) = parse_command_md(
+        "---\ndescription: peek\nside: true\nshell: \"echo captured\"\n---\nAsk about $ARGUMENTS",
+    );
+    assert!(fm.side);
+    assert_eq!(fm.shell.as_deref(), Some("echo captured"));
+    assert_eq!(body, "Ask about $ARGUMENTS");
+
+    let home = std::env::var("HOME").expect("HOME set");
+    let commands = std::path::PathBuf::from(&home).join(".config/ka/commands");
+    std::fs::create_dir_all(&commands).unwrap();
+    std::fs::write(
+        commands.join("ka-contract-side.md"),
+        "---\nside: true\n---\nAsk about $ARGUMENTS",
+    )
+    .unwrap();
+    let s = slash_command("/ka-contract-side the build").expect("side command parses");
+    match s.event {
+        Some(ka_protocol::Command::SideQuestion { text }) => {
+            assert_eq!(text, "Ask about the build");
+        }
+        other => panic!("side command must dispatch SideQuestion, got {other:?}"),
+    }
+    std::fs::write(
+        commands.join("ka-contract-shell.md"),
+        "---\nshell: echo shell-out\n---\nBody after",
+    )
+    .unwrap();
+    let s = slash_command("/ka-contract-shell").expect("shell command parses");
+    match s.event {
+        Some(ka_protocol::Command::Prompt { text, .. }) => {
+            assert!(
+                text.starts_with("shell-out\n\nBody after"),
+                "shell output rides ahead of the body: {text}"
+            );
+        }
+        other => panic!("shell command must dispatch Prompt, got {other:?}"),
+    }
+    let _ = std::fs::remove_file(commands.join("ka-contract-side.md"));
+    let _ = std::fs::remove_file(commands.join("ka-contract-shell.md"));
+
+    // the shell machinery itself: captured output, inline errors, cap
+    let out = run_command_shell("echo shell-out", std::path::Path::new("."));
+    assert_eq!(out.trim_end(), "shell-out");
+    let out = run_command_shell("echo oops >&2; exit 3", std::path::Path::new("."));
+    assert!(
+        out.contains("[error: exit 3]") && out.contains("oops"),
+        "{out}"
+    );
+    let out = run_command_shell(
+        "head -c 20000 /dev/zero | tr '\\0' 'x'",
+        std::path::Path::new("."),
+    );
+    assert!(
+        out.chars().count() > 8000 && out.ends_with("[shell output truncated at 8 KiB]"),
+        "capped at 8 KiB with a note ({} chars)",
+        out.chars().count()
+    );
+}
+
+// ------------------------------------------------------------ EXT-09
+
+/// EXT-09: the `¶ <style>` badge renders on the status line whenever a
+/// style is active (a state badge that survives any segment order),
+/// and hides when off.
+#[test]
+fn ext09_style_badge_renders_when_active() {
+    let mut meters = Meters {
+        style: Some("prose".into()),
+        ..Meters::default()
+    };
+    let with_style = status_segments(&meters, &["model".to_string()])
+        .iter()
+        .map(|s| s.content.clone())
+        .collect::<String>();
+    assert!(with_style.contains("\u{00b6} prose"), "{with_style}");
+    // the badge survives a custom segment order that omits every other
+    // id (state badge, not a segment)
+    let custom = status_segments(&meters, &["cost".to_string()])
+        .iter()
+        .map(|s| s.content.clone())
+        .collect::<String>();
+    assert!(custom.contains("\u{00b6} prose"), "{custom}");
+    meters.style = None;
+    let off = status_segments(&meters, &["model".to_string()])
+        .iter()
+        .map(|s| s.content.clone())
+        .collect::<String>();
+    assert!(!off.contains('\u{00b6}'), "{off}");
+}
+
+/// `/style` is intercepted before the slash table (picker/arm/off), so
+/// the table itself returns None for it — the same contract /theme has.
+/// The completion catalog documents it.
+#[test]
+fn ext09_style_slash_intercepted_like_theme() {
+    assert!(
+        slash_command("/style").is_none(),
+        "handled by the intercept"
+    );
+    assert!(
+        slash_command("/style prose").is_none(),
+        "handled by the intercept"
+    );
+    let catalog = available_slash_commands();
+    assert!(
+        catalog.iter().any(|(c, _)| c == "/style"),
+        "/style must appear in the command catalog"
+    );
 }

@@ -305,6 +305,13 @@ pub fn modal_lines(
             }
             ("theme".into(), rows)
         }
+        Modal::Style { names, selected } => {
+            let mut rows = vec![format!("{} built-in identity", marker(0, *selected))];
+            for (i, name) in names.iter().enumerate() {
+                rows.push(format!("{} {name}", marker(i + 1, *selected)));
+            }
+            ("style".into(), rows)
+        }
         Modal::CopyPick {
             blocks,
             selected,

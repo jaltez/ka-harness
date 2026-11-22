@@ -527,6 +527,15 @@ pub enum Command {
         /// The loop action.
         action: LoopAction,
     },
+    /// EXT-09: switch the session's output style (identity prose). A
+    /// named style resolves against `.ka/styles/<name>.md` and
+    /// `~/.config/ka/styles/<name>.md`; `None` restores the built-in
+    /// identity (config `identity_file`/`identity_inline` still win
+    /// over styles). Session-scoped.
+    SetStyle {
+        /// Style name, or None for the built-in identity.
+        style: Option<String>,
+    },
     /// CTX-10: consolidate the memory inbox (`.ka/memory/inbox.md`,
     /// staged by the `remember` hand) into `MEMORY.md` with the fast
     /// role: the consolidated text REPLACES the file (≤80 lines), the

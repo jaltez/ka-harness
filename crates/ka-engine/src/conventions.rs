@@ -254,6 +254,85 @@ pub struct Skill {
     pub path: PathBuf,
     /// One-line description from frontmatter.
     pub description: String,
+    /// EXT-07 `disable-model-invocation: true`: the skill never enters
+    /// the prompt's skill listing — only an explicit `/skill:<name>`
+    /// may load it.
+    pub disable_model_invocation: bool,
+    /// EXT-07 `paths:` globs: the skill activates only once a file the
+    /// session has read matches one of them (matched against the full
+    /// path and the file name, like rule files). None = always on.
+    pub paths: Option<Vec<String>>,
+    /// EXT-07 `max_tokens:`: the body cap when the skill is injected,
+    /// with a truncation note. None = uncapped.
+    pub max_tokens: Option<usize>,
+}
+
+/// The SKILL.md frontmatter ka reads (no YAML dep, line-based like the
+/// rule-file parser).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SkillFrontmatter {
+    pub description: Option<String>,
+    pub disable_model_invocation: bool,
+    pub paths: Option<Vec<String>>,
+    pub max_tokens: Option<usize>,
+}
+
+/// Parse a SKILL.md's `---` frontmatter block: `description`,
+/// `disable-model-invocation` (bool), `paths` (comma/space-separated
+/// globs), `max_tokens` (integer). Unknown keys are tolerated
+/// (agentskills.io convention); an unterminated block is no
+/// frontmatter.
+pub fn parse_skill_frontmatter(content: &str) -> (SkillFrontmatter, String) {
+    let mut fm = SkillFrontmatter::default();
+    let Some(rest) = content.strip_prefix("---\n") else {
+        return (fm, content.to_string());
+    };
+    let Some(end) = rest.find("\n---") else {
+        return (fm, content.to_string());
+    };
+    for line in rest[..end].lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        match key.trim() {
+            "description" => {
+                let v = value.trim_matches('"').trim_matches('\'');
+                if !v.is_empty() {
+                    fm.description = Some(v.to_string());
+                }
+            }
+            "disable-model-invocation" | "disable_model_invocation" => {
+                fm.disable_model_invocation = value.eq_ignore_ascii_case("true");
+            }
+            "paths" => {
+                let globs: Vec<String> = value
+                    .trim_matches('[')
+                    .trim_matches(']')
+                    .split([',', ' '])
+                    .map(str::trim)
+                    .filter(|g| !g.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                if !globs.is_empty() {
+                    fm.paths = Some(globs);
+                }
+            }
+            "max_tokens" | "max-tokens" => {
+                if let Ok(n) = value.trim().parse::<usize>() {
+                    fm.max_tokens = Some(n);
+                }
+            }
+            _ => {}
+        }
+    }
+    (
+        fm,
+        rest[end + 4..]
+            .trim_start_matches('\n')
+            .trim_end()
+            .to_string(),
+    )
 }
 
 /// Discover SKILL.md skills across ka-native and ecosystem directories.
@@ -321,12 +400,17 @@ pub fn discover_skills_in(roots: Vec<PathBuf>) -> Vec<Skill> {
             let Ok(content) = std::fs::read_to_string(&skill_md) else {
                 continue;
             };
-            let description = parse_frontmatter_description(&content)
+            let (fm, _body) = parse_skill_frontmatter(&content);
+            let description = fm
+                .description
                 .unwrap_or_else(|| "(no description)".to_string());
             skills.push(Skill {
                 name,
                 path: skill_md,
                 description,
+                disable_model_invocation: fm.disable_model_invocation,
+                paths: fm.paths,
+                max_tokens: fm.max_tokens,
             });
         }
     }
@@ -334,19 +418,82 @@ pub fn discover_skills_in(roots: Vec<PathBuf>) -> Vec<Skill> {
     skills.truncate(20);
     skills
 }
-/// Extract `description:` from YAML-ish frontmatter (no YAML dep).
-fn parse_frontmatter_description(content: &str) -> Option<String> {
-    let rest = content.strip_prefix("---\n")?;
-    let end = rest.find("\n---")?;
-    for line in rest[..end].lines() {
-        if let Some(v) = line.strip_prefix("description:") {
-            let v = v.trim().trim_matches('"').trim_matches('\'');
-            if !v.is_empty() {
-                return Some(v.to_string());
+/// Whether a project style resolves (EXT-09): trusted-project
+/// `.ka/styles/<name>.md` first, then the user
+/// `~/.config/ka/styles/<name>.md`. Both must hold prose identity text
+/// (`.md`), styles being `.ka/` customizations are dropped entirely in
+/// safe mode.
+pub fn resolve_style(name: &str, cwd: &Path) -> Option<PathBuf> {
+    if bare_mode() || name.is_empty() {
+        return None;
+    }
+    let trusted = crate::trust::project_trusted(cwd);
+    let home = std::env::var("HOME").map(PathBuf::from).ok();
+    resolve_style_in(name, cwd, trusted, home.as_deref())
+}
+
+/// [`resolve_style`] with explicit trust and home (tests).
+pub fn resolve_style_in(
+    name: &str,
+    cwd: &Path,
+    project_trusted: bool,
+    home: Option<&Path>,
+) -> Option<PathBuf> {
+    if name.contains('/') || name.contains('\\') || name.starts_with('.') {
+        return None; // style names are bare file stems
+    }
+    if project_trusted {
+        let project = crate::project_root(cwd)
+            .join(".ka/styles")
+            .join(format!("{name}.md"));
+        if project.is_file() {
+            return Some(project);
+        }
+    }
+    let user = home.map(|h| h.join(".config/ka/styles").join(format!("{name}.md")));
+    match user {
+        Some(path) if path.is_file() => Some(path),
+        _ => None,
+    }
+}
+
+/// The style names visible to `/style` (EXT-09): trusted-project
+/// `.ka/styles/*.md` stems first, then user `~/.config/ka/styles/*.md`
+/// stems, deduplicated (project wins), sorted.
+pub fn available_styles(cwd: &Path) -> Vec<String> {
+    if bare_mode() {
+        return Vec::new();
+    }
+    let trusted = crate::trust::project_trusted(cwd);
+    let home = std::env::var("HOME").map(PathBuf::from).ok();
+    available_styles_in(cwd, trusted, home.as_deref())
+}
+
+/// [`available_styles`] with explicit trust and home (tests).
+pub fn available_styles_in(cwd: &Path, project_trusted: bool, home: Option<&Path>) -> Vec<String> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if project_trusted {
+        roots.push(crate::project_root(cwd).join(".ka/styles"));
+    }
+    if let Some(h) = home {
+        roots.push(h.join(".config/ka/styles"));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for root in roots {
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_none_or(|e| e != "md") {
+                continue;
+            }
+            if let Some(stem) = path.file_stem() {
+                seen.insert(stem.to_string_lossy().into_owned());
             }
         }
     }
-    None
+    seen.into_iter().collect()
 }
 
 #[cfg(test)]
@@ -498,12 +645,33 @@ mod tests {
     }
 
     #[test]
-    fn frontmatter_description_parsed() {
-        assert_eq!(
-            parse_frontmatter_description("---\nname: x\ndescription: \"quoted desc\"\n---\n"),
-            Some("quoted desc".to_string())
+    fn skill_frontmatter_parses_ext07_fields() {
+        let (fm, _body) = parse_skill_frontmatter(
+            "---\nname: x\ndescription: \"quoted desc\"\ndisable-model-invocation: true\npaths: src/**, *.md\nmax_tokens: 400\n---\nbody",
         );
-        assert_eq!(parse_frontmatter_description("no frontmatter"), None);
+        assert_eq!(fm.description.as_deref(), Some("quoted desc"));
+        assert!(fm.disable_model_invocation);
+        assert_eq!(
+            fm.paths,
+            Some(vec!["src/**".to_string(), "*.md".to_string()])
+        );
+        assert_eq!(fm.max_tokens, Some(400));
+
+        // tolerant spellings: snake_case aliases, bracketed lists
+        let (fm, body) = parse_skill_frontmatter(
+            "---\ndisable_model_invocation: true\npaths: [a.md]\nmax-tokens: 12\n---\nthe body",
+        );
+        assert!(fm.disable_model_invocation);
+        assert_eq!(fm.paths, Some(vec!["a.md".to_string()]));
+        assert_eq!(fm.max_tokens, Some(12));
+        assert_eq!(body, "the body");
+
+        // absent frontmatter / unknown keys: defaults, body intact
+        let (fm, body) = parse_skill_frontmatter("no frontmatter");
+        assert_eq!(fm, SkillFrontmatter::default());
+        assert_eq!(body, "no frontmatter");
+        let (fm, _) = parse_skill_frontmatter("---\ncapabilities: [x]\n---\n");
+        assert_eq!(fm, SkillFrontmatter::default());
     }
 
     #[test]

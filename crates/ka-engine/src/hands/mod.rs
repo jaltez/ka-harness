@@ -388,6 +388,12 @@ impl Ledger {
         stamps.sort_by_key(|(_, read_at)| std::cmp::Reverse(*read_at));
         stamps.into_iter().take(n).map(|(p, _)| p).collect()
     }
+
+    /// Every path read this session (EXT-07 glob-scoped skills gate on
+    /// this ledger).
+    pub fn read_paths(&self) -> Vec<PathBuf> {
+        self.stamps.keys().cloned().collect()
+    }
 }
 
 /// Spill store: oversized tool outputs parked on disk, referenced as

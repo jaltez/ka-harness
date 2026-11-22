@@ -1099,6 +1099,9 @@ async fn hook_exit2_blocks_pre_tool_use() {
         event: ka_engine::config::HookEvent::PreToolUse,
         tool: Some("bash".into()),
         command: "echo no-way >&2; exit 2".into(),
+        timeout_secs: None,
+        async_: None,
+        url: None,
     }]);
     let events = run_turn(&mut voice, "run it", None).await;
     assert!(
@@ -1124,6 +1127,9 @@ async fn hook_stdout_steers_mode() {
         event: ka_engine::config::HookEvent::PreToolUse,
         tool: None,
         command: "printf '{\"mode\":\"readonly\",\"note\":\"steered\"}'".into(),
+        timeout_secs: None,
+        async_: None,
+        url: None,
     }]);
     let events = run_turn(&mut voice, "run it", None).await;
     assert!(
@@ -1159,6 +1165,9 @@ async fn hook_feedback_rides_the_tool_result() {
         event: ka_engine::config::HookEvent::PostToolUse,
         tool: Some("bash".into()),
         command: r#"printf '{"feedback":"shellcheck: 2 findings (SC2086)"}'"#.into(),
+        timeout_secs: None,
+        async_: None,
+        url: None,
     }]);
     let events = run_turn(&mut voice, "run it", None).await;
     // the model-facing result carries the feedback block…
@@ -1504,6 +1513,9 @@ async fn hook_updated_input_patches_arguments() {
         event: CfgHookEvent::PreToolUse,
         tool: Some("bash".into()),
         command: r#"echo '{"updated_input":{"command":"echo patched-by-hook"}}'"#.to_string(),
+        timeout_secs: None,
+        async_: None,
+        url: None,
     }]);
     let events = run_turn(&mut voice, "go", None).await;
     assert!(
@@ -1579,6 +1591,9 @@ async fn hook_pre_approve_skips_the_ask_but_not_hardstops() {
         event: CfgHookEvent::PreToolUse,
         tool: Some("bash".into()),
         command: r#"echo '{"decision":"allow"}'"#.to_string(),
+        timeout_secs: None,
+        async_: None,
+        url: None,
     }]);
     let events = run_turn(&mut voice, "one", Some(2)).await;
     assert!(
@@ -1635,6 +1650,9 @@ async fn hook_pre_approve_cannot_override_deny_verdicts() {
         event: CfgHookEvent::PreToolUse,
         tool: Some("bash".into()),
         command: r#"echo '{"decision":"allow"}'"#.to_string(),
+        timeout_secs: None,
+        async_: None,
+        url: None,
     }]);
     let events = run_turn(&mut voice, "check git", None).await;
     assert!(
@@ -1662,6 +1680,9 @@ async fn hook_pre_approve_cannot_override_deny_verdicts() {
         event: CfgHookEvent::PreToolUse,
         tool: Some("write".into()),
         command: r#"echo '{"decision":"allow"}'"#.to_string(),
+        timeout_secs: None,
+        async_: None,
+        url: None,
     }]);
     let events = run_turn(&mut voice, "implement", None).await;
     assert!(
@@ -2476,4 +2497,604 @@ async fn turn_scoped_allowed_tools_restrict_the_turn() {
         "scope must not leak into the next turn: {events:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ------------------------------------------------------------ EXT-01
+
+/// The EXT-01 hook events parse and round-trip on the wire under their
+/// documented snake_case names, and `wire_name` matches.
+#[test]
+fn ext01_hook_events_wire_names_roundtrip() {
+    use ka_engine::config::HookEvent;
+    for (text, expected) in [
+        ("subagent_start", HookEvent::SubagentStart),
+        ("subagent_stop", HookEvent::SubagentStop),
+        ("pre_model_switch", HookEvent::PreModelSwitch),
+        ("post_model_switch", HookEvent::PostModelSwitch),
+        ("post_compact", HookEvent::PostCompact),
+        ("permission_request", HookEvent::PermissionRequest),
+        ("permission_denied", HookEvent::PermissionDenied),
+    ] {
+        let parsed: HookEvent = serde_json::from_value(serde_json::json!(text)).expect(text);
+        assert_eq!(parsed, expected, "{text}");
+        assert_eq!(
+            serde_json::to_value(parsed).expect("serializable"),
+            serde_json::json!(text),
+            "round-trip {text}"
+        );
+        assert_eq!(parsed.wire_name(), text, "wire name {text}");
+    }
+}
+
+/// permission_request fires before the ask (advisory — the ask still
+/// poses), and permission_denied rides the user's deny.
+#[tokio::test]
+async fn ext01_permission_hooks_bracket_ask_and_deny() {
+    let dir = tmp_dir("ext01-perm");
+    let marker = |name: &str| dir.join(name);
+    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Ask, 5)
+        .with_speaker(
+            ka_dialect::Wire::OpenaiChat,
+            Scripted::calls(vec![(
+                "write",
+                serde_json::json!({"path": dir.join("t.txt").display().to_string(), "content": "x"}),
+            )]),
+        );
+    voice.set_hooks(vec![
+        ka_engine::config::Hook {
+            event: ka_engine::config::HookEvent::PermissionRequest,
+            tool: Some("write".into()),
+            command: format!("cat >> {}", marker("request.txt").display()),
+            timeout_secs: None,
+            async_: None,
+            url: None,
+        },
+        ka_engine::config::Hook {
+            event: ka_engine::config::HookEvent::PermissionDenied,
+            tool: None,
+            command: format!("cat >> {}", marker("denied.txt").display()),
+            timeout_secs: None,
+            async_: None,
+            url: None,
+        },
+    ]);
+    let events = run_turn(&mut voice, "write it", Some(2)).await;
+    assert!(
+        asks_of(&events).iter().any(|q| q.text.contains("write")),
+        "the ask still poses (advisory hook): {events:?}"
+    );
+    assert!(
+        marker("request.txt").exists(),
+        "permission_request fired before the ask"
+    );
+    assert!(
+        marker("denied.txt").exists(),
+        "permission_denied fired on the user deny"
+    );
+    assert!(
+        errored_outputs(&events, "write")
+            .iter()
+            .any(|o| o.contains("permission denied by user")),
+        "{events:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ------------------------------------------------------------ EXT-02
+
+/// A URL hook receives the same JSON envelope POSTed and its response
+/// body follows the same steering contract: `decision: "block"` with a
+/// reason vetoes the call like exit 2.
+#[tokio::test]
+async fn ext02_url_hook_block_vetoes_the_call() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let dir = tmp_dir("ext02-url");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = vec![0u8; 16 * 1024];
+        let mut seen = Vec::new();
+        loop {
+            let n = sock.read(&mut buf).await.unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            seen.extend_from_slice(&buf[..n]);
+            if seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let body = String::from_utf8_lossy(&seen).to_string();
+        assert!(body.contains("\"tool\":\"bash\""), "envelope: {body}");
+        let reply = r#"{"decision":"block","reason":"no-net-friday"}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+            reply.len()
+        );
+        sock.write_all(response.as_bytes()).await.ok();
+    });
+    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Allow, 5)
+        .with_speaker(
+            ka_dialect::Wire::OpenaiChat,
+            Scripted::calls(vec![("bash", serde_json::json!({"command": "echo hi"}))]),
+        );
+    voice.set_hooks(vec![ka_engine::config::Hook {
+        event: ka_engine::config::HookEvent::PreToolUse,
+        tool: None,
+        command: String::new(),
+        timeout_secs: None,
+        async_: None,
+        url: Some(format!("http://{addr}/hook")),
+    }]);
+    let events = run_turn(&mut voice, "run it", None).await;
+    server.await.unwrap();
+    assert!(
+        errored_outputs(&events, "bash")
+            .iter()
+            .any(|o| o.contains("blocked by hook") && o.contains("no-net-friday")),
+        "url block vetoes like exit 2: {events:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+/// A URL hook's clean JSON response steers like stdout (`mode` + `note`).
+#[tokio::test]
+async fn ext02_url_hook_response_steers() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let dir = tmp_dir("ext02-url-steer");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = vec![0u8; 16 * 1024];
+        loop {
+            let n = sock.read(&mut buf).await.unwrap_or(0);
+            if n == 0 || buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let reply = r#"{"mode":"readonly","note":"http-steered"}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+            reply.len()
+        );
+        sock.write_all(response.as_bytes()).await.ok();
+    });
+    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Allow, 5)
+        .with_speaker(
+            ka_dialect::Wire::OpenaiChat,
+            Scripted::calls(vec![("bash", serde_json::json!({"command": "echo hi"}))]),
+        );
+    voice.set_hooks(vec![ka_engine::config::Hook {
+        event: ka_engine::config::HookEvent::PreToolUse,
+        tool: None,
+        command: String::new(),
+        timeout_secs: None,
+        async_: None,
+        url: Some(format!("http://{addr}/hook")),
+    }]);
+    let events = run_turn(&mut voice, "run it", None).await;
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            Event::ModeChanged {
+                mode: ka_protocol::Mode::Readonly
+            }
+        )),
+        "the http response steered the mode: {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::Note { message } if message.contains("http-steered"))),
+        "{events:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `async = true` hooks fire and forget: they never block the turn and
+/// their outcome only surfaces later.
+#[tokio::test]
+async fn ext02_async_hook_never_blocks_the_turn() {
+    let dir = tmp_dir("ext02-async");
+    let marker = dir.join("async.txt");
+    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Allow, 5)
+        .with_speaker(
+            ka_dialect::Wire::OpenaiChat,
+            Scripted::calls(vec![("bash", serde_json::json!({"command": "echo hi"}))]),
+        );
+    voice.set_hooks(vec![ka_engine::config::Hook {
+        event: ka_engine::config::HookEvent::PreToolUse,
+        tool: None,
+        command: format!("sleep 2; touch {}", marker.display()),
+        timeout_secs: None,
+        async_: Some(true),
+        url: None,
+    }]);
+    let started = std::time::Instant::now();
+    let events = run_turn(&mut voice, "run it", None).await;
+    // the turn finished in well under the hook's 2s sleep — the call
+    // was never blocked — and the bash call itself succeeded
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(1500),
+        "async hook must not block: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::CallFinished { tool, ok: true, .. } if tool == "bash")),
+        "{events:?}"
+    );
+    assert!(
+        !marker.exists(),
+        "the detached hook has not landed yet at turn end"
+    );
+    // fire-and-forget still runs to completion
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    while !marker.exists() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(marker.exists(), "the async hook ran to completion");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// EXT-02 config validation: `command`/`url` are exclusive, and
+/// `timeout_secs` stays in 1..=600.
+#[test]
+fn ext02_hook_config_validation() {
+    let msg = |err: &ka_engine::config::ConfigError| err.to_string();
+    let base = "[[hooks]]\nevent = \"pre_tool_use\"\n";
+    let err = ka_engine::config::Config::parse_layer(
+        &format!("{base}command = \"x\"\nurl = \"http://a/b\"\n"),
+        "t",
+    )
+    .expect_err("both handlers is an error");
+    assert!(msg(&err).contains("either command or url"), "{err:?}");
+    let err =
+        ka_engine::config::Config::parse_layer(base, "t").expect_err("no handler is an error");
+    assert!(msg(&err).contains("one of command or url"), "{err:?}");
+    let err = ka_engine::config::Config::parse_layer(
+        &format!("{base}command = \"x\"\ntimeout_secs = 601\n"),
+        "t",
+    )
+    .expect_err("over the cap is an error");
+    assert!(msg(&err).contains("timeout_secs"), "{err:?}");
+    let err = ka_engine::config::Config::parse_layer(
+        &format!("{base}command = \"x\"\ntimeout_secs = 0\n"),
+        "t",
+    )
+    .expect_err("zero is an error");
+    assert!(msg(&err).contains("timeout_secs"), "{err:?}");
+    // a url-only hook parses; the accessor caps defensively at 600
+    // (the validator already bounds parsed values)
+    let cfg = ka_engine::config::Config::parse_layer(
+        &format!("{base}url = \"http://a/b\"\ntimeout_secs = 600\n"),
+        "t",
+    )
+    .unwrap_or_else(|e| panic!("{e:?}"));
+    let hook = &cfg.hooks[0];
+    assert!(hook.url.is_some() && hook.command.is_empty());
+    assert_eq!(
+        hook.effective_timeout_secs(),
+        ka_engine::config::MAX_HOOK_TIMEOUT_SECS
+    );
+    let plain = ka_engine::config::Config::parse_layer(&format!("{base}command = \"x\"\n"), "t")
+        .expect("plain hook parses");
+    assert_eq!(
+        plain.hooks[0].effective_timeout_secs(),
+        ka_engine::config::DEFAULT_HOOK_TIMEOUT_SECS
+    );
+}
+
+// ------------------------------------------------------------ EXT-04
+
+/// `enabled_tools`/`disabled_tools` semantics: disabled wins, empty
+/// allowlist admits everything, entries match raw and wire names.
+#[test]
+fn ext04_tool_filter_disabled_wins() {
+    let cfg = |enabled: &[&str], disabled: &[&str]| ka_engine::mcp::McpServerConfig {
+        name: "srv".into(),
+        command: Some("x".into()),
+        args: Vec::new(),
+        env: Default::default(),
+        url: None,
+        headers: Vec::new(),
+        enabled_tools: enabled.iter().map(|s| s.to_string()).collect(),
+        disabled_tools: disabled.iter().map(|s| s.to_string()).collect(),
+        approval: None,
+        tool_timeout_secs: None,
+        output_limit: None,
+    };
+    let c = cfg(&["read_a", "read_b"], &["read_b"]);
+    assert!(c.tool_enabled("read_a", "srv__read_a"));
+    assert!(!c.tool_enabled("read_b", "srv__read_b"), "disabled wins");
+    let c = cfg(&["write_all"], &[]);
+    assert!(
+        !c.tool_enabled("read_a", "srv__read_a"),
+        "allowlist is closed"
+    );
+    assert!(c.tool_enabled("write_all", "srv__write_all"));
+    let c = cfg(&[], &["write_all"]);
+    assert!(c.tool_enabled("write_x", "srv__write_x"));
+    assert!(!c.tool_enabled("write_all", "srv__write_all"));
+    // accessors: approval defaults to ask; 0 output_limit reads unset
+    assert_eq!(c.effective_approval(), ka_engine::mcp::McpApproval::Ask);
+    assert_eq!(c.effective_output_limit(), None);
+    let mut capped = cfg(&[], &[]);
+    capped.output_limit = Some(10);
+    assert_eq!(capped.effective_output_limit(), Some(10));
+}
+
+/// The EXT-04 ask bypass: `auto` skips the server's asks, `writes`
+/// only skips explicitly read-only tools, unknown servers keep the
+/// ask (eager and lazy shapes both resolve).
+#[test]
+fn ext04_approval_ask_bypass_resolution() {
+    let cfg = |approval: Option<ka_engine::mcp::McpApproval>| ka_engine::mcp::McpServerConfig {
+        name: "srv".into(),
+        command: Some("x".into()),
+        args: Vec::new(),
+        env: Default::default(),
+        url: None,
+        headers: Vec::new(),
+        enabled_tools: Vec::new(),
+        disabled_tools: Vec::new(),
+        approval,
+        tool_timeout_secs: None,
+        output_limit: None,
+    };
+    let mk = |approval| {
+        let mut v = Voice::new(
+            test_catalog(),
+            tmp_dir("ext04-bypass"),
+            ka_protocol::Mode::Allow,
+            5,
+        );
+        v.set_mcp_policies(vec![cfg(approval)]);
+        v
+    };
+    // eager wire-name shape
+    let auto = mk(Some(ka_engine::mcp::McpApproval::Auto));
+    assert!(auto.mcp_ask_bypass("srv__read", &serde_json::json!({})));
+    let writes = mk(Some(ka_engine::mcp::McpApproval::Writes));
+    // unknown tool (no catalog) reads as not-read-only → keep the ask
+    assert!(!writes.mcp_ask_bypass("srv__read", &serde_json::json!({})));
+    // lazy shape resolves the server from the arguments
+    let auto = mk(Some(ka_engine::mcp::McpApproval::Auto));
+    assert!(auto.mcp_ask_bypass(
+        "mcp_call",
+        &serde_json::json!({"server": "srv", "tool": "read"})
+    ));
+    assert!(!auto.mcp_ask_bypass(
+        "mcp_call",
+        &serde_json::json!({"server": "other", "tool": "read"})
+    ));
+    // default policy = ask
+    let plain = mk(None);
+    assert!(!plain.mcp_ask_bypass("srv__read", &serde_json::json!({})));
+}
+
+// ------------------------------------------------------------ EXT-07
+
+/// EXT-07: `disable-model-invocation` keeps a skill out of the prompt
+/// listing, while `/skill:<name>` still injects its body with `!cmd`
+/// lines executed and `max_tokens` capping the body.
+/// (a plain test: the trust override wraps its own single-thread
+/// runtime, so this must not run inside tokio's)
+#[test]
+fn ext07_command_only_skill_listing_invocation_and_caps() {
+    let dir = tmp_dir("ext07-skill");
+    // project-scope fixture: trust is redirected for the whole body
+    // (process-global override, serialized — no user-dir pollution)
+    let skill = dir.join(".ka/skills/ext07-conductor");
+    std::fs::create_dir_all(&skill).unwrap();
+    std::fs::write(
+        skill.join("SKILL.md"),
+        "---\ndescription: hidden helper\ndisable-model-invocation: true\nmax_tokens: 400\n---\n!`echo inline-ran`\nafter the run",
+    )
+    .unwrap();
+    let sys = std::sync::Arc::new(RecSysSpeaker {
+        requests: parking_lot::Mutex::new(Vec::new()),
+    });
+    // the whole body runs under a redirected trust store so the tmp
+    // project scope is trusted for skill discovery
+    ka_engine::trust::test_support::with_trust_file(|_| {
+        ka_engine::trust::approve(&dir);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(ext07_turns(dir.clone(), skill.clone(), sys.clone()))
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The three-turn body of the ext07 contract (extracted so the trust
+/// override can wrap it synchronously).
+async fn ext07_turns(
+    dir: std::path::PathBuf,
+    skill: std::path::PathBuf,
+    sys: std::sync::Arc<RecSysSpeaker>,
+) {
+    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Allow, 5)
+        .with_speaker(ka_dialect::Wire::OpenaiChat, sys.clone());
+    // turn 1: plain prompt — the listing must not mention the skill
+    let _ = run_turn(&mut voice, "hi", None).await;
+    // turn 2: explicit invocation — the body rides and the !cmd line
+    // executed inline (a 400-token budget leaves the body intact)
+    voice.set_turn_skills(Some(vec!["ext07-conductor".to_string()]));
+    let _ = run_turn(&mut voice, "use it", None).await;
+    let requests: Vec<_> = sys.requests.lock().iter().cloned().collect();
+    assert_eq!(requests.len(), 2, "two system prompts captured");
+    assert!(
+        !requests[0].contains("ext07-conductor"),
+        "command-only skills stay out of the listing: {}",
+        requests[0]
+    );
+    let injected = &requests[1];
+    let start = injected.find("<skill").unwrap_or_default();
+    let section: String = injected[start..].chars().take(600).collect();
+    assert!(
+        injected.contains("<skill src=") && !injected.contains("error=\""),
+        "invocation injects the body cleanly: {section}"
+    );
+    assert!(
+        injected.contains("inline-ran"),
+        "the !`cmd` line executed inline: {section}"
+    );
+    assert!(
+        !injected.contains("[skill truncated"),
+        "400 tokens leave the body intact: {section}"
+    );
+    drop(requests);
+    // turn 3: a 2-token budget truncates the body with the note (the
+    // file is re-read every prompt assembly)
+    std::fs::write(
+        skill.join("SKILL.md"),
+        "---\ndisable-model-invocation: true\nmax_tokens: 2\n---\nbody that cannot fit",
+    )
+    .unwrap();
+    let _ = run_turn(&mut voice, "again", None).await;
+    let requests = sys.requests.lock();
+    assert_eq!(requests.len(), 3, "three system prompts captured");
+    assert!(
+        requests[2].contains("[skill truncated at 2 tokens]"),
+        "max_tokens caps the body with the note"
+    );
+    drop(requests);
+}
+
+/// The recording speaker shared by the EXT-07/EXT-09 prompt-capture
+/// contracts.
+struct RecSysSpeaker {
+    requests: parking_lot::Mutex<Vec<String>>,
+}
+
+impl ka_dialect::speaker::Speaker for RecSysSpeaker {
+    fn speak<'a>(
+        &'a self,
+        req: ka_dialect::speaker::SpeakRequest,
+        out: tokio::sync::mpsc::Sender<ka_dialect::speaker::StreamEvent>,
+    ) -> ka_dialect::speaker::SpeakFuture<'a> {
+        Box::pin(async move {
+            self.requests.lock().push(req.system);
+            out.send(ka_dialect::speaker::StreamEvent::Text("done".into()))
+                .await
+                .ok();
+            out.send(ka_dialect::speaker::StreamEvent::Finished {
+                stop: ka_protocol::Stop::Done,
+                usage: ka_protocol::Usage::default(),
+            })
+            .await
+            .ok();
+        })
+    }
+}
+
+// ------------------------------------------------------------ EXT-09
+
+/// Style resolution: trusted project `.ka/styles/<name>.md` first,
+/// then `~/.config/ka/styles/<name>.md`; path-like names are refused.
+#[test]
+fn ext09_style_resolution_paths() {
+    let dir = tmp_dir("ext09-style");
+    let home = dir.join("home");
+    std::fs::create_dir_all(dir.join(".ka/styles")).unwrap();
+    std::fs::create_dir_all(home.join(".config/ka/styles")).unwrap();
+    std::fs::write(dir.join(".ka/styles/ka-docs.md"), "project style").unwrap();
+    std::fs::write(home.join(".config/ka/styles/ka-docs.md"), "user style").unwrap();
+    std::fs::write(home.join(".config/ka/styles/ka-prose.md"), "user prose").unwrap();
+    // project (trusted) wins over user on a name collision
+    let picked = ka_engine::conventions::resolve_style_in("ka-docs", &dir, true, Some(&home))
+        .expect("resolves");
+    assert!(picked.starts_with(&dir), "project scope wins: {picked:?}");
+    // untrusted project: only the user scope answers
+    let picked = ka_engine::conventions::resolve_style_in("ka-docs", &dir, false, Some(&home))
+        .expect("user scope answers");
+    assert!(picked.starts_with(&home));
+    // user-only name
+    let picked = ka_engine::conventions::resolve_style_in("ka-prose", &dir, true, Some(&home))
+        .expect("user");
+    assert!(picked.ends_with("ka-prose.md"));
+    // unknown name / traversal names refuse
+    assert!(ka_engine::conventions::resolve_style_in("nope", &dir, true, Some(&home)).is_none());
+    assert!(
+        ka_engine::conventions::resolve_style_in("../escape", &dir, true, Some(&home)).is_none(),
+        "path-like names are refused"
+    );
+    // the listing dedupes project-first, sorted
+    let names = ka_engine::conventions::available_styles_in(&dir, true, Some(&home));
+    assert_eq!(names, vec!["ka-docs".to_string(), "ka-prose".to_string()]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Identity precedence with a style armed: identity_file >
+/// identity_inline > style > built-in. The style replaces the built-in
+/// identity when no file/inline applies. KNOWN COUPLING: the fixture
+/// is a user-scope style (~/.config/ka/styles, ungated by the trust
+/// store); the project tier is covered by ext09_style_resolution_paths.
+#[tokio::test]
+async fn ext09_style_identity_precedence() {
+    let dir = tmp_dir("ext09-identity");
+    let style_dir = std::path::PathBuf::from(std::env::var("HOME").expect("HOME set"))
+        .join(".config/ka/styles");
+    std::fs::create_dir_all(&style_dir).unwrap();
+    std::fs::write(style_dir.join("ext09-prose.md"), "STYLE IDENTITY MARKER").unwrap();
+    let style_name = "ext09-prose";
+    let style_file = style_dir.join("ext09-prose.md");
+    let mk = || {
+        std::sync::Arc::new(RecSysSpeaker {
+            requests: parking_lot::Mutex::new(Vec::new()),
+        })
+    };
+    // style alone replaces the built-in sentence
+    let sys = mk();
+    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Allow, 5)
+        .with_speaker(ka_dialect::Wire::OpenaiChat, sys.clone());
+    voice.set_style(Some(style_name.into()));
+    let _ = run_turn(&mut voice, "hi", None).await;
+    assert!(
+        sys.requests.lock()[0].contains("STYLE IDENTITY MARKER"),
+        "the style replaces the built-in identity"
+    );
+    assert!(
+        !sys.requests.lock()[0].contains("You are ka, a precise coding agent"),
+        "no built-in sentence alongside the style"
+    );
+    // identity_inline outranks the style
+    let sys = mk();
+    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Allow, 5)
+        .with_speaker(ka_dialect::Wire::OpenaiChat, sys.clone());
+    voice.set_style(Some(style_name.into()));
+    voice.set_identity_inline(Some("INLINE IDENTITY MARKER".into()));
+    let _ = run_turn(&mut voice, "hi", None).await;
+    let system = sys.requests.lock()[0].clone();
+    assert!(system.contains("INLINE IDENTITY MARKER"), "{system}");
+    assert!(!system.contains("STYLE IDENTITY MARKER"), "{system}");
+    // identity_file outranks everything; style never applies
+    let file = dir.join("identity.txt");
+    std::fs::write(&file, "FILE IDENTITY MARKER").unwrap();
+    let sys = mk();
+    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Allow, 5)
+        .with_speaker(ka_dialect::Wire::OpenaiChat, sys.clone());
+    voice.set_style(Some(style_name.into()));
+    voice.set_identity_inline(Some("INLINE IDENTITY MARKER".into()));
+    voice.set_identity_file(Some(file.display().to_string()));
+    let _ = run_turn(&mut voice, "hi", None).await;
+    let system = sys.requests.lock()[0].clone();
+    assert!(system.contains("FILE IDENTITY MARKER"), "{system}");
+    assert!(!system.contains("INLINE IDENTITY MARKER"), "{system}");
+    // style off restores the built-in sentence
+    let sys = mk();
+    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Allow, 5)
+        .with_speaker(ka_dialect::Wire::OpenaiChat, sys.clone());
+    voice.set_style(None);
+    let _ = run_turn(&mut voice, "hi", None).await;
+    assert!(
+        sys.requests.lock()[0].contains("You are ka, a precise coding agent"),
+        "built-in identity restored"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_file(&style_file);
 }

@@ -1568,6 +1568,11 @@ async fn mcp_cache_registers_tools_without_waiting_on_the_server() {
         env: std::collections::HashMap::new(),
         url: None,
         headers: Vec::new(),
+        enabled_tools: Vec::new(),
+        disabled_tools: Vec::new(),
+        approval: None,
+        tool_timeout_secs: None,
+        output_limit: None,
     };
     // legacy-shape cache: a dotted name written before sanitization —
     // load must re-derive `demo__fetch`.
@@ -1578,6 +1583,7 @@ async fn mcp_cache_registers_tools_without_waiting_on_the_server() {
             raw_name: "fetch".into(),
             description: "fetch things".into(),
             schema: serde_json::json!({"type": "object"}),
+            read_only_hint: false,
         }],
     );
     let cfg = ka_engine::Config {
@@ -1640,6 +1646,11 @@ async fn mcp_cache_miss_reports_the_dead_server() {
             env: std::collections::HashMap::new(),
             url: None,
             headers: Vec::new(),
+            enabled_tools: Vec::new(),
+            disabled_tools: Vec::new(),
+            approval: None,
+            tool_timeout_secs: None,
+            output_limit: None,
         }],
         ..Default::default()
     };
@@ -2080,4 +2091,137 @@ async fn steer_left_over_at_strand_attach_is_not_reinjected() {
         "no delivery note for a dropped steer: {events:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ------------------------------------------------------------ EXT-01
+
+/// The EXT-01 model-switch hooks bracket `SetModel` with the from/to
+/// selectors, and `post_compact` fires after a digest with the token
+/// counts (the stdin payloads are the contract — capture them).
+#[tokio::test]
+async fn ext01_model_switch_and_post_compact_hooks_fire() {
+    let dir = tmp_dir("ext01-switch");
+    let layer = format!(
+        "model = \"test/m\"\ncwd = \"{}\"\n[[hooks]]\nevent = \"pre_model_switch\"\ncommand = \"cat >> {}\"\n[[hooks]]\nevent = \"post_model_switch\"\ncommand = \"cat >> {}\"\n[[hooks]]\nevent = \"post_compact\"\ncommand = \"cat >> {}\"\n",
+        dir.display(),
+        dir.join("pre.txt").display(),
+        dir.join("post.txt").display(),
+        dir.join("compact.txt").display(),
+    );
+    let cfg = ka_engine::config::Config::parse_layer(&layer, "test").unwrap();
+    let mut handle = ka_engine::spawn_with_speaker(
+        cfg,
+        test_catalog(),
+        ka_engine::StrandChoice::New,
+        ka_dialect::Wire::OpenaiChat,
+        Scripted::new(vec![]),
+    );
+    settle(
+        &mut handle,
+        Command::SetModel {
+            selector: "test/m".into(),
+        },
+        on_idle,
+    )
+    .await;
+    for name in ["pre.txt", "post.txt"] {
+        let payload = std::fs::read_to_string(dir.join(name)).unwrap_or_default();
+        assert!(
+            payload.contains("\"to\":\"test/m\""),
+            "{name} hook received the selectors: {payload}"
+        );
+    }
+    let pre = std::fs::read_to_string(dir.join("pre.txt")).unwrap_or_default();
+    assert!(
+        pre.contains("\"event\":\"pre_model_switch\""),
+        "event name on the wire: {pre}"
+    );
+    // a live turn arms the voice's model selector (dispatch_turn stores
+    // it per turn) — the digest needs it before post_compact can fire
+    settle(
+        &mut handle,
+        Command::Prompt {
+            text: "hi".into(),
+            schema: None,
+            images: vec![],
+            allowed_tools: None,
+            model: None,
+            skills: Vec::new(),
+        },
+        on_idle,
+    )
+    .await;
+    // one compact fires post_compact with token counts
+    settle(&mut handle, Command::Compact { focus: None }, on_idle).await;
+    let payload = std::fs::read_to_string(dir.join("compact.txt")).unwrap_or_default();
+    assert!(
+        payload.contains("\"event\":\"post_compact\"")
+            && payload.contains("\"tokens_before\":")
+            && payload.contains("\"tokens_after\":"),
+        "post_compact carries the counts: {payload}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ------------------------------------------------------------ EXT-09
+
+/// `SetStyle` resolves engine-side: a known name arms the style (the
+/// note names the path), an unknown one refuses without changing the
+/// armed style, and `None` restores the built-in identity. KNOWN
+/// COUPLING: the fixture is a user-scope style
+/// (`~/.config/ka/styles/`, ungated by the trust store like user
+/// commands); the project tier is trust-gated and covered by the
+/// `ext09_style_resolution_paths` contract.
+#[tokio::test]
+async fn ext09_set_style_resolves_and_refuses() {
+    let dir = tmp_dir("ext09-setstyle");
+    let home = std::env::var("HOME").expect("HOME set");
+    let user_styles = std::path::PathBuf::from(&home).join(".config/ka/styles");
+    std::fs::create_dir_all(&user_styles).unwrap();
+    std::fs::write(user_styles.join("prose.md"), "STYLE PROSE").unwrap();
+    let cfg = ka_engine::Config {
+        cwd: Some(dir.to_string_lossy().into_owned()),
+        ..Default::default()
+    };
+    let mut handle = ka_engine::spawn_with_speaker(
+        cfg,
+        test_catalog(),
+        ka_engine::StrandChoice::New,
+        ka_dialect::Wire::OpenaiChat,
+        Scripted::new(vec![]),
+    );
+    let events = settle(
+        &mut handle,
+        Command::SetStyle {
+            style: Some("prose".into()),
+        },
+        on_idle,
+    )
+    .await;
+    assert!(
+        events.iter().any(|e| matches!(e, Event::Note { message }
+            if message.contains("style · prose") && message.contains("styles/prose.md"))),
+        "armed note names the path: {events:?}"
+    );
+    let events = settle(
+        &mut handle,
+        Command::SetStyle {
+            style: Some("nope".into()),
+        },
+        on_idle,
+    )
+    .await;
+    assert!(
+        events.iter().any(|e| matches!(e, Event::Note { message }
+            if message.contains("style \"nope\" not found") && message.contains("keeping \"prose\""))),
+        "unresolvable names change nothing: {events:?}"
+    );
+    let events = settle(&mut handle, Command::SetStyle { style: None }, on_idle).await;
+    assert!(
+        events.iter().any(|e| matches!(e, Event::Note { message }
+            if message.contains("style · off (built-in identity)"))),
+        "{events:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_file(user_styles.join("prose.md"));
 }

@@ -35,7 +35,9 @@ pub struct Rule {
     pub verdict: Verdict,
 }
 
-/// One hook: a shell command run around tool calls or at turn end.
+/// One hook: a shell command or an HTTP handler run around tool calls
+/// or at turn end. `command` and `url` are mutually exclusive — exactly
+/// one must be configured (a config-parse error otherwise).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Hook {
@@ -48,7 +50,48 @@ pub struct Hook {
     /// on stdin; `stop` hooks receive `{"event": "stop", "stop": "done"
     /// | "aborted" | "error"}`. Exit 2 blocks the call (pre_tool_use)
     /// with stderr as the reason.
+    #[serde(default)]
     pub command: String,
+    /// Per-hook timeout in seconds (EXT-02). Default
+    /// [`DEFAULT_HOOK_TIMEOUT_SECS`]; hard-capped at
+    /// [`MAX_HOOK_TIMEOUT_SECS`] (a config-parse error outside 1–600).
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+    /// Fire-and-forget (EXT-02, `async = true` in TOML): the hook runs
+    /// detached, its exit (or failure) surfaces as a transcript note,
+    /// and it can never block the turn — exit 2 does not block, stdout
+    /// steering is ignored, the result is discarded.
+    #[serde(rename = "async", default)]
+    pub async_: Option<bool>,
+    /// HTTP handler (EXT-02): the same JSON envelope a command hook
+    /// receives on stdin is POSTed to this URL; the JSON response body
+    /// follows the same exit/steering contract (`decision: "block"`
+    /// with `reason` blocks like exit 2, `decision: "allow"`
+    /// pre-approves, `mode`/`note`/`updated_input`/`feedback` steer).
+    /// A non-2xx status or a network error is a hook failure.
+    #[serde(default)]
+    pub url: Option<String>,
+}
+
+/// Default per-hook timeout in seconds.
+pub const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 10;
+/// Hard cap for `timeout_secs` (a chatty hook must not pin a turn for
+/// minutes).
+pub const MAX_HOOK_TIMEOUT_SECS: u64 = 600;
+
+impl Hook {
+    /// The effective timeout: `timeout_secs` when set (the config
+    /// validator already bounds it), else the 10 s default.
+    pub fn effective_timeout_secs(&self) -> u64 {
+        self.timeout_secs
+            .unwrap_or(DEFAULT_HOOK_TIMEOUT_SECS)
+            .min(MAX_HOOK_TIMEOUT_SECS)
+    }
+
+    /// Whether this hook is fire-and-forget.
+    pub fn is_async(&self) -> bool {
+        self.async_ == Some(true)
+    }
 }
 
 /// Hook trigger points.
@@ -77,6 +120,32 @@ pub enum HookEvent {
     /// Before a digest/compaction runs (`{"event":"pre_compact",
     /// "focus":…}`). Only advisory steering; cannot stop the digest.
     PreCompact,
+    /// A `delegate` spawn started (EXT-01): `{"event":"subagent_start",
+    /// "agent":…,"task":…}`. Advisory.
+    SubagentStart,
+    /// A delegate run finished (EXT-01): `{"event":"subagent_stop",
+    /// "agent":…,"task":…,"status":"finished"|"failed","summary":…}`.
+    /// Advisory; cancelled tasks do not fire it.
+    SubagentStop,
+    /// A `SetModel` is about to apply (EXT-01):
+    /// `{"event":"pre_model_switch","from":…,"to":…}`. Advisory; cannot
+    /// veto the switch.
+    PreModelSwitch,
+    /// A `SetModel` applied (EXT-01): `{"event":"post_model_switch",
+    /// "from":…,"to":…}`. Advisory.
+    PostModelSwitch,
+    /// A digest/compaction finished (EXT-01): `{"event":"post_compact",
+    /// "tokens_before":…,"tokens_after":…}`. Advisory.
+    PostCompact,
+    /// A permission ask is about to be posed (EXT-01):
+    /// `{"event":"permission_request","tool":…,"argument":…}`. Fires
+    /// BEFORE the ask and is advisory only — it can never block,
+    /// answer, or replace the ask.
+    PermissionRequest,
+    /// A permission decision refused a call (EXT-01): a deny-class gate
+    /// verdict or the user answering deny on the ask —
+    /// `{"event":"permission_denied","tool":…,"reason":…}`. Advisory.
+    PermissionDenied,
 }
 
 impl HookEvent {
@@ -91,6 +160,13 @@ impl HookEvent {
             HookEvent::SessionEnd => "session_end",
             HookEvent::UserPromptSubmit => "user_prompt_submit",
             HookEvent::PreCompact => "pre_compact",
+            HookEvent::SubagentStart => "subagent_start",
+            HookEvent::SubagentStop => "subagent_stop",
+            HookEvent::PreModelSwitch => "pre_model_switch",
+            HookEvent::PostModelSwitch => "post_model_switch",
+            HookEvent::PostCompact => "post_compact",
+            HookEvent::PermissionRequest => "permission_request",
+            HookEvent::PermissionDenied => "permission_denied",
         }
     }
 }
@@ -981,6 +1057,33 @@ impl Config {
                         .collect::<Vec<_>>()
                         .join(", ")
                 ));
+            }
+        }
+        // [[hooks]] EXT-02: command/url are mutually exclusive (exactly
+        // one handler per hook) and timeout_secs stays in 1..=600
+        for hook in &self.hooks {
+            let event = hook.event.wire_name();
+            match (hook.command.trim().is_empty(), hook.url.is_some()) {
+                (true, false) => {
+                    return Err(format!(
+                        "[[hooks]] {event}: one of command or url is required"
+                    ));
+                }
+                (false, true) => {
+                    return Err(format!(
+                        "[[hooks]] {event}: set either command or url, not both"
+                    ));
+                }
+                _ => {}
+            }
+            if let Some(secs) = hook.timeout_secs {
+                if secs == 0 || secs > crate::config::MAX_HOOK_TIMEOUT_SECS {
+                    return Err(format!(
+                        "[[hooks]] {event}: timeout_secs {secs} is out of range \
+                         (1-{})",
+                        crate::config::MAX_HOOK_TIMEOUT_SECS
+                    ));
+                }
             }
         }
         Ok(())

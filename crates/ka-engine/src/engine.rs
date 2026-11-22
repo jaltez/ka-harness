@@ -681,7 +681,14 @@ async fn run(
     // mode; the names only widen the per-directory search
     voice.set_project_doc_fallbacks(config.project_doc_fallback_filenames.clone());
     voice.set_allowed_tools(allowed_tools);
-    voice.set_hooks(hooks);
+    voice.set_hooks(hooks.clone());
+    // [[mcp]] per-server policies (EXT-04): the ask bypass reads them
+    // at admit time; hidden in safe mode like the rest of the tier
+    voice.set_mcp_policies(if crate::conventions::bare_mode() {
+        Vec::new()
+    } else {
+        config.mcp.clone()
+    });
     voice.set_bash_background_ms(config.effective_bash_background_after_ms());
     voice.set_fallbacks(config.fallback.models.clone());
     voice.set_max_image_mb(config.effective_max_image_mb());
@@ -789,7 +796,8 @@ async fn run(
                 agent_tasks.clone(),
                 ctx.events.clone(),
                 features.clone(),
-            ),
+            )
+            .with_hooks(std::sync::Arc::new(hooks.clone())),
         ));
         ctx.voice
             .push_hand(std::sync::Arc::new(crate::hands::tasks::TasksHand::new(
@@ -976,7 +984,8 @@ async fn handle_maintenance(update: crate::mcp::Maintenance, ctx: &mut Ctx) {
         if changed {
             if let Some(shared) = ctx.mcp_shared.iter().find(|s| s.name() == server).cloned() {
                 if !ctx.mcp_lazy {
-                    let hands: Vec<std::sync::Arc<dyn crate::hands::Hand>> = tools
+                    let hands: Vec<std::sync::Arc<dyn crate::hands::Hand>> = shared
+                        .model_tools()
                         .iter()
                         .map(|t| {
                             std::sync::Arc::new(crate::mcp::McpHand::new(t.clone(), shared.clone()))
@@ -1061,7 +1070,8 @@ async fn handle_maintenance(update: crate::mcp::Maintenance, ctx: &mut Ctx) {
     };
     if let Some(shared) = ctx.mcp_shared.iter().find(|s| s.name() == server).cloned() {
         if !ctx.mcp_lazy {
-            let hands: Vec<std::sync::Arc<dyn crate::hands::Hand>> = tools
+            let hands: Vec<std::sync::Arc<dyn crate::hands::Hand>> = shared
+                .model_tools()
                 .iter()
                 .map(|t| {
                     std::sync::Arc::new(crate::mcp::McpHand::new(t.clone(), shared.clone())) as _
@@ -1113,7 +1123,7 @@ async fn ensure_mcp_server(ctx: &mut Ctx, cfg: crate::mcp::McpServerConfig) -> M
         let count = cached.len();
         let shared = crate::mcp::McpShared::placeholder(cfg.clone(), cached);
         if !ctx.mcp_lazy {
-            for tool in shared.tools() {
+            for tool in shared.model_tools() {
                 ctx.voice
                     .push_hand(std::sync::Arc::new(crate::mcp::McpHand::new(
                         tool,
@@ -1157,10 +1167,11 @@ async fn ensure_mcp_server(ctx: &mut Ctx, cfg: crate::mcp::McpServerConfig) -> M
             // from cache and never waits on this handshake
             crate::mcp_cache::store_tools(&cfg, &tools);
             let shared = crate::mcp::McpShared::new(cfg.clone(), client, tools.clone());
-            // eager mode: every tool becomes its own hand; lazy mode
-            // fronts the server through the single mcp_call hand
+            // eager mode: every policy-visible tool becomes its own
+            // hand (EXT-04 enabled_tools/disabled_tools filter); lazy
+            // mode fronts the server through the single mcp_call hand
             if !ctx.mcp_lazy {
-                for tool in tools {
+                for tool in shared.model_tools() {
                     ctx.voice
                         .push_hand(std::sync::Arc::new(crate::mcp::McpHand::new(
                             tool,
@@ -1766,9 +1777,10 @@ async fn handle_command(
                     continue;
                 }
                 match shared.refresh_and_install().await {
-                    Ok((tools, delta)) => {
+                    Ok((_tools, delta)) => {
                         if delta != 0 {
-                            let hands: Vec<std::sync::Arc<dyn crate::hands::Hand>> = tools
+                            let hands: Vec<std::sync::Arc<dyn crate::hands::Hand>> = shared
+                                .model_tools()
                                 .iter()
                                 .map(|t| {
                                     std::sync::Arc::new(crate::mcp::McpHand::new(
@@ -1863,6 +1875,21 @@ async fn handle_command(
             }
         }
         Command::SetModel { selector } => {
+            // EXT-01: the advisory model-switch hooks bracket the
+            // switch (from = the session's current selector); nothing
+            // they emit can veto or redirect the switch
+            let previous = ctx.state.model.clone();
+            ctx.voice
+                .lifecycle_hook(
+                    crate::config::HookEvent::PreModelSwitch,
+                    serde_json::json!({
+                        "event": "pre_model_switch",
+                        "from": previous,
+                        "to": selector,
+                    }),
+                    &ctx.events,
+                )
+                .await;
             ctx.state.model = Some(selector.clone());
             ctx.voice.pathfinder_slot().write().model = Some(selector.clone());
             let _ = ctx.strand.append(ka_strand::Record::Change {
@@ -1873,7 +1900,22 @@ async fn handle_command(
                 features: None,
                 sandbox: None,
             });
-            ctx.events.send(Event::ModelChanged { selector }).await?;
+            ctx.events
+                .send(Event::ModelChanged {
+                    selector: selector.clone(),
+                })
+                .await?;
+            ctx.voice
+                .lifecycle_hook(
+                    crate::config::HookEvent::PostModelSwitch,
+                    serde_json::json!({
+                        "event": "post_model_switch",
+                        "from": previous,
+                        "to": selector,
+                    }),
+                    &ctx.events,
+                )
+                .await;
             // a model change re-announces the stored level so surfaces stay truthful
             // (the level itself is not model-derived)
             ctx.events
@@ -1882,6 +1924,51 @@ async fn handle_command(
                 })
                 .await
                 .ok();
+            ctx.events.send(Event::Idle).await.ok();
+        }
+        // EXT-09: the session's output style. Resolution happens
+        // engine-side (fail closed: an unresolvable name changes
+        // nothing) and the voice re-resolves the file every prompt
+        // assembly. Session-scoped: no Change record v1 — styles do
+        // not survive a resume, like the in-memory context trims.
+        Command::SetStyle { style } => {
+            match style {
+                Some(name) => match crate::conventions::resolve_style(&name, &ctx.cwd) {
+                    Some(path) => {
+                        ctx.voice.set_style(Some(name.clone()));
+                        ctx.events
+                            .send(Event::Note {
+                                message: format!("style · {} ({})", name, path.display()),
+                            })
+                            .await
+                            .ok();
+                    }
+                    None => {
+                        let current = ctx
+                            .voice
+                            .style_name()
+                            .map_or_else(|| "built-in identity".to_string(), |s| format!("{s:?}"));
+                        ctx.events
+                            .send(Event::Note {
+                                message: format!(
+                                    "style {name:?} not found (.ka/styles/, \
+                                     ~/.config/ka/styles/) — keeping {current}"
+                                ),
+                            })
+                            .await
+                            .ok();
+                    }
+                },
+                None => {
+                    ctx.voice.set_style(None);
+                    ctx.events
+                        .send(Event::Note {
+                            message: "style · off (built-in identity)".to_string(),
+                        })
+                        .await
+                        .ok();
+                }
+            }
             ctx.events.send(Event::Idle).await.ok();
         }
         Command::SetMode { mode } => {
@@ -4290,6 +4377,8 @@ async fn run_digest(
             events,
         )
         .await;
+    // EXT-01: post_compact carries the token estimate before/after
+    let tokens_before = voice.debug_last_context();
     // a ready speculative candidate with a matching watermark skips the
     // synchronous summarize entirely
     if focus.is_none() {
@@ -4297,6 +4386,17 @@ async fn run_digest(
             let _ = voice.apply_digest(summary, ratio);
             persist_delta(voice, state, strand);
             reinject_after_digest(voice, events).await;
+            voice
+                .lifecycle_hook(
+                    crate::config::HookEvent::PostCompact,
+                    serde_json::json!({
+                        "event": "post_compact",
+                        "tokens_before": tokens_before,
+                        "tokens_after": voice.debug_last_context(),
+                    }),
+                    events,
+                )
+                .await;
             events
                 .send(Event::Note {
                     message: "context digested (speculative)".to_string(),
@@ -4316,6 +4416,17 @@ async fn run_digest(
             let _ = kept;
             persist_delta(voice, state, strand);
             reinject_after_digest(voice, events).await;
+            voice
+                .lifecycle_hook(
+                    crate::config::HookEvent::PostCompact,
+                    serde_json::json!({
+                        "event": "post_compact",
+                        "tokens_before": tokens_before,
+                        "tokens_after": voice.debug_last_context(),
+                    }),
+                    events,
+                )
+                .await;
             events
                 .send(Event::Note {
                     message: "context digested".to_string(),
@@ -4339,6 +4450,17 @@ unavailable). The most recent exchange follows; re-read files you need."
             voice.apply_digest(summary, ratio);
             persist_delta(voice, state, strand);
             reinject_after_digest(voice, events).await;
+            voice
+                .lifecycle_hook(
+                    crate::config::HookEvent::PostCompact,
+                    serde_json::json!({
+                        "event": "post_compact",
+                        "tokens_before": tokens_before,
+                        "tokens_after": voice.debug_last_context(),
+                    }),
+                    events,
+                )
+                .await;
             DigestResult::Digested
         }
     }
@@ -6163,6 +6285,11 @@ mod tests {
                 env: Default::default(),
                 url: None,
                 headers: Vec::new(),
+                enabled_tools: Vec::new(),
+                disabled_tools: Vec::new(),
+                approval: None,
+                tool_timeout_secs: None,
+                output_limit: None,
             }],
             ..Config::default()
         };
@@ -6244,6 +6371,11 @@ mod tests {
             env: Default::default(),
             url: None,
             headers: Vec::new(),
+            enabled_tools: Vec::new(),
+            disabled_tools: Vec::new(),
+            approval: None,
+            tool_timeout_secs: None,
+            output_limit: None,
         };
         crate::mcp_cache::store_tools(
             &server,
@@ -6252,6 +6384,7 @@ mod tests {
                 raw_name: "ping".into(),
                 description: "ping".into(),
                 schema: serde_json::json!({"type": "object"}),
+                read_only_hint: false,
             }],
         );
         let root = std::env::temp_dir().join(format!(

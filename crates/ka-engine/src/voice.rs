@@ -325,6 +325,15 @@ pub struct Voice {
     /// skills' full SKILL.md bodies ride this turn's system prompt.
     /// Set by the engine around one turn, cleared after.
     turn_skills: Option<Vec<String>>,
+    /// Per-server MCP policies (EXT-04 `[[mcp]]` entries): the ask
+    /// bypass (`approval`) consults these at admit time. Engine
+    /// bootstrap; empty when no servers are configured.
+    mcp_policies: Vec<crate::mcp::McpServerConfig>,
+    /// EXT-09 active output style (the `/style <name>` selector). The
+    /// style file resolves fresh every prompt assembly (like
+    /// `identity_file`) and REPLACES the built-in identity when no
+    /// `identity_file`/`identity_inline` applies. None = built-in.
+    style: Option<String>,
     /// Cached tool-spec set for the current hand set: building it
     /// clones every description/schema per call, so it is built once
     /// and reused across steps/retries. Invalidated at turn start and
@@ -416,6 +425,8 @@ impl Voice {
             reviewer_model: None,
             turn_tools: None,
             turn_skills: None,
+            mcp_policies: Vec::new(),
+            style: None,
             specs_cache: parking_lot::Mutex::new(None),
             tables,
             features: crate::features::FeatureToggles::slot(Vec::new()),
@@ -639,6 +650,8 @@ impl Voice {
             reviewer_model: None,
             turn_tools: None,
             turn_skills: None,
+            mcp_policies: Vec::new(),
+            style: None,
             specs_cache: parking_lot::Mutex::new(None),
             tables,
             features: crate::features::FeatureToggles::slot(Vec::new()),
@@ -890,12 +903,13 @@ impl Voice {
     }
 
     /// This turn's identity text: `[prompt] identity_file` wins, then
-    /// `[prompt] identity_inline`, then the built-in sentence (None).
-    /// The file is re-read every prompt assembly so edits apply
-    /// without a restart; an unreadable file warns once per session
-    /// and falls through to the inline text. Content over 8 KiB is cut
-    /// on a char boundary and marked. Safe mode keeps the built-in
-    /// identity.
+    /// `[prompt] identity_inline`, then the active output style
+    /// (EXT-09, `/style <name>`), then the built-in sentence (None).
+    /// The file and the style file are re-read every prompt assembly
+    /// so edits apply without a restart; an unreadable file warns once
+    /// per session and falls through to the inline text. Content over
+    /// 8 KiB is cut on a char boundary and marked. Safe mode keeps the
+    /// built-in identity (styles are `.ka/` customizations).
     async fn load_identity(&mut self, events: &mpsc::Sender<Event>) -> Option<String> {
         if crate::conventions::bare_mode() {
             return None;
@@ -920,6 +934,8 @@ impl Voice {
                         self.identity_warned = true;
                         let fallback = if self.identity_inline.is_some() {
                             "[prompt] identity_inline"
+                        } else if self.style.is_some() {
+                            "the active style"
                         } else {
                             "ka's default identity"
                         };
@@ -933,9 +949,32 @@ impl Voice {
                 }
             }
         }
-        self.identity_inline
-            .as_deref()
-            .map(|text| cap_8kib(text.to_string()))
+        if let Some(inline) = self.identity_inline.as_deref() {
+            return Some(cap_8kib(inline.to_string()));
+        }
+        // EXT-09: an active style replaces the built-in identity when
+        // no file/inline identity applies. Unresolvable or unreadable
+        // → built-in (the /style command only arms resolvable names,
+        // so this mostly guards a style deleted mid-session).
+        if let Some(name) = self.style.clone() {
+            return match crate::conventions::resolve_style(&name, &self.hand_ctx.cwd)
+                .and_then(|path| std::fs::read_to_string(path).ok())
+            {
+                Some(text) if !text.trim().is_empty() => Some(cap_8kib(text)),
+                _ => {
+                    events
+                        .send(Event::Note {
+                            message: format!(
+                                "style {name:?} is gone or empty — using ka's default identity"
+                            ),
+                        })
+                        .await
+                        .ok();
+                    None
+                }
+            };
+        }
+        None
     }
 
     /// Set the LSP diagnostics manager (engine bootstrap).
@@ -1015,6 +1054,84 @@ impl Voice {
         self.turn_skills = skills;
     }
 
+    /// Set the per-server MCP policies (EXT-04, engine bootstrap): the
+    /// `[[mcp]]` entries the ask bypass consults at admit time.
+    pub fn set_mcp_policies(&mut self, policies: Vec<crate::mcp::McpServerConfig>) {
+        self.mcp_policies = policies;
+    }
+
+    /// Set the active output style (EXT-09 `/style <name>`); `None`
+    /// restores the built-in identity. Session-scoped: the strand keeps
+    /// no Change record for styles.
+    pub fn set_style(&mut self, name: Option<String>) {
+        self.style = name;
+    }
+
+    /// The active style name, if any (EXT-09).
+    pub fn style_name(&self) -> Option<&str> {
+        self.style.as_deref()
+    }
+
+    /// Whether an MCP call may skip its permission ask (EXT-04
+    /// `approval`): `auto` skips for the whole server; `writes` skips
+    /// when the target tool advertises `readOnlyHint = true`. Resolves
+    /// both shapes — eager `<server>__<tool>` wire names and the lazy
+    /// `mcp_call` arguments — against the configured policies and the
+    /// live MCP catalog. Anything unresolved keeps the ask (fail toward
+    /// asking); deny-class verdicts never reach here.
+    pub fn mcp_ask_bypass(&self, tool: &str, args: &serde_json::Value) -> bool {
+        use crate::mcp::McpApproval;
+        // The target tool's advertised read-only hint from the live
+        // MCP catalog; `None` (unknown server/tool) reads as "not
+        // explicitly read-only" under `writes`.
+        let read_only_of = |server: &str, target: Option<&str>| -> Option<bool> {
+            self.tables
+                .mcp_catalog
+                .read()
+                .iter()
+                .find(|s| s.name() == server)
+                .and_then(|s| target.and_then(|t| s.find_model_tool(t)))
+                .map(|t| t.read_only_hint)
+        };
+        if tool == "mcp_call" {
+            // lazy: the arguments name the server and (on a call) the
+            // tool; a bare listing is informational, never auto-runs
+            let server = match args.get("server").and_then(serde_json::Value::as_str) {
+                Some(s) => s.to_string(),
+                None => return false,
+            };
+            let target = args.get("tool").and_then(serde_json::Value::as_str);
+            let cfg = match self.mcp_policies.iter().find(|c| {
+                c.name == server || crate::mcp::wire_prefix(&c.name) == format!("{server}__")
+            }) {
+                Some(c) => c,
+                None => return false,
+            };
+            let read_only = read_only_of(&cfg.name, target);
+            return match cfg.effective_approval() {
+                McpApproval::Auto => true,
+                McpApproval::Writes => read_only == Some(true),
+                McpApproval::Ask => false,
+            };
+        }
+        // eager: the wire name is `<server>__<tool>`; the policy owns
+        // the prefix
+        let cfg = match self
+            .mcp_policies
+            .iter()
+            .find(|c| tool.starts_with(&crate::mcp::wire_prefix(&c.name)))
+        {
+            Some(c) => c,
+            None => return false,
+        };
+        let read_only = read_only_of(&cfg.name, Some(tool));
+        match cfg.effective_approval() {
+            McpApproval::Auto => true,
+            McpApproval::Writes => read_only == Some(true),
+            McpApproval::Ask => false,
+        }
+    }
+
     /// Whether a per-turn tool allowlist is active (contract tests).
     pub fn turn_tools_active(&self) -> bool {
         self.turn_tools.is_some()
@@ -1066,19 +1183,77 @@ impl Voice {
         &self.tables
     }
     /// Run matching hooks for one event. Returns Err(reason) when a
-    /// pre_tool_use hook blocked the call (exit 2, stderr as reason);
-    /// Ok(steering) carries stdout steering when a hook emitted it.
-    /// The `hooks` feature toggle silences every hook class.
+    /// pre_tool_use hook blocked the call (exit 2 or `decision: block`,
+    /// stderr/reason as message); Ok(steering) carries stdout steering
+    /// when a hook emitted it. The `hooks` feature toggle silences
+    /// every hook class. `events` carries the async-hook outcome notes.
     async fn run_hooks(
         &self,
         event: crate::config::HookEvent,
         tool: &str,
         args: &serde_json::Value,
+        events: &mpsc::Sender<Event>,
     ) -> Result<Option<crate::fshooks::Steering>, String> {
         if !self.features.read().hooks_enabled() {
             return Ok(None);
         }
-        run_hook_scripts(&self.hooks_cfg, event, tool, args, &self.hand_ctx.cwd).await
+        run_hook_scripts(
+            &self.hooks_cfg,
+            event,
+            tool,
+            args,
+            &self.hand_ctx.cwd,
+            Some(events),
+        )
+        .await
+    }
+
+    /// Fire one advisory, tool-scoped hook event (EXT-01
+    /// permission_request / permission_denied): failures surface as
+    /// notes, the ask/deny course never changes, clean stdout may note
+    /// (mode steering from these advisory events is ignored — the
+    /// decision belongs to the gate and the user).
+    async fn advisory_tool_hook(
+        &mut self,
+        event: crate::config::HookEvent,
+        tool: &str,
+        payload: serde_json::Value,
+        events: &mpsc::Sender<Event>,
+    ) {
+        if !self.features.read().hooks_enabled() {
+            return;
+        }
+        let (failures, steer) = run_event_scripts(
+            &self.hooks_cfg,
+            event,
+            Some(tool),
+            &payload,
+            &self.hand_ctx.cwd,
+            Some(events),
+        )
+        .await;
+        for reason in failures {
+            events
+                .send(Event::Note {
+                    message: format!("{} hook: {reason}", event.wire_name()),
+                })
+                .await
+                .ok();
+        }
+        if let Some(s) = steer {
+            self.apply_steering(
+                Some(crate::fshooks::Steering {
+                    mode: None,
+                    note: s.note,
+                    updated_input: None,
+                    allow: false,
+                    feedback: None,
+                    block: None,
+                }),
+                events,
+            )
+            .await;
+        }
     }
 
     /// Apply hook steering: switch the gate's permission mode (same
@@ -1122,8 +1297,15 @@ impl Voice {
             crate::config::HookEvent::TurnEnd,
         ] {
             let payload = serde_json::json!({"event": event.wire_name(), "stop": status});
-            let (failures, steer) =
-                run_event_scripts(&self.hooks_cfg, event, &payload, &self.hand_ctx.cwd).await;
+            let (failures, steer) = run_event_scripts(
+                &self.hooks_cfg,
+                event,
+                None,
+                &payload,
+                &self.hand_ctx.cwd,
+                Some(events),
+            )
+            .await;
             for reason in failures {
                 events
                     .send(Event::Note {
@@ -1150,8 +1332,15 @@ impl Voice {
         if !self.features.read().hooks_enabled() {
             return;
         }
-        let (failures, steer) =
-            run_event_scripts(&self.hooks_cfg, event, &payload, &self.hand_ctx.cwd).await;
+        let (failures, steer) = run_event_scripts(
+            &self.hooks_cfg,
+            event,
+            None,
+            &payload,
+            &self.hand_ctx.cwd,
+            Some(events),
+        )
+        .await;
         for reason in failures {
             events
                 .send(Event::Note {
@@ -2141,19 +2330,46 @@ impl Voice {
         }
         // skills: progressive disclosure — names/descriptions/paths only.
         // The whole block drops when `skills` is toggled off; individual
-        // skills drop by name. (Guard scoped: the turn loop below needs
+        // skills drop by name. EXT-07 adds two more gates:
+        // `disable-model-invocation: true` skills stay command-only
+        // (they never appear in the model-facing listing, but
+        // `/skill:<name>` still injects them), and `paths:`-scoped
+        // skills activate only once a session read matches one of
+        // their globs. (Guard scoped: the turn loop below needs
         // `&mut self` back.)
-        let skills = {
+        let (skills, command_skills) = {
             let features = self.features.read();
             let discovered = if features.skills_enabled() {
                 crate::conventions::discover_skills(&self.hand_ctx.cwd)
             } else {
                 Vec::new()
             };
-            discovered
-                .into_iter()
-                .filter(|sk| features.skill_enabled(&sk.name))
-                .collect::<Vec<_>>()
+            let read_paths = self.hand_ctx.ledger.lock().read_paths();
+            let paths_match = |sk: &crate::conventions::Skill| match &sk.paths {
+                None => true,
+                Some(globs) => read_paths.iter().any(|p| {
+                    let path = p.to_string_lossy();
+                    let name = p.file_name().map(|f| f.to_string_lossy());
+                    globs.iter().any(|g| {
+                        glob_match(g, &path) || name.as_ref().is_some_and(|n| glob_match(g, n))
+                    })
+                }),
+            };
+            let enabled = |sk: &&crate::conventions::Skill| features.skill_enabled(&sk.name);
+            let listed = discovered
+                .iter()
+                .filter(|sk| enabled(sk) && !sk.disable_model_invocation && paths_match(sk))
+                .cloned()
+                .collect::<Vec<_>>();
+            // explicit invocation may still reach command-only and
+            // paths-gated skills — the engine's admit-time validation
+            // checks this same feature-enabled set
+            let invocable = discovered
+                .iter()
+                .filter(|sk| enabled(sk))
+                .cloned()
+                .collect::<Vec<_>>();
+            (listed, invocable)
         };
         if !skills.is_empty() {
             system.push_str("\nAvailable skills (read the SKILL.md path with the read tool before using one):\n");
@@ -2170,22 +2386,41 @@ impl Voice {
         // bodies ride this turn only — the engine clears the scope
         // when the turn settles, like `allowed-tools`. Admit-time
         // validation ran engine-side; a name that slipped through
-        // injects nothing (the listing above stays honest).
+        // injects nothing (the listing above stays honest). EXT-07:
+        // body lines shaped `` !`command` `` run at load and their
+        // output inlines (8 KiB cap each, errors inline), and
+        // `max_tokens:` caps the body with a truncation note.
         if let Some(invoked) = &self.turn_skills {
             for name in invoked {
-                if let Some(sk) = skills.iter().find(|s| &s.name == name) {
-                    match std::fs::read_to_string(&sk.path) {
-                        Ok(body) => system.push_str(&format!(
-                            "\n<skill src=\"{}\">\n{}\n</skill>\n",
-                            sk.path.display(),
-                            body
-                        )),
-                        Err(err) => system.push_str(&format!(
+                let Some(sk) = command_skills.iter().find(|s| &s.name == name) else {
+                    continue;
+                };
+                let body = match std::fs::read_to_string(&sk.path) {
+                    Ok(body) => body,
+                    Err(err) => {
+                        system.push_str(&format!(
                             "\n<skill src=\"{}\" error=\"{err}\" />\n",
                             sk.path.display()
-                        )),
+                        ));
+                        continue;
+                    }
+                };
+                let mut body =
+                    run_skill_shell_lines(&body, &self.hand_ctx.cwd, &self.hand_ctx.shell_env)
+                        .await;
+                if let Some(max_tokens) = sk.max_tokens {
+                    let ratio = self.model_ratio();
+                    let budget = ((max_tokens as f64) * ratio).max(1.0) as usize;
+                    if body.chars().count() > budget {
+                        let cut: String = body.chars().take(budget).collect();
+                        body = format!("{cut}\n[skill truncated at {max_tokens} tokens]");
                     }
                 }
+                system.push_str(&format!(
+                    "\n<skill src=\"{}\">\n{}\n</skill>\n",
+                    sk.path.display(),
+                    body
+                ));
             }
         }
         let identity = self.load_identity(events).await;
@@ -3070,6 +3305,7 @@ impl Voice {
                 crate::config::HookEvent::PreToolUse,
                 &call.tool,
                 &call.arguments,
+                events,
             )
             .await
         {
@@ -3103,6 +3339,7 @@ impl Voice {
                             updated_input: None,
                             allow: false,
                             feedback: None,
+                            block: None,
                         }),
                         events,
                     )
@@ -3147,6 +3384,13 @@ impl Voice {
         } else {
             self.gate(clearance, call)
         };
+        // EXT-04 per-server approval: `auto` skips this server's asks
+        // outright; `writes` skips them for tools advertised
+        // `readOnlyHint = true`. Deny-class verdicts and hardstops are
+        // never touched — only a plain Ask downgrades to Allow.
+        if matches!(gate, Gate::Ask { .. }) && self.mcp_ask_bypass(&call.tool, &call.arguments) {
+            gate = Gate::Allow;
+        }
         // auto_review (roadmap 9.4, PERM-02): the fast-role reviewer
         // pre-screens reviewable asks — auto-allow only, never deny,
         // always visible as a note; unavailable reviewer fails toward
@@ -3257,6 +3501,17 @@ impl Voice {
                 }
             }
             Gate::Deny { reason } => {
+                self.advisory_tool_hook(
+                    crate::config::HookEvent::PermissionDenied,
+                    &call.tool,
+                    serde_json::json!({
+                        "event": "permission_denied",
+                        "tool": call.tool,
+                        "reason": reason,
+                    }),
+                    events,
+                )
+                .await;
                 let output = ToolOutput::err(reason);
                 self.surface_decided(call, &output, events).await;
                 return Err(output);
@@ -3274,6 +3529,19 @@ impl Voice {
                 } else {
                     question
                 };
+                // EXT-01: permission_request fires BEFORE the ask and is
+                // advisory only — it can never answer or replace the ask
+                self.advisory_tool_hook(
+                    crate::config::HookEvent::PermissionRequest,
+                    &call.tool,
+                    serde_json::json!({
+                        "event": "permission_request",
+                        "tool": call.tool,
+                        "argument": primary_argument(call),
+                    }),
+                    events,
+                )
+                .await;
                 let detail = self.ask_detail(call);
                 match self
                     .pose_ask(question, detail, commands, events, steers, queue)
@@ -3305,6 +3573,19 @@ impl Voice {
                         }
                     }
                     AskOutcome::Choice(2) => {
+                        // EXT-01: the user's deny fires the advisory
+                        // permission_denied hook
+                        self.advisory_tool_hook(
+                            crate::config::HookEvent::PermissionDenied,
+                            &call.tool,
+                            serde_json::json!({
+                                "event": "permission_denied",
+                                "tool": call.tool,
+                                "reason": "permission denied by user",
+                            }),
+                            events,
+                        )
+                        .await;
                         let output =
                             ToolOutput::err(format!("permission denied by user for {}", call.tool));
                         self.surface_decided(call, &output, events).await;
@@ -3922,6 +4203,7 @@ async fn execute_approved(
         &call.tool,
         &call.arguments,
         &ctx.cwd,
+        Some(events),
     )
     .await
     {
@@ -4199,17 +4481,222 @@ fn lint_command(rule_command: &str, rel: &str) -> String {
     }
 }
 
-/// Run matching hook scripts for one event. Returns Err(reason) when a
-/// pre_tool_use hook blocked the call (exit 2, stderr as reason). A free
-/// fn so concurrent per-call tasks can run post_tool_use hooks.
+/// One hook execution outcome (EXT-02 shared machinery for command and
+/// URL handlers).
+enum HookRun {
+    /// Exited zero (or a 2xx HTTP response): stdout/body may steer.
+    Ok(String),
+    /// The exit-2 / `decision: "block"` veto; the reason is stderr (or
+    /// the block reason).
+    Blocked(String),
+    /// A non-2, non-zero exit: advisory tail, ignored by the tool-call
+    /// path (pre-existing semantics), a failure note on lifecycle
+    /// events.
+    Exited(i32, String),
+    /// Spawn/wait/timeout/network failure — a hard failure on both
+    /// paths.
+    Failed(String),
+}
+
+/// Execute one configured hook: a shell command (payload on stdin) or
+/// an HTTP handler (payload POSTed as JSON, response body parsed with
+/// the same steering language). The per-hook `timeout_secs` (default
+/// 10, cap 600) bounds both shapes.
+async fn run_one_hook(
+    hook: &crate::config::Hook,
+    payload: &serde_json::Value,
+    cwd: &std::path::Path,
+) -> HookRun {
+    let timeout = std::time::Duration::from_secs(hook.effective_timeout_secs());
+    if let Some(url) = &hook.url {
+        let client = match reqwest::Client::builder().timeout(timeout).build() {
+            Ok(c) => c,
+            Err(e) => return HookRun::Failed(format!("hook client failed to build: {e}")),
+        };
+        let response = match client.post(url).json(payload).send().await {
+            Ok(r) => r,
+            Err(e) => return HookRun::Failed(format!("hook url failed: {e}")),
+        };
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return HookRun::Failed(format!("hook url returned status {status}"));
+        }
+        return HookRun::Ok(body);
+    }
+    let mut child = match tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg(&hook.command)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => return HookRun::Failed(format!("hook failed to spawn: {e}")),
+    };
+    {
+        use tokio::io::AsyncWriteExt;
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(payload.to_string().as_bytes()).await;
+            // drop before waiting: a hook that never reads stdin must
+            // not deadlock against a full pipe buffer
+        }
+    }
+    let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => return HookRun::Failed(format!("hook failed: {e}")),
+        Err(_) => {
+            return HookRun::Failed(format!("hook timed out after {}s", timeout.as_secs()));
+        }
+    };
+    if output.status.code() == Some(2) {
+        let reason = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return HookRun::Blocked(reason);
+    }
+    match output.status.code() {
+        Some(0) => HookRun::Ok(String::from_utf8_lossy(&output.stdout).to_string()),
+        Some(code) => HookRun::Exited(
+            code,
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ),
+        None => HookRun::Exited(
+            -1,
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ),
+    }
+}
+
+/// Fire one hook detached (EXT-02 `async = true`): it can never block
+/// the turn, its steering is ignored, and its outcome surfaces as a
+/// transcript note when there is an event sink to carry it.
+fn spawn_async_hook(
+    hook: crate::config::Hook,
+    payload: serde_json::Value,
+    cwd: std::path::PathBuf,
+    notes: Option<mpsc::Sender<Event>>,
+) {
+    tokio::spawn(async move {
+        let event = hook.event.wire_name();
+        let outcome = run_one_hook(&hook, &payload, &cwd).await;
+        let Some(notes) = notes else { return };
+        let message = match outcome {
+            HookRun::Ok(_) => format!("hook (async) {event}: exit 0"),
+            HookRun::Blocked(reason) => {
+                format!("hook (async) {event}: exit 2{}", reason_suffix(&reason))
+            }
+            HookRun::Exited(code, tail) => {
+                format!("hook (async) {event}: exit {code}{}", reason_suffix(&tail))
+            }
+            HookRun::Failed(reason) => format!("hook (async) {event}: {reason}"),
+        };
+        notes.send(Event::Note { message }).await.ok();
+    });
+}
+
+/// `": {tail}"` when a hook outcome carries a non-empty tail.
+fn reason_suffix(tail: &str) -> String {
+    if tail.trim().is_empty() {
+        String::new()
+    } else {
+        format!(": {}", tail.trim())
+    }
+}
+
+/// Cap for one `` !`command` `` line's inlined output (EXT-07).
+const SKILL_CMD_OUTPUT_CHARS: usize = 8192;
+/// Wall-clock budget for one skill-load command.
+const SKILL_CMD_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Run a SKILL.md body's `` !`command` `` lines (EXT-07) and return the
+/// body with each line replaced by its inlined output: the output is
+/// capped at 8 KiB with a note, and failures inline as `[error: …]` —
+/// a broken command never fails the skill load. Non-command lines pass
+/// through untouched.
+async fn run_skill_shell_lines(
+    body: &str,
+    cwd: &std::path::Path,
+    shell_env: &crate::config::ShellEnvPolicy,
+) -> String {
+    let mut out = String::with_capacity(body.len());
+    for line in body.lines() {
+        let trimmed = line.trim_start();
+        let Some(command) = trimmed
+            .strip_prefix('!')
+            .and_then(|rest| rest.trim().strip_prefix('`'))
+            .and_then(|rest| rest.strip_suffix('`'))
+            .filter(|c| !c.trim().is_empty())
+        else {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        };
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(command.trim())
+            .current_dir(cwd)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        shell_env.apply_to(&mut cmd);
+        let inline = match tokio::time::timeout(SKILL_CMD_TIMEOUT, cmd.output()).await {
+            Ok(Ok(output)) => {
+                let mut text = String::from_utf8_lossy(&output.stdout).to_string();
+                if !output.status.success() {
+                    let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                    if text.trim().is_empty() {
+                        text = err;
+                    }
+                    let code = output
+                        .status
+                        .code()
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| "signal".to_string());
+                    text = format!("{}\n[error: exit {code}]", text.trim_end());
+                }
+                let text = text.trim_end().to_string();
+                if text.chars().count() > SKILL_CMD_OUTPUT_CHARS {
+                    let cut: String = text.chars().take(SKILL_CMD_OUTPUT_CHARS).collect();
+                    format!("{cut}\n[output truncated at 8 KiB]")
+                } else if text.is_empty() {
+                    "(no output)".to_string()
+                } else {
+                    text
+                }
+            }
+            Ok(Err(e)) => format!("[error: {e}]"),
+            Err(_) => format!(
+                "[error: skill command timed out after {}s]",
+                SKILL_CMD_TIMEOUT.as_secs()
+            ),
+        };
+        out.push_str(&format!("!`{}`\n{}\n", command.trim(), inline));
+    }
+    // `lines()` dropped the trailing newline; restore it when the body
+    // ended with one
+    if body.ends_with('\n') && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+/// Run matching hook scripts for one tool-shaped event. Returns
+/// Err(reason) when a hook vetoed the call (exit 2 / `decision:
+/// "block"`, or a spawn/timeout/network failure). A clean exit's stdout
+/// (or an HTTP response body) may steer — mode/note, argument patch,
+/// pre-approval — the latest hook wins. `async = true` hooks fire
+/// detached: they never block, steer, or fail the call; their outcome
+/// surfaces as a note. A free fn so concurrent per-call tasks can run
+/// post_tool_use hooks.
 async fn run_hook_scripts(
     hooks: &[crate::config::Hook],
     event: crate::config::HookEvent,
     tool: &str,
     args: &serde_json::Value,
     cwd: &std::path::Path,
+    notes: Option<&mpsc::Sender<Event>>,
 ) -> Result<Option<crate::fshooks::Steering>, String> {
-    use tokio::io::AsyncWriteExt;
     let mut steering = None;
     for hook in hooks {
         if hook.event != event {
@@ -4225,107 +4712,91 @@ async fn run_hook_scripts(
             "arguments": args,
             "cwd": cwd.display().to_string(),
         });
-        let mut child = match tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg(&hook.command)
-            .current_dir(cwd)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-        {
-            Ok(c) => c,
-            Err(e) => return Err(format!("hook failed to spawn: {e}")),
-        };
-        let stdin_opt = child.stdin.take();
-        if let Some(mut stdin) = stdin_opt {
-            let _ = stdin.write_all(payload.to_string().as_bytes()).await;
+        if hook.is_async() {
+            spawn_async_hook(hook.clone(), payload, cwd.to_path_buf(), notes.cloned());
+            continue;
         }
-        let output = match tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            child.wait_with_output(),
-        )
-        .await
-        {
-            Ok(Ok(o)) => o,
-            Ok(Err(e)) => return Err(format!("hook failed: {e}")),
-            Err(_) => return Err("hook timed out after 30s".to_string()),
-        };
-        if output.status.code() == Some(2) {
-            let reason = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            return Err(if reason.is_empty() {
-                "blocked by hook".to_string()
-            } else {
-                reason
-            });
-        }
-        // steering: on a clean exit, a JSON object on stdout may switch
-        // the mode and/or surface a note. Unparsable or empty stdout is
-        // IGNORED — it never erases an earlier hook's steering (only a
-        // hook that actually emits steering wins, latest first).
-        if output.status.success() {
-            if let Some(s) =
-                crate::fshooks::parse_steering(&String::from_utf8_lossy(&output.stdout))
-                    .into_nonempty()
-            {
-                steering = Some(s);
+        // steering: a JSON object on stdout (or in the HTTP response
+        // body) may switch the mode and/or surface a note. Unparsable
+        // or empty output is IGNORED — it never erases an earlier
+        // hook's steering (only a hook that actually emits steering
+        // wins, latest first).
+        match run_one_hook(hook, &payload, cwd).await {
+            HookRun::Blocked(reason) => {
+                return Err(if reason.is_empty() {
+                    "blocked by hook".to_string()
+                } else {
+                    reason
+                });
+            }
+            HookRun::Exited(..) => {}
+            HookRun::Failed(reason) => return Err(reason),
+            HookRun::Ok(stdout) => {
+                if let Some(s) = crate::fshooks::parse_steering(&stdout).into_nonempty() {
+                    if let Some(reason) = s.block {
+                        return Err(reason);
+                    }
+                    steering = Some(s);
+                }
             }
         }
     }
     Ok(steering)
 }
 
-/// Run configured hooks for a lifecycle `event` (stop / turn_end /
-/// session_start / session_end / user_prompt_submit / pre_compact).
-/// Exit codes are advisory: failures are collected for the caller to
-/// surface as notes, never to fail the turn. Clean stdout may steer
-/// (mode/note only — argument patches and pre-approval are pre_tool_use
-/// powers and are ignored here). Tool-filtered hooks never fire.
-async fn run_event_scripts(
+/// Run configured hooks for a payload-shaped event (stop / turn_end /
+/// session_start / session_end / user_prompt_submit / pre_compact /
+/// subagent_start / subagent_stop / pre/post_model_switch /
+/// post_compact / permission_request / permission_denied). Exit codes
+/// are advisory: failures are collected for the caller to surface as
+/// notes, never to fail the turn. Clean stdout may steer (mode/note
+/// only — argument patches, pre-approval, and block vetoes are
+/// tool-call powers and are ignored here). When `tool` is Some, only
+/// unfiltered hooks and hooks naming exactly that tool fire
+/// (permission_request / permission_denied); `None` keeps the
+/// lifecycle behavior (tool-filtered hooks never fire).
+pub(crate) async fn run_event_scripts(
     hooks: &[crate::config::Hook],
     event: crate::config::HookEvent,
+    tool: Option<&str>,
     payload: &serde_json::Value,
     cwd: &std::path::Path,
+    notes: Option<&mpsc::Sender<Event>>,
 ) -> (Vec<String>, Option<crate::fshooks::Steering>) {
-    use tokio::io::AsyncWriteExt;
     let mut failures = Vec::new();
     let mut steering = None;
     for hook in hooks {
-        if hook.event != event || hook.tool.is_some() {
+        if hook.event != event {
             continue;
         }
-        let outcome = async {
-            let mut child = tokio::process::Command::new("sh")
-                .arg("-c")
-                .arg(&hook.command)
-                .current_dir(cwd)
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn()
-                .map_err(|e| format!("failed to spawn: {e}"))?;
-            if let Some(mut stdin) = child.stdin.take() {
-                let _ = stdin.write_all(payload.to_string().as_bytes()).await;
-            }
-            let output =
-                tokio::time::timeout(std::time::Duration::from_secs(30), child.wait_with_output())
-                    .await
-                    .map_err(|_| "timed out after 30s".to_string())?
-                    .map_err(|e| format!("failed: {e}"))?;
-            if !output.status.success() {
-                let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                return Err(if err.is_empty() {
-                    format!("exit {}", output.status)
-                } else {
-                    err
-                });
-            }
-            Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        match (&hook.tool, tool) {
+            (Some(t), Some(call_tool)) if t == call_tool => {}
+            (None, _) => {}
+            _ => continue,
         }
-        .await;
+        if hook.is_async() {
+            spawn_async_hook(
+                hook.clone(),
+                payload.clone(),
+                cwd.to_path_buf(),
+                notes.cloned(),
+            );
+            continue;
+        }
+        let outcome = run_one_hook(hook, payload, cwd).await;
         match outcome {
-            Err(reason) => failures.push(reason),
-            Ok(stdout) => {
+            HookRun::Blocked(reason) => failures.push(if reason.is_empty() {
+                "exit 2".to_string()
+            } else {
+                reason
+            }),
+            HookRun::Exited(code, tail) => failures.push(if tail.is_empty() {
+                format!("exit {code}")
+            } else {
+                tail
+            }),
+            HookRun::Failed(reason) => failures.push(reason),
+            HookRun::Ok(stdout) => {
                 if let Some(s) = crate::fshooks::parse_steering(&stdout).into_nonempty() {
                     steering = Some(crate::fshooks::Steering {
                         mode: s.mode,
@@ -4333,6 +4804,7 @@ async fn run_event_scripts(
                         updated_input: None,
                         allow: false,
                         feedback: None,
+                        block: None,
                     });
                 }
             }
@@ -4542,6 +5014,28 @@ fn command_of(call: &ToolCall) -> String {
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default()
         .to_string()
+}
+
+/// The call's primary argument (EXT-01 permission hook payload): the
+/// command line for exec-tier calls, the target path for everything
+/// else — the same subject shape the ask UI shows.
+fn primary_argument(call: &ToolCall) -> String {
+    let arg = |key: &str| {
+        call.arguments
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    let command = command_of(call);
+    if !command.is_empty() {
+        return command;
+    }
+    let path = arg("path");
+    if !path.is_empty() {
+        return path;
+    }
+    arg("pattern")
 }
 
 /// What the fast-role reviewer sees for a call: the command line for
@@ -5385,6 +5879,9 @@ mod tests {
             event: crate::config::HookEvent::Stop,
             tool: None,
             command: format!("cat >> {}", marker.display()),
+            timeout_secs: None,
+            async_: None,
+            url: None,
         }]);
 
         let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
@@ -7008,6 +7505,9 @@ mod tests {
             event: crate::config::HookEvent::PreToolUse,
             tool: Some("bash".to_string()),
             command: r#"echo '{"mode":"plan","note":"switching"}'"#.to_string(),
+            timeout_secs: None,
+            async_: None,
+            url: None,
         }]);
         let mut guards = GuardRuntime::default();
         let (events, _) = drive_turn(&mut voice, &mut guards, "run", None).await;

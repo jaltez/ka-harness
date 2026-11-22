@@ -36,3 +36,6 @@
 
 ### Batch 9 — permissions
 - Named permission profiles with one-level `extends`, activated by `[permissions] profile`; profile rules sort before `[[rules]]` · `ka rules check <command>` dry-runs your rules · `dontAsk` mode denies reviewable asks (hardstops still confirm) · `[permissions] prompt_policy = "deny"` for serve/CI · auto-review extended to write-tier asks (`auto_review_tier = "exec+write"`) · web-result prompt-injection screening (heuristic always, optional fast-role classifier) · `[shell]` env policy (all/core/none + keep/set).
+
+### Batch 10 — extensibility
+- Hook events: subagent_start/stop, pre/post model switch, post_compact, permission_request/denied · Hook handler types: HTTP endpoints (same JSON envelope) plus per-hook timeouts and async fire-and-forget · MCP per-server policy: enabled/disabled tool filters, approval modes (ask/auto/writes), per-tool timeouts and output caps · Enriched skills: `disable-model-invocation`, `paths` globs, `max_tokens` body cap, `!`cmd`` dynamic context · Enriched commands: `side` (side-question dispatch) and `shell` preamble · Output styles: `.ka/styles/*.md` + `/style` picker (session-scoped, built-in fallback).

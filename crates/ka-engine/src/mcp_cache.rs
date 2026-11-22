@@ -170,6 +170,11 @@ mod tests {
             env: std::collections::HashMap::new(),
             url: None,
             headers: Vec::new(),
+            enabled_tools: Vec::new(),
+            disabled_tools: Vec::new(),
+            approval: None,
+            tool_timeout_secs: None,
+            output_limit: None,
         }
     }
 
@@ -179,6 +184,7 @@ mod tests {
             raw_name: name.into(),
             description: "a tool".into(),
             schema: serde_json::json!({"type": "object"}),
+            read_only_hint: false,
         }
     }
 

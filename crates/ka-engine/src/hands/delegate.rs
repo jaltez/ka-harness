@@ -30,6 +30,9 @@ pub struct DelegateHand {
     tasks: Arc<super::tasks::AgentTaskTable>,
     /// Event sink for completion notes.
     events: mpsc::Sender<ka_protocol::Event>,
+    /// Configured `[[hooks]]` (EXT-01): `subagent_start` /
+    /// `subagent_stop` fire around every delegate run (advisory).
+    hooks: std::sync::Arc<Vec<crate::config::Hook>>,
 }
 
 impl DelegateHand {
@@ -49,7 +52,14 @@ impl DelegateHand {
             parent_mode,
             tasks,
             events,
+            hooks: std::sync::Arc::new(Vec::new()),
         }
+    }
+
+    /// Arm the subagent lifecycle hooks (EXT-01, engine bootstrap).
+    pub fn with_hooks(mut self, hooks: std::sync::Arc<Vec<crate::config::Hook>>) -> Self {
+        self.hooks = hooks;
+        self
     }
 
     /// Agents visible to the model right now (`agent:<name>` toggles).
@@ -190,12 +200,43 @@ track it with the tasks tool.",
                 let tasks = self.tasks.clone();
                 let events = self.events.clone();
                 let tasks_in = tasks.clone();
+                // EXT-01: subagent_start fires once the spawn is armed
+                fire_subagent_hook(
+                    &self.hooks,
+                    &self.features,
+                    &self.events,
+                    crate::config::HookEvent::SubagentStart,
+                    agent_name,
+                    &task,
+                    None,
+                    &ctx.cwd,
+                )
+                .await;
+                let hooks_in = self.hooks.clone();
+                let features_in = self.features.clone();
+                let events_in = self.events.clone();
+                let agent_hook = agent_name.to_string();
+                let task_hook = task.clone();
+                let hook_cwd_in = ctx.cwd.clone();
                 let runner = tokio::spawn(async move {
                     let (outcome, branch, cost) =
                         run_agent(def, task.clone(), cwd, source, parent_mode, roster, |tx| {
                             tasks_in.attach_cmds(id, tx)
                         })
                         .await;
+                    // EXT-01: subagent_stop fires when the runner
+                    // settled (cancelled tasks never reach this)
+                    fire_subagent_hook(
+                        &hooks_in,
+                        &features_in,
+                        &events_in,
+                        crate::config::HookEvent::SubagentStop,
+                        &agent_hook,
+                        &task_hook,
+                        Some(&outcome),
+                        &hook_cwd_in,
+                    )
+                    .await;
                     tasks_in.set_cost(id, cost);
                     if let Some(branch) = &branch {
                         tasks_in.set_branch(id, branch.clone());
@@ -215,6 +256,18 @@ track it with the tasks tool.",
             }
             let roster = Some(self.tasks.rows_except(None));
             let source = self.source.read().clone();
+            // EXT-01: the run is bracketed by subagent_start/stop
+            fire_subagent_hook(
+                &self.hooks,
+                &self.features,
+                &self.events,
+                crate::config::HookEvent::SubagentStart,
+                agent_name,
+                task,
+                None,
+                &ctx.cwd,
+            )
+            .await;
             let (outcome, _branch, _cost) = run_agent(
                 def.clone(),
                 task.to_string(),
@@ -225,11 +278,68 @@ track it with the tasks tool.",
                 |_| {},
             )
             .await;
+            fire_subagent_hook(
+                &self.hooks,
+                &self.features,
+                &self.events,
+                crate::config::HookEvent::SubagentStop,
+                agent_name,
+                task,
+                Some(&outcome),
+                &ctx.cwd,
+            )
+            .await;
             match outcome {
                 Ok(summary) => ToolOutput::ok(summary),
                 Err(e) => ToolOutput::err(e),
             }
         })
+    }
+}
+
+/// Fire one advisory subagent hook event (EXT-01 `subagent_start` /
+/// `subagent_stop`): failures surface as notes; nothing a hook outputs
+/// can change the spawn or its result. `outcome` rides the stop event
+/// (`status` finished|failed + a capped `summary`).
+#[allow(clippy::too_many_arguments)] // advisory fan-out: every arg is a distinct engine handle
+async fn fire_subagent_hook(
+    hooks: &[crate::config::Hook],
+    features: &crate::features::FeatureSlot,
+    events: &mpsc::Sender<ka_protocol::Event>,
+    event: crate::config::HookEvent,
+    agent: &str,
+    task: &str,
+    outcome: Option<&Result<String, String>>,
+    cwd: &std::path::Path,
+) {
+    if hooks.is_empty() || !features.read().hooks_enabled() {
+        return;
+    }
+    let mut payload = serde_json::json!({
+        "event": event.wire_name(),
+        "agent": agent,
+        "task": task,
+    });
+    if let Some(outcome) = outcome {
+        payload["status"] = serde_json::json!(if outcome.is_ok() {
+            "finished"
+        } else {
+            "failed"
+        });
+        payload["summary"] = serde_json::json!(match outcome {
+            Ok(summary) => truncate_for_note(summary, 200),
+            Err(reason) => truncate_for_note(reason, 200),
+        });
+    }
+    let (failures, _steer) =
+        crate::voice::run_event_scripts(hooks, event, None, &payload, cwd, Some(events)).await;
+    for reason in failures {
+        events
+            .send(ka_protocol::Event::Note {
+                message: format!("{} hook: {reason}", event.wire_name()),
+            })
+            .await
+            .ok();
     }
 }
 
@@ -291,15 +401,31 @@ impl DelegateHand {
         let mut handles = Vec::with_capacity(picked.len());
         for entry in picked {
             let sem = sem.clone();
+            let hooks = self.hooks.clone();
+            let features = self.features.clone();
+            let events = self.events.clone();
             handles.push(tokio::spawn(async move {
                 let _permit = sem.acquire().await;
                 match entry {
                     Ok(job) => {
                         let name = job.def.name.clone();
+                        // EXT-01: each fanout leg brackets its own
+                        // subagent_start/stop
+                        fire_subagent_hook(
+                            &hooks,
+                            &features,
+                            &events,
+                            crate::config::HookEvent::SubagentStart,
+                            &name,
+                            &job.task,
+                            None,
+                            &job.cwd,
+                        )
+                        .await;
                         let out = run_agent(
                             job.def,
-                            job.task,
-                            job.cwd,
+                            job.task.clone(),
+                            job.cwd.clone(),
                             job.source,
                             job.parent_mode,
                             None,
@@ -307,6 +433,17 @@ impl DelegateHand {
                         )
                         .await
                         .0;
+                        fire_subagent_hook(
+                            &hooks,
+                            &features,
+                            &events,
+                            crate::config::HookEvent::SubagentStop,
+                            &name,
+                            &job.task,
+                            Some(&out),
+                            &job.cwd,
+                        )
+                        .await;
                         (Some(name), out)
                     }
                     Err(reason) => (None, Err(reason)),

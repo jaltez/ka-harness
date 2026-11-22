@@ -43,6 +43,29 @@ pub struct McpServerConfig {
     /// Extra HTTP headers (url transports, e.g. auth).
     #[serde(default)]
     pub headers: Vec<(String, String)>,
+    /// EXT-04 allowlist of tool names (raw or wire names, matched
+    /// against both). Empty = every tool is offered. `disabled_tools`
+    /// wins on a name present in both.
+    #[serde(default)]
+    pub enabled_tools: Vec<String>,
+    /// EXT-04 denylist of tool names (raw or wire names). A disabled
+    /// tool is filtered from eager registration, lazy listings, and
+    /// rejected at call time.
+    #[serde(default)]
+    pub disabled_tools: Vec<String>,
+    /// EXT-04 ask policy for this server's tools. Default
+    /// [`McpApproval::Ask`].
+    #[serde(default)]
+    pub approval: Option<McpApproval>,
+    /// EXT-04 per-call timeout in seconds for `tools/call` requests
+    /// against this server. Unset keeps the protocol default
+    /// ([`REQUEST_TIMEOUT`], 30 s).
+    #[serde(default)]
+    pub tool_timeout_secs: Option<u64>,
+    /// EXT-04 result cap in characters. A longer result is cut on the
+    /// cap with a truncation note.
+    #[serde(default)]
+    pub output_limit: Option<usize>,
 }
 
 impl McpServerConfig {
@@ -60,6 +83,65 @@ impl McpServerConfig {
             )),
         }
     }
+
+    /// EXT-04 tool filter: `disabled_tools` wins over `enabled_tools`;
+    /// an empty allowlist admits everything else. Entries match a
+    /// tool's raw name or its wire name.
+    pub fn tool_enabled(&self, raw_name: &str, wire_name: &str) -> bool {
+        if self
+            .disabled_tools
+            .iter()
+            .any(|t| t == raw_name || t == wire_name)
+        {
+            return false;
+        }
+        self.enabled_tools.is_empty()
+            || self
+                .enabled_tools
+                .iter()
+                .any(|t| t == raw_name || t == wire_name)
+    }
+
+    /// The effective ask policy (default ask).
+    pub fn effective_approval(&self) -> McpApproval {
+        self.approval.unwrap_or_default()
+    }
+
+    /// The effective per-call timeout.
+    pub fn effective_tool_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.tool_timeout_secs.unwrap_or(30).max(1))
+    }
+
+    /// The effective result cap in characters, if set (0 is treated as
+    /// unset).
+    pub fn effective_output_limit(&self) -> Option<usize> {
+        self.output_limit.filter(|l| *l > 0)
+    }
+}
+
+/// EXT-04 ask policy for one server's tools (`approval` in `[[mcp]]`).
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum McpApproval {
+    /// Normal permission gate (the default).
+    #[default]
+    Ask,
+    /// This server's tools skip the permission ask entirely (deny-class
+    /// verdicts and hardstops still apply).
+    Auto,
+    /// Only tools advertised with `readOnlyHint = false` ask;
+    /// read-only tools run without the ask.
+    Writes,
 }
 
 /// One tool advertised by a server.
@@ -73,6 +155,11 @@ pub struct McpTool {
     pub description: String,
     /// JSON schema for the arguments object.
     pub schema: Value,
+    /// The tool's `annotations.readOnlyHint` (EXT-04). Unadvertised =
+    /// false: under the `writes` approval policy only explicitly
+    /// read-only tools skip the ask.
+    #[serde(default)]
+    pub read_only_hint: bool,
 }
 
 /// One resource advertised by a server.
@@ -363,13 +450,18 @@ impl McpClient {
         &self.server_name
     }
 
-    async fn request(&mut self, method: &str, params: Value) -> Result<Value, String> {
+    async fn request(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout: std::time::Duration,
+    ) -> Result<Value, String> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let msg = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
         match &mut self.transport {
             // streamable HTTP: the response rides the POST itself
             Transport::StreamableHttp(rpc) => {
-                let resp = tokio::time::timeout(REQUEST_TIMEOUT, rpc.post(&msg))
+                let resp = tokio::time::timeout(timeout, rpc.post(&msg))
                     .await
                     .map_err(|_| format!("{method}: request timed out"))?
                     .map_err(|e| e.message)?
@@ -385,7 +477,7 @@ impl McpClient {
                 let (tx, rx) = oneshot::channel();
                 self.pending.lock().await.insert(id, tx);
                 self.send_msg(&msg).await?;
-                let resp = tokio::time::timeout(REQUEST_TIMEOUT, rx)
+                let resp = tokio::time::timeout(timeout, rx)
                     .await
                     .map_err(|_| format!("{method}: server timed out"))?
                     .map_err(|_| format!("{method}: reader dropped the reply"))?;
@@ -430,6 +522,7 @@ impl McpClient {
                 "capabilities": {},
                 "clientInfo": {"name": "ka", "version": env!("CARGO_PKG_VERSION")},
             }),
+            REQUEST_TIMEOUT,
         )
         .await?;
         self.notify("notifications/initialized", json!({})).await?;
@@ -442,16 +535,30 @@ impl McpClient {
     }
 
     async fn list_tools(&mut self) -> Result<Vec<McpTool>, String> {
-        let result = self.request("tools/list", json!({})).await?;
+        let result = self
+            .request("tools/list", json!({}), REQUEST_TIMEOUT)
+            .await?;
         parse_tools(&result, &self.server_name)
     }
 
     /// Invoke a tool; returns the concatenated text content.
     pub async fn call_tool(&mut self, tool: &str, args: Value) -> Result<String, String> {
+        self.call_tool_timeout(tool, args, REQUEST_TIMEOUT).await
+    }
+
+    /// [`Self::call_tool`] with an explicit per-call timeout (EXT-04
+    /// `[[mcp]] tool_timeout_secs`).
+    pub async fn call_tool_timeout(
+        &mut self,
+        tool: &str,
+        args: Value,
+        timeout: std::time::Duration,
+    ) -> Result<String, String> {
         let result = self
             .request(
                 "tools/call",
                 json!({"name": tool, "arguments": args.as_object().cloned().unwrap_or_default()}),
+                timeout,
             )
             .await?;
         if result["isError"].as_bool().unwrap_or(false) {
@@ -462,7 +569,9 @@ impl McpClient {
 
     /// List resources advertised by the server.
     pub async fn list_resources(&mut self) -> Result<Vec<McpResource>, String> {
-        let result = self.request("resources/list", json!({})).await?;
+        let result = self
+            .request("resources/list", json!({}), REQUEST_TIMEOUT)
+            .await?;
         let items = result["resources"].as_array().ok_or_else(|| {
             "resources/list: no resources array (server may lack resources support)".to_string()
         })?;
@@ -481,7 +590,9 @@ impl McpClient {
 
     /// Read one resource; returns the concatenated text contents.
     pub async fn read_resource(&mut self, uri: &str) -> Result<String, String> {
-        let result = self.request("resources/read", json!({"uri": uri})).await?;
+        let result = self
+            .request("resources/read", json!({"uri": uri}), REQUEST_TIMEOUT)
+            .await?;
         let parts = result["contents"]
             .as_array()
             .ok_or_else(|| "resources/read: no contents array".to_string())?;
@@ -494,7 +605,9 @@ impl McpClient {
 
     /// List prompts advertised by the server with their argument names.
     pub async fn list_prompts(&mut self) -> Result<Vec<McpPrompt>, String> {
-        let result = self.request("prompts/list", json!({})).await?;
+        let result = self
+            .request("prompts/list", json!({}), REQUEST_TIMEOUT)
+            .await?;
         let items = result["prompts"].as_array().ok_or_else(|| {
             "prompts/list: no prompts array (server may lack prompts support)".to_string()
         })?;
@@ -531,6 +644,7 @@ impl McpClient {
                     "name": name,
                     "arguments": args,
                 }),
+                REQUEST_TIMEOUT,
             )
             .await?;
         let messages = result["messages"]
@@ -558,7 +672,10 @@ impl McpClient {
     pub async fn alive(&mut self) -> bool {
         match &mut self.transport {
             Transport::Stdio { child, .. } => matches!(child.try_wait(), Ok(None)),
-            _ => self.request("ping", json!({})).await.is_ok(),
+            _ => self
+                .request("ping", json!({}), REQUEST_TIMEOUT)
+                .await
+                .is_ok(),
         }
     }
 
@@ -645,6 +762,31 @@ impl McpShared {
         &self.cfg.name
     }
 
+    /// The server's configured policy ([`McpServerConfig`]).
+    pub fn cfg(&self) -> &McpServerConfig {
+        &self.cfg
+    }
+
+    /// The tools the model may see: the live tool list with the EXT-04
+    /// `enabled_tools`/`disabled_tools` filters applied (`disabled`
+    /// wins). Empty while disconnected.
+    pub fn model_tools(&self) -> Vec<McpTool> {
+        self.tools
+            .lock()
+            .clone()
+            .into_iter()
+            .filter(|t| self.cfg.tool_enabled(&t.raw_name, &t.name))
+            .collect()
+    }
+
+    /// Find a policy-visible tool by raw or wire name (EXT-04: a
+    /// filtered-out tool resolves to `None`).
+    pub fn find_model_tool(&self, name: &str) -> Option<McpTool> {
+        self.model_tools()
+            .into_iter()
+            .find(|t| t.raw_name == name || t.name == name)
+    }
+
     /// The current tool list (empty while disconnected).
     pub fn tools(&self) -> Vec<McpTool> {
         self.tools.lock().clone()
@@ -678,6 +820,35 @@ impl McpShared {
             Some(c) => c.call_tool(tool, args).await,
             None => Err(format!("mcp {}: disconnected", self.cfg.name)),
         }
+    }
+
+    /// [`Self::call_tool`] through the EXT-04 policy: the configured
+    /// `tool_timeout_secs` bounds the call and `output_limit` caps the
+    /// result (truncation note appended). One entry point for both the
+    /// eager per-tool hands and the lazy `mcp_call` path.
+    pub async fn call_model_tool(&self, tool: &str, args: Value) -> Result<String, String> {
+        let timeout = self.cfg.effective_tool_timeout();
+        let mut guard = self.cell.lock().await;
+        let text = match guard.as_mut() {
+            Some(c) => match tokio::time::timeout(timeout, c.call_tool(tool, args)).await {
+                Ok(r) => r?,
+                Err(_) => {
+                    return Err(format!(
+                        "mcp {}: tool call timed out after {}s",
+                        self.cfg.name,
+                        timeout.as_secs()
+                    ));
+                }
+            },
+            None => return Err(format!("mcp {}: disconnected", self.cfg.name)),
+        };
+        Ok(match self.cfg.effective_output_limit() {
+            Some(limit) if text.chars().count() > limit => {
+                let cut: String = text.chars().take(limit).collect();
+                format!("{cut}\n[mcp output truncated at {limit} chars]")
+            }
+            _ => text,
+        })
     }
 
     /// List resources through the current client.
@@ -734,7 +905,7 @@ impl McpShared {
         let Some(c) = guard.as_mut() else {
             return Err(format!("mcp {}: disconnected", self.cfg.name));
         };
-        let result = c.request("tools/list", json!({})).await?;
+        let result = c.request("tools/list", json!({}), REQUEST_TIMEOUT).await?;
         parse_tools(&result, &self.cfg.name)
     }
 
@@ -853,11 +1024,17 @@ fn parse_tools(result: &Value, server_name: &str) -> Result<Vec<McpTool>, String
                 .get("inputSchema")
                 .cloned()
                 .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+            let read_only_hint = t
+                .get("annotations")
+                .and_then(|a| a.get("readOnlyHint"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             Some(McpTool {
                 name: wire_name(server_name, &raw_name),
                 raw_name,
                 description,
                 schema,
+                read_only_hint,
             })
         })
         .collect())
@@ -1005,7 +1182,7 @@ impl crate::hands::Hand for McpHand {
             },
             parameters: self.tool.schema.clone(),
             clearance: crate::hands::Clearance::Exec,
-            read_only: false,
+            read_only: self.tool.read_only_hint,
         }
     }
 
@@ -1018,7 +1195,8 @@ impl crate::hands::Hand for McpHand {
         let args = args.clone();
         let shared = self.shared.clone();
         Box::pin(async move {
-            match shared.call_tool(&tool, args).await {
+            // EXT-04: the per-server timeout + output cap ride this path
+            match shared.call_model_tool(&tool, args).await {
                 Ok(text) if text.trim().is_empty() => {
                     crate::hands::ToolOutput::ok("(empty result)".to_string())
                 }
@@ -1083,7 +1261,7 @@ impl crate::hands::Hand for McpCallHand {
              to list that server's tools first. Servers: ",
         );
         for s in self.visible() {
-            listing.push_str(&format!("{} ({} tools), ", s.name(), s.tools().len()));
+            listing.push_str(&format!("{} ({} tools), ", s.name(), s.model_tools().len()));
         }
         crate::hands::HandDef {
             name: "mcp_call".to_string(),
@@ -1117,7 +1295,7 @@ impl crate::hands::Hand for McpCallHand {
             };
             let Some(tool) = args.get("tool").and_then(Value::as_str) else {
                 let mut out = String::new();
-                for t in shared.tools() {
+                for t in shared.model_tools() {
                     let desc = if t.description.is_empty() {
                         String::new()
                     } else {
@@ -1133,14 +1311,18 @@ impl crate::hands::Hand for McpCallHand {
                     crate::hands::ToolOutput::ok(out)
                 };
             };
-            let raw = shared
-                .tools()
-                .iter()
-                .find(|t| t.name == tool || t.raw_name == tool)
-                .map(|t| t.raw_name.clone())
-                .unwrap_or_else(|| tool.to_string());
+            // EXT-04: a policy-filtered tool refuses here — it never
+            // reaches the server
+            let Some(target) = shared.find_model_tool(tool) else {
+                return crate::hands::ToolOutput::err(format!(
+                    "mcp_call: tool {tool:?} is not available on server {server:?} \
+                     (filtered by the [[mcp]] enabled_tools/disabled_tools policy, \
+                     unknown, or the server is disconnected)"
+                ));
+            };
             let call_args = args.get("arguments").cloned().unwrap_or_else(|| json!({}));
-            match shared.call_tool(&raw, call_args).await {
+            // EXT-04: the per-server timeout + output cap ride this path
+            match shared.call_model_tool(&target.raw_name, call_args).await {
                 Ok(text) if text.trim().is_empty() => {
                     crate::hands::ToolOutput::ok("(empty result)".to_string())
                 }
@@ -1358,6 +1540,11 @@ for line in sys.stdin:
             env: HashMap::new(),
             url: None,
             headers: Vec::new(),
+            enabled_tools: Vec::new(),
+            disabled_tools: Vec::new(),
+            approval: None,
+            tool_timeout_secs: None,
+            output_limit: None,
         }
     }
 
@@ -1561,6 +1748,11 @@ for line in sys.stdin:
             env: HashMap::new(),
             url: Some(format!("http://{addr}/mcp")),
             headers: vec![("Authorization".into(), "Bearer t".into())],
+            enabled_tools: Vec::new(),
+            disabled_tools: Vec::new(),
+            approval: None,
+            tool_timeout_secs: None,
+            output_limit: None,
         };
         let (mut client, tools) = McpClient::spawn_connect(&cfg).await.unwrap();
         assert_eq!(tools.len(), 1);
@@ -1673,6 +1865,11 @@ for line in sys.stdin:
             env: HashMap::new(),
             url: Some(format!("http://{addr}/sse")),
             headers: Vec::new(),
+            enabled_tools: Vec::new(),
+            disabled_tools: Vec::new(),
+            approval: None,
+            tool_timeout_secs: None,
+            output_limit: None,
         };
         let (_client, tools) = McpClient::spawn_connect(&cfg).await.unwrap();
         assert_eq!(tools.len(), 1);
@@ -1727,6 +1924,11 @@ for line in sys.stdin:
             env: HashMap::new(),
             url: Some(format!("http://{addr}/mcp")),
             headers: Vec::new(),
+            enabled_tools: Vec::new(),
+            disabled_tools: Vec::new(),
+            approval: None,
+            tool_timeout_secs: None,
+            output_limit: None,
         };
         let (client, _tools) = McpClient::spawn_connect(&cfg).await.unwrap();
         let shared = McpShared::new(cfg, client, Vec::new());
