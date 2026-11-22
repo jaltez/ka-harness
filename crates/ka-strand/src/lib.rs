@@ -4,6 +4,7 @@
 //! session-file management used by the engine: ids, settings replay,
 //! listing, and dangling-turn synthesis.
 
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -364,6 +365,13 @@ pub fn strand_dir(cwd: &Path) -> PathBuf {
         }
     }
     dir
+}
+
+/// The archived-strand sibling of [`strand_dir`]: the same cwd encoding
+/// under a parallel `strands-archived` tree, so [`archive`] moves a
+/// session out of the live listing's reach without renaming keys.
+fn archived_strand_dir(cwd: &Path) -> PathBuf {
+    data_dir().join("strands-archived").join(encode_cwd(cwd))
 }
 
 /// Windows long paths: past ~240 chars, std::fs calls fail at MAX_PATH
@@ -825,10 +833,12 @@ struct UsageProbe {
     cache_write: u64,
 }
 
-pub fn list(cwd: &Path) -> std::io::Result<Vec<StrandSummary>> {
-    let dir = strand_dir(cwd);
+/// Summarize every .jsonl strand under `dir`, newest first (shared by
+/// [`list`] and [`list_archived`]). A missing directory is an empty
+/// listing, like `list` always treated fresh cwds.
+fn summaries_in(dir: &Path) -> std::io::Result<Vec<StrandSummary>> {
     let mut summaries = Vec::new();
-    let entries = match std::fs::read_dir(store_path(&dir)) {
+    let entries = match std::fs::read_dir(store_path(dir)) {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(summaries),
         Err(e) => return Err(e),
@@ -846,6 +856,22 @@ pub fn list(cwd: &Path) -> std::io::Result<Vec<StrandSummary>> {
     // first even when RFC 3339 timestamps tie at second granularity.
     summaries.sort_by(|a, b| b.id.cmp(&a.id));
     Ok(summaries)
+}
+
+/// List strands for a working directory, newest first. Scans cheaply:
+/// full parse for the header line only, `"record":…` prefix tests for
+/// counting/summing, and one partial probe for the title — no
+/// per-record deserialization of calls/results.
+pub fn list(cwd: &Path) -> std::io::Result<Vec<StrandSummary>> {
+    summaries_in(&strand_dir(cwd))
+}
+
+/// The archived mirror of [`list`]: summaries for every strand filed
+/// under `<data_dir>/strands-archived/<encoded-cwd>/` (by [`archive`]),
+/// newest first. Tolerant by signature — a missing archive tree is an
+/// empty vec (nothing archived yet), never an error.
+pub fn list_archived(cwd: &Path) -> Vec<StrandSummary> {
+    summaries_in(&archived_strand_dir(cwd)).unwrap_or_default()
 }
 
 /// One strand's header (first line only): `(id, ts, parent)`.
@@ -976,6 +1002,149 @@ pub fn latest(cwd: &Path) -> std::io::Result<Option<StrandSummary>> {
         .into_iter()
         .next()
         .and_then(|(path, _)| summarize(&path)))
+}
+
+/// Append a [`Record::Title`] to the strand at `path`: replay and
+/// [`list`] then report `title` as the display title, while every other
+/// record — messages, the memorable [`Record::Name`] alias, settings —
+/// stays untouched (the `ka session rename` contract). Errors when the
+/// file is missing or is not a strand (no header record).
+pub fn retitle(path: &Path, title: &str) -> std::io::Result<()> {
+    if !path.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("no strand file at {}", path.display()),
+        ));
+    }
+    let mut strand = StrandFile::open(path)?;
+    strand.append(Record::Title {
+        id: new_record_id(),
+        title: title.to_string(),
+    })
+}
+
+/// Delete the strand at `path` and, in cascade, every sibling strand
+/// whose header-declared `parent` chain reaches one of the doomed ids.
+/// Returns the number of files removed, the original included. Sibling
+/// headers are scanned first-line-only (one cheap read per .jsonl);
+/// strands without a parent edge into the doomed set — even forked ones
+/// whose parent is unrelated — survive. Refuses anything that is not a
+/// `.jsonl` file with a strand header.
+pub fn delete_cascade(path: &Path) -> std::io::Result<u32> {
+    if !path.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("no strand file at {}", path.display()),
+        ));
+    }
+    if path.extension().is_none_or(|e| e != "jsonl") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "not a strand file (missing .jsonl extension): {}",
+                path.display()
+            ),
+        ));
+    }
+    let Some((root_id, _, _)) = header_of(path) else {
+        return Err(std::io::Error::other(format!(
+            "not a strand file (missing header record): {}",
+            path.display()
+        )));
+    };
+    let dir = path.parent().ok_or_else(|| {
+        std::io::Error::other(format!(
+            "strand has no parent directory: {}",
+            path.display()
+        ))
+    })?;
+    // one first-line read per sibling .jsonl: id → (file, parent edge)
+    let mut strand_of: HashMap<String, (PathBuf, Option<String>)> = HashMap::new();
+    for entry in std::fs::read_dir(store_path(dir))?.flatten() {
+        let sibling = entry.path();
+        if sibling.extension().is_none_or(|e| e != "jsonl") {
+            continue;
+        }
+        if let Some((id, _, parent)) = header_of(&sibling) {
+            strand_of.insert(id, (sibling, parent));
+        }
+    }
+    // grow the doomed set to its fixpoint: every strand whose parent
+    // chain reaches the deleted root joins. The set only ever grows, so
+    // parent-pointer cycles cannot loop the scan — a cycle elsewhere in
+    // the dir stays disconnected and untouched.
+    let mut doomed: HashSet<&str> = HashSet::new();
+    doomed.insert(root_id.as_str());
+    loop {
+        let mut grew = false;
+        for (id, (_, parent)) in &strand_of {
+            if doomed.contains(id.as_str()) {
+                continue;
+            }
+            if parent.as_deref().is_some_and(|p| doomed.contains(p)) {
+                doomed.insert(id.as_str());
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    let mut removed = 0u32;
+    for id in &doomed {
+        if let Some((file, _)) = strand_of.get(*id) {
+            std::fs::remove_file(store_path(file))?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+/// Move the strand at `path` between the live store tree and the
+/// archived tree: `archived = true` files it under
+/// `<data_dir>/strands-archived/<encoded-cwd>/` (the store's own cwd
+/// encoding, carried over from the file's strand dir), `false` restores
+/// it to `<data_dir>/strands/<encoded-cwd>/`. Both directories are
+/// created as needed and the new path is returned. [`list`]/[`latest`]
+/// scan the live tree only, so an archived session drops out of resume
+/// pickers until unarchived; [`list_archived`] sees it. Refuses
+/// anything that is not a strand file with a header record.
+pub fn archive(path: &Path, archived: bool) -> std::io::Result<PathBuf> {
+    if !path.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("no strand file at {}", path.display()),
+        ));
+    }
+    if header_of(path).is_none() {
+        return Err(std::io::Error::other(format!(
+            "not a strand file (missing header record): {}",
+            path.display()
+        )));
+    }
+    let key = path
+        .parent()
+        .and_then(|p| p.file_name())
+        .ok_or_else(|| {
+            std::io::Error::other(format!(
+                "strand has no parent directory: {}",
+                path.display()
+            ))
+        })?
+        .to_owned();
+    let name = path.file_name().ok_or_else(|| {
+        std::io::Error::other(format!("strand has no file name: {}", path.display()))
+    })?;
+    let tree = if archived {
+        "strands-archived"
+    } else {
+        "strands"
+    };
+    let dest_dir = data_dir().join(tree).join(&key);
+    std::fs::create_dir_all(store_path(&dest_dir))?;
+    let dest = dest_dir.join(name);
+    std::fs::rename(store_path(path), store_path(&dest))?;
+    Ok(dest)
 }
 
 /// Outcome of resolving a user-supplied session reference.

@@ -101,6 +101,14 @@ struct Cli {
     /// temp data dir removed at exit (TUI and `ka run` only)
     #[arg(long)]
     ephemeral: bool,
+    /// Load a profile layer on top of the user config
+    /// (~/.config/ka/profiles/<name>.toml; missing file is a hard error)
+    #[arg(long)]
+    profile: Option<String>,
+    /// Grant sandbox write access to an additional directory (repeatable;
+    /// file access only — .ka config and trust are not extended)
+    #[arg(long = "add-dir", value_name = "DIR")]
+    add_dirs: Vec<PathBuf>,
 }
 
 /// The Run variant carries the whole headless flag surface and dwarfs
@@ -160,6 +168,11 @@ enum CliCommand {
         /// changes (like the TUI's /review)
         #[arg(long)]
         review: bool,
+        /// Bidirectional RPC over stdio: read Command JSONL from stdin
+        /// (Prompt, Abort, Answer, SetModel, ...), write Event JSONL to
+        /// stdout; ends when stdin closes and the engine settles
+        #[arg(long)]
+        rpc: bool,
         /// Reasoning-effort override (off|low|medium|high|max)
         #[arg(long)]
         effort: Option<String>,
@@ -187,6 +200,12 @@ enum CliCommand {
         /// Leave no persistent trace (temp data dir, removed at exit)
         #[arg(long)]
         ephemeral: bool,
+        /// Load a profile layer on top of the user config
+        #[arg(long)]
+        profile: Option<String>,
+        /// Grant sandbox write access to an additional directory
+        #[arg(long = "add-dir", value_name = "DIR")]
+        add_dirs: Vec<PathBuf>,
         /// Write the final answer to this file instead of stdout
         /// (text mode only)
         #[arg(short = 'o', long, value_name = "FILE")]
@@ -322,6 +341,43 @@ enum CliCommand {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Run a command under ka's sandbox policy
+    /// (bwrap / firejail / landlock — the same policy bash children get)
+    Sandbox {
+        /// Force the fs sandbox even when `[sandbox] mode` is off
+        #[arg(long)]
+        fs: bool,
+        /// The command to run (joined into one shell line under the policy)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+    /// Queue a message into a live `ka serve` session
+    Queue {
+        /// Session id prefix, memorable name, or title substring
+        #[arg(long, value_name = "ID")]
+        session: String,
+        /// The message text to queue
+        #[arg(long, value_name = "TEXT")]
+        message: String,
+        /// Server address
+        #[arg(long, default_value = "127.0.0.1:8417")]
+        addr: String,
+        /// Bearer token (or KA_SERVE_TOKEN)
+        #[arg(long)]
+        token: Option<String>,
+    },
+    /// Import a session from another agent into a ka strand
+    /// (claude | codex; one-shot, never modifies the source)
+    ImportSession {
+        /// Source format: claude | codex
+        format: String,
+        /// Path to the source session file (.jsonl)
+        path: PathBuf,
+        /// Working directory the imported strand anchors to
+        /// (default: the current directory)
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+    },
     /// Observe a live `ka serve` session read-only (SSE; presence
     /// chips, no write path — prompting stays on the server API)
     Attach {
@@ -346,6 +402,15 @@ enum CliCommand {
         /// path, cost, tokens).
         #[arg(long)]
         json: bool,
+        /// List archived sessions instead (see `ka session archive`)
+        #[arg(long)]
+        archived: bool,
+    },
+    /// Manage one session: rename (retitle), delete (cascades to
+    /// children), archive / unarchive
+    Session {
+        #[command(subcommand)]
+        cmd: SessionCmd,
     },
     /// Restore the latest snapshot of the newest session here
     Undo,
@@ -403,6 +468,35 @@ enum ConfigCommand {
     },
     /// Print the config layer paths ka reads
     Path,
+}
+
+/// `ka session …`: one-session management backed by the strand store.
+#[derive(Subcommand, Clone)]
+enum SessionCmd {
+    /// Set the session's display title (the `/name` alias is untouched)
+    Rename {
+        /// Session id prefix or memorable name
+        id: String,
+        /// New display title
+        title: String,
+    },
+    /// Delete a session and every child forked from it
+    /// (irreversible; the waypointer falls back to the newest)
+    Delete {
+        /// Session id prefix
+        id: String,
+    },
+    /// Move a session out of the active list
+    /// (`ka sessions --archived` lists it; `unarchive` brings it back)
+    Archive {
+        /// Session id prefix
+        id: String,
+    },
+    /// Move an archived session back into the active list
+    Unarchive {
+        /// Session id prefix (searched in the archive)
+        id: String,
+    },
 }
 
 /// Ed25519 public key embedded at build time (`KA_PUBKEY=<base64>`); the
@@ -466,6 +560,7 @@ mod doctor;
 mod herdr;
 mod import;
 mod serve;
+mod session_import;
 mod skills;
 mod update;
 
@@ -698,11 +793,12 @@ fn load_surface_config(configs: &[PathBuf], cwd: &std::path::Path) -> Result<Con
         project,
         &FeatureFlags::default(),
         false,
+        None,
     )
 }
 
-/// Defaults < user (unless skipped) < project (if trusted) < extra files
-/// < env < flags.
+/// Defaults < user (unless skipped) < profile < project (if trusted) <
+/// extra files < env (`KA_*` per-key layer) < flags.
 fn load_config(
     configs: &[PathBuf],
     flag_model: Option<String>,
@@ -710,6 +806,7 @@ fn load_config(
     project_cwd: Option<PathBuf>,
     features: &FeatureFlags,
     skip_user: bool,
+    profile: Option<PathBuf>,
 ) -> Result<Config, String> {
     let mut cfg = Config::default();
 
@@ -720,7 +817,12 @@ fn load_config(
     // no project layer)
     let project = project_cwd.map(|cwd| ka_engine::project_root(&cwd).join(".ka/ka.toml"));
 
-    for path in user.iter().chain(project.iter()).chain(configs.iter()) {
+    let chain = user
+        .iter()
+        .chain(profile.iter())
+        .chain(project.iter())
+        .chain(configs.iter());
+    for path in chain {
         match std::fs::read_to_string(path) {
             Ok(text) => {
                 let layer = Config::parse_layer(&text, &path.display().to_string())
@@ -741,6 +843,25 @@ fn load_config(
         if !mode.is_empty() {
             cfg.mode = Some(parse_mode(&mode)?);
         }
+    }
+    // CFG-02: `KA_<KEY>` env layer — one variable per settable key,
+    // `__` spells the dot (`KA_TUI__MOUSE=native` → `tui.mouse`).
+    // Unknown suffixes are ignored (the KA_ namespace also carries
+    // runtime vars: KA_DATA_DIR, KA_HOOK, KA_SERVE_TOKEN, KA_TTY, ...);
+    // a known key with a bad value is a hard error naming the variable.
+    // The layer sits above the file layers, below flags.
+    for (var, value) in std::env::vars() {
+        let Some(suffix) = var.strip_prefix("KA_") else {
+            continue;
+        };
+        if suffix.is_empty() || var.as_str() == "KA_MODEL" || var.as_str() == "KA_MODE" {
+            continue;
+        }
+        let key = suffix.to_lowercase().replace("__", ".");
+        if !known_config_key(&key) {
+            continue;
+        }
+        apply_config_key(&mut cfg, &key, &value).map_err(|e| format!("{var}: {e}"))?;
     }
     if let Some(model) = flag_model {
         cfg.model = Some(model);
@@ -886,6 +1007,13 @@ fn config_set(key: &str, value: &str) -> Result<PathBuf, String> {
 /// Apply one `ka config set` key onto a config layer. The match IS the
 /// key table: adding a key here is the whole change.
 fn apply_config_key(cfg: &mut Config, key: &str, value: &str) -> Result<(), String> {
+    if !known_config_key(key) {
+        return Err(format!(
+            "unknown key {key:?} — see `ka config schema`; list-of-table keys \
+([[rules]], [[hooks]], [[mcp]], [[search]], [[verify.lints]], [[model_pins]]) \
+are file-edited only"
+        ));
+    }
     let list = |v: &str| -> Vec<String> {
         v.split(',')
             .map(str::trim)
@@ -963,20 +1091,84 @@ fn apply_config_key(cfg: &mut Config, key: &str, value: &str) -> Result<(), Stri
         "debug.enable" => cfg.debug.enable = Some(parse_bool(key, value)?),
         "verify.test" => cfg.verify.test = Some(value.to_string()),
         "prompt.identity_file" => cfg.prompt.identity_file = Some(value.to_string()),
+        "prompt.identity_inline" => cfg.prompt.identity_inline = Some(value.to_string()),
         "features.disable" => cfg.features.disable = list(value),
         "features.allow" => cfg.features.allow = list(value),
         "project_doc_fallback_filenames" => cfg.project_doc_fallback_filenames = list(value),
         "fallback.models" => cfg.fallback.models = list(value),
         "sandbox.allow_write" => cfg.sandbox.allow_write = list(value),
         other => {
-            return Err(format!(
-                "unknown key {other:?} — see `ka config schema`; list-of-table keys \
-([[rules]], [[hooks]], [[mcp]], [[search]], [[verify.lints]], [[model_pins]]) \
-are file-edited only"
-            ));
+            // known_config_key is the gatekeeper: reaching here with an
+            // unlisted key means the table and the const drifted
+            unreachable!("key {other:?} passed known_config_key but has no arm");
         }
     }
     Ok(())
+}
+
+/// Every key `ka config set` / the `KA_*` env layer accepts. The
+/// union-by-name and priority semantics live in `Config::overlay`
+/// (CFG-03); this table only gates spelling. Keep in sync with
+/// `apply_config_key` — the drift test proves it.
+const KNOWN_CONFIG_KEYS: &[&str] = &[
+    "model",
+    "effort",
+    "mode",
+    "roles.default",
+    "roles.fast",
+    "tui.header_glyph",
+    "tui.bell",
+    "tui.notify",
+    "tui.mouse",
+    "tui.herdr",
+    "tools.bash.background_after_ms",
+    "tools.read.max_image_mb",
+    "tools.web.allow_private_hosts",
+    "tools.mcp.discovery",
+    "git.auto_commit",
+    "guards.spend_usd",
+    "guards.context_pct",
+    "guards.auto_review",
+    "context.promote",
+    "pokes.max",
+    "update.repo",
+    "update.check",
+    "sandbox.mode",
+    "lsp.enable",
+    "lsp.write_through",
+    "debug.enable",
+    "verify.test",
+    "prompt.identity_file",
+    "prompt.identity_inline",
+    "features.disable",
+    "features.allow",
+    "project_doc_fallback_filenames",
+    "fallback.models",
+    "sandbox.allow_write",
+];
+
+/// Whether a key spelling is settable at all (set table / env layer).
+fn known_config_key(key: &str) -> bool {
+    KNOWN_CONFIG_KEYS.contains(&key)
+}
+
+/// `--profile <name>` layer path: `~/.config/ka/profiles/<name>.toml`,
+/// loaded between the user layer and the project layer.
+fn profile_layer_path(name: &str) -> Result<PathBuf, String> {
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(format!(
+            "--profile {name:?}: profile names are [a-zA-Z0-9_-] (they name a file)"
+        ));
+    }
+    let dir = ka_engine::config::user_config_path()
+        .parent()
+        .map(|p| p.join("profiles"))
+        .unwrap_or_else(|| PathBuf::from("profiles"));
+    Ok(dir.join(format!("{name}.toml")))
 }
 
 /// Print one key's effective value from the resolved config chain —
@@ -1168,6 +1360,8 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
         ignore_user_config: cli.ignore_user_config,
         ignore_rules: cli.ignore_rules,
         ephemeral: cli.ephemeral,
+        profile: cli.profile,
+        add_dirs: cli.add_dirs,
     };
     match cli.command {
         Some(CliCommand::Run {
@@ -1186,6 +1380,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             schema,
             print,
             review,
+            rpc,
             effort,
             image,
             offline,
@@ -1195,6 +1390,8 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             ignore_user_config,
             ignore_rules,
             ephemeral: _,
+            profile,
+            add_dirs,
             out,
             max_turns,
             max_budget_usd,
@@ -1248,6 +1445,9 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
                 offline,
                 ignore_user_config,
                 ignore_rules,
+                profile,
+                add_dirs,
+                rpc,
             };
             run_headless(
                 prompt,
@@ -1310,6 +1510,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
                 trusted_project_cwd(trust),
                 &FeatureFlags::default(),
                 false,
+                None,
             )?;
             let repo = cfg
                 .update
@@ -1364,7 +1565,8 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
         Some(CliCommand::Agents) => run_agents(),
         Some(CliCommand::Providers) => run_providers(),
         Some(CliCommand::Init) => run_init(),
-        Some(CliCommand::Sessions { json }) => run_sessions(json),
+        Some(CliCommand::Sessions { json, archived }) => run_sessions_archived(json, archived),
+        Some(CliCommand::Session { cmd }) => run_session_mgmt(cmd),
         Some(CliCommand::Rewind { turns }) => run_rewind(turns).await,
         Some(CliCommand::Export {
             out,
@@ -1390,6 +1592,29 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
                 }
             };
             import::run(&format, &path, layer, dry_run)
+        }
+        Some(CliCommand::Sandbox { fs, command }) => run_sandbox(fs, &command),
+        Some(CliCommand::Queue {
+            session,
+            message,
+            addr,
+            token,
+        }) => run_queue(&session, &message, &addr, token.as_deref()).await,
+        Some(CliCommand::ImportSession { format, path, cwd }) => {
+            let target = cwd
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+            let report = session_import::import_session(&format, &path, &target)?;
+            println!(
+                "imported {} record(s) ({} mapped, {} skipped) → {}",
+                report.records,
+                report.mapped,
+                report.skipped,
+                report.path.display()
+            );
+            for note in &report.notes {
+                println!("note: {note}");
+            }
+            Ok(ExitCode::SUCCESS)
         }
         Some(CliCommand::Attach {
             session,
@@ -1417,6 +1642,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
                     trusted_project_cwd(trust),
                     &FeatureFlags::default(),
                     false,
+                    None,
                 )?;
                 let text =
                     toml::to_string_pretty(&cfg).map_err(|e| format!("serialize config: {e}"))?;
@@ -1437,6 +1663,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
                     trusted_project_cwd(trust),
                     &FeatureFlags::default(),
                     false,
+                    None,
                 )?;
                 let text = config_get(&cfg, &key)?;
                 println!("{text}");
@@ -1509,6 +1736,9 @@ struct RunOpts {
     offline: bool,
     ignore_user_config: bool,
     ignore_rules: bool,
+    profile: Option<String>,
+    add_dirs: Vec<PathBuf>,
+    rpc: bool,
 }
 
 /// Exit code for a cost/time cap breach (distinct from abort=2 and
@@ -1540,17 +1770,35 @@ async fn run_headless(
         trusted_project_cwd(trust),
         &features,
         opts.ignore_user_config,
+        match opts.profile.as_deref() {
+            Some(name) => {
+                let path = profile_layer_path(name)?;
+                if !path.exists() {
+                    return Err(format!(
+                        "--profile {name}: no profile file at {}",
+                        path.display()
+                    ));
+                }
+                Some(path)
+            }
+            None => None,
+        },
     )?;
     apply_run_opts(&mut cfg, &opts);
-    let with_discovery = with_discovery && !opts.offline;
-    let prompt = match prompt {
-        Some(p) => p,
-        None => read_stdin()?,
-    };
-    if prompt.trim().is_empty() {
-        return Err("empty prompt".to_string());
+    if !opts.add_dirs.is_empty() {
+        for dir in &opts.add_dirs {
+            if !cfg
+                .sandbox
+                .allow_write
+                .contains(&dir.to_string_lossy().to_string())
+            {
+                cfg.sandbox
+                    .allow_write
+                    .push(dir.to_string_lossy().to_string());
+            }
+        }
     }
-
+    let with_discovery = with_discovery && !opts.offline;
     let cfg_model = cfg.model.clone();
     let catalog = build_catalog(dialects, with_discovery).await?;
     let choice = if let Some(id) = session {
@@ -1568,6 +1816,19 @@ async fn run_headless(
         ka_engine::StrandChoice::New
     };
     let mut handle = spawn_full(cfg, catalog, choice);
+    if opts.rpc {
+        // the stdin side of the protocol IS the prompt channel: reading
+        // a prompt here would swallow the host's command lines
+        return rpc_loop(handle).await;
+    }
+    let prompt = match prompt {
+        Some(p) => p,
+        None => read_stdin()?,
+    };
+    if prompt.trim().is_empty() {
+        return Err("empty prompt".to_string());
+    }
+
     handle
         .commands
         .send(Command::Prompt {
@@ -1716,6 +1977,245 @@ fn apply_run_opts(cfg: &mut Config, opts: &RunOpts) {
             }
         }
     }
+}
+
+/// `ka sandbox <cmd>`: run one command under the session's sandbox
+/// policy — the same bwrap/firejail/landlock wrapper bash children
+/// get, exposed for scripts and CI. Exit code passes through.
+fn run_sandbox(fs: bool, command: &[String]) -> Result<ExitCode, String> {
+    if command.is_empty() {
+        return Err(
+            "ka sandbox: a command is required (e.g. `ka sandbox -- cargo build`)".to_string(),
+        );
+    }
+    let trust = trust_for_cwd(false);
+    let mut cfg = load_config(
+        &[],
+        None,
+        None,
+        trusted_project_cwd(trust),
+        &FeatureFlags::default(),
+        false,
+        None,
+    )?;
+    if fs {
+        cfg.sandbox.mode = Some("fs".into());
+    }
+    let cwd = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
+    let policy = ka_sandbox::policy_from_config(&cfg.sandbox.to_policy_config(), &cwd)?;
+    if matches!(policy, ka_sandbox::Policy::Off) {
+        return Err(
+            "ka sandbox: the sandbox is off — set [sandbox] mode = \"fs\" or pass --fs".to_string(),
+        );
+    }
+    let line = command.join(" ");
+    let argv = ka_sandbox::wrap_command(&policy, &line, &cwd)?;
+    let (program, args) = argv.split_first().ok_or("empty sandbox argv")?;
+    let status = std::process::Command::new(program)
+        .args(args)
+        .status()
+        .map_err(|e| format!("spawn {program}: {e}"))?;
+    Ok(status
+        .code()
+        .and_then(|c| u8::try_from(c).ok())
+        .map(ExitCode::from)
+        .unwrap_or(ExitCode::FAILURE))
+}
+
+/// One blocking-ish HTTP/1.1 request against `ka serve` (queue's
+/// client; Connection: close, bounded by a 10 s timeout).
+async fn http_json_request(
+    addr: &str,
+    method: &str,
+    path: &str,
+    token: Option<&str>,
+    body: Option<&str>,
+) -> Result<(u16, String), String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let sock = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::net::TcpStream::connect(addr),
+    )
+    .await
+    .map_err(|_| format!("connect {addr}: timed out"))?
+    .map_err(|e| format!("connect {addr}: {e}"))?;
+    let (mut reader, mut writer) = sock.into_split();
+    let body = body.unwrap_or("");
+    let auth = token
+        .map(|t| format!("Authorization: Bearer {t}\r\n"))
+        .unwrap_or_default();
+    let req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n{auth}Content-Length: {}\r\nAccept: */*\r\n\r\n{body}",
+        body.len()
+    );
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        writer.write_all(req.as_bytes()),
+    )
+    .await
+    .map_err(|_| "write: timed out")?
+    .map_err(|e| format!("write: {e}"))?;
+    let mut buf = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        reader.read_to_end(&mut buf),
+    )
+    .await
+    .map_err(|_| "read: timed out")?
+    .map_err(|e| format!("read: {e}"))?;
+    let raw = String::from_utf8_lossy(&buf);
+    let (head, resp_body) = raw
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| "malformed HTTP response".to_string())?;
+    let status = head
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse::<u16>().ok())
+        .ok_or_else(|| "malformed HTTP status".to_string())?;
+    Ok((status, resp_body.to_string()))
+}
+
+/// `ka queue --session <id> --message <text>`: the write path against a
+/// live `ka serve` — resolve the session by id prefix, memorable name
+/// or title substring (unique match required), then POST the prompt.
+async fn run_queue(
+    session: &str,
+    message: &str,
+    addr: &str,
+    token: Option<&str>,
+) -> Result<ExitCode, String> {
+    let token = token.map(String::from).or_else(|| {
+        std::env::var("KA_SERVE_TOKEN")
+            .ok()
+            .filter(|t| !t.is_empty())
+    });
+    let (status, body) =
+        http_json_request(addr, "GET", "/sessions", token.as_deref(), None).await?;
+    if status != 200 {
+        return Err(format!("queue: HTTP {status} listing sessions: {body}"));
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("sessions: invalid JSON: {e}"))?;
+    let list = value.as_array().ok_or("sessions: unexpected shape")?;
+    let mut hits: Vec<(String, String)> = Vec::new();
+    for s in list {
+        let id = s.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+        let title = s.get("title").and_then(|v| v.as_str()).unwrap_or_default();
+        let name = s.get("name").and_then(|v| v.as_str()).unwrap_or_default();
+        let hit = id.starts_with(session)
+            || (!name.is_empty() && name == session)
+            || (!title.is_empty() && title.contains(session));
+        if hit {
+            hits.push((id.to_string(), format!("{title} [{id}]")));
+        }
+    }
+    match hits.len() {
+        0 => return Err(format!("queue: no live session matches {session:?}")),
+        1 => {}
+        _ => {
+            let shown: Vec<String> = hits.iter().take(5).map(|(_, l)| l.clone()).collect();
+            return Err(format!(
+                "queue: ambiguous session {session:?} — {} candidate(s): {}",
+                hits.len(),
+                shown.join(", ")
+            ));
+        }
+    }
+    let (id, label) = &hits[0];
+    let payload = serde_json::json!({ "text": message }).to_string();
+    let (status, body) = http_json_request(
+        addr,
+        "POST",
+        &format!("/sessions/{id}/prompt"),
+        token.as_deref(),
+        Some(&payload),
+    )
+    .await?;
+    if status != 200 {
+        return Err(format!("queue: HTTP {status}: {body}"));
+    }
+    println!("queued into {label}");
+    Ok(ExitCode::SUCCESS)
+}
+
+/// CLI-15 · `ka run --rpc`: bidirectional JSONL protocol over stdio.
+/// stdin carries one Command per line in the same serde shape the
+/// NDJSON output uses (e.g. `{"Prompt":{"text":"..."}}`,
+/// `{"Answer":{"question":"…","choice":0}}`, `{"Abort":null}`); stdout
+/// carries the Event stream (one JSON object per line). Asks are NOT
+/// auto-denied in this mode — the host decides. Ends when stdin closes
+/// and the engine settles.
+async fn rpc_loop(handle: ka_engine::EngineHandle) -> Result<ExitCode, String> {
+    use tokio::io::AsyncWriteExt;
+    use tokio::sync::mpsc;
+    let ka_engine::EngineHandle {
+        commands,
+        mut events,
+    } = handle;
+    let (lines_tx, mut lines_rx) = mpsc::channel::<String>(64);
+    tokio::task::spawn_blocking(move || {
+        use std::io::BufRead;
+        let stdin = std::io::stdin();
+        for line in stdin.lock().lines() {
+            match line {
+                Ok(l) => {
+                    if lines_tx.blocking_send(l).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    let mut stdout = tokio::io::stdout();
+    let mut final_stop: Option<Stop> = None;
+    let mut idle_seen = false;
+    let mut stdin_open = true;
+    loop {
+        tokio::select! {
+            line = lines_rx.recv(), if stdin_open => {
+                match line {
+                    Some(l) => {
+                        let t = l.trim();
+                        if t.is_empty() {
+                            continue;
+                        }
+                        match serde_json::from_str::<Command>(t) {
+                            Ok(c) => {
+                                if commands.send(c).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(e) => eprintln!("ka rpc: bad command line: {e}"),
+                        }
+                    }
+                    None => stdin_open = false,
+                }
+            }
+            event = events.recv() => {
+                let Some(event) = event else { break };
+                if let Event::TurnFinished { stop, .. } = &event {
+                    final_stop = Some(*stop);
+                }
+                if let Event::Idle = &event {
+                    idle_seen = true;
+                }
+                let line = to_line(&event).map_err(|e| format!("serialize event: {e}"))?;
+                stdout
+                    .write_all(line.as_bytes())
+                    .await
+                    .map_err(|e| format!("stdout: {e}"))?;
+                stdout.flush().await.map_err(|e| format!("stdout: {e}"))?;
+                if let Event::Idle = &event {
+                    if !stdin_open {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    exit_code_for(final_stop, idle_seen, idle_seen)
 }
 
 /// Terminal exit status of a headless run. A missing final stop with no
@@ -1962,6 +2462,19 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
         trusted_project_cwd(trust),
         &features,
         cli.ignore_user_config,
+        match cli.profile.as_deref() {
+            Some(name) => {
+                let path = profile_layer_path(name)?;
+                if !path.exists() {
+                    return Err(format!(
+                        "--profile {name}: no profile file at {}",
+                        path.display()
+                    ));
+                }
+                Some(path)
+            }
+            None => None,
+        },
     )?;
     let run_opts = RunOpts {
         images: image_parts(&cli.image)?,
@@ -2099,6 +2612,7 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
             trusted_project_cwd(trust),
             &features,
             cli.ignore_user_config,
+            None,
         )
         .map(|c| {
             (
@@ -2167,6 +2681,7 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
                 trusted_project_cwd(trust),
                 &FeatureFlags::default(),
                 false,
+                None,
             )?;
             let repo = cfg
                 .update
@@ -2297,9 +2812,13 @@ fn resolve_session(cwd: &std::path::Path, id: &str) -> Result<ka_engine::StrandC
 }
 
 /// `ka sessions`: list strands for this cwd with resolvable ids.
-fn run_sessions(json: bool) -> Result<ExitCode, String> {
+fn run_sessions_archived(json: bool, archived: bool) -> Result<ExitCode, String> {
     let cwd = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
-    let strands = ka_strand::list(&cwd).map_err(|e| format!("listing sessions: {e}"))?;
+    let strands = if archived {
+        ka_strand::list_archived(&cwd)
+    } else {
+        ka_strand::list(&cwd).map_err(|e| format!("listing sessions: {e}"))?
+    };
     if json {
         let rows: Vec<serde_json::Value> = strands
             .iter()
@@ -2321,7 +2840,11 @@ fn run_sessions(json: bool) -> Result<ExitCode, String> {
         return Ok(ExitCode::SUCCESS);
     }
     if strands.is_empty() {
-        println!("no sessions yet for {}", cwd.display());
+        if archived {
+            println!("no archived sessions for {}", cwd.display());
+        } else {
+            println!("no sessions yet for {}", cwd.display());
+        }
         return Ok(ExitCode::SUCCESS);
     }
     println!(
@@ -2346,6 +2869,81 @@ fn run_sessions(json: bool) -> Result<ExitCode, String> {
         );
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// `ka session …` — rename / delete (cascade) / archive / unarchive,
+/// resolving the id the same way `--session` does (live tree; unarchive
+/// resolves inside the archive tree instead).
+fn run_session_mgmt(cmd: SessionCmd) -> Result<ExitCode, String> {
+    let cwd = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
+    match cmd {
+        SessionCmd::Rename { id, title } => {
+            let path = resolve_session_path(&cwd, &id, false)?;
+            ka_strand::retitle(&path, &title).map_err(|e| format!("retitle: {e}"))?;
+            println!("{} — renamed to {title:?}", path.display());
+        }
+        SessionCmd::Delete { id } => {
+            let path = resolve_session_path(&cwd, &id, false)?;
+            let removed = ka_strand::delete_cascade(&path).map_err(|e| format!("delete: {e}"))?;
+            println!(
+                "deleted {removed} session(s) under {}",
+                path.parent().map(|p| p.display()).unwrap_or(path.display())
+            );
+        }
+        SessionCmd::Archive { id } => {
+            let path = resolve_session_path(&cwd, &id, false)?;
+            let new = ka_strand::archive(&path, true).map_err(|e| format!("archive: {e}"))?;
+            println!("archived → {}", new.display());
+        }
+        SessionCmd::Unarchive { id } => {
+            let list = ka_strand::list_archived(&cwd);
+            let hits: Vec<_> = list
+                .iter()
+                .filter(|s| {
+                    s.id.starts_with(id.as_str())
+                        || s.name.as_deref() == Some(id.as_str())
+                        || (!id.is_empty() && s.title.contains(id.as_str()))
+                })
+                .collect();
+            match hits.len() {
+                0 => return Err(format!("no archived session matches {id:?}")),
+                1 => {
+                    let new = ka_strand::archive(&hits[0].path, false)
+                        .map_err(|e| format!("unarchive: {e}"))?;
+                    println!("unarchived → {}", new.display());
+                }
+                _ => {
+                    let shown: Vec<String> = hits.iter().take(5).map(|s| s.id.clone()).collect();
+                    return Err(format!(
+                        "ambiguous id {id:?} — {} archived candidate(s): {}",
+                        hits.len(),
+                        shown.join(", ")
+                    ));
+                }
+            }
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Resolve a session reference to its strand file. `archived` searches
+/// the archive tree instead of the live one.
+fn resolve_session_path(cwd: &Path, id: &str, archived: bool) -> Result<PathBuf, String> {
+    if archived {
+        let hits: Vec<_> = ka_strand::list_archived(cwd)
+            .into_iter()
+            .filter(|s| s.id.starts_with(id) || s.name.as_deref() == Some(id))
+            .collect();
+        return match hits.len() {
+            0 => Err(format!("no archived session matches {id:?}")),
+            1 => Ok(hits[0].path.clone()),
+            _ => Err(format!("ambiguous id {id:?}")),
+        };
+    }
+    match resolve_session(cwd, id)? {
+        ka_engine::StrandChoice::Path(path) => Ok(path),
+        _ => Err("session did not resolve to a strand file".to_string()),
+    }
 }
 
 /// `ka undo`: restore the newest session's latest snapshot (headless).
@@ -2406,6 +3004,7 @@ async fn run_mcp() -> Result<ExitCode, String> {
         trusted_project_cwd(trust),
         &FeatureFlags::default(),
         false,
+        None,
     )?;
     if cfg.mcp.is_empty() {
         println!("no [[mcp]] servers configured (~/.config/ka/ka.toml or .ka/ka.toml)");
@@ -2645,7 +3244,7 @@ async fn run_rewind(turns: u32) -> Result<ExitCode, String> {
     };
     // rewind only reads strand files — it must not silently approve the
     // project's .ka layer (trust is a side effect no reader should trip)
-    let cfg = load_config(&[], None, None, None, &FeatureFlags::default(), false)?;
+    let cfg = load_config(&[], None, None, None, &FeatureFlags::default(), false, None)?;
     let catalog = build_catalog(&[], true).await?;
     let mut handle = ka_engine::spawn_full(cfg, catalog, choice);
     handle
@@ -3329,5 +3928,90 @@ mod audit_fix_tests {
         assert_eq!(deny_choice(&[ask(&["allow", "deny"])]), 1);
         // degenerate ask: fall back to the historical hardcoded 2
         assert_eq!(deny_choice(&[]), 2);
+    }
+}
+
+#[cfg(test)]
+mod config_surface_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    /// CFG-02/`ka config set`: the key table and `apply_config_key`
+    /// cannot drift — every listed key applies (a value-type error is
+    /// fine; the probe is deliberately not a valid number), and nothing
+    /// outside the table is ever applicable.
+    #[test]
+    fn known_config_keys_cover_the_apply_table() {
+        for key in KNOWN_CONFIG_KEYS {
+            let mut cfg = Config::default();
+            let err = apply_config_key(&mut cfg, key, "\u{0}probe");
+            let unknown = err.as_ref().is_err_and(|e| e.contains("unknown key"));
+            assert!(!unknown, "KNOWN_CONFIG_KEYS drifted: {key} is not applied");
+        }
+        let mut cfg = Config::default();
+        assert!(
+            apply_config_key(&mut cfg, "totally.bogus", "x")
+                .is_err_and(|e| e.contains("unknown key"))
+        );
+    }
+
+    /// CFG-02: `KA_<KEY>` env names map onto keys with `__` → dot.
+    #[test]
+    fn env_key_spelling_maps_double_underscore_to_dot() {
+        assert_eq!("TUI__MOUSE".to_lowercase().replace("__", "."), "tui.mouse");
+        assert!(known_config_key("tui.mouse"));
+        // single underscores stay underscores: runtime vars like
+        // KA_DEBUG_SETTLE land on unknown keys and are ignored
+        assert!(!known_config_key("debug.settle"));
+    }
+
+    /// `--profile` names name a file: charset is enforced.
+    #[test]
+    fn profile_names_are_file_safe() {
+        assert!(profile_layer_path("fast-models").is_ok());
+        assert!(profile_layer_path("ci_2").is_ok());
+        assert!(profile_layer_path("../evil").is_err());
+        assert!(profile_layer_path("").is_err());
+    }
+
+    /// Batch 2 CLI surface parses.
+    #[test]
+    fn structural_cli_parses() {
+        let cli = Cli::try_parse_from([
+            "ka",
+            "--profile",
+            "fast",
+            "--add-dir",
+            "/tmp/extra",
+            "run",
+            "--rpc",
+            "ignored",
+        ])
+        .unwrap();
+        assert_eq!(cli.profile.as_deref(), Some("fast"));
+        assert_eq!(cli.add_dirs.len(), 1);
+        let Some(CliCommand::Run { rpc, .. }) = cli.command else {
+            panic!("expected run");
+        };
+        assert!(rpc);
+
+        let cli =
+            Cli::try_parse_from(["ka", "sandbox", "--fs", "cargo", "build", "--release"]).unwrap();
+        let Some(CliCommand::Sandbox { fs, command }) = cli.command else {
+            panic!("expected sandbox");
+        };
+        assert!(fs);
+        assert_eq!(command, vec!["cargo", "build", "--release"]);
+
+        let cli =
+            Cli::try_parse_from(["ka", "queue", "--session", "abc", "--message", "ping"]).unwrap();
+        let Some(CliCommand::Queue {
+            session, message, ..
+        }) = cli.command
+        else {
+            panic!("expected queue");
+        };
+        assert_eq!(session, "abc");
+        assert_eq!(message, "ping");
     }
 }

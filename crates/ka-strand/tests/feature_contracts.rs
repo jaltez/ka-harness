@@ -380,3 +380,203 @@ fn history_persistence_and_ceiling_honor_the_policy() {
     assert_eq!(capped.records().len(), 3, "the session continues in memory");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The header strand id of a materialized strand (test helper).
+fn header_id(strand: &StrandFile) -> String {
+    match strand.records().first() {
+        Some(Record::Header { id, .. }) => id.0.clone(),
+        _ => unreachable!("every strand starts with a header"),
+    }
+}
+
+/// A user message record (test helper).
+fn user_msg(content: &str) -> Record {
+    Record::Message {
+        images: Vec::new(),
+        id: ka_strand::new_record_id(),
+        role: Role::User,
+        content: content.into(),
+        calls: Vec::new(),
+        results: Vec::new(),
+        thinking: None,
+    }
+}
+
+/// Retitle appends a Title record: the next read/listing reports the
+/// new display title while the memorable Name alias stays intact (the
+/// `ka session rename` contract).
+#[test]
+fn retitle_updates_title_and_keeps_name_alias() {
+    let _guard = DATA_DIR_LOCK.lock().unwrap();
+    let dir = temp_data_dir("retitle");
+    let cwd = dir.join("proj");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut strand = StrandFile::create(&cwd, None).unwrap();
+    strand.append(user_msg("original topic")).unwrap();
+    strand
+        .append(Record::Name {
+            id: ka_strand::new_record_id(),
+            name: "my-session".into(),
+        })
+        .unwrap();
+    let path = strand.path().unwrap().to_path_buf();
+    let id = header_id(&strand);
+    drop(strand);
+
+    ka_strand::retitle(&path, "renamed topic").unwrap();
+
+    // re-legible: replay reports the appended title
+    let reopened = StrandFile::open(&path).unwrap();
+    assert_eq!(
+        ka_strand::title_of(reopened.records()),
+        "renamed topic",
+        "the appended Title must become the effective title"
+    );
+    // listing agrees, and the alias survives
+    let summary = ka_strand::list(&cwd)
+        .unwrap()
+        .into_iter()
+        .find(|s| s.id == id)
+        .expect("retitled strand listed");
+    assert_eq!(summary.title, "renamed topic");
+    assert_eq!(
+        summary.name.as_deref(),
+        Some("my-session"),
+        "the Name alias must survive a retitle"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Cascade delete removes the strand and every descendant whose parent
+/// chain reaches it — counting all removed files — while strands
+/// without an edge into the doomed set survive, even forked ones (the
+/// `ka session delete` contract).
+#[test]
+fn delete_cascade_removes_tree_leaves_unrelated() {
+    let _guard = DATA_DIR_LOCK.lock().unwrap();
+    let dir = temp_data_dir("delete-cascade");
+    let cwd = dir.join("proj");
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    let mut parent = StrandFile::create(&cwd, None).unwrap();
+    parent.append(user_msg("trunk")).unwrap();
+    let parent_path = parent.path().unwrap().to_path_buf();
+    let parent_id = header_id(&parent);
+    drop(parent);
+
+    let mut child = StrandFile::create(&cwd, None).unwrap();
+    child.set_parent(&parent_id);
+    child.append(user_msg("offshoot")).unwrap();
+    let child_path = child.path().unwrap().to_path_buf();
+    let child_id = header_id(&child);
+    drop(child);
+
+    let mut grandchild = StrandFile::create(&cwd, None).unwrap();
+    grandchild.set_parent(&child_id);
+    grandchild.append(user_msg("off-offshoot")).unwrap();
+    let grandchild_path = grandchild.path().unwrap().to_path_buf();
+    drop(grandchild);
+
+    // an unrelated trunk with its own fork: a parent pointer alone must
+    // not doom a strand — only an edge INTO the doomed set does
+    let mut unrelated = StrandFile::create(&cwd, None).unwrap();
+    unrelated.append(user_msg("unrelated trunk")).unwrap();
+    let unrelated_path = unrelated.path().unwrap().to_path_buf();
+    let unrelated_id = header_id(&unrelated);
+    drop(unrelated);
+
+    let mut unrelated_child = StrandFile::create(&cwd, None).unwrap();
+    unrelated_child.set_parent(&unrelated_id);
+    unrelated_child.append(user_msg("unrelated fork")).unwrap();
+    let unrelated_child_path = unrelated_child.path().unwrap().to_path_buf();
+    drop(unrelated_child);
+
+    let removed = ka_strand::delete_cascade(&parent_path).unwrap();
+    assert_eq!(removed, 3, "parent → child → grandchild = 3 files");
+    for gone in [&parent_path, &child_path, &grandchild_path] {
+        assert!(!gone.exists(), "{gone:?} must be deleted");
+    }
+    for kept in [&unrelated_path, &unrelated_child_path] {
+        assert!(kept.exists(), "{kept:?} must survive the cascade");
+    }
+    let survivors = ka_strand::list(&cwd).unwrap();
+    assert_eq!(survivors.len(), 2, "{survivors:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Archive files a strand out of the live tree — `list` and `latest` no
+/// longer see it, `list_archived` does — and unarchive restores it to
+/// its original store path (the `ka session archive` contract).
+#[test]
+fn archive_hides_from_list_and_unarchive_restores() {
+    let _guard = DATA_DIR_LOCK.lock().unwrap();
+    let dir = temp_data_dir("archive");
+    let cwd = dir.join("proj");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut strand = StrandFile::create(&cwd, None).unwrap();
+    strand.append(user_msg("archivable session")).unwrap();
+    let path = strand.path().unwrap().to_path_buf();
+    let id = header_id(&strand);
+    drop(strand);
+
+    assert_eq!(ka_strand::list(&cwd).unwrap().len(), 1);
+    assert!(ka_strand::list_archived(&cwd).is_empty());
+
+    let archived_path = ka_strand::archive(&path, true).unwrap();
+    assert!(!path.exists(), "the live file must move away");
+    assert!(archived_path.exists());
+    assert_ne!(archived_path, path);
+    // same cwd encoding, parallel tree
+    assert!(
+        archived_path.starts_with(dir.join("strands-archived")),
+        "{archived_path:?} must live in the archive tree"
+    );
+    // the live listing goes blind to it
+    assert!(ka_strand::list(&cwd).unwrap().is_empty());
+    assert!(ka_strand::latest(&cwd).unwrap().is_none());
+    let archived = ka_strand::list_archived(&cwd);
+    assert_eq!(archived.len(), 1, "{archived:?}");
+    assert_eq!(archived[0].id, id);
+    assert_eq!(archived[0].title, "archivable session");
+
+    // unarchive restores the original store path and the live listing
+    let restored = ka_strand::archive(&archived_path, false).unwrap();
+    assert_eq!(
+        restored, path,
+        "unarchive must return the strand to its original store path"
+    );
+    assert!(restored.exists());
+    assert!(!archived_path.exists());
+    assert_eq!(ka_strand::list(&cwd).unwrap().len(), 1);
+    assert!(ka_strand::list_archived(&cwd).is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Session management refuses non-strands: missing files, files without
+/// a strand header, and cascade/archive/retitle all error instead of
+/// touching anything (the CLI's session-file guard rails).
+#[test]
+fn session_management_refuses_missing_or_non_strand_paths() {
+    let _guard = DATA_DIR_LOCK.lock().unwrap();
+    let dir = temp_data_dir("refuse");
+    let cwd = dir.join("proj");
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    let missing = cwd.join("nope.jsonl");
+    assert!(ka_strand::delete_cascade(&missing).is_err());
+    assert!(ka_strand::retitle(&missing, "x").is_err());
+    assert!(ka_strand::archive(&missing, true).is_err());
+
+    // a .jsonl without a strand header record is not a session
+    let junk = cwd.join("junk.jsonl");
+    std::fs::write(
+        &junk,
+        "{\"record\":\"message\",\"id\":\"r1\",\"role\":\"user\",\"content\":\"hi\"}\n",
+    )
+    .unwrap();
+    assert!(ka_strand::delete_cascade(&junk).is_err());
+    assert!(ka_strand::retitle(&junk, "x").is_err());
+    assert!(ka_strand::archive(&junk, true).is_err());
+    assert!(junk.exists(), "refused operations must not touch the file");
+    let _ = std::fs::remove_dir_all(&dir);
+}

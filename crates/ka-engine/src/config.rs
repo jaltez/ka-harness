@@ -645,16 +645,30 @@ impl Config {
             self.cwd = other.cwd;
         }
         if !other.rules.is_empty() {
-            self.rules = other.rules;
+            // arrays merge across layers (CFG-03): the more specific
+            // layer's rules sort FIRST — ka evaluates first-match-wins,
+            // so a project deny beats a user allow
+            let mut merged = other.rules;
+            merged.append(&mut self.rules);
+            self.rules = merged;
         }
         if !other.permissions.allow.is_empty() {
-            self.permissions.allow = other.permissions.allow;
+            Self::merge_dedupe(&mut self.permissions.allow, &other.permissions.allow);
         }
         if other.guards.context_pct.is_some() {
             self.guards.context_pct = other.guards.context_pct;
         }
         if !other.mcp.is_empty() {
-            self.mcp = other.mcp;
+            // union by name; the upper layer wins a name collision
+            let names: Vec<&str> = other.mcp.iter().map(|m| m.name.as_str()).collect();
+            let lower = self
+                .mcp
+                .drain(..)
+                .filter(|m| !names.contains(&m.name.as_str()))
+                .collect::<Vec<_>>();
+            let mut merged = other.mcp;
+            merged.extend(lower);
+            self.mcp = merged;
         }
         if other.tools.bash.background_after_ms.is_some() {
             self.tools.bash.background_after_ms = other.tools.bash.background_after_ms;
@@ -663,7 +677,10 @@ impl Config {
             self.tools.read.max_image_mb = other.tools.read.max_image_mb;
         }
         if !other.fallback.models.is_empty() {
-            self.fallback.models = other.fallback.models;
+            // try-order is priority order: the more specific layer first
+            let mut merged = other.fallback.models.clone();
+            Self::merge_dedupe(&mut merged, &self.fallback.models);
+            self.fallback.models = merged;
         }
         if other.update.repo.is_some() {
             self.update.repo = other.update.repo;
@@ -675,7 +692,7 @@ impl Config {
             self.context.promote = other.context.promote;
         }
         if !other.hooks.is_empty() {
-            self.hooks = other.hooks;
+            self.hooks.extend(other.hooks);
         }
         if other.git.auto_commit.is_some() {
             self.git.auto_commit = other.git.auto_commit;
@@ -699,7 +716,7 @@ impl Config {
             self.sandbox.mode = other.sandbox.mode;
         }
         if !other.sandbox.allow_write.is_empty() {
-            self.sandbox.allow_write = other.sandbox.allow_write;
+            Self::merge_dedupe(&mut self.sandbox.allow_write, &other.sandbox.allow_write);
         }
         if other.guards.auto_review.is_some() {
             self.guards.auto_review = other.guards.auto_review;
@@ -726,13 +743,17 @@ impl Config {
             self.pokes.max = other.pokes.max;
         }
         if !other.verify.lints.is_empty() {
-            self.verify.lints = other.verify.lints;
+            self.verify.lints.extend(other.verify.lints);
         }
         if other.guards.spend_usd.is_some() {
             self.guards.spend_usd = other.guards.spend_usd;
         }
         if !other.search.is_empty() {
-            self.search = other.search;
+            // the first active provider wins: the more specific layer
+            // sorts first
+            let mut merged = other.search;
+            merged.append(&mut self.search);
+            self.search = merged;
         }
         if other.tools.web.allow_private_hosts.is_some() {
             self.tools.web.allow_private_hosts = other.tools.web.allow_private_hosts;
@@ -741,7 +762,7 @@ impl Config {
             self.tui.header_glyph = other.tui.header_glyph;
         }
         if !other.features.disable.is_empty() {
-            self.features.disable = other.features.disable;
+            Self::merge_dedupe(&mut self.features.disable, &other.features.disable);
         }
         if other.prompt.identity_file.is_some() {
             self.prompt.identity_file = other.prompt.identity_file;
@@ -756,13 +777,31 @@ impl Config {
             self.history.max_bytes = other.history.max_bytes;
         }
         if !other.model_pins.is_empty() {
-            self.model_pins = other.model_pins;
+            // first-match priority: the more specific layer's pins first
+            let mut merged = other.model_pins;
+            merged.append(&mut self.model_pins);
+            self.model_pins = merged;
         }
         if !other.project_doc_fallback_filenames.is_empty() {
-            self.project_doc_fallback_filenames = other.project_doc_fallback_filenames;
+            // fallback names are tried in order: the more specific layer
+            // sorts first
+            let mut merged = other.project_doc_fallback_filenames.clone();
+            Self::merge_dedupe(&mut merged, &self.project_doc_fallback_filenames);
+            self.project_doc_fallback_filenames = merged;
         }
         if !other.features.allow.is_empty() {
-            self.features.allow = other.features.allow;
+            Self::merge_dedupe(&mut self.features.allow, &other.features.allow);
+        }
+    }
+
+    /// Merge-dedupe helper for the accumulate-style array keys
+    /// (CFG-03): upper-layer entries append in order, exact duplicates
+    /// stay single.
+    fn merge_dedupe<T: PartialEq + Clone>(base: &mut Vec<T>, upper: &[T]) {
+        for item in upper {
+            if !base.contains(item) {
+                base.push(item.clone());
+            }
         }
     }
     /// Effective step cap (default 20).
@@ -1245,6 +1284,51 @@ mod tests {
         assert_eq!(base.effective_mode(), Mode::Allow);
     }
 
+    /// CFG-03: arrays merge across layers. Priority-ordered keys
+    /// (rules, model_pins, search, fallbacks, fallback filenames) put
+    /// the more specific layer's entries FIRST; accumulate keys
+    /// (hooks, allow lists, allow_write, lints, features) append with
+    /// dedupe; mcp unions by name with the upper layer winning.
+    #[test]
+    fn arrays_merge_across_layers_with_priority_order() {
+        let user = Config::parse_layer(
+            "[[rules]]\ntool = \"bash\"\nverdict = \"allow\"\n\n[[search]]\nprovider = \"brave\"\napi_key_env = \"B\"\n\n[permissions]\nallow = [\"read\", \"bash\"]\n\n[features]\ndisable = [\"skills\"]\n\n[[mcp]]\nname = \"github\"\ncommand = \"old\"\n\n[[mcp]]\nname = \"local\"\ncommand = \"keep\"\n",
+            "user",
+        )
+        .unwrap();
+        let project = Config::parse_layer(
+            "[[rules]]\ntool = \"bash\"\npattern = \"cargo *\"\nverdict = \"deny\"\n\n[[search]]\nprovider = \"tavily\"\napi_key_env = \"T\"\n\n[permissions]\nallow = [\"bash\"]\n\n[features]\ndisable = [\"agents\"]\n\n[[mcp]]\nname = \"github\"\ncommand = \"new\"\n",
+            "project",
+        )
+        .unwrap();
+        let mut cfg = user;
+        cfg.overlay(project);
+        // rules: the project (more specific) layer sorts first, so its
+        // deny is evaluated before the user's blanket allow
+        assert_eq!(cfg.rules.len(), 2);
+        assert_eq!(cfg.rules[0].verdict, Verdict::Deny);
+        assert_eq!(cfg.rules[1].verdict, Verdict::Allow);
+        // search: project tavily wins the first-active slot
+        assert_eq!(cfg.search[0].provider, "tavily");
+        assert_eq!(cfg.search.len(), 2);
+        // allow lists: union with dedupe
+        assert_eq!(
+            cfg.permissions.allow,
+            vec!["read".to_string(), "bash".to_string()]
+        );
+        // features.disable: union with dedupe
+        assert_eq!(
+            cfg.features.disable,
+            vec!["skills".to_string(), "agents".to_string()]
+        );
+        // mcp: union by name — the project's github definition wins,
+        // the user's local server survives
+        assert_eq!(cfg.mcp.len(), 2);
+        assert_eq!(cfg.mcp[0].name, "github");
+        assert_eq!(cfg.mcp[0].command.as_deref(), Some("new"));
+        assert_eq!(cfg.mcp[1].name, "local");
+    }
+
     #[test]
     fn unknown_key_rejected() {
         let err = Config::parse_layer("modle = \"a/x\"\n", "user")
@@ -1541,8 +1625,10 @@ mod tests {
             )
             .unwrap(),
         );
-        assert_eq!(base.verify.lints.len(), 1, "non-empty lints replace");
-        assert_eq!(base.verify.lints[0].pattern, "*.ts");
+        // CFG-03: lints accumulate — both rules run, upper layer last
+        assert_eq!(base.verify.lints.len(), 2, "lints merge across layers");
+        assert_eq!(base.verify.lints[0].pattern, "*.rs");
+        assert_eq!(base.verify.lints[1].pattern, "*.ts");
         // unknown keys hard-error
         let err = Config::parse_layer("[verify]\ntests = \"x\"\n", "user")
             .unwrap_err()
@@ -1641,8 +1727,9 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("glob"), "{err}");
-        // overlay: a non-empty upper layer replaces the whole list, an
-        // empty layer keeps the lower one
+        // overlay (CFG-03): arrays merge — an empty layer keeps the
+        // lower pins; an upper layer's pins sort FIRST (first-match
+        // priority) and both survive
         let mut base = c;
         base.overlay(Config::default());
         assert_eq!(base.model_pins.len(), 2, "empty layer keeps pins");
@@ -1653,10 +1740,19 @@ mod tests {
             )
             .unwrap(),
         );
-        assert_eq!(base.model_pins.len(), 1, "non-empty layer replaces");
+        assert_eq!(base.model_pins.len(), 3, "upper pins merge in");
+        assert_eq!(
+            base.model_pins[0].path, "sandbox/*",
+            "upper-layer pins sort first"
+        );
         assert_eq!(
             base.effective_model_for(std::path::Path::new("sandbox/deep")),
             Some("c/third".to_string())
+        );
+        assert_eq!(
+            base.effective_model_for(std::path::Path::new("/home/me/work/x")),
+            Some("anthropic/claude-opus-4".to_string()),
+            "lower-layer pins still match after the merge"
         );
         // the schema documents the table
         let schema = Config::schema_json().unwrap();
@@ -1737,16 +1833,26 @@ mod tests {
             c.project_doc_fallback_filenames,
             vec!["CONTEXT.md".to_string(), ".cursorrules".to_string()]
         );
-        // overlay: a non-empty upper layer replaces, an empty one keeps
+        // overlay (CFG-03): merge — upper names sort first, lower names
+        // survive (dedupe keeps single occurrences)
         let mut base = c;
         base.overlay(Config::default());
         assert_eq!(base.project_doc_fallback_filenames.len(), 2);
         base.overlay(
-            Config::parse_layer("project_doc_fallback_filenames = [\"NOTES.md\"]\n", "p").unwrap(),
+            Config::parse_layer(
+                "project_doc_fallback_filenames = [\"NOTES.md\", \"CONTEXT.md\"]\n",
+                "p",
+            )
+            .unwrap(),
         );
         assert_eq!(
             base.project_doc_fallback_filenames,
-            vec!["NOTES.md".to_string()]
+            vec![
+                "NOTES.md".to_string(),
+                "CONTEXT.md".to_string(),
+                ".cursorrules".to_string()
+            ],
+            "upper first, dedupe keeps CONTEXT.md once"
         );
         // wrong type is a hard error
         assert!(

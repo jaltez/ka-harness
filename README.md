@@ -44,7 +44,7 @@ More: [selectors](https://ka-harness.dev/docs/models/selectors/) · [providers &
 
 ## Config
 
-Strict TOML, layered: defaults → `~/.config/ka/ka.toml` → `.ka/ka.toml` (project, trust-gated) → env (`KA_MODEL`, `KA_MODE`) → flags. Unknown keys are hard errors with line numbers. The project layer lives at the project root (nearest `.git` ancestor), so sessions started in a subdirectory share one `.ka/`.
+Strict TOML, layered: defaults → `~/.config/ka/ka.toml` → profiles (`--profile <name>` → `~/.config/ka/profiles/<name>.toml`) → `.ka/ka.toml` (project, trust-gated) → `--config` files → env (`KA_MODEL`, `KA_MODE`, plus **one `KA_<KEY>` variable per key** — `__` spells the dot: `KA_TUI__MOUSE=native` sets `tui.mouse`; unknown `KA_*` names are ignored) → flags. Unknown keys are hard errors with line numbers. **Arrays merge across layers**: the more specific layer's entries sort first where order carries priority (`[[rules]]`, `[[model_pins]]`, `[[search]]`, fallbacks, fallback filenames — so a project-layer deny is evaluated before a user-layer allow), the rest append with dedupe (`hooks`, allow lists, `allow_write`, lints, features, mcp by name). The project layer lives at the project root (nearest `.git` ancestor), so sessions started in a subdirectory share one `.ka/`.
 
 ```toml
 model = "ollama/qwen3.5:9b"
@@ -66,6 +66,9 @@ Handy extras, all strict-TOML like everything else:
 - `project_doc_fallback_filenames = ["CLAUDE.md", ...]` — extra instruction-file names where a directory has no `AGENTS.md`; `AGENTS.override.md` replaces a directory's layer entirely.
 - `[prompt] identity_inline` — replace ka's built-in identity sentence inline (`identity_file` still wins); also `--system-prompt "…"` per run.
 - `[features] allow = [...]` — positive hand allowlist: unlisted hands are hidden from the model and rejected at admit time (disable still wins).
+- `ka session rename|delete|archive|unarchive` — rename (retitle), delete with child-fork cascade, and an archive tree (`ka sessions --archived` lists it).
+- `ka import codex|gemini` — permission rules from another agent's config into `[[rules]]` (untranslatable settings are printed as notes, never dropped silently; `cursor` rules are instructions, not permissions — ka points at the right homes instead).
+- `ka import-session claude|codex <file>` — import a foreign session as a ka strand (text, tool calls, thinking best-effort; the source is never modified).
 
 ## Safety
 
@@ -85,11 +88,11 @@ Details — doom-loop rules, protected paths, project trust, runtime feature tog
 | Surface      | Use                                                           |
 | ------------ | ------------------------------------------------------------- |
 | `ka`         | terminal UI                                                   |
-| `ka run "…"` | headless one-turn, final text (`--print ndjson`/`stream-json` for events, `-o FILE` to a file), exit 0 ok · 1 error · 2 aborted · 3 cap |
+| `ka run "…"` | headless one-turn, final text (`--print ndjson`/`stream-json`/`--rpc` for event protocols, `-o FILE` to a file), exit 0 ok · 1 error · 2 aborted · 3 cap |
 | `ka serve`   | HTTP: prompt via POST, SSE event streams, read-only observers |
 | `ka acp`     | Agent Client Protocol for editors                             |
 
-Also: `ka sessions` · `ka export` (markdown / self-contained HTML / roundtrippable JSONL) · `ka rewind` · `ka attach` · `ka completions` · `ka init` · `ka update`.
+Also: `ka sessions [--archived]` · `ka session rename|delete|archive|unarchive` · `ka export` (markdown / self-contained HTML / roundtrippable JSONL) · `ka rewind` · `ka attach` · `ka queue` (prompt a live serve session) · `ka sandbox <cmd>` (run one command under the fs sandbox) · `ka completions` · `ka init` · `ka update`.
 
 ## Extend
 
