@@ -459,6 +459,7 @@ async fn compact_from_keeps_abandoned_branch_as_summary() {
         roles: ka_engine::config::Roles {
             default: None,
             fast: Some("test/m".into()),
+            extra: Default::default(),
         },
         ..Default::default()
     };
@@ -549,6 +550,7 @@ async fn compact_from_to_boundary_skips_summary() {
         roles: ka_engine::config::Roles {
             default: None,
             fast: Some("test/m".into()),
+            extra: Default::default(),
         },
         ..Default::default()
     };
@@ -623,6 +625,7 @@ async fn side_question_rides_fast_role_only() {
         roles: ka_engine::config::Roles {
             default: None,
             fast: Some("test/m".into()),
+            extra: Default::default(),
         },
         ..Default::default()
     };
@@ -719,6 +722,7 @@ async fn goal_judge_yes_drops_goal() {
         roles: ka_engine::config::Roles {
             default: None,
             fast: Some("test/m".into()),
+            extra: Default::default(),
         },
         ..Default::default()
     };
@@ -804,6 +808,7 @@ async fn goal_no_transforms_the_auto_poke() {
         roles: ka_engine::config::Roles {
             default: None,
             fast: Some("test/m".into()),
+            extra: Default::default(),
         },
         ..Default::default()
     };
@@ -887,6 +892,7 @@ async fn goal_budget_exhaustion_pauses_without_judging() {
         roles: ka_engine::config::Roles {
             default: None,
             fast: Some("test/m".into()),
+            extra: Default::default(),
         },
         ..Default::default()
     };
@@ -1039,6 +1045,7 @@ async fn prewalk_runs_once_before_the_first_turn() {
         roles: ka_engine::config::Roles {
             default: None,
             fast: Some("test/m".into()),
+            extra: Default::default(),
         },
         context: ka_engine::config::Context {
             prewalk: Some(true),
@@ -1127,6 +1134,7 @@ async fn prewalk_off_by_default() {
         roles: ka_engine::config::Roles {
             default: None,
             fast: Some("test/m".into()),
+            extra: Default::default(),
         },
         ..Default::default()
     };
@@ -1190,6 +1198,7 @@ async fn memory_consolidate_rewrites_memory_and_empties_inbox() {
         roles: ka_engine::config::Roles {
             default: None,
             fast: Some("test/m".into()),
+            extra: Default::default(),
         },
         ..Default::default()
     };

@@ -401,6 +401,15 @@ pub struct Git {
 }
 
 /// Role → model-selector mappings.
+///
+/// EXT-11 TOML shape: the two built-in names stay flat
+/// (`[roles] default = "…"`, `fast = "…"`); every *additional* role
+/// lives in an explicit sub-table — `[roles.extra.review] =
+/// "vendor/model@high"`. An explicit table (rather than
+/// `#[serde(flatten)]`) keeps typo rejection intact: an unknown key
+/// directly under `[roles]` is a hard config error, while
+/// `roles.extra.<anything>` is a role. Session side: `--model @review`
+/// and `SetModel "@review"` resolve through this table.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct Roles {
@@ -408,6 +417,65 @@ pub struct Roles {
     pub default: Option<String>,
     /// Selector for the fast (cheap) role.
     pub fast: Option<String>,
+    /// Named roles (`[roles.extra.<name>] = "selector"`), resolved by
+    /// `@<name>` selectors.
+    #[serde(default)]
+    pub extra: std::collections::BTreeMap<String, String>,
+}
+
+impl Roles {
+    /// Resolve an `@<role>` selector to its configured selector.
+    /// `@default`/`@fast` read the built-ins; any other name reads
+    /// [`Roles::extra`]. Unknown roles resolve to `None` (callers fall
+    /// back to the literal selector, the pre-EXT-11 behavior).
+    pub fn resolve(&self, selector: &str) -> Option<&str> {
+        let name = selector.strip_prefix('@')?;
+        if name.is_empty() {
+            return None;
+        }
+        match name {
+            "default" => self.default.as_deref(),
+            "fast" => self.fast.as_deref(),
+            other => self.extra.get(other).map(String::as_str),
+        }
+    }
+}
+
+/// EXT-11 router strategy for `[virtual_models.<name>]`.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum RouterStrategy {
+    /// Each turn takes the next selector in `models`, wrapping around.
+    #[default]
+    RoundRobin,
+    /// Each turn starts at `models[0]`; a provider/auth/network failure
+    /// hops to the next entry (the built-in fallback chain, capped at
+    /// 2 hops per turn like `[fallback]`).
+    Failover,
+}
+
+/// EXT-11 virtual model (`[virtual_models.<name>]`): a named router
+/// over several selectors. Addressed as `virtual/<name>` (or
+/// `@virtual/<name>`) from `--model`, `SetModel`, or a role mapping;
+/// the concrete model is picked per turn by
+/// [`VirtualModel::strategy`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct VirtualModel {
+    /// Member selectors (`vendor/model[@effort]`), in try-order.
+    pub models: Vec<String>,
+    /// [`RouterStrategy::RoundRobin`] (the default) or
+    /// [`RouterStrategy::Failover`].
+    pub strategy: Option<RouterStrategy>,
+}
+
+impl VirtualModel {
+    /// The effective strategy (default round-robin).
+    pub fn effective_strategy(&self) -> RouterStrategy {
+        self.strategy.unwrap_or_default()
+    }
 }
 
 /// Per-tool settings (`[tools]` in a ka.toml layer).
@@ -878,6 +946,11 @@ pub struct Config {
     pub mode: Option<Mode>,
     /// Role mappings.
     pub roles: Roles,
+    /// EXT-11 model routers ([virtual_models.<name>]): selector
+    /// `virtual/<name>` picks a member per turn (round-robin or
+    /// failover).
+    #[serde(default)]
+    pub virtual_models: std::collections::BTreeMap<String, VirtualModel>,
     /// Maximum tool-execution steps per prompt before forcing a text reply.
     #[serde(default)]
     pub max_steps: Option<u32>,
@@ -1086,6 +1159,24 @@ impl Config {
                 }
             }
         }
+        // [virtual_models] EXT-11: each router needs at least one
+        // member selector, and members must parse as selectors so a
+        // typo fails at startup, not mid-turn
+        for (name, router) in &self.virtual_models {
+            if router.models.is_empty() {
+                return Err(format!(
+                    "[virtual_models.{name}]: at least one entry in models is required"
+                ));
+            }
+            for selector in &router.models {
+                if ka_dialect::parse_selector(selector).is_err() {
+                    return Err(format!(
+                        "[virtual_models.{name}]: models entry {selector:?} is not a \
+                         model selector (vendor/model[@effort])"
+                    ));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1105,6 +1196,18 @@ impl Config {
         }
         if other.roles.fast.is_some() {
             self.roles.fast = other.roles.fast;
+        }
+        if !other.roles.extra.is_empty() {
+            // named roles merge by name; the upper layer wins
+            for (name, selector) in other.roles.extra {
+                self.roles.extra.insert(name, selector);
+            }
+        }
+        if !other.virtual_models.is_empty() {
+            // routers merge by name; the upper layer wins
+            for (name, router) in other.virtual_models {
+                self.virtual_models.insert(name, router);
+            }
         }
         if other.max_steps.is_some() {
             self.max_steps = other.max_steps;
@@ -2084,6 +2187,102 @@ mod tests {
         let roles_part = schema.split("\"Roles\"").nth(1).expect("Roles definition");
         assert!(roles_part.contains("default"), "got: {roles_part}");
         assert!(roles_part.contains("fast"), "got: {roles_part}");
+    }
+
+    /// EXT-11: named roles via `[roles.extra.<name>]`, `@role`
+    /// resolution, old-config compatibility, and router parsing.
+    #[test]
+    fn roles_extra_and_virtual_models_parse_overlay_and_resolve() {
+        // existing configs keep parsing byte-identically
+        let c =
+            Config::parse_layer("[roles]\ndefault = \"a/x\"\nfast = \"b/y\"\n", "user").unwrap();
+        assert!(c.roles.extra.is_empty());
+        // named roles: [roles.extra.<name>] = "selector"
+        let c = Config::parse_layer(
+            "[roles]\ndefault = \"a/x\"\nfast = \"b/y@low\"\n\n[roles.extra]\nreview = \"r/r\"\n\"deep.name\" = \"c/z\"\n",
+            "user",
+        )
+        .unwrap();
+        assert_eq!(c.roles.extra.get("review").map(String::as_str), Some("r/r"));
+        assert_eq!(
+            c.roles.extra.get("deep.name").map(String::as_str),
+            Some("c/z")
+        );
+        // resolution: @default/@fast read the built-ins, others read extra
+        assert_eq!(c.roles.resolve("@default"), Some("a/x"));
+        assert_eq!(c.roles.resolve("@fast"), Some("b/y@low"));
+        assert_eq!(c.roles.resolve("@review"), Some("r/r"));
+        assert_eq!(c.roles.resolve("@deep.name"), Some("c/z"));
+        // unknown @names and bare selectors stay literal (None)
+        assert_eq!(c.roles.resolve("@nope"), None);
+        assert_eq!(c.roles.resolve("a/x"), None);
+        assert_eq!(c.roles.resolve("@"), None);
+        // overlay merges extra by name, upper layer wins
+        let mut base =
+            Config::parse_layer("[roles.extra]\nreview = \"b/y\"\nother = \"d/w\"\n", "base")
+                .unwrap();
+        let over = Config::parse_layer("[roles.extra]\nreview = \"c/z\"\n", "over").unwrap();
+        base.overlay(over);
+        assert_eq!(
+            base.roles.extra.get("review").map(String::as_str),
+            Some("c/z")
+        );
+        assert_eq!(
+            base.roles.extra.get("other").map(String::as_str),
+            Some("d/w")
+        );
+        // a typo directly under [roles] is STILL a hard error (the
+        // explicit extra table keeps deny_unknown_fields useful)
+        let err = Config::parse_layer("[roles]\nrevew = \"b/y\"\n", "user")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("revew"), "got: {err}");
+        // virtual routers: table + strategy (default round_robin)
+        let c = Config::parse_layer(
+            "[virtual_models.fleet]\nmodels = [\"a/x\", \"b/y@low\"]\n\n[virtual_models.backup]\nmodels = [\"c/z\"]\nstrategy = \"failover\"\n",
+            "user",
+        )
+        .unwrap();
+        assert_eq!(
+            c.virtual_models["fleet"].effective_strategy(),
+            RouterStrategy::RoundRobin
+        );
+        assert_eq!(c.virtual_models["fleet"].models, ["a/x", "b/y@low"]);
+        assert_eq!(
+            c.virtual_models["backup"].effective_strategy(),
+            RouterStrategy::Failover
+        );
+        // routers merge by name across layers
+        let mut base =
+            Config::parse_layer("[virtual_models.a]\nmodels = [\"a/x\"]\n", "base").unwrap();
+        let over = Config::parse_layer(
+            "[virtual_models.a]\nmodels = [\"b/y\"]\n\n[virtual_models.b]\nmodels = [\"c/z\"]\n",
+            "over",
+        )
+        .unwrap();
+        base.overlay(over);
+        assert_eq!(base.virtual_models["a"].models, ["b/y"]);
+        assert_eq!(base.virtual_models["b"].models, ["c/z"]);
+        // validation: empty router and non-selector members are startup errors
+        let err = Config::parse_layer("[virtual_models.a]\nmodels = []\n", "user")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("at least one entry"), "got: {err}");
+        let err = Config::parse_layer("[virtual_models.a]\nmodels = [\"noslash\"]\n", "user")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a model selector"), "got: {err}");
+        // the schema exposes the new surfaces
+        let schema = Config::schema_json().unwrap();
+        for key in [
+            "extra",
+            "virtual_models",
+            "strategy",
+            "round_robin",
+            "failover",
+        ] {
+            assert!(schema.contains(&format!("\"{key}\"")), "schema lost {key}");
+        }
     }
 
     #[test]

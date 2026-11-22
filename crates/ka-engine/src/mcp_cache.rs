@@ -175,6 +175,11 @@ mod tests {
             approval: None,
             tool_timeout_secs: None,
             output_limit: None,
+            oauth: None,
+            oauth_client_id: None,
+            oauth_scopes: Vec::new(),
+            bearer_token_env: None,
+            headers_helper: None,
         }
     }
 

@@ -645,6 +645,18 @@ fn config_schema_carries_every_documented_key() {
         // Lote 7: [generate_image] (gated hand registration)
         "generate_image",
         "output_dir",
+        // Lote 10b: EXT-03 OAuth/headers_helper on [[mcp]]
+        "oauth",
+        "oauth_client_id",
+        "oauth_scopes",
+        "bearer_token_env",
+        "headers_helper",
+        // Lote 10b: EXT-11 named roles + virtual model routers
+        "extra",
+        "virtual_models",
+        "strategy",
+        "round_robin",
+        "failover",
     ] {
         assert!(
             schema.contains(&format!("\"{key}\"")),
@@ -690,6 +702,56 @@ fn selectors_parse_vendor_model_effort_and_colons() {
     assert_eq!(s.effort.as_deref(), Some("high"));
 
     assert!(ka_dialect::parse_selector("no-slash").is_err());
+}
+
+/// EXT-11 config contract: the documented TOML shapes parse, keep
+/// legacy `[roles]` configs compatible, and reject typos.
+#[test]
+fn roles_extra_and_virtual_models_contract() {
+    // legacy shape untouched
+    let c = ka_engine::config::Config::parse_layer(
+        "[roles]\ndefault = \"vendor/a\"\nfast = \"vendor/b@low\"\n",
+        "user",
+    )
+    .unwrap();
+    assert_eq!(c.roles.default.as_deref(), Some("vendor/a"));
+    assert_eq!(c.roles.resolve("@default"), Some("vendor/a"));
+    assert_eq!(c.roles.resolve("@fast"), Some("vendor/b@low"));
+    // EXT-11 named-role shape: `[roles.extra.<name>] = "selector"`
+    let c = ka_engine::config::Config::parse_layer(
+        "[roles.extra]\nreview = \"vendor/r@high\"\n",
+        "user",
+    )
+    .unwrap();
+    assert_eq!(c.roles.resolve("@review"), Some("vendor/r@high"));
+    // EXT-11 router shape: `[virtual_models.<name>]` with
+    // `models` + `strategy` (round_robin default)
+    let c = ka_engine::config::Config::parse_layer(
+        "[virtual_models.fleet]\nmodels = [\"vendor/a\", \"vendor/b\"]\nstrategy = \"round_robin\"\n\n[virtual_models.hot]\nmodels = [\"vendor/a\", \"vendor/b\"]\nstrategy = \"failover\"\n",
+        "user",
+    )
+    .unwrap();
+    use ka_engine::config::RouterStrategy;
+    assert_eq!(
+        c.virtual_models["fleet"].effective_strategy(),
+        RouterStrategy::RoundRobin
+    );
+    assert_eq!(
+        c.virtual_models["hot"].effective_strategy(),
+        RouterStrategy::Failover
+    );
+    // both `virtual/<name>` and `@virtual/<name>` parse as selectors
+    assert!(ka_dialect::parse_selector("virtual/fleet").is_ok());
+    // typo safety: unknown keys under [roles] still hard-error
+    assert!(ka_engine::config::Config::parse_layer("[roles]\nrevew = \"v\"\n", "user").is_err());
+    // router validation: a member that is not a selector is a startup error
+    assert!(
+        ka_engine::config::Config::parse_layer(
+            "[virtual_models.fleet]\nmodels = [\"noslash\"]\n",
+            "user"
+        )
+        .is_err()
+    );
 }
 
 /// ka glob semantics (rules, lint patterns, scoped rules): `*` crosses
@@ -2805,6 +2867,11 @@ fn ext04_tool_filter_disabled_wins() {
         approval: None,
         tool_timeout_secs: None,
         output_limit: None,
+        oauth: None,
+        oauth_client_id: None,
+        oauth_scopes: Vec::new(),
+        bearer_token_env: None,
+        headers_helper: None,
     };
     let c = cfg(&["read_a", "read_b"], &["read_b"]);
     assert!(c.tool_enabled("read_a", "srv__read_a"));
@@ -2843,6 +2910,11 @@ fn ext04_approval_ask_bypass_resolution() {
         approval,
         tool_timeout_secs: None,
         output_limit: None,
+        oauth: None,
+        oauth_client_id: None,
+        oauth_scopes: Vec::new(),
+        bearer_token_env: None,
+        headers_helper: None,
     };
     let mk = |approval| {
         let mut v = Voice::new(

@@ -1573,6 +1573,11 @@ async fn mcp_cache_registers_tools_without_waiting_on_the_server() {
         approval: None,
         tool_timeout_secs: None,
         output_limit: None,
+        oauth: None,
+        oauth_client_id: None,
+        oauth_scopes: Vec::new(),
+        bearer_token_env: None,
+        headers_helper: None,
     };
     // legacy-shape cache: a dotted name written before sanitization —
     // load must re-derive `demo__fetch`.
@@ -1651,6 +1656,11 @@ async fn mcp_cache_miss_reports_the_dead_server() {
             approval: None,
             tool_timeout_secs: None,
             output_limit: None,
+            oauth: None,
+            oauth_client_id: None,
+            oauth_scopes: Vec::new(),
+            bearer_token_env: None,
+            headers_helper: None,
         }],
         ..Default::default()
     };
@@ -1698,6 +1708,7 @@ async fn plan_goal_below_hill_climb_gate_gets_pushback() {
         roles: ka_engine::config::Roles {
             default: None,
             fast: Some("test/m".into()),
+            extra: Default::default(),
         },
         ..Default::default()
     };
@@ -1751,6 +1762,7 @@ async fn hill_climb_rates_only_plan_mode() {
         roles: ka_engine::config::Roles {
             default: None,
             fast: Some("test/m".into()),
+            extra: Default::default(),
         },
         ..Default::default()
     };
@@ -2224,4 +2236,94 @@ async fn ext09_set_style_resolves_and_refuses() {
     );
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_file(user_styles.join("prose.md"));
+}
+
+// ------------------------------------------------------------ EXT-11
+
+/// `SetModel "@<role>"` resolves through the [roles] table before it
+/// applies: the ModelChanged event (and the armed selector) carry the
+/// RESOLVED selector. Unknown `@names` stay literal, and the
+/// `@virtual/<name>` router selector passes through untouched (the
+/// voice routes it per turn).
+#[tokio::test]
+async fn ext11_set_model_resolves_roles_and_passes_routers_through() {
+    let dir = tmp_dir("ext11-roles");
+    let layer = format!(
+        "model = \"test/m\"\ncwd = \"{}\"\n[roles]\ndefault = \"test/m\"\n\n[roles.extra]\nreview = \"test/m@low\"\n",
+        dir.display()
+    );
+    let cfg = ka_engine::config::Config::parse_layer(&layer, "test").unwrap();
+    let mut handle = ka_engine::spawn_with_speaker(
+        cfg,
+        test_catalog(),
+        ka_engine::StrandChoice::New,
+        ka_dialect::Wire::OpenaiChat,
+        Scripted::new(vec![]),
+    );
+    // a named role resolves to its selector
+    let events = settle(
+        &mut handle,
+        Command::SetModel {
+            selector: "@review".into(),
+        },
+        on_idle,
+    )
+    .await;
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::ModelChanged { selector }
+            if selector == "test/m@low")),
+        "@review resolves to its configured selector: {events:?}"
+    );
+    // @default reads the built-in
+    let events = settle(
+        &mut handle,
+        Command::SetModel {
+            selector: "@default".into(),
+        },
+        on_idle,
+    )
+    .await;
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::ModelChanged { selector }
+            if selector == "test/m")),
+        "@default resolves: {events:?}"
+    );
+    // an unknown @name keeps the literal (fails at the next turn, not here)
+    let events = settle(
+        &mut handle,
+        Command::SetModel {
+            selector: "@nope".into(),
+        },
+        on_idle,
+    )
+    .await;
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::ModelChanged { selector }
+            if selector == "@nope")),
+        "unknown @names stay literal: {events:?}"
+    );
+    // router selectors pass through for the voice's per-turn routing
+    let events = settle(
+        &mut handle,
+        Command::SetModel {
+            selector: "@virtual/fleet".into(),
+        },
+        on_idle,
+    )
+    .await;
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::ModelChanged { selector }
+            if selector == "@virtual/fleet")),
+        "router selectors stay literal: {events:?}"
+    );
+    drop(handle.commands);
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -15,6 +15,7 @@ pub mod hands;
 pub mod lsp;
 pub mod mcp;
 pub mod mcp_cache;
+pub mod mcp_oauth;
 pub mod readers;
 pub mod trust;
 pub mod voice;

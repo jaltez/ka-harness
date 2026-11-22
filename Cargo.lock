@@ -1059,6 +1059,7 @@ dependencies = [
  "ka-sandbox",
  "ka-strand",
  "ka-term",
+ "parking_lot",
  "reqwest",
  "serde",
  "serde_json",

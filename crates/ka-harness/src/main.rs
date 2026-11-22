@@ -442,6 +442,18 @@ enum CliCommand {
     Undo,
     /// Probe configured MCP servers and list their tools
     Mcp,
+    /// Serve ka's read hands as a read-only MCP stdio server
+    /// (JSON-RPC 2.0, one message per line)
+    McpServe {
+        /// Only expose these tools, comma-separated or repeatable
+        /// (read, glob, grep, sessions_search, session_info)
+        #[arg(long, value_delimiter = ',')]
+        tools: Vec<String>,
+        /// Restrict to read-only tools (v1: the server never exposes
+        /// bash regardless — see mcp_serve module docs)
+        #[arg(long)]
+        read_only: bool,
+    },
     /// List discovered markdown agents (.ka/agents/*.md)
     Agents,
     /// List known providers with API-key env status
@@ -618,6 +630,7 @@ mod attach;
 mod doctor;
 mod herdr;
 mod import;
+mod mcp_serve;
 mod serve;
 mod session_import;
 mod skills;
@@ -1668,6 +1681,9 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
         }
         Some(CliCommand::Undo) => run_undo(),
         Some(CliCommand::Mcp) => run_mcp().await,
+        Some(CliCommand::McpServe { tools, read_only }) => {
+            mcp_serve::run(mcp_serve::ServeOpts { tools, read_only }).await
+        }
         Some(CliCommand::Agents) => run_agents(),
         Some(CliCommand::Providers) => run_providers(),
         Some(CliCommand::Init) => run_init(),

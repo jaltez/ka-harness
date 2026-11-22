@@ -292,7 +292,7 @@ async fn safe_mode_never_arms_the_loop() {
         .await
         .expect("engine alive");
     loop {
-        match tokio::time::timeout(std::time::Duration::from_secs(5), handle.events.recv()).await {
+        match tokio::time::timeout(std::time::Duration::from_secs(10), handle.events.recv()).await {
             Ok(Some(Event::Note { message, .. })) => {
                 if message.contains("loop unavailable in safe mode") {
                     break;

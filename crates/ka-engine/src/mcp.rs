@@ -7,6 +7,23 @@
 //! Lifecycle: [`McpClient::spawn_connect`] connects, handshakes, and
 //! lists tools. Failures are per-server and non-fatal: the engine notes
 //! them and carries on with the built-in hands.
+//!
+//! EXT-03: HTTP servers gain auth — a `headers_helper` command, a
+//! `bearer_token_env` bearer, or the OAuth 2.0 flow
+//! ([`crate::mcp_oauth`]: metadata discovery, DCR/CIMD, PKCE code
+//! exchange, cached refresh). A 401 carrying `WWW-Authenticate`
+//! triggers the flow once per connect; an expired token refreshes once
+//! per request before the request fails.
+//!
+//! EXT-05: server-initiated traffic is no longer dropped. Requests
+//! (`roots/list`, `elicitation/create`, `sampling/createMessage`) and
+//! notifications (`notifications/tools/list_changed`,
+//! `notifications/resources/updated`) route through
+//! [`McpShared`]'s inbox: `pump_inbound` answers `roots/list`
+//! directly (cwd) and forwards everything else to the engine via
+//! [`Maintenance`]. They are handled between turns — a server that
+//! elicits mid-`tools/call` waits for the turn to settle (the engine
+//! loop owns asks; see [`crate::engine`]).
 
 use std::collections::HashMap;
 use std::process::Stdio;
@@ -17,6 +34,48 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{Mutex, mpsc, oneshot};
+
+/// A server-initiated JSON-RPC message (EXT-05). Requests carry the
+/// raw id (string or number — echoed verbatim in the response);
+/// notifications carry none.
+#[derive(Debug, Clone)]
+pub enum ServerMessage {
+    /// A request the server expects answered (`roots/list`,
+    /// `elicitation/create`, `sampling/createMessage`, …).
+    Request {
+        /// The verbatim JSON-RPC id to echo in the response.
+        id: Value,
+        /// The method name.
+        method: String,
+        /// The request params.
+        params: Value,
+    },
+    /// A server-initiated notification (`notifications/*`).
+    Notification {
+        /// The method name.
+        method: String,
+        /// The notification params.
+        params: Value,
+    },
+}
+
+/// Auth context for an HTTP transport (EXT-03): the resolved bearer
+/// plus what a 401 needs to refresh once before failing.
+#[derive(Debug, Clone)]
+struct HttpAuth {
+    bearer: String,
+    refresh: Option<String>,
+    token_endpoint: String,
+    client_id: String,
+    scopes: Vec<String>,
+    /// Token-cache key (`mcp_oauth::server_key`); `None` = never
+    /// persist refreshed tokens (bearer_token_env path).
+    cache_key: Option<String>,
+    /// One silent refresh per transport lifetime guard: a fresh
+    /// transport retries once, a poisoned token fails loud instead of
+    /// looping.
+    refreshed_401: bool,
+}
 
 /// A configured MCP server (one `[[mcp]]` table in ka.toml).
 #[derive(
@@ -66,22 +125,91 @@ pub struct McpServerConfig {
     /// cap with a truncation note.
     #[serde(default)]
     pub output_limit: Option<usize>,
+    /// EXT-03: engage the OAuth 2.0 flow for this HTTP server (401 +
+    /// `WWW-Authenticate` also triggers it when unset). With
+    /// `bearer_token_env` set, OAuth never runs.
+    #[serde(default)]
+    pub oauth: Option<bool>,
+    /// EXT-03: a pre-registered (CIMD) OAuth client id. Its presence
+    /// implies `oauth = true` and skips dynamic client registration.
+    #[serde(default)]
+    pub oauth_client_id: Option<String>,
+    /// EXT-03: scopes to request during authorization.
+    #[serde(default)]
+    pub oauth_scopes: Vec<String>,
+    /// EXT-03: bearer-token override — the access token is read from
+    /// this environment variable and NO OAuth flow runs.
+    #[serde(default)]
+    pub bearer_token_env: Option<String>,
+    /// EXT-03b: a shell command whose stdout is a JSON object of extra
+    /// HTTP headers, executed before each HTTP connection (output
+    /// capped at 8 KiB; failures surface as the connect error).
+    #[serde(default)]
+    pub headers_helper: Option<String>,
 }
 
 impl McpServerConfig {
     /// Exactly one transport must be configured.
     pub fn validate(&self) -> Result<(), String> {
         match (self.command.is_some(), self.url.is_some()) {
-            (true, false) | (false, true) => Ok(()),
-            (true, true) => Err(format!(
-                "mcp {}: set either command or url, not both",
-                self.name
-            )),
-            (false, false) => Err(format!(
-                "mcp {}: one of command or url is required",
-                self.name
-            )),
+            (true, false) | (false, true) => {}
+            (true, true) => {
+                return Err(format!(
+                    "mcp {}: set either command or url, not both",
+                    self.name
+                ));
+            }
+            (false, false) => {
+                return Err(format!(
+                    "mcp {}: one of command or url is required",
+                    self.name
+                ));
+            }
         }
+        // EXT-03: the HTTP-auth knobs are meaningless (and silently
+        // dead) on a stdio server — reject them instead.
+        if self.command.is_some() {
+            for (key, set) in [
+                ("oauth", self.oauth.is_some()),
+                ("oauth_client_id", self.oauth_client_id.is_some()),
+                ("oauth_scopes", !self.oauth_scopes.is_empty()),
+                ("bearer_token_env", self.bearer_token_env.is_some()),
+                ("headers_helper", self.headers_helper.is_some()),
+            ] {
+                if set {
+                    return Err(format!(
+                        "mcp {}: {key} applies to url servers only",
+                        self.name
+                    ));
+                }
+            }
+        }
+        if let Some(id) = &self.oauth_client_id {
+            if id.trim().is_empty() {
+                return Err(format!(
+                    "mcp {}: oauth_client_id must not be empty",
+                    self.name
+                ));
+            }
+        }
+        if let Some(helper) = &self.headers_helper {
+            if helper.trim().is_empty() {
+                return Err(format!(
+                    "mcp {}: headers_helper must not be empty",
+                    self.name
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// EXT-03: whether OAuth should engage for this server (config
+    /// opt-in, a CIMD client id, or any configured scope).
+    pub fn oauth_enabled(&self) -> bool {
+        self.bearer_token_env.is_none()
+            && (self.oauth == Some(true)
+                || self.oauth_client_id.is_some()
+                || !self.oauth_scopes.is_empty())
     }
 
     /// EXT-04 tool filter: `disabled_tools` wins over `enabled_tools`;
@@ -202,8 +330,13 @@ pub struct McpClient {
     /// Responses routed by id (shared with the stdio/SSE reader tasks).
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
     next_id: AtomicU64,
-    /// Server-initiated notifications/requests (logged, not handled).
-    _noise: mpsc::Receiver<String>,
+    /// Server-initiated requests/notifications (EXT-05), moved into
+    /// [`McpShared`]'s inbox when the client is installed.
+    noise_rx: Option<mpsc::Receiver<ServerMessage>>,
+    /// The most recent HTTP transport error (status +
+    /// `WWW-Authenticate`), kept so the connect path can decide on an
+    /// OAuth retry (EXT-03). Cleared on every request.
+    last_http: Option<HttpError>,
 }
 
 /// How one client talks to its server.
@@ -227,14 +360,48 @@ struct HttpRpc {
     headers: Vec<(String, String)>,
     session_id: Option<String>,
     client: reqwest::Client,
+    /// EXT-03 auth: bearer + refresh material, `None` for anonymous.
+    auth: Option<HttpAuth>,
+    /// Server-initiated frames routed off the POST responses (EXT-05).
+    noise: Option<mpsc::Sender<ServerMessage>>,
 }
 
 /// Transport-level failure. The message carries the HTTP status when
 /// one was received (a 404/405 on a streamable POST hints at a
-/// legacy-SSE-only server — see [`McpClient::legacy_fallback_possible`]).
-#[derive(Debug)]
+/// legacy-SSE-only server — see [`McpClient::legacy_fallback_possible`]);
+/// `www_authenticate` carries the 401 challenge header verbatim (the
+/// OAuth trigger, EXT-03).
+#[derive(Debug, Clone)]
 struct HttpError {
     message: String,
+    www_authenticate: Option<String>,
+    status: Option<u16>,
+}
+
+impl HttpError {
+    fn plain(message: String) -> Self {
+        Self {
+            message,
+            www_authenticate: None,
+            status: None,
+        }
+    }
+}
+
+/// Classify one decoded JSON-RPC frame into its server-initiated
+/// [`ServerMessage`]; `None` = a response frame (routed by id, not
+/// method) or junk.
+fn classify_frame(frame: Value) -> Option<ServerMessage> {
+    let method = frame.get("method")?.as_str()?.to_string();
+    let params = frame.get("params").cloned().unwrap_or(Value::Null);
+    match frame.get("id").filter(|v| !v.is_null()) {
+        Some(id) => Some(ServerMessage::Request {
+            id: id.clone(),
+            method,
+            params,
+        }),
+        None => Some(ServerMessage::Notification { method, params }),
+    }
 }
 
 impl HttpRpc {
@@ -244,7 +411,19 @@ impl HttpRpc {
             headers,
             session_id: None,
             client: reqwest::Client::new(),
+            auth: None,
+            noise: None,
         }
+    }
+
+    fn with_noise(mut self, noise: mpsc::Sender<ServerMessage>) -> Self {
+        self.noise = Some(noise);
+        self
+    }
+
+    fn with_auth(mut self, auth: HttpAuth) -> Self {
+        self.auth = Some(auth);
+        self
     }
 
     fn apply_common(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -254,23 +433,74 @@ impl HttpRpc {
         for (k, v) in &self.headers {
             req = req.header(k.as_str(), v.as_str());
         }
+        if let Some(auth) = &self.auth {
+            req = req.header("Authorization", format!("Bearer {}", auth.bearer));
+        }
         if let Some(sid) = &self.session_id {
             req = req.header("Mcp-Session-Id", sid);
         }
         req
     }
 
+    /// EXT-03: refresh the access token once (401 guard). Updates the
+    /// transport's bearer, re-caches, and reports whether the caller
+    /// should retry the request.
+    async fn refresh_on_401(&mut self) -> Result<bool, String> {
+        let Some(auth) = self.auth.as_mut() else {
+            return Ok(false);
+        };
+        if auth.refreshed_401 {
+            return Ok(false);
+        }
+        let Some(refresh) = auth.refresh.clone() else {
+            return Ok(false);
+        };
+        auth.refreshed_401 = true;
+        let fresh = crate::mcp_oauth::refresh_tokens(
+            &self.client,
+            &auth.token_endpoint,
+            &auth.client_id,
+            &refresh,
+            &auth.scopes,
+        )
+        .await?;
+        auth.bearer = fresh.access_token.clone();
+        auth.refresh = fresh.refresh_token.clone();
+        if let Some(key) = &auth.cache_key {
+            crate::mcp_oauth::store_tokens(key, &fresh);
+        }
+        Ok(true)
+    }
+
     /// POST one JSON-RPC message. `Ok(None)` = accepted with no body
-    /// (notifications / 202).
+    /// (notifications / 202). A 401 with refreshable auth retries once
+    /// after a refresh grant.
     async fn post(&mut self, msg: &Value) -> Result<Option<Value>, HttpError> {
+        match self.post_once(msg).await {
+            Err(e) if e.status == Some(401) => match self.refresh_on_401().await {
+                Ok(true) => self.post_once(msg).await,
+                Ok(false) => Err(e),
+                Err(refresh_err) => Err(HttpError {
+                    message: format!("{} (token refresh failed: {refresh_err})", e.message),
+                    www_authenticate: e.www_authenticate,
+                    status: e.status,
+                }),
+            },
+            other => other,
+        }
+    }
+
+    /// [`Self::post`] without the 401 refresh dance.
+    async fn post_once(&mut self, msg: &Value) -> Result<Option<Value>, HttpError> {
+        // keep a verbatim copy for id matching when the server streams
+        // extra frames (server-initiated requests) beside the response
+        let own_id = msg.get("id").cloned();
         let resp = self
             .apply_common(self.client.post(&self.url))
             .json(msg)
             .send()
             .await
-            .map_err(|e| HttpError {
-                message: format!("mcp http: {e}"),
-            })?;
+            .map_err(|e| HttpError::plain(format!("mcp http: {e}")))?;
         if let Some(sid) = resp
             .headers()
             .get("mcp-session-id")
@@ -279,9 +509,16 @@ impl HttpRpc {
             self.session_id = Some(sid.to_string());
         }
         let status = resp.status();
+        let www_authenticate = resp
+            .headers()
+            .get("www-authenticate")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
         if !status.is_success() {
             return Err(HttpError {
                 message: format!("mcp http: status {status}"),
+                www_authenticate,
+                status: Some(status.as_u16()),
             });
         }
         if status.as_u16() == 202 {
@@ -293,30 +530,57 @@ impl HttpRpc {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
-        let body = resp.text().await.map_err(|e| HttpError {
-            message: format!("mcp http: {e}"),
-        })?;
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| HttpError::plain(format!("mcp http: {e}")))?;
         if ct.contains("event-stream") {
-            return Ok(first_sse_response(&body));
+            return Ok(self.consume_sse(&body, own_id));
         }
-        Ok(serde_json::from_str::<Value>(&body).ok())
+        let parsed: Value = serde_json::from_str(&body)
+            .map_err(|e| HttpError::plain(format!("mcp http: non-JSON body: {e}")))?;
+        Ok(self.consume_frame(parsed, own_id))
     }
-}
 
-/// Pull the first JSON-RPC response out of an SSE body.
-fn first_sse_response(body: &str) -> Option<Value> {
-    for frame in body.split("\n\n") {
-        for line in frame.lines() {
-            if let Some(data) = line.strip_prefix("data:") {
-                if let Ok(v) = serde_json::from_str::<Value>(data.trim()) {
-                    if v.get("result").is_some() || v.get("error").is_some() {
-                        return Some(v);
+    /// Route every JSON-RPC frame in an SSE body: our response is
+    /// returned (after the WHOLE body is scanned — servers may append
+    /// server-initiated requests/notifications behind it), everything
+    /// else flows to the inbox.
+    fn consume_sse(&mut self, body: &str, own_id: Option<Value>) -> Option<Value> {
+        let mut own: Option<Value> = None;
+        for frame in body.split("\n\n") {
+            for line in frame.lines() {
+                if let Some(data) = line.strip_prefix("data:") {
+                    if let Ok(v) = serde_json::from_str::<Value>(data.trim()) {
+                        if own.is_none() {
+                            own = self.consume_frame(v, own_id.clone());
+                        } else if let (Some(tx), Some(msg)) =
+                            (self.noise.clone(), classify_frame(v))
+                        {
+                            tx.try_send(msg).ok();
+                        }
                     }
                 }
             }
         }
+        own
     }
-    None
+
+    /// Classify one decoded frame: our response (id match + result or
+    /// error) is returned; other frames route to the inbox.
+    fn consume_frame(&mut self, frame: Value, own_id: Option<Value>) -> Option<Value> {
+        if let Some(id) = &own_id {
+            if frame.get("id") == Some(id)
+                && (frame.get("result").is_some() || frame.get("error").is_some())
+            {
+                return Some(frame);
+            }
+        }
+        if let (Some(tx), Some(msg)) = (self.noise.clone(), classify_frame(frame)) {
+            tx.try_send(msg).ok();
+        }
+        None
+    }
 }
 
 impl McpClient {
@@ -324,10 +588,21 @@ impl McpClient {
     /// handshake, and list tools. One call so callers get a
     /// fully-usable client or an error string.
     pub async fn spawn_connect(cfg: &McpServerConfig) -> Result<(Self, Vec<McpTool>), String> {
+        Self::spawn_connect_with(cfg, &crate::mcp_oauth::FlowHooks::default()).await
+    }
+
+    /// [`Self::spawn_connect`] with OAuth flow hooks (EXT-03): the
+    /// Note sink the authorize URL lands in and the headless/test
+    /// allowance. Watchdogs thread the shared handle's hooks through
+    /// so reconnects surface the same UX.
+    pub async fn spawn_connect_with(
+        cfg: &McpServerConfig,
+        ux: &crate::mcp_oauth::FlowHooks,
+    ) -> Result<(Self, Vec<McpTool>), String> {
         cfg.validate()?;
         match (&cfg.command, &cfg.url) {
             (Some(command), _) => Self::spawn_stdio(cfg, command).await,
-            (None, Some(url)) => Self::connect_http(cfg, url).await,
+            (None, Some(url)) => Self::connect_http(cfg, url, ux).await,
             (None, None) => Err("mcp: unreachable: unvalidated config".to_string()),
         }
     }
@@ -363,7 +638,8 @@ impl McpClient {
             transport: Transport::Stdio { child, stdin },
             pending,
             next_id: AtomicU64::new(1),
-            _noise: noise_rx,
+            noise_rx: Some(noise_rx),
+            last_http: None,
         };
         client.initialize().await?;
         let tools = client.list_tools().await?;
@@ -373,17 +649,27 @@ impl McpClient {
     /// HTTP transport: try streamable HTTP first; on a 404/405 from the
     /// POST fall back to a legacy-SSE server (GET endpoint event gives
     /// the messages URL).
+    ///
+    /// EXT-03 auth order: `headers_helper` headers first, then the
+    /// `bearer_token_env` bearer (which disables OAuth entirely), then
+    /// OAuth — config opt-in up front, or once on a 401 that carries a
+    /// `WWW-Authenticate` challenge. An OAuth connect retries the
+    /// handshake with the fresh bearer.
     async fn connect_http(
         cfg: &McpServerConfig,
         url: &str,
+        ux: &crate::mcp_oauth::FlowHooks,
     ) -> Result<(Self, Vec<McpTool>), String> {
-        let rpc = HttpRpc::new(url.to_string(), cfg.headers.clone());
+        let (noise_tx, noise_rx) = mpsc::channel(64);
+        let rpc =
+            HttpRpc::new(url.to_string(), Self::http_headers(cfg).await?).with_noise(noise_tx);
         let mut client = Self {
             server_name: cfg.name.clone(),
             transport: Transport::StreamableHttp(rpc),
             pending: Arc::new(Mutex::new(HashMap::new())),
             next_id: AtomicU64::new(1),
-            _noise: mpsc::channel(64).1,
+            noise_rx: Some(noise_rx),
+            last_http: None,
         };
         match client.initialize().await {
             Ok(()) => {}
@@ -392,10 +678,94 @@ impl McpClient {
                 client.transport = Transport::LegacySse(rpc);
                 client.initialize().await?;
             }
+            Err(_) if Self::oauth_due(cfg, &client.last_http) => {
+                // authorize (or refresh from cache), then rebuild the
+                // transport with the fresh bearer and retry once
+                let http = reqwest::Client::new();
+                let (tokens, meta) = crate::mcp_oauth::ensure_tokens(&http, cfg, ux).await?;
+                let (noise_tx, noise_rx) = mpsc::channel(64);
+                let rpc = HttpRpc::new(url.to_string(), Self::http_headers(cfg).await?)
+                    .with_noise(noise_tx)
+                    .with_auth(HttpAuth {
+                        bearer: tokens.access_token,
+                        refresh: tokens.refresh_token,
+                        token_endpoint: meta.token_endpoint,
+                        client_id: tokens.client_id.unwrap_or_default(),
+                        scopes: cfg.oauth_scopes.clone(),
+                        cache_key: Some(crate::mcp_oauth::server_key(cfg)),
+                        refreshed_401: false,
+                    });
+                client.transport = Transport::StreamableHttp(rpc);
+                client.noise_rx = Some(noise_rx);
+                client.last_http = None;
+                client.initialize().await?;
+            }
             Err(e) => return Err(e),
         }
         let tools = client.list_tools().await?;
         Ok((client, tools))
+    }
+
+    /// EXT-03b + EXT-03: the static headers for an HTTP connect —
+    /// configured `headers`, then `headers_helper` output (8 KiB cap,
+    /// failures inline), then the `bearer_token_env` bearer. Helper
+    /// output carrying an `authorization` entry is dropped when ka
+    /// adds its own bearer, so a transport never ships two.
+    async fn http_headers(cfg: &McpServerConfig) -> Result<Vec<(String, String)>, String> {
+        let mut headers = cfg.headers.clone();
+        if let Some(helper) = &cfg.headers_helper {
+            let extra = tokio::task::spawn_blocking({
+                let helper = helper.clone();
+                move || crate::mcp_oauth::run_headers_helper(&helper)
+            })
+            .await
+            .map_err(|e| format!("mcp {}: headers_helper join failed: {e}", cfg.name))?
+            .map_err(|e| format!("mcp {}: {e}", cfg.name))?;
+            headers.extend(extra);
+        }
+        let mut bearer = None;
+        if let Some(env_name) = &cfg.bearer_token_env {
+            let token = std::env::var(env_name).map_err(|_| {
+                format!(
+                    "mcp {}: bearer_token_env {env_name:?} is not set in the environment",
+                    cfg.name
+                )
+            })?;
+            if token.trim().is_empty() {
+                return Err(format!(
+                    "mcp {}: bearer_token_env {env_name:?} is empty",
+                    cfg.name
+                ));
+            }
+            bearer = Some(token);
+        }
+        if bearer.is_some() {
+            headers.retain(|(k, _)| !k.eq_ignore_ascii_case("authorization"));
+        }
+        if let Some(token) = bearer {
+            headers.push(("Authorization".into(), format!("Bearer {token}")));
+        }
+        Ok(headers)
+    }
+
+    /// Whether the OAuth flow should run for this connect: config
+    /// opt-in always; a 401 whose `WWW-Authenticate` names OAuth also
+    /// triggers it (never under `bearer_token_env` — that override
+    /// wins and OAuth stays off).
+    fn oauth_due(cfg: &McpServerConfig, last_http: &Option<HttpError>) -> bool {
+        if !cfg.oauth_enabled() {
+            return false;
+        }
+        if cfg.oauth == Some(true) || cfg.oauth_client_id.is_some() {
+            return true;
+        }
+        // scopes-only configs still wait for the server to ask
+        last_http.as_ref().is_some_and(|e| {
+            e.status == Some(401)
+                && e.www_authenticate
+                    .as_deref()
+                    .is_some_and(|w| w.to_ascii_lowercase().contains("oauth"))
+        })
     }
 
     /// Whether an initialize failure should trigger a legacy-SSE retry.
@@ -411,6 +781,7 @@ impl McpClient {
         };
         let base = old.url.clone();
         let headers = old.headers.clone();
+        let auth = old.auth.clone();
         let client = old.client.clone();
         let resp = client
             .get(&base)
@@ -424,7 +795,8 @@ impl McpClient {
         let (ep_tx, ep_rx) = oneshot::channel::<String>();
         let pending = self.pending.clone();
         let (noise_tx, noise_rx) = mpsc::channel(64);
-        self._noise = noise_rx;
+        let post_noise = noise_tx.clone();
+        self.noise_rx = Some(noise_rx);
         tokio::spawn(sse_read_loop(resp, pending, noise_tx, Some(ep_tx)));
         let endpoint = tokio::time::timeout(REQUEST_TIMEOUT, ep_rx)
             .await
@@ -442,6 +814,8 @@ impl McpClient {
             headers,
             session_id: None,
             client,
+            auth,
+            noise: Some(post_noise),
         })
     }
 
@@ -458,13 +832,17 @@ impl McpClient {
     ) -> Result<Value, String> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let msg = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+        self.last_http = None;
         match &mut self.transport {
             // streamable HTTP: the response rides the POST itself
             Transport::StreamableHttp(rpc) => {
                 let resp = tokio::time::timeout(timeout, rpc.post(&msg))
                     .await
                     .map_err(|_| format!("{method}: request timed out"))?
-                    .map_err(|e| e.message)?
+                    .map_err(|e| {
+                        self.last_http = Some(e.clone());
+                        e.message
+                    })?
                     .ok_or_else(|| format!("{method}: no response body"))?;
                 if let Some(err) = resp.get("error") {
                     return Err(format!("{method}: {err}"));
@@ -511,6 +889,36 @@ impl McpClient {
                 rpc.post(msg).await.map(|_| ()).map_err(|e| e.message)?;
                 Ok(())
             }
+        }
+    }
+
+    /// Answer a server-initiated request (EXT-05): the result half of
+    /// a JSON-RPC response, id echoed verbatim.
+    async fn respond(&mut self, id: &Value, result: Value) -> Result<(), String> {
+        self.send_msg(&json!({"jsonrpc": "2.0", "id": id, "result": result}))
+            .await
+    }
+
+    /// Answer a server-initiated request with a JSON-RPC error object
+    /// (unsupported method, refused elicitation, sampling rejection).
+    async fn respond_error(&mut self, id: &Value, code: i64, message: &str) -> Result<(), String> {
+        self.send_msg(&json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {"code": code, "message": message},
+        }))
+        .await
+    }
+
+    /// The transport's live bearer token (oauth tests poison it to
+    /// exercise the 401 → refresh → retry path).
+    #[cfg(test)]
+    pub fn test_bearer_mut(&mut self) -> Option<&mut String> {
+        match &mut self.transport {
+            Transport::StreamableHttp(rpc) | Transport::LegacySse(rpc) => {
+                rpc.auth.as_mut().map(|a| &mut a.bearer)
+            }
+            Transport::Stdio { .. } => None,
         }
     }
 
@@ -714,6 +1122,23 @@ pub enum Maintenance {
         tools: Vec<McpTool>,
         changed: bool,
     },
+    /// EXT-05: a server-initiated JSON-RPC request reached the inbox
+    /// (`elicitation/create`, `sampling/createMessage`, anything
+    /// unknown). `roots/list` never leaves mcp — the pump answers it.
+    McpServerRequest {
+        server: String,
+        id: Value,
+        method: String,
+        params: Value,
+    },
+    /// EXT-05: a server-initiated notification reached the inbox
+    /// (`notifications/tools/list_changed`,
+    /// `notifications/resources/updated`, anything unknown).
+    McpServerNotification {
+        server: String,
+        method: String,
+        params: Value,
+    },
 }
 
 /// Watchdog timing (tests shrink everything).
@@ -745,16 +1170,37 @@ pub struct McpShared {
     cfg: McpServerConfig,
     cell: Arc<Mutex<Option<McpClient>>>,
     tools: Arc<parking_lot::Mutex<Vec<McpTool>>>,
+    /// Server-initiated traffic (EXT-05): each installed client
+    /// contributes its reader; [`pump_inbound`] takes and drains it.
+    inbox: Arc<Mutex<Option<mpsc::Receiver<ServerMessage>>>>,
+    /// OAuth flow hooks (EXT-03) threaded to every (re)connect.
+    auth_hooks: crate::mcp_oauth::FlowHooks,
 }
 
 impl McpShared {
-    /// Wrap a freshly connected client and its tool list.
-    pub fn new(cfg: McpServerConfig, client: McpClient, tools: Vec<McpTool>) -> Self {
+    /// Wrap a freshly connected client and its tool list. The client's
+    /// server-initiated traffic moves into the inbox for the pump.
+    pub fn new(cfg: McpServerConfig, mut client: McpClient, tools: Vec<McpTool>) -> Self {
+        let inbox = client.noise_rx.take();
         Self {
             cfg,
             cell: Arc::new(Mutex::new(Some(client))),
             tools: Arc::new(parking_lot::Mutex::new(tools)),
+            inbox: Arc::new(Mutex::new(inbox)),
+            auth_hooks: crate::mcp_oauth::FlowHooks::default(),
         }
+    }
+
+    /// Builder: thread OAuth flow hooks (the engine's Note sink) into
+    /// every subsequent connect, including watchdog reconnects.
+    pub fn with_auth_hooks(mut self, hooks: crate::mcp_oauth::FlowHooks) -> Self {
+        self.auth_hooks = hooks;
+        self
+    }
+
+    /// The OAuth hooks every connect for this server carries.
+    pub fn auth_hooks(&self) -> &crate::mcp_oauth::FlowHooks {
+        &self.auth_hooks
     }
 
     /// The configured server name.
@@ -801,6 +1247,8 @@ impl McpShared {
             cfg,
             cell: Arc::new(Mutex::new(None)),
             tools: Arc::new(parking_lot::Mutex::new(tools)),
+            inbox: Arc::new(Mutex::new(None)),
+            auth_hooks: crate::mcp_oauth::FlowHooks::default(),
         }
     }
 
@@ -909,9 +1357,13 @@ impl McpShared {
         parse_tools(&result, &self.cfg.name)
     }
 
-    async fn install(&self, client: McpClient, tools: Vec<McpTool>) {
+    async fn install(&self, mut client: McpClient, tools: Vec<McpTool>) {
+        // hand the fresh client's server-initiated traffic to the pump:
+        // a previous receiver simply closes when its client drops
+        let inbox = client.noise_rx.take();
         *self.cell.lock().await = Some(client);
         *self.tools.lock() = tools;
+        *self.inbox.lock().await = inbox;
     }
 
     async fn mark_down(&self) {
@@ -920,6 +1372,33 @@ impl McpShared {
 
     fn tool_count(&self) -> usize {
         self.tools.lock().len()
+    }
+
+    /// Take the current inbox reader, if one is installed. The pump
+    /// holds it until the client is swapped (the old receiver closes),
+    /// then calls again for the new one.
+    pub async fn take_inbox(&self) -> Option<mpsc::Receiver<ServerMessage>> {
+        self.inbox.lock().await.take()
+    }
+
+    /// Answer a server-initiated request through the current client
+    /// (EXT-05 elicitation/sampling/roots). Fails when disconnected —
+    /// the request is moot then anyway.
+    pub async fn respond(&self, id: &Value, result: Value) -> Result<(), String> {
+        let mut guard = self.cell.lock().await;
+        match guard.as_mut() {
+            Some(c) => c.respond(id, result).await,
+            None => Err(format!("mcp {}: disconnected", self.cfg.name)),
+        }
+    }
+
+    /// [`Self::respond`] with a JSON-RPC error object.
+    pub async fn respond_error(&self, id: &Value, code: i64, message: &str) -> Result<(), String> {
+        let mut guard = self.cell.lock().await;
+        match guard.as_mut() {
+            Some(c) => c.respond_error(id, code, message).await,
+            None => Err(format!("mcp {}: disconnected", self.cfg.name)),
+        }
     }
 
     /// Kill the current stdio server process (watchdog tests).
@@ -951,7 +1430,9 @@ pub async fn supervise(
         let mut restored = None;
         for delay in timing.backoffs {
             tokio::time::sleep(delay).await;
-            if let Ok((client, tools)) = McpClient::spawn_connect(&shared.cfg).await {
+            if let Ok((client, tools)) =
+                McpClient::spawn_connect_with(&shared.cfg, shared.auth_hooks()).await
+            {
                 restored = Some((client, tools));
                 break;
             }
@@ -995,7 +1476,7 @@ pub async fn verify_initial(
 ) {
     let cached = shared.tools();
     let cfg = shared.cfg.clone();
-    if let Ok((client, tools)) = McpClient::spawn_connect(&cfg).await {
+    if let Ok((client, tools)) = McpClient::spawn_connect_with(&cfg, shared.auth_hooks()).await {
         let changed = tools != cached;
         shared.install(client, tools.clone()).await;
         maintenance
@@ -1008,6 +1489,59 @@ pub async fn verify_initial(
             .ok();
     }
     supervise(shared, maintenance, timing).await;
+}
+
+/// EXT-05: drain one server's inbox for the engine. `roots/list` is
+/// answered right here (cwd-scoped, no ask machinery needed);
+/// everything else becomes a [`Maintenance`] message. Reconnects swap
+/// the inbox reader — this loop re-takes it whenever the old one
+/// closes. While disconnected it parks on a short poll (the watchdog
+/// cadence dwarfs it).
+pub async fn pump_inbound(
+    shared: McpShared,
+    cwd: std::path::PathBuf,
+    maintenance: mpsc::Sender<Maintenance>,
+) {
+    loop {
+        let Some(mut rx) = shared.take_inbox().await else {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            continue;
+        };
+        while let Some(msg) = rx.recv().await {
+            match msg {
+                ServerMessage::Request { id, method, params } => {
+                    if method == "roots/list" {
+                        let name = cwd
+                            .file_name()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| cwd.to_string_lossy().into_owned());
+                        let uri = format!("file://{}", cwd.display());
+                        let _ = shared
+                            .respond(&id, json!({"roots": [{"uri": uri, "name": name}]}))
+                            .await;
+                        continue;
+                    }
+                    let _ = maintenance
+                        .send(Maintenance::McpServerRequest {
+                            server: shared.name().to_string(),
+                            id,
+                            method,
+                            params,
+                        })
+                        .await;
+                }
+                ServerMessage::Notification { method, params } => {
+                    let _ = maintenance
+                        .send(Maintenance::McpServerNotification {
+                            server: shared.name().to_string(),
+                            method,
+                            params,
+                        })
+                        .await;
+                }
+            }
+        }
+    }
 }
 
 /// Parse a tools/list result into prefixed [`McpTool`]s.
@@ -1084,7 +1618,7 @@ fn extract_text(result: &Value) -> String {
 async fn read_loop(
     stdout: ChildStdout,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
-    noise: mpsc::Sender<String>,
+    noise: mpsc::Sender<ServerMessage>,
 ) {
     let mut lines = BufReader::new(stdout).lines();
     while let Ok(Some(line)) = lines.next_line().await {
@@ -1095,19 +1629,23 @@ async fn read_loop(
     }
 }
 
-/// Route one decoded JSON-RPC message: responses by id, methods to the
-/// noise channel.
+/// Route one decoded JSON-RPC message: requests/notifications by
+/// method (server-initiated, EXT-05), responses by id. The method
+/// check runs first — a server-initiated request also carries a
+/// numeric id, and must never land in the pending-response map.
 async fn route_message(
     msg: Value,
     pending: &Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
-    noise: &mpsc::Sender<String>,
+    noise: &mpsc::Sender<ServerMessage>,
 ) {
-    if let Some(id) = msg["id"].as_u64() {
+    if msg.get("method").is_some() {
+        if let Some(message) = classify_frame(msg) {
+            let _ = noise.send(message).await;
+        }
+    } else if let Some(id) = msg["id"].as_u64() {
         if let Some(tx) = pending.lock().await.remove(&id) {
             tx.send(msg).ok();
         }
-    } else if let Some(method) = msg["method"].as_str() {
-        let _ = noise.send(method.to_string()).await;
     }
 }
 
@@ -1116,7 +1654,7 @@ async fn route_message(
 async fn sse_read_loop(
     mut resp: reqwest::Response,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
-    noise: mpsc::Sender<String>,
+    noise: mpsc::Sender<ServerMessage>,
     endpoint_tx: Option<oneshot::Sender<String>>,
 ) {
     let mut buf = String::new();
@@ -1333,6 +1871,123 @@ impl crate::hands::Hand for McpCallHand {
     }
 }
 
+/// EXT-05 elicitation, simplified: what the user is asked and how the
+/// chosen option maps back into the MCP result. One question per
+/// request — the first schema property drives the options.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ElicitAsk {
+    /// The question text (`message` + property context).
+    pub question: String,
+    /// The selectable options (index-referenced by the surface).
+    pub options: Vec<String>,
+    /// The schema property the answer fills (`None` = plain
+    /// accept/decline on the message).
+    pub prop: Option<String>,
+    /// The enum values when the property is a choice.
+    pub enum_values: Vec<String>,
+    /// `Some(true)`/`Some(false)` when the property is boolean.
+    pub boolean: Option<bool>,
+}
+
+/// Build the ask for an `elicitation/create` request. The schema is
+/// simplified: the FIRST property wins — an `enum` string renders its
+/// values as options, a boolean renders true/false, a free-form
+/// string renders accept-empty/decline; with no properties the ask is
+/// a plain accept/decline on the message.
+pub fn elicitation_ask(params: &Value) -> ElicitAsk {
+    let message = params["message"]
+        .as_str()
+        .unwrap_or("(the server requests input)")
+        .to_string();
+    let props = params["requestedSchema"]["properties"].as_object();
+    let Some((prop, schema)) = props.and_then(|p| p.iter().next()) else {
+        return ElicitAsk {
+            question: message,
+            options: vec!["accept".into(), "decline".into()],
+            prop: None,
+            enum_values: Vec::new(),
+            boolean: None,
+        };
+    };
+    let question = format!("{message} (requested: {prop})");
+    let enum_values: Vec<String> = schema["enum"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|v| match v {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if !enum_values.is_empty() {
+        let mut options = enum_values.clone();
+        options.push("decline".into());
+        return ElicitAsk {
+            question,
+            options,
+            prop: Some(prop.clone()),
+            enum_values,
+            boolean: None,
+        };
+    }
+    if schema["type"].as_str() == Some("boolean") {
+        return ElicitAsk {
+            question,
+            options: vec!["true".into(), "false".into(), "decline".into()],
+            prop: Some(prop.clone()),
+            enum_values: Vec::new(),
+            boolean: Some(true),
+        };
+    }
+    ElicitAsk {
+        question,
+        options: vec!["accept (empty value)".into(), "decline".into()],
+        prop: Some(prop.clone()),
+        enum_values: Vec::new(),
+        boolean: None,
+    }
+}
+
+/// Map the ask answer back into the MCP elicitation result:
+/// `{"action": "accept"|"decline"|"cancel", "content"?: {…}}`.
+/// `None` (surface abort) maps to `cancel`.
+pub fn elicitation_result(choice: Option<usize>, ask: &ElicitAsk) -> Value {
+    let Some(choice) = choice else {
+        return json!({"action": "cancel"});
+    };
+    let decline = json!({"action": "decline"});
+    let Some(prop) = &ask.prop else {
+        return match choice {
+            0 => json!({"action": "accept"}),
+            _ => decline,
+        };
+    };
+    let content = |v: Value| {
+        let mut map = serde_json::Map::new();
+        map.insert(prop.clone(), v);
+        json!({"action": "accept", "content": map})
+    };
+    if !ask.enum_values.is_empty() {
+        return match ask.enum_values.get(choice) {
+            Some(v) => content(Value::String(v.clone())),
+            _ => decline,
+        };
+    }
+    if ask.boolean == Some(true) {
+        return match choice {
+            0 => content(Value::Bool(true)),
+            1 => content(Value::Bool(false)),
+            _ => decline,
+        };
+    }
+    match choice {
+        0 => content(Value::String(String::new())),
+        _ => decline,
+    }
+}
+
 /// Char-boundary truncate with ellipsis (listing caps).
 fn truncate_chars(s: &str, cap: usize) -> String {
     if s.chars().count() > cap {
@@ -1545,6 +2200,11 @@ for line in sys.stdin:
             approval: None,
             tool_timeout_secs: None,
             output_limit: None,
+            oauth: None,
+            oauth_client_id: None,
+            oauth_scopes: Vec::new(),
+            bearer_token_env: None,
+            headers_helper: None,
         }
     }
 
@@ -1753,6 +2413,11 @@ for line in sys.stdin:
             approval: None,
             tool_timeout_secs: None,
             output_limit: None,
+            oauth: None,
+            oauth_client_id: None,
+            oauth_scopes: Vec::new(),
+            bearer_token_env: None,
+            headers_helper: None,
         };
         let (mut client, tools) = McpClient::spawn_connect(&cfg).await.unwrap();
         assert_eq!(tools.len(), 1);
@@ -1870,6 +2535,11 @@ for line in sys.stdin:
             approval: None,
             tool_timeout_secs: None,
             output_limit: None,
+            oauth: None,
+            oauth_client_id: None,
+            oauth_scopes: Vec::new(),
+            bearer_token_env: None,
+            headers_helper: None,
         };
         let (_client, tools) = McpClient::spawn_connect(&cfg).await.unwrap();
         assert_eq!(tools.len(), 1);
@@ -1929,6 +2599,11 @@ for line in sys.stdin:
             approval: None,
             tool_timeout_secs: None,
             output_limit: None,
+            oauth: None,
+            oauth_client_id: None,
+            oauth_scopes: Vec::new(),
+            bearer_token_env: None,
+            headers_helper: None,
         };
         let (client, _tools) = McpClient::spawn_connect(&cfg).await.unwrap();
         let shared = McpShared::new(cfg, client, Vec::new());
@@ -1948,5 +2623,383 @@ for line in sys.stdin:
             {"type":"text","text":"b"},
         ]});
         assert_eq!(extract_text(&v), "a\nb");
+    }
+
+    // ------------------------------------------- EXT-05 server-initiated
+
+    /// EXT-05 fixture: streamable HTTP server whose tools/list response
+    /// is an SSE body carrying the tools frame PLUS one injected
+    /// server-initiated message (request or notification). Every other
+    /// POST is captured verbatim and answered 202.
+    struct Ext05State {
+        tool_count: std::sync::atomic::AtomicUsize,
+        /// (method, params) injected after the next tools/list.
+        inject: parking_lot::Mutex<Option<(String, Value)>>,
+        /// Raw POSTed bodies (our JSON-RPC responses land here).
+        posted: parking_lot::Mutex<Vec<Value>>,
+    }
+
+    async fn ext05_server(listener: tokio::net::TcpListener, state: Arc<Ext05State>) {
+        serve_http(
+            listener,
+            Arc::new(move |_head, body| {
+                let state = state.clone();
+                Box::pin(async move {
+                    let text = String::from_utf8_lossy(&body).into_owned();
+                    let msg: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+                    match msg["method"].as_str() {
+                        Some("initialize") => {
+                            let result = json!({
+                                "jsonrpc": "2.0",
+                                "id": msg["id"],
+                                "result": {
+                                    "protocolVersion": msg["params"]["protocolVersion"],
+                                    "capabilities": {"tools": {}, "elicitation": {}, "sampling": {}, "roots": {"listChanged": true}},
+                                    "serverInfo": {"name": "ext05", "version": "0"}
+                                }
+                            });
+                            let resp =
+                                http_ok("application/json", "", &result.to_string());
+                            String::from_utf8(resp)
+                                .unwrap()
+                                .replace("Content-Type:", "Mcp-Session-Id: s1\r\nContent-Type:")
+                                .into_bytes()
+                        }
+                        Some("notifications/initialized") => {
+                            b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                                .to_vec()
+                        }
+                        Some("tools/list") => {
+                            let tools: Vec<Value> =
+                                (0..state.tool_count.load(std::sync::atomic::Ordering::Relaxed))
+                                .map(|i| {
+                                    json!({"name": format!("tool{i}"), "description": "d",
+                                           "inputSchema": {"type": "object"}})
+                                })
+                                .collect();
+                            let mut body = format!(
+                                "data: {}\n\n",
+                                json!({
+                                    "jsonrpc": "2.0",
+                                    "id": msg["id"],
+                                    "result": {"tools": tools}
+                                })
+                            );
+                            if let Some((method, params)) = state.inject.lock().take() {
+                                // notifications carry no id; requests
+                                // do (string ids echo verbatim)
+                                let mut frame = json!({"jsonrpc": "2.0", "method": method, "params": params});
+                                if !method.starts_with("notifications/") {
+                                    frame["id"] = json!("srv-1");
+                                }
+                                body.push_str(&format!("data: {frame}\n\n"));
+                            }
+                            http_ok("text/event-stream", "", &body)
+                        }
+                        Some("ping") => {
+                            let result =
+                                json!({"jsonrpc": "2.0", "id": msg["id"], "result": {}});
+                            http_ok("application/json", "", &result.to_string())
+                        }
+                        _ => {
+                            state.posted.lock().push(msg);
+                            b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                                .to_vec()
+                        }
+                    }
+                })
+            }),
+        )
+        .await;
+    }
+
+    async fn ext05_setup(
+        state: Arc<Ext05State>,
+    ) -> (
+        McpShared,
+        McpServerConfig,
+        mpsc::Sender<Maintenance>,
+        mpsc::Receiver<Maintenance>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(ext05_server(listener, state.clone()));
+        let cfg = McpServerConfig {
+            name: "ext05".into(),
+            command: None,
+            args: Vec::new(),
+            env: HashMap::new(),
+            url: Some(format!("http://{addr}/mcp")),
+            headers: Vec::new(),
+            enabled_tools: Vec::new(),
+            disabled_tools: Vec::new(),
+            approval: None,
+            tool_timeout_secs: None,
+            output_limit: None,
+            oauth: None,
+            oauth_client_id: None,
+            oauth_scopes: Vec::new(),
+            bearer_token_env: None,
+            headers_helper: None,
+        };
+        let (client, tools) = McpClient::spawn_connect(&cfg).await.unwrap();
+        let shared = McpShared::new(cfg.clone(), client, tools);
+        let (tx, rx) = mpsc::channel(16);
+        (shared, cfg, tx, rx)
+    }
+
+    async fn next_maintenance(rx: &mut mpsc::Receiver<Maintenance>) -> Maintenance {
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("no server-initiated message arrived")
+            .expect("maintenance channel closed")
+    }
+
+    /// Wait until the fixture captured a POST matching `pred`.
+    async fn wait_posted(state: &Arc<Ext05State>, pred: impl Fn(&Value) -> bool) -> Value {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            {
+                let posted = state.posted.lock();
+                if let Some(v) = posted.iter().find(|v| pred(v)) {
+                    return v.clone();
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the client never answered the server request"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Elicitation roundtrip: the server's `elicitation/create` request
+    /// surfaces as a Maintenance message, the simplified schema maps to
+    /// ask options, and the answer routes back as the JSON-RPC result.
+    #[tokio::test]
+    async fn elicitation_roundtrips_through_the_pump() {
+        let state = Arc::new(Ext05State {
+            tool_count: std::sync::atomic::AtomicUsize::new(1),
+            inject: parking_lot::Mutex::new(Some((
+                "elicitation/create".into(),
+                json!({
+                    "message": "Approve the deployment?",
+                    "requestedSchema": {"type": "object", "properties": {
+                        "confirm": {"type": "boolean", "description": "ok?"}
+                    }}
+                }),
+            ))),
+            posted: parking_lot::Mutex::new(Vec::new()),
+        });
+        let (shared, _cfg, tx, mut rx) = ext05_setup(state.clone()).await;
+        tokio::spawn(crate::mcp::pump_inbound(
+            shared.clone(),
+            std::env::temp_dir(),
+            tx,
+        ));
+        match next_maintenance(&mut rx).await {
+            Maintenance::McpServerRequest {
+                server,
+                id,
+                method,
+                params,
+            } => {
+                assert_eq!(server, "ext05");
+                assert_eq!(method, "elicitation/create");
+                let ask = elicitation_ask(&params);
+                assert_eq!(ask.options, ["true", "false", "decline"]);
+                // the user picks the first option (true)
+                let result = elicitation_result(Some(0), &ask);
+                shared.respond(&id, result).await.unwrap();
+            }
+            other => panic!("expected the elicitation request, got {other:?}"),
+        }
+        // the client's answer reached the server as a JSON-RPC result
+        let answer = wait_posted(&state, |v| {
+            v.get("id").and_then(Value::as_str) == Some("srv-1")
+        })
+        .await;
+        assert_eq!(
+            answer["result"],
+            json!({"action": "accept", "content": {"confirm": true}})
+        );
+    }
+
+    /// `roots/list` is answered inside the pump with the cwd — the
+    /// engine never sees it.
+    #[tokio::test]
+    async fn roots_list_answers_with_the_cwd() {
+        let state = Arc::new(Ext05State {
+            tool_count: std::sync::atomic::AtomicUsize::new(1),
+            inject: parking_lot::Mutex::new(Some(("roots/list".into(), json!({})))),
+            posted: parking_lot::Mutex::new(Vec::new()),
+        });
+        let (shared, _cfg, tx, mut rx) = ext05_setup(state.clone()).await;
+        let cwd = std::env::temp_dir();
+        tokio::spawn(crate::mcp::pump_inbound(shared.clone(), cwd.clone(), tx));
+        // nothing is forwarded for roots — give the pump a beat
+        let forwarded =
+            tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv()).await;
+        assert!(
+            forwarded.is_err(),
+            "roots/list must be answered inline, not forwarded"
+        );
+        let expected_name = cwd
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| cwd.to_string_lossy().into_owned());
+        let answer = wait_posted(&state, |v| {
+            v.get("id").and_then(Value::as_str) == Some("srv-1")
+        })
+        .await;
+        assert_eq!(
+            answer["result"],
+            json!({"roots": [{"uri": format!("file://{}", cwd.display()), "name": expected_name}]})
+        );
+    }
+
+    /// `notifications/tools/list_changed` arrives as a Maintenance
+    /// notification and the same refresh path the explicit refresh
+    /// uses swaps the (grown) tool list on the shared handle.
+    #[tokio::test]
+    async fn tools_list_changed_notification_refreshes_the_catalog() {
+        let state = Arc::new(Ext05State {
+            tool_count: std::sync::atomic::AtomicUsize::new(1),
+            inject: parking_lot::Mutex::new(Some((
+                "notifications/tools/list_changed".into(),
+                json!({}),
+            ))),
+            posted: parking_lot::Mutex::new(Vec::new()),
+        });
+        let (shared, _cfg, tx, mut rx) = ext05_setup(state.clone()).await;
+        tokio::spawn(crate::mcp::pump_inbound(
+            shared.clone(),
+            std::env::temp_dir(),
+            tx,
+        ));
+        match next_maintenance(&mut rx).await {
+            Maintenance::McpServerNotification {
+                server,
+                method,
+                params: _,
+            } => {
+                assert_eq!(server, "ext05");
+                assert_eq!(method, "notifications/tools/list_changed");
+            }
+            other => panic!("expected the notification, got {other:?}"),
+        }
+        // the engine arm: the server grew a second tool since connect
+        state
+            .tool_count
+            .store(2, std::sync::atomic::Ordering::Relaxed);
+        let (tools, delta) = shared.refresh_and_install().await.unwrap();
+        assert_eq!(delta, 1);
+        assert_eq!(tools.len(), 2);
+        assert_eq!(shared.tools().len(), 2, "the catalog swapped in place");
+    }
+
+    /// `sampling/createMessage` forwards to the engine (the voice
+    /// completes it there — see voice's mcp_sampling tests); unknown
+    /// server requests would surface the same way and be answered
+    /// "method not supported" by the engine arm.
+    #[tokio::test]
+    async fn sampling_request_forwards_to_the_engine() {
+        let state = Arc::new(Ext05State {
+            tool_count: std::sync::atomic::AtomicUsize::new(1),
+            inject: parking_lot::Mutex::new(Some((
+                "sampling/createMessage".into(),
+                json!({
+                    "messages": [{"role": "user", "content": {"type": "text", "text": "summarize"}}],
+                    "maxTokens": 64
+                }),
+            ))),
+            posted: parking_lot::Mutex::new(Vec::new()),
+        });
+        let (shared, _cfg, tx, mut rx) = ext05_setup(state.clone()).await;
+        tokio::spawn(crate::mcp::pump_inbound(
+            shared.clone(),
+            std::env::temp_dir(),
+            tx,
+        ));
+        match next_maintenance(&mut rx).await {
+            Maintenance::McpServerRequest {
+                server,
+                id,
+                method,
+                params,
+            } => {
+                assert_eq!(server, "ext05");
+                assert_eq!(method, "sampling/createMessage");
+                assert_eq!(params["maxTokens"], 64);
+                assert_eq!(id, json!("srv-1"), "server ids echo verbatim");
+                // the engine would complete via the default role; the
+                // mcp-layer contract is the verbatim-id response path
+                shared
+                    .respond(
+                        &id,
+                        json!({"role": "assistant", "content": {"type": "text", "text": "ok"}}),
+                    )
+                    .await
+                    .unwrap();
+            }
+            other => panic!("expected the sampling request, got {other:?}"),
+        }
+        let answer = wait_posted(&state, |v| {
+            v.get("id").and_then(Value::as_str) == Some("srv-1")
+        })
+        .await;
+        assert_eq!(answer["result"]["content"]["text"], "ok");
+    }
+
+    /// Elicitation ask/result mapping: enum → choices, boolean →
+    /// true/false, free string → accept-empty/decline, no props →
+    /// accept/decline; abort maps to cancel.
+    #[test]
+    fn elicitation_mappings_cover_schema_kinds() {
+        // boolean property
+        let ask = elicitation_ask(&json!({
+            "message": "Proceed?",
+            "requestedSchema": {"type": "object", "properties": {"go": {"type": "boolean"}}}
+        }));
+        assert_eq!(ask.question, "Proceed? (requested: go)");
+        assert_eq!(ask.options, ["true", "false", "decline"]);
+        assert_eq!(
+            elicitation_result(Some(1), &ask),
+            json!({"action": "accept", "content": {"go": false}})
+        );
+        assert_eq!(
+            elicitation_result(Some(2), &ask),
+            json!({"action": "decline"})
+        );
+        assert_eq!(elicitation_result(None, &ask), json!({"action": "cancel"}));
+        // enum choice
+        let ask = elicitation_ask(&json!({
+            "message": "Pick",
+            "requestedSchema": {"type": "object", "properties": {
+                "env": {"type": "string", "enum": ["dev", "stage", "prod"]}
+            }}
+        }));
+        assert_eq!(ask.options, ["dev", "stage", "prod", "decline"]);
+        assert_eq!(
+            elicitation_result(Some(2), &ask),
+            json!({"action": "accept", "content": {"env": "prod"}})
+        );
+        // free-form string
+        let ask = elicitation_ask(&json!({
+            "message": "Name it",
+            "requestedSchema": {"type": "object", "properties": {"name": {"type": "string"}}}
+        }));
+        assert_eq!(ask.options, ["accept (empty value)", "decline"]);
+        assert_eq!(
+            elicitation_result(Some(0), &ask),
+            json!({"action": "accept", "content": {"name": ""}})
+        );
+        // no properties: plain accept/decline on the message
+        let ask = elicitation_ask(&json!({"message": "Allow?"}));
+        assert_eq!(ask.prop, None);
+        assert_eq!(
+            elicitation_result(Some(0), &ask),
+            json!({"action": "accept"})
+        );
     }
 }

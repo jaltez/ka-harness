@@ -39,3 +39,6 @@
 
 ### Batch 10 — extensibility
 - Hook events: subagent_start/stop, pre/post model switch, post_compact, permission_request/denied · Hook handler types: HTTP endpoints (same JSON envelope) plus per-hook timeouts and async fire-and-forget · MCP per-server policy: enabled/disabled tool filters, approval modes (ask/auto/writes), per-tool timeouts and output caps · Enriched skills: `disable-model-invocation`, `paths` globs, `max_tokens` body cap, `!`cmd`` dynamic context · Enriched commands: `side` (side-question dispatch) and `shell` preamble · Output styles: `.ka/styles/*.md` + `/style` picker (session-scoped, built-in fallback).
+
+### Batch 10b — MCP protocol & roles
+- OAuth for HTTP MCP servers (dynamic client registration RFC 7591, CIMD, local callback, token cache with refresh in the data dir, `bearer_token_env` / `headers_helper` per server) · MCP elicitation routed to ka asks, sampling via the default model, `roots`, and server-initiated notifications applied live (tools/list_changed refreshes catalogs) · `[roles.<name>]` arbitrary roles addressable as `@name` · `[virtual_models.<name>]` round-robin/failover routers · `ka mcp-serve` read-only MCP stdio server (read/glob/grep/sessions_search/session_info; bash deliberately excluded).

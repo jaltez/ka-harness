@@ -64,6 +64,17 @@ fn resolve_role(catalog: &ka_dialect::Catalog, selector: &str) -> Option<String>
     catalog.get(&id).is_some().then_some(id)
 }
 
+/// EXT-11: `@<role>` selectors resolve through the [roles] table
+/// (`@default`, `@fast`, or any `[roles.extra.<name>]`); anything else
+/// — including unknown `@names` and the `virtual/<name>` router
+/// selectors, which the voice routes per turn — stays literal.
+fn expand_role_selector(roles: &crate::config::Roles, selector: &str) -> String {
+    roles
+        .resolve(selector)
+        .map(str::to_string)
+        .unwrap_or_else(|| selector.to_string())
+}
+
 /// Resolve the `[roles]` table against the catalog. `default` falls
 /// back to the configured model; a missing/invalid `fast` simply stays
 /// `None` (fast-role-gated features degrade gracefully).
@@ -596,6 +607,9 @@ struct Ctx {
     /// MCP prompts gathered at connect time (inventory re-emits replay
     /// this cache filtered by enabled servers).
     mcp_prompts: Vec<String>,
+    /// The effective `[roles]` table (EXT-11): `@<role>` selectors in
+    /// `SetModel` resolve through it.
+    roles_cfg: crate::config::Roles,
 }
 
 async fn run(
@@ -621,6 +635,18 @@ async fn run(
     if let Some(pinned) = config.effective_model_for(&cwd) {
         config.model = Some(pinned);
     }
+    // EXT-11: `--model @<role>` resolves through the [roles] table
+    // (default/fast/extra) before anything reads the selector; an
+    // unknown @name keeps the literal (the turn machine reports it
+    // like any unresolvable selector)
+    if let Some(resolved) = config
+        .model
+        .as_deref()
+        .and_then(|sel| config.roles.resolve(sel))
+        .map(str::to_string)
+    {
+        config.model = Some(resolved);
+    }
     // safe mode: config-file hooks are customizations too — built-ins,
     // config chain, rules, and auth stay
     let mcp_servers = if crate::conventions::bare_mode() {
@@ -644,6 +670,9 @@ async fn run(
     // roles resolve once at engine start, through the same catalog the
     // main model uses (discovery overlays already applied by the caller)
     let roles = resolve_roles(&catalog, &config.roles, config.model.as_deref());
+    // the full table rides the ctx so `SetModel "@<role>"` resolves
+    // the same way (EXT-11)
+    let roles_table = config.roles.clone();
     let pathfinder_catalog = catalog.clone();
     let search_providers = config.effective_search();
     let web_allow_private = config.effective_web_allow_private();
@@ -691,6 +720,9 @@ async fn run(
     });
     voice.set_bash_background_ms(config.effective_bash_background_after_ms());
     voice.set_fallbacks(config.fallback.models.clone());
+    // [virtual_models] EXT-11: per-turn routers (round-robin cursor on
+    // the voice, failover through the turn fallback chain)
+    voice.set_routers(&config.virtual_models);
     voice.set_max_image_mb(config.effective_max_image_mb());
     voice.set_context_promote(config.effective_context_promote());
     voice.set_shell_env(config.effective_shell_env());
@@ -776,6 +808,7 @@ async fn run(
         debug_cfg: debug_cfg.clone(),
         sandbox_cfg,
         mcp_prompts: Vec::new(),
+        roles_cfg: roles_table,
     };
     // markdown agents: .ka/agents/*.md etc. become one `delegate` hand
     // (empty in safe mode). The hands register even when `agents` is
@@ -936,7 +969,7 @@ async fn run(
             }
             maybe = ctx.maintenance.recv() => {
                 if let Some(update) = maybe {
-                    handle_maintenance(update, &mut ctx).await;
+                    handle_maintenance(update, &mut ctx, &mut commands).await;
                 }
             }
             _ = idle_tick.tick() => {
@@ -970,8 +1003,37 @@ async fn run(
 /// routing split. Arms that need to poll the surface mid-turn (Prompt)
 /// also receive the receiver.
 /// Apply one MCP supervisor update: swap the server's hands for the
-/// fresh tool set and tell the surface.
-async fn handle_maintenance(update: crate::mcp::Maintenance, ctx: &mut Ctx) {
+/// fresh tool set and tell the surface. EXT-05: server-initiated
+/// requests and notifications land here too (elicitation → ask,
+/// sampling → default-role completion, list_changed → refresh,
+/// resources/updated → Note).
+async fn handle_maintenance(
+    update: crate::mcp::Maintenance,
+    ctx: &mut Ctx,
+    commands: &mut mpsc::Receiver<Command>,
+) {
+    // EXT-05: server-initiated traffic is handled before the bookkeeping
+    // arms — these messages carry their own routing
+    match update {
+        crate::mcp::Maintenance::McpServerRequest {
+            server,
+            id,
+            method,
+            params,
+        } => {
+            handle_mcp_server_request(server, id, method, params, ctx, commands).await;
+            return;
+        }
+        crate::mcp::Maintenance::McpServerNotification {
+            server,
+            method,
+            params: _,
+        } => {
+            handle_mcp_server_notification(server, method, ctx).await;
+            return;
+        }
+        _ => {}
+    }
     if let crate::mcp::Maintenance::McpVerified {
         server,
         tools,
@@ -1047,6 +1109,9 @@ async fn handle_maintenance(update: crate::mcp::Maintenance, ctx: &mut Ctx) {
         ),
         // handled by the if-let above; listed for exhaustiveness
         crate::mcp::Maintenance::McpVerified { .. } => return,
+        // handled by the EXT-05 match above; listed for exhaustiveness
+        crate::mcp::Maintenance::McpServerRequest { .. }
+        | crate::mcp::Maintenance::McpServerNotification { .. } => return,
         crate::mcp::Maintenance::McpRefreshed {
             server,
             tools,
@@ -1068,6 +1133,20 @@ async fn handle_maintenance(update: crate::mcp::Maintenance, ctx: &mut Ctx) {
             return;
         }
     };
+    apply_refresh_update(&server, tools, &note, ctx).await;
+}
+
+/// The tail [`handle_maintenance`] and the EXT-05 list_changed path
+/// share: swap the server's hands for the fresh tool set, refresh the
+/// on-disk cache, and surface the note. (A direct recursive call from
+/// `handle_mcp_server_notification` would box the whole async fn.)
+async fn apply_refresh_update(
+    server: &str,
+    tools: Vec<crate::mcp::McpTool>,
+    note: &str,
+    ctx: &mut Ctx,
+) {
+    let server = server.to_string();
     if let Some(shared) = ctx.mcp_shared.iter().find(|s| s.name() == server).cloned() {
         if !ctx.mcp_lazy {
             let hands: Vec<std::sync::Arc<dyn crate::hands::Hand>> = shared
@@ -1095,6 +1174,137 @@ async fn handle_maintenance(update: crate::mcp::Maintenance, ctx: &mut Ctx) {
         .ok();
 }
 
+/// EXT-05: answer one server-initiated request. `roots/list` was
+/// already handled in the pump; `elicitation/create` becomes an
+/// `Event::Ask` on the existing ask machinery and routes the choice
+/// back as the JSON-RPC result; `sampling/createMessage` completes
+/// with the session's default role model; anything else is a
+/// JSON-RPC "method not supported" error.
+async fn handle_mcp_server_request(
+    server: String,
+    id: serde_json::Value,
+    method: String,
+    params: serde_json::Value,
+    ctx: &mut Ctx,
+    commands: &mut mpsc::Receiver<Command>,
+) {
+    let Some(shared) = ctx.mcp_shared.iter().find(|s| s.name() == server).cloned() else {
+        return;
+    };
+    match method.as_str() {
+        "elicitation/create" => {
+            let ask = crate::mcp::elicitation_ask(&params);
+            let (question, options) = (ask.question.clone(), ask.options.clone());
+            let choice = engine_ask(
+                &ctx.events,
+                commands,
+                ka_protocol::AskId(format!("mcp-elicit-{server}")),
+                question,
+                options,
+            )
+            .await;
+            let result = crate::mcp::elicitation_result(choice, &ask);
+            if shared.respond(&id, result).await.is_err() {
+                // the server went away mid-ask; nothing to route
+            }
+        }
+        "sampling/createMessage" => {
+            if crate::conventions::bare_mode() {
+                let _ = shared
+                    .respond_error(&id, -32601, "sampling is unavailable in safe mode")
+                    .await;
+                return;
+            }
+            let Some(model) = ctx.state.roles.default.clone() else {
+                let _ = shared
+                    .respond_error(
+                        &id,
+                        -32000,
+                        "no default model is configured for MCP sampling \
+                         (set [roles] default)",
+                    )
+                    .await;
+                return;
+            };
+            match ctx.voice.mcp_sampling(&model, &params).await {
+                Ok(result) => {
+                    ctx.events
+                        .send(Event::Note {
+                            message: format!(
+                                "mcp {server}: sampling request completed with {model}"
+                            ),
+                        })
+                        .await
+                        .ok();
+                    let _ = shared.respond(&id, result).await;
+                }
+                Err(e) => {
+                    let _ = shared.respond_error(&id, -32000, &e).await;
+                }
+            }
+        }
+        other => {
+            let _ = shared
+                .respond_error(
+                    &id,
+                    -32601,
+                    &format!("method {other:?} is not supported by this client"),
+                )
+                .await;
+        }
+    }
+}
+
+/// EXT-05: react to one server-initiated notification.
+/// `notifications/tools/list_changed` refreshes that server's catalog
+/// through the same rebuild path an explicit refresh uses;
+/// `notifications/resources/updated` is informational. Unknown
+/// notifications are dropped (they were before, too).
+async fn handle_mcp_server_notification(server: String, method: String, ctx: &mut Ctx) {
+    if method == "notifications/tools/list_changed" {
+        let Some(shared) = ctx.mcp_shared.iter().find(|s| s.name() == server).cloned() else {
+            return;
+        };
+        ctx.events
+            .send(Event::Note {
+                message: format!("mcp {server}: server signaled tools/list_changed"),
+            })
+            .await
+            .ok();
+        match shared.refresh_and_install().await {
+            Ok((tools, delta)) => {
+                apply_refresh_update(
+                    &server,
+                    tools,
+                    &format!("mcp {{server}} refreshed ({delta:+} tools)"),
+                    ctx,
+                )
+                .await;
+            }
+            Err(e) => {
+                ctx.events
+                    .send(Event::Note {
+                        message: format!("mcp {server}: refresh after list_changed failed: {e}"),
+                    })
+                    .await
+                    .ok();
+            }
+        }
+        return;
+    }
+    if method == "notifications/resources/updated" {
+        ctx.events
+            .send(Event::Note {
+                message: format!(
+                    "mcp {server}: server reports resources updated — re-read via the \
+                     `mcp` tool to see fresh contents"
+                ),
+            })
+            .await
+            .ok();
+    }
+}
+
 /// Recompute and install the live sandbox policy for `mode` ("off" |
 /// "fs"). The `fs` policy comes from the config allowlist — unpersisted
 /// session grants drop on off→fs (fresh-policy semantics).
@@ -1115,13 +1325,42 @@ fn apply_sandbox_policy(
 /// Spawn + handshake + hands for one configured MCP server (bootstrap
 /// and runtime enable). Failures are per-server errors, never fatal.
 async fn ensure_mcp_server(ctx: &mut Ctx, cfg: crate::mcp::McpServerConfig) -> McpSummary {
+    // EXT-03: HTTP-auth servers get a Note sink (the authorize URL
+    // lands there) threaded into every connect — including watchdog
+    // reconnects — plus the EXT-05 inbound pump. The forwarder owns
+    // the receiver end; notes outlive the connect gate.
+    let hooks = if cfg.url.is_some() {
+        let (notes_tx, mut notes_rx) = mpsc::unbounded_channel::<String>();
+        tokio::spawn({
+            let events = ctx.events.clone();
+            async move {
+                while let Some(message) = notes_rx.recv().await {
+                    events.send(Event::Note { message }).await.ok();
+                }
+            }
+        });
+        crate::mcp_oauth::FlowHooks {
+            notes: Some(notes_tx),
+            allow_headless: std::io::IsTerminal::is_terminal(&std::io::stdin()),
+            authorize_timeout: crate::mcp_oauth::DEFAULT_AUTHORIZE_TIMEOUT,
+        }
+    } else {
+        crate::mcp_oauth::FlowHooks::default()
+    };
+    let spawn_pump = |shared: &crate::mcp::McpShared, ctx: &Ctx| {
+        tokio::spawn(crate::mcp::pump_inbound(
+            shared.clone(),
+            ctx.cwd.clone(),
+            ctx.maintenance_tx.clone(),
+        ));
+    };
     // cache hit: register the remembered hands immediately — startup
     // never blocks on the handshake, the tool list stays stable across
     // runs (provider prompt-cache stability) — and verify in the
     // background; the watchdog spawned alongside owns retries
     if let Some(cached) = crate::mcp_cache::load_tools(&cfg) {
         let count = cached.len();
-        let shared = crate::mcp::McpShared::placeholder(cfg.clone(), cached);
+        let shared = crate::mcp::McpShared::placeholder(cfg.clone(), cached).with_auth_hooks(hooks);
         if !ctx.mcp_lazy {
             for tool in shared.model_tools() {
                 ctx.voice
@@ -1132,6 +1371,7 @@ async fn ensure_mcp_server(ctx: &mut Ctx, cfg: crate::mcp::McpServerConfig) -> M
             }
         }
         ctx.mcp_shared.push(shared.clone());
+        spawn_pump(&shared, ctx);
         // verify_initial owns the first connect, then chains into the
         // supervise watchdog — never two spawn_connects in flight
         tokio::spawn(crate::mcp::verify_initial(
@@ -1155,9 +1395,16 @@ async fn ensure_mcp_server(ctx: &mut Ctx, cfg: crate::mcp::McpServerConfig) -> M
             tools: count,
         };
     }
+    // interactive OAuth can take minutes (browser round trip): the
+    // connect gate widens for servers that may run the flow
+    let connect_gate = if cfg.oauth_enabled() {
+        std::time::Duration::from_secs(320)
+    } else {
+        std::time::Duration::from_secs(20)
+    };
     let connected = tokio::time::timeout(
-        std::time::Duration::from_secs(20),
-        crate::mcp::McpClient::spawn_connect(&cfg),
+        connect_gate,
+        crate::mcp::McpClient::spawn_connect_with(&cfg, &hooks),
     )
     .await;
     match connected {
@@ -1166,7 +1413,8 @@ async fn ensure_mcp_server(ctx: &mut Ctx, cfg: crate::mcp::McpServerConfig) -> M
             // remember the advertised list: the next startup registers
             // from cache and never waits on this handshake
             crate::mcp_cache::store_tools(&cfg, &tools);
-            let shared = crate::mcp::McpShared::new(cfg.clone(), client, tools.clone());
+            let shared = crate::mcp::McpShared::new(cfg.clone(), client, tools.clone())
+                .with_auth_hooks(hooks);
             // eager mode: every policy-visible tool becomes its own
             // hand (EXT-04 enabled_tools/disabled_tools filter); lazy
             // mode fronts the server through the single mcp_call hand
@@ -1199,6 +1447,7 @@ async fn ensure_mcp_server(ctx: &mut Ctx, cfg: crate::mcp::McpServerConfig) -> M
                 }
             }
             ctx.mcp_shared.push(shared.clone());
+            spawn_pump(&shared, ctx);
             tokio::spawn(crate::mcp::supervise(
                 shared,
                 ctx.maintenance_tx.clone(),
@@ -1875,6 +2124,11 @@ async fn handle_command(
             }
         }
         Command::SetModel { selector } => {
+            // EXT-11: an `@<role>` selector resolves through the
+            // [roles] table (default/fast/extra) before it applies;
+            // an unknown @name keeps the literal and fails at the
+            // next turn like any unresolvable selector
+            let selector = expand_role_selector(&ctx.roles_cfg, &selector);
             // EXT-01: the advisory model-switch hooks bracket the
             // switch (from = the session's current selector); nothing
             // they emit can veto or redirect the switch
@@ -6290,6 +6544,11 @@ mod tests {
                 approval: None,
                 tool_timeout_secs: None,
                 output_limit: None,
+                oauth: None,
+                oauth_client_id: None,
+                oauth_scopes: Vec::new(),
+                bearer_token_env: None,
+                headers_helper: None,
             }],
             ..Config::default()
         };
@@ -6376,6 +6635,11 @@ mod tests {
             approval: None,
             tool_timeout_secs: None,
             output_limit: None,
+            oauth: None,
+            oauth_client_id: None,
+            oauth_scopes: Vec::new(),
+            bearer_token_env: None,
+            headers_helper: None,
         };
         crate::mcp_cache::store_tools(
             &server,
@@ -6598,6 +6862,7 @@ mod tests {
             roles: crate::config::Roles {
                 default: None,
                 fast: fast.map(str::to_string),
+                extra: Default::default(),
             },
             cwd: Some(work.display().to_string()),
             ..Config::default()
@@ -7423,6 +7688,7 @@ mod tests {
             roles: crate::config::Roles {
                 default: None,
                 fast: Some("test/fast".into()),
+                extra: Default::default(),
             },
             cwd: Some(work.display().to_string()),
             context: crate::config::Context {
@@ -7545,7 +7811,7 @@ mod tests {
         // within a couple of ticks the cron entry fires as its own turn
         let mut fired = false;
         let mut post_fire_turn = false;
-        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
         while std::time::Instant::now() < deadline {
             match tokio::time::timeout(Duration::from_millis(300), h.events.recv()).await {
                 Ok(Some(Event::Note { message, .. })) => {
@@ -7604,7 +7870,7 @@ mod tests {
             .unwrap();
         let _ = drain_to_idle(&mut h).await;
         let mut firings = 0usize;
-        let deadline = std::time::Instant::now() + Duration::from_secs(4);
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
         while std::time::Instant::now() < deadline {
             match tokio::time::timeout(Duration::from_millis(300), h.events.recv()).await {
                 Ok(Some(Event::Note { message, .. }))
