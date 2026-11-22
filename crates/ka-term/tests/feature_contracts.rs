@@ -992,3 +992,380 @@ fn status_line_segments_contract() {
         .collect();
     assert_eq!(text, "$0.5000 42% cache 75% ◎ goal");
 }
+
+/// TUI-18: the read-only panels parse as documented and carry their
+/// modal kinds — /hooks /permissions /doctor open pickers (never queue),
+/// /vim /screen /plain /recap are session-local rows (no engine event).
+#[test]
+fn management_panels_and_session_toggles_parse() {
+    for head in ["/hooks", "/permissions", "/doctor"] {
+        let cmd = slash_command(head).expect(head);
+        assert!(cmd.modal.is_some(), "{head} opens a panel");
+        assert!(cmd.event.is_none(), "{head} is surface-local");
+    }
+    for head in ["/vim", "/screen", "/plain", "/recap"] {
+        let cmd = slash_command(head).expect(head);
+        assert!(cmd.event.is_none(), "{head} never sends an engine event");
+        assert!(cmd.modal.is_none(), "{head} is an instant local action");
+        assert!(!cmd.quit, "{head} never quits");
+    }
+    // argumented forms stay refused rather than misread
+    assert!(
+        slash_command("/vim aggressive").is_none() || {
+            let cmd = slash_command("/vim aggressive").expect("parses");
+            cmd.event.is_none() && cmd.modal.is_none()
+        }
+    );
+}
+
+/// TUI-15 + TUI-14: the /tasks roster rows the engine pre-renders feed
+/// the status-line pill (running tasks · jobs · dap) and the Agent-Hub
+/// cost footer — only facts the rows already carry.
+#[test]
+fn tasks_roster_feeds_pill_and_cost() {
+    use ka_term::roster::{cost_summary, pill_counts, pill_text};
+    use ka_term::tui::{JobsPill, Meters, status_ids_valid, status_segments};
+
+    let rows = vec![
+        "t-3  running   12s  scout — summarize$0.1234".to_string(),
+        "t-4  done      5s  task — merge".to_string(),
+        "job-1`  running  make".to_string(),
+        "dap 7  running  breakpoints in 1 file(s)".to_string(),
+    ];
+    assert_eq!(pill_counts(&rows), (1, 1, 1));
+    assert_eq!(pill_text(&rows).as_deref(), Some("1 task · 1 job · 1 dap"));
+    assert_eq!(pill_text(&["t-4  done  5s  a — b".to_string()]), None);
+
+    // the `jobs` status segment renders the pill; unknown ids still fail
+    let m = Meters {
+        jobs: JobsPill {
+            tasks: 2,
+            jobs: 0,
+            dap: 1,
+        },
+        ..Default::default()
+    };
+    assert!(status_ids_valid(&["jobs".to_string()]).is_ok());
+    let text: String = status_segments(&m, &["jobs".to_string()])
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect();
+    assert_eq!(text, "2 tasks · 1 dap");
+
+    // cost footer: only when some row reports a cost, summed per agent
+    let (total, agents) = cost_summary(&rows).expect("a cost is reported");
+    assert!((total - 0.1234).abs() < 1e-9);
+    assert_eq!(agents, 1);
+    assert!(cost_summary(&["t-4  done  5s  a — b".to_string()]).is_none());
+}
+
+/// TUI-03: the composer vim layer — motions, operators with counts and
+/// text objects, visual selection — all edit through the InputBuffer
+/// (undo survives, the mode tag reports INSERT/NORMAL/VISUAL).
+#[test]
+fn vim_mode_edits_through_the_input_buffer() {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    use ka_term::tui::InputBuffer;
+    use ka_term::vim::{self, Flow, Mode};
+
+    fn key(c: char) -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    let mut buf = InputBuffer::default();
+    buf.insert_str("deploy the staging build");
+    buf.cursor = 0;
+    buf.vim.on = true;
+    buf.vim.mode = Mode::Normal;
+    assert_eq!(buf.vim.label(), Some("NORMAL"));
+
+    // motions + operator + count: d2w deletes two words
+    for c in "d2w".chars() {
+        vim::handle(&mut buf, &key(c));
+    }
+    assert_eq!(buf.text, "staging build");
+    assert_eq!(buf.cursor, 0);
+
+    // x with a register write, then undo restores
+    vim::handle(&mut buf, &key('x'));
+    assert_eq!(buf.text, "taging build");
+    vim::handle(&mut buf, &key('u'));
+    assert_eq!(buf.text, "staging build");
+
+    // iw text object yanks the word under the cursor
+    for c in "yiw".chars() {
+        vim::handle(&mut buf, &key(c));
+    }
+    assert_eq!(buf.vim.register, Some(("staging".to_string(), false)));
+
+    // visual select over a word motion, then change into insert:
+    // w is word-exclusive, so `v w c` drops `deploy ` from a one-word
+    // lead and lands in INSERT with the rest intact
+    let mut vis = InputBuffer::default();
+    vis.insert_str("deploy");
+    vis.cursor = 0;
+    vis.vim.on = true;
+    vis.vim.mode = Mode::Normal;
+    vim::handle(&mut vis, &key('v'));
+    assert_eq!(vis.vim.mode, Mode::Visual);
+    vim::handle(&mut vis, &key('w'));
+    vim::handle(&mut vis, &key('c'));
+    assert_eq!(vis.vim.mode, Mode::Insert);
+    assert_eq!(vis.text, "");
+
+    // INSERT passes typing through untouched and Esc returns to NORMAL
+    for c in "rebuilt".chars() {
+        assert_eq!(
+            vim::handle(&mut vis, &key(c)),
+            Flow::Passthrough,
+            "insert mode keeps typing native"
+        );
+        vis.insert(c);
+    }
+    assert_eq!(vis.text, "rebuilt");
+    let esc = crossterm::event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+    assert_eq!(vim::handle(&mut vis, &esc), Flow::Handled);
+    assert_eq!(vis.vim.mode, Mode::Normal);
+
+    // /vim-style toggle resets to Insert and reports
+    assert!(!buf.vim.toggle());
+    assert!(buf.vim.toggle());
+    assert_eq!(buf.vim.mode, Mode::Insert);
+    assert_eq!(buf.vim.label(), Some("INSERT"));
+}
+
+/// TUI-09: ghost text — the dim continuation suggests the first matching
+/// slash command or @-mention, and Tab-accept applies exactly what the
+/// matching completion path would.
+#[test]
+fn ghost_text_suggests_and_accepts() {
+    use ka_term::ghost;
+    use ka_term::tui::InputBuffer;
+
+    let cmds = vec![
+        ("/model".to_string(), "pick a model".to_string()),
+        ("/mode".to_string(), "permission mode".to_string()),
+    ];
+    let g = ghost::slash_ghost("/mod", &cmds).expect("prefix ghost");
+    assert_eq!(g.suffix("/mod"), "el");
+    let mut buf = InputBuffer::default();
+    buf.insert_str("/mod");
+    buf.cursor = buf.text.chars().count();
+    ghost::accept(&g, &mut buf);
+    assert_eq!(buf.text, "/model ");
+    // exact commands suggest nothing; spaces end the token
+    assert!(ghost::slash_ghost("/model", &cmds).is_none());
+    assert!(ghost::slash_ghost("/mod now", &cmds).is_none());
+
+    // @-mentions: first walk match, files complete with a trailing space
+    let entries = vec![
+        ("src/lib.rs".to_string(), false),
+        ("src/main.rs".to_string(), false),
+    ];
+    let mut buf = InputBuffer::default();
+    buf.insert_str("see @sr");
+    buf.cursor = buf.text.chars().count();
+    let g = ghost::mention_ghost(&buf.text, buf.cursor, &entries).expect("mention ghost");
+    ghost::accept(&g, &mut buf);
+    assert_eq!(buf.text, "see @src/lib.rs ");
+}
+
+/// TUI-13: the /plain renderer textualizes every block kind with
+/// prefixes and block separators — the screen-reader contract.
+#[test]
+fn plain_render_contract() {
+    use ka_term::plain::{ask_lines, tool_row, transcript_rows};
+    use ka_term::tui::{Line, PendingAsk, SummaryTone, ToolCall, Transcript};
+
+    let mut t = Transcript::default();
+    t.push(Line::User("run the tests".into()));
+    t.push(Line::ToolBlock(vec![ToolCall {
+        head: "→ bash · cargo test".into(),
+        ok: false,
+        note: "compile error".into(),
+        excerpt: String::new(),
+        spill: None,
+        dur: None,
+        expanded: false,
+    }]));
+    t.push(Line::Info("queued 1 prompt".into()));
+    t.push(Line::Summary {
+        glyph: '✗',
+        tone: SummaryTone::Err,
+        text: "build failed".into(),
+        detail: None,
+        expanded: false,
+    });
+    let rows = transcript_rows(&t);
+    let wanted = [
+        "user: run the tests",
+        "tool: bash cargo test → failed: compile error",
+        "note: queued 1 prompt",
+        "failed: build failed",
+    ];
+    for w in wanted {
+        assert!(rows.contains(&w.to_string()), "missing {w:?} in {rows:?}");
+    }
+    // every block is followed by a blank row (linear pause)
+    assert_eq!(rows.iter().filter(|r| r.is_empty()).count(), 4);
+    // no glyphs ride the plain rows: structure is the prefixes
+    assert!(
+        rows.iter()
+            .all(|r| !r.contains('✗') && !r.contains('→') || r.starts_with("tool:"))
+    );
+
+    assert_eq!(
+        tool_row(&ToolCall {
+            head: "→ read · src/main.rs".into(),
+            ok: true,
+            note: String::new(),
+            excerpt: String::new(),
+            spill: None,
+            dur: None,
+            expanded: false,
+        }),
+        "tool: read src/main.rs → ok"
+    );
+
+    let ask = PendingAsk {
+        id: ka_protocol::AskId("q".into()),
+        question: "apply?".into(),
+        options: vec!["allow".into(), "deny".into()],
+        selected: 0,
+        detail: None,
+    };
+    let rows = ask_lines(&ask);
+    assert!(rows.contains(&"> 1. allow".to_string()), "{rows:?}");
+    assert!(rows.contains(&"  2. deny".to_string()), "{rows:?}");
+}
+
+/// TUI-07: the /screen handoff dump — plain transcript between
+/// full-width separator rules, ready for the primary-screen scrollback.
+#[test]
+fn screen_dump_contract() {
+    use ka_term::screen::dump_text;
+    use ka_term::tui::{Line, Transcript};
+
+    let mut t = Transcript::default();
+    t.push(Line::User("hello".into()));
+    t.push(Line::Assistant("hi there".into()));
+    let dump = dump_text(&t, "sbeef01", 44);
+    let lines: Vec<&str> = dump.lines().collect();
+    assert!(lines.first().unwrap().contains("ka · sbeef01"), "{lines:?}");
+    assert!(lines.contains(&"user: hello"), "{lines:?}");
+    assert!(lines.contains(&"hi there"), "{lines:?}");
+    assert!(lines.last().unwrap().contains("end of transcript"));
+    for line in lines {
+        assert!(
+            line.chars().count() <= 44,
+            "dump rows must fit the width: {line:?}"
+        );
+    }
+}
+
+/// TUI-12: the recap — the persisted strand recap (via the
+/// `StrandSummary.recap` field, never raw records) wins, else a local
+/// model-free summary from the surface's own transcript; silent when
+/// there is nothing to say.
+#[test]
+fn recap_contract() {
+    use ka_term::recap::{recap_from_transcript, recap_note};
+    use ka_term::tui::{Line, Transcript};
+
+    fn transcript_with(prompts: &[&str]) -> Transcript {
+        let mut t = Transcript::default();
+        for p in prompts {
+            t.push(Line::User((*p).to_string()));
+        }
+        t
+    }
+
+    // no user turns → no recap (nothing invented)
+    assert!(recap_from_transcript(&Transcript::default()).is_none());
+    // slash-command turns are actions, not asks
+    let t = transcript_with(&["/compact", "the real ask"]);
+    assert_eq!(
+        recap_from_transcript(&t).as_deref(),
+        Some("1 turn in context · last: the real ask")
+    );
+    let t = transcript_with(&["fix the bug", "then write tests"]);
+    assert_eq!(
+        recap_from_transcript(&t).as_deref(),
+        Some("2 turns in context · last: then write tests")
+    );
+    // recaps clamp to one transcript line
+    let long = "word ".repeat(80);
+    let t = transcript_with(&[long.as_str()]);
+    let recap = recap_from_transcript(&t).expect("recap");
+    assert_eq!(recap.lines().count(), 1);
+    assert!(recap.chars().count() <= 160, "{recap}");
+    // the local transcript summary is the fallback for any session
+    // without a stored recap — with turns in the transcript it fires
+    let cwd = std::env::temp_dir();
+    let t = transcript_with(&["fix the bug", "then write tests"]);
+    assert_eq!(
+        recap_note("sunknown-session", &cwd, &t).as_deref(),
+        Some("2 turns in context · last: then write tests")
+    );
+    // and an empty transcript keeps it silent
+    assert!(recap_note("sunknown-session", &cwd, &Transcript::default()).is_none());
+    assert!(recap_note("", &cwd, &Transcript::default()).is_none());
+}
+
+/// TUI-18 /doctor + panels rows read the layered config: rules, hooks,
+/// sandbox and the live facts render without inventing anything.
+#[test]
+fn panel_rows_render_configured_facts() {
+    use ka_term::panels::{DoctorFacts, doctor_rows, hooks_rows, permissions_rows};
+    use ka_term::tui::ProviderInfo;
+    use std::path::Path;
+
+    let layer = ka_engine::Config::parse_layer(
+        "[[hooks]]\nevent = \"stop\"\ncommand = \"notify.sh\"\n\
+         [[rules]]\ntool = \"bash\"\nverdict = \"ask\"\n\
+         [sandbox]\nmode = \"fs\"\n",
+        "contract",
+    )
+    .expect("layer parses");
+    let mut cfg = ka_engine::Config::default();
+    cfg.overlay(layer);
+
+    let hook_rows = hooks_rows(&cfg, Path::new("."));
+    let joined = hook_rows.join("\n");
+    assert!(joined.contains("stop"), "{joined}");
+    assert!(joined.contains("notify.sh"), "{joined}");
+    assert!(joined.contains("pre-turn"), "{joined}");
+
+    let perm_rows = permissions_rows(&cfg, Some("off"), "allow");
+    let joined = perm_rows.join("\n");
+    assert!(joined.contains("mode: allow"), "{joined}");
+    assert!(joined.contains("bash"), "{joined}");
+    assert!(joined.contains("ask"), "{joined}");
+    assert!(joined.contains("live override off"), "{joined}");
+    assert!(joined.contains("protected paths"), "{joined}");
+
+    let providers = vec![ProviderInfo {
+        name: "zai".into(),
+        env_var: String::new(),
+        base_url: String::new(),
+        key_set: false,
+    }];
+    let facts = DoctorFacts {
+        session: "",
+        model: "zai/glm-5.3",
+        effort: "off",
+        mode: "allow",
+        providers: &providers,
+        live_sandbox: None,
+        turns: 0,
+        cost: 0.0,
+        context: (0, 0),
+        update: None,
+        mcp: &[],
+    };
+    let rows = doctor_rows(&cfg, &facts);
+    let joined = rows.join("\n");
+    assert!(joined.contains("ka "), "{joined}");
+    assert!(joined.contains("fs (config)"), "{joined}");
+    assert!(joined.contains("doctor CLI"), "{joined}");
+}

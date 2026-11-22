@@ -27,3 +27,6 @@
 
 ### Earlier batches (v0.7.2)
 - See `research/ka-harness/` and the GitHub release notes.
+
+### Batch 6 — interactive TUI
+- `/vim` (INSERT/NORMAL/VISUAL sobre el draft, motions/counts/text objects mínimos) · `/screen` alt-screen fullscreen con dump limpio al scrollback · ghost text en el composer (slash/paths, Tab acepta) · `/recap` + recap automático al recuperar foco tras >5 min · `/plain` render para lectores de pantalla · paneles `/hooks` //`/permissions` //`/doctor` de solo lectura · pill de jobs/DAP en la status line · Agent Hub ligero en `/tasks` (coste por subagente cuando los Usage lo traen). `/tan` difiere (refactor del spawn de delegados).

@@ -8,14 +8,21 @@ use crossterm::event::{Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyM
 
 pub mod emoji;
 pub mod fx;
+pub mod ghost;
 pub mod icons;
 pub mod keys;
 pub mod markdown;
 pub mod mermaid;
 pub mod observer;
 pub mod palette;
+pub mod panels;
+pub mod plain;
+pub mod recap;
+pub mod roster;
+pub mod screen;
 pub mod theme;
 pub mod tui;
+pub mod vim;
 
 /// A decoded keypress, surface-agnostic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -42,6 +42,9 @@ pub struct InputBuffer {
     kill: Option<String>,
     /// Active reverse incremental search (Ctrl+R); None = not searching.
     pub search: Option<SearchState>,
+    /// TUI-03: composer vim mode. The on/off preference lives here —
+    /// session-scoped (`/vim` toggles), never persisted to config.
+    pub vim: crate::vim::Vim,
 }
 
 /// State of a Ctrl+R reverse incremental history search. The search scans
@@ -65,6 +68,21 @@ impl InputBuffer {
         self.text.insert(byte, c);
         self.cursor += 1;
         self.browsing = None;
+    }
+
+    /// Delete the char range `[start, end)` in CHAR indices and leave
+    /// the cursor at `start` — the shared mutation behind the vim
+    /// operators (`d`/`c`/`x` and their ranges), riding the same undo
+    /// stack as every other edit.
+    pub fn delete_range(&mut self, start: usize, end: usize) {
+        let len = self.text.chars().count();
+        if start >= end || start >= len {
+            return;
+        }
+        self.push_undo();
+        let end = end.min(len);
+        self.delete_char_range(start, end);
+        self.cursor = start;
     }
 
     /// Delete the character before the cursor.
@@ -2793,6 +2811,23 @@ pub struct Meters {
     pub goal: Option<GoalState>,
     /// CTX-06: loop-mode mirror (see [`LoopState`]); None = disarmed.
     pub loop_task: Option<LoopState>,
+    /// TUI-15: active background work, counted from the last /tasks
+    /// roster snapshot — `(running tasks, running jobs, dap sessions)`.
+    /// All zero = the pill disappears from the status line.
+    pub jobs: JobsPill,
+}
+
+/// Running background-work counts behind the status-line pill (see
+/// [`Meters::jobs`]). Parsed from the engine's pre-rendered `/tasks`
+/// rows — the surface never invents task state.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct JobsPill {
+    /// Running background delegate tasks.
+    pub tasks: u32,
+    /// Running bash jobs.
+    pub jobs: u32,
+    /// Live DAP sessions.
+    pub dap: u32,
 }
 
 /// Bootstrap inventory for the sidebar (the [`Event::Inventory`] payload,
@@ -3987,7 +4022,7 @@ const MODE_CHOICES: [(ka_protocol::Mode, &str, &str); 4] = [
 
 /// Footer label for a mode — the canonical lowercase word (`ask`,
 /// `accept_edits`, `allow`, `readonly`).
-fn mode_label(mode: ka_protocol::Mode) -> &'static str {
+pub(crate) fn mode_label(mode: ka_protocol::Mode) -> &'static str {
     crate::icons::mode_word(mode)
 }
 
@@ -4413,6 +4448,10 @@ pub enum Modal {
         entries: Vec<(Option<u64>, String)>,
         /// Selected row index.
         selected: usize,
+        /// TUI-15: last-line result previews keyed by task id, filled
+        /// from TaskDetail answers (paged results only — the surface
+        /// never fetches what the user did not ask to see).
+        previews: Vec<(u64, String)>,
     },
     /// Full result of one background task (the pager over
     /// `Command::TaskDetail`).
@@ -4496,6 +4535,27 @@ pub enum Modal {
         /// Selected row index.
         selected: usize,
     },
+    /// TUI-18: [[hooks]] + .ka/hooks file hooks (read-only pager).
+    Hooks {
+        /// Rendered rows.
+        rows: Vec<String>,
+        /// Scroll anchor (None = pinned to the top).
+        scroll: Option<usize>,
+    },
+    /// TUI-18: permission posture (read-only pager).
+    Permissions {
+        /// Rendered rows.
+        rows: Vec<String>,
+        /// Scroll anchor (None = pinned to the top).
+        scroll: Option<usize>,
+    },
+    /// TUI-18: live surface state (read-only pager).
+    Doctor {
+        /// Rendered rows.
+        rows: Vec<String>,
+        /// Scroll anchor (None = pinned to the top).
+        scroll: Option<usize>,
+    },
 }
 
 /// Which modal the next roster event should open instead of rendering
@@ -4527,6 +4587,17 @@ fn task_id_of_row(row: &str) -> Option<u64> {
     let digits = row.strip_prefix("t-")?;
     let end = digits.find(char::is_whitespace).unwrap_or(digits.len());
     digits[..end].parse().ok()
+}
+
+/// TUI-15: the status-line pill counts off a roster snapshot — running
+/// tasks, running bash jobs, live DAP sessions.
+fn roster_pill(rows: &[String]) -> JobsPill {
+    let (tasks, jobs, dap) = crate::roster::pill_counts(rows);
+    JobsPill {
+        tasks: tasks as u32,
+        jobs: jobs as u32,
+        dap: dap as u32,
+    }
 }
 
 /// Push the terminal sequences for one mouse mode. Captured = SGR
@@ -4890,6 +4961,7 @@ pub async fn run(
         startup_notes,
         title_enabled,
         status_order,
+        session_cwd.clone(),
     )
     .await;
     let _ = crossterm::execute!(
@@ -4913,7 +4985,15 @@ pub async fn run(
     // crate's copy here is what restores cooked mode; without it the
     // shell is left unable to echo keystrokes.
     let _ = crossterm::terminal::disable_raw_mode();
-    let (exit, resume) = result?;
+    let (exit, resume, dump) = result?;
+    // TUI-07: the /screen dump lands AFTER the alt screen is gone and
+    // cooked mode is back, so the transcript lands in the terminal's
+    // native scrollback instead of vanishing with the alt buffer.
+    if let Some(dump) = dump {
+        print!("{dump}");
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
+    }
     if let Some(hint) = resume {
         println!();
         println!("{hint}");
@@ -4937,7 +5017,8 @@ async fn app(
     mut startup_notes: Vec<String>,
     title_enabled: bool,
     status_order: Option<Vec<String>>,
-) -> std::io::Result<(Exit, Option<String>)> {
+    session_cwd: std::path::PathBuf,
+) -> std::io::Result<(Exit, Option<String>, Option<String>)> {
     use crossterm::event::{Event as TermEvent, KeyCode, KeyModifiers};
     let _ = agents.clone();
 
@@ -5034,7 +5115,32 @@ async fn app(
     let mut exit = None;
     let mut slash_popup: Option<SlashPopup> = None;
     let mut path_popup: Option<PathPopup> = None;
-    // last /find query + the row to resume a bare /find after
+    // TUI-13 /plain: screen-reader render (plain text, prefix structure)
+    let mut plain_mode = false;
+    // TUI-07 /screen: the transcript dumps to the scrollback on exit
+    // (or on the disarm handoff mid-session)
+    let mut screen_dump = false;
+    // TUI-12: focus-loss timestamp — the recap fires when focus returns
+    // after >RECAP_GAP away
+    let mut focus_lost: Option<Instant> = None;
+    // TUI-12: recap-on-open fires once, on the first SessionInfo of a
+    // resumed session with activity today
+    let mut recap_on_open = !fresh;
+    // TUI-15: last /tasks roster snapshot (pill source) + last-line
+    // result previews per paged task id + the id whose pager the user
+    // asked for (Event::TaskDetail routes on it)
+    let mut last_task_rows: Vec<String>;
+    let mut task_previews: std::collections::BTreeMap<u64, String> =
+        std::collections::BTreeMap::new();
+    let mut pending_detail: Option<u64> = None;
+    // TUI-09: cached @-mention walk for the ghost text (the recursive
+    // walk is too heavy per keystroke; a short TTL keeps it honest)
+    let mut mention_cache: Option<(Instant, Vec<(String, bool)>)> = None;
+    // TUI-15: the roster poll — live pill refresh every few seconds
+    // while something is active, a slow ambient cadence otherwise
+    let mut roster_poll = tokio::time::interval(Duration::from_secs(10));
+    roster_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // first find/last/scroll anchor for /find
     let mut find_last: Option<(String, usize)> = None;
     let mut modal: Option<Modal> = None;
     // /tasks and /debug set this so the roster event opens the modal
@@ -5254,6 +5360,12 @@ async fn app(
                     sel,
                     hover,
                     status_order.as_deref(),
+                    plain_mode,
+                    input.vim.label(),
+                    // TUI-09: the dim continuation at the caret (slash
+                    // command / @-mention); None = nothing to suggest
+                    ghost_suggestion(&input_snapshot, cursor, &mut mention_cache)
+                        .map(|g| g.suffix(&input_snapshot)),
                 );
             })?;
 
@@ -6107,7 +6219,7 @@ async fn app(
                                 }
                                 _ => {}
                             },
-                            Modal::Tasks { entries, selected } => match key.code {
+                            Modal::Tasks { entries, selected, .. } => match key.code {
                                 KeyCode::Esc => modal = None,
                                 KeyCode::Up => {
                                     *selected = selected.saturating_sub(1);
@@ -6120,8 +6232,12 @@ async fn app(
                                 KeyCode::Enter => {
                                     // page the selected task's full result;
                                     // the modal stays open and is replaced
-                                    // when TaskDetail arrives
+                                    // when TaskDetail arrives (the detail
+                                    // flag routes the answer to the pager —
+                                    // unsolicited answers only refresh the
+                                    // roster previews)
                                     if let Some((Some(id), _)) = entries.get(*selected) {
+                                        pending_detail = Some(*id);
                                         let _ = commands.send(Command::TaskDetail { id: *id }).await;
                                     }
                                 }
@@ -6130,6 +6246,15 @@ async fn app(
                             Modal::TaskDetail { text, scroll, .. } => {
                                 let visible = pager_visible(view_rows);
                                 if pager_keys(key.code, text.lines().count(), scroll, visible) {
+                                    modal = None;
+                                }
+                            }
+                            // TUI-18: the read-only panels page like Debug
+                            Modal::Hooks { rows, scroll }
+                            | Modal::Permissions { rows, scroll }
+                            | Modal::Doctor { rows, scroll } => {
+                                let visible = pager_visible(view_rows);
+                                if pager_keys(key.code, rows.len(), scroll, visible) {
                                     modal = None;
                                 }
                             }
@@ -6496,6 +6621,28 @@ async fn app(
                             // (fixed chord — not a [keybindings] action)
                             let _ = terminal.clear();
                             continue;
+                        }
+                        // TUI-03: vim mode owns the printable keys while
+                        // it is on and no overlay (popup, modal, picker)
+                        // holds focus — handled first, ahead of every
+                        // readline arm, so NORMAL-mode letters are vim
+                        // motions, not typed text. INSERT passes
+                        // everything through except Esc; overlays keep
+                        // their native keys (the popup owns Tab/↑↓/⏎).
+                        _ if input.vim.on
+                            && modal.is_none()
+                            && picker.is_none()
+                            && slash_popup.is_none()
+                            && path_popup.is_none()
+                            && !(busy && matches!(key.code, KeyCode::Esc)) =>
+                        {
+                            if crate::vim::handle(&mut input, &key)
+                                == crate::vim::Flow::Handled
+                            {
+                                continue;
+                            }
+                            // passthrough keys (Enter, Tab, arrows, ctrl
+                            // chords) fall through to the arms below
                         }
                         _ if bindings.matches(&key, "popups.skills") => {
                             // skills & inventory popup (button on the strip)
@@ -7020,6 +7167,97 @@ async fn app(
                                 }
                                 continue;
                             }
+                            // TUI-03 /vim: composer vim mode for this
+                            // session. INSERT behaves exactly like the
+                            // plain composer; NORMAL/VISUAL answer to the
+                            // vim keymap over the draft. The preference
+                            // lives on the input buffer — session-scoped,
+                            // never persisted.
+                            if text.trim() == "/vim" {
+                                let on = input.vim.toggle();
+                                transcript.push_separated(Line::Info(if on {
+                                    "vim mode on — INSERT types normally; Esc switches \
+                                     to NORMAL (hjkl d c y p i a o v, counts; /help has the map)"
+                                        .into()
+                                } else {
+                                    "vim mode off — back to plain composer editing".into()
+                                }));
+                                continue;
+                            }
+                            // TUI-13 /plain: screen-reader view — plain
+                            // text lines, prefix structure, extra blank
+                            // lines between blocks; no glyphs, no boxes,
+                            // nothing color-coded.
+                            if text.trim() == "/plain" {
+                                plain_mode = !plain_mode;
+                                needs_repaint = true;
+                                transcript.push_separated(Line::Info(if plain_mode {
+                                    "plain view on — transcript as plain text, \
+                                     structure by prefixes (user:/ka:/tool:)"
+                                        .into()
+                                } else {
+                                    "plain view off — decorated view restored".into()
+                                }));
+                                continue;
+                            }
+                            // TUI-12 /recap: the one-line session recap on
+                            // demand — the latest stored x.ka.recap, else a
+                            // local summary of the recorded turns.
+                            if text.trim() == "/recap" {
+                                match crate::recap::recap_note(&meters.session, &session_cwd, &transcript) {
+                                    Some(text) => transcript
+                                        .push_separated(Line::Info(format!("recap · {text}"))),
+                                    None => transcript.push_separated(Line::Info(
+                                        "recap · nothing yet — this session has no turns today"
+                                            .into(),
+                                    )),
+                                }
+                                continue;
+                            }
+                            // TUI-07 /screen: the clean alt-screen handoff.
+                            // Arming prints the transcript to the primary
+                            // screen's scrollback when the session leaves
+                            // (exit or the second /screen); disarming does
+                            // the handoff right away and re-enters the pane.
+                            if text.trim() == "/screen" {
+                                if screen_dump {
+                                    screen_dump = false;
+                                    let width = terminal.size().map(|s| s.width).unwrap_or(80);
+                                    let _ = crossterm::execute!(
+                                        std::io::stdout(),
+                                        crossterm::terminal::LeaveAlternateScreen
+                                    );
+                                    let dump = crate::screen::dump_text(
+                                        &transcript,
+                                        &meters.session,
+                                        width as usize,
+                                    );
+                                    // raw mode is still on: \n alone would
+                                    // staircase, so every line ends \r\n
+                                    let cooked = dump.replace('\n', "\r\n");
+                                    use std::io::Write as _;
+                                    let _ = std::io::stdout().write_all(cooked.as_bytes());
+                                    let _ = std::io::stdout().flush();
+                                    let _ = crossterm::execute!(
+                                        std::io::stdout(),
+                                        crossterm::terminal::EnterAlternateScreen
+                                    );
+                                    let _ = terminal.clear();
+                                    transcript.push_separated(Line::Info(
+                                        "screen · transcript dumped to the scrollback \
+                                         — fullscreen pane restored"
+                                            .into(),
+                                    ));
+                                } else {
+                                    screen_dump = true;
+                                    transcript.push_separated(Line::Info(
+                                        "screen · the transcript will be dumped to the \
+                                         scrollback on exit (run /screen again to do it now)"
+                                            .into(),
+                                    ));
+                                }
+                                continue;
+                            }
                             // /image: stage an attachment instead of a prompt
                             if text.starts_with("/image ") || text == "/image" {
                                 match handle_image_command(&text, &mut pending_image) {
@@ -7201,6 +7439,77 @@ async fn app(
                     None => transcript.push_separated(Line::Warn("no api key variable is known for this model".into())),
                 }
                                                 }
+                                                // TUI-18: the read-only panels read
+                                                // the layered config the surface
+                                                // sees; a broken file warns instead
+                                                // of silently rendering defaults
+                                                ModalKind::Hooks
+                                                | ModalKind::Permissions
+                                                | ModalKind::Doctor => {
+                                                    let cfg =
+                                                        match crate::theme::surface_config(
+                                                            &session_cwd,
+                                                        ) {
+                                                            Ok(cfg) => cfg,
+                                                            Err(e) => {
+                                                                transcript.push_separated(
+                                                                    Line::Warn(format!(
+                                                                        "config: {e}"
+                                                                    )),
+                                                                );
+                                                                continue;
+                                                            }
+                                                        };
+                                                    modal = Some(match kind {
+                                                        ModalKind::Hooks => Modal::Hooks {
+                                                            rows: crate::panels::hooks_rows(
+                                                                &cfg,
+                                                                &session_cwd,
+                                                            ),
+                                                            scroll: None,
+                                                        },
+                                                        ModalKind::Permissions => {
+                                                            Modal::Permissions {
+                                                                rows: crate::panels::permissions_rows(
+                                                                    &cfg,
+                                                                    sidebar.sandbox.as_deref(),
+                                                                    &meters.mode,
+                                                                ),
+                                                                scroll: None,
+                                                            }
+                                                        }
+                                                        ModalKind::Doctor => Modal::Doctor {
+                                                            rows: {
+                                                                let facts =
+                                                                    crate::panels::DoctorFacts {
+                                                                        session: &meters.session,
+                                                                        model: &meters.model,
+                                                                        effort: &meters.effort,
+                                                                        mode: &meters.mode,
+                                                                        providers: &providers,
+                                                                        live_sandbox: sidebar
+                                                                            .sandbox
+                                                                            .as_deref(),
+                                                                        turns: meters.turns,
+                                                                        cost: meters.cost,
+                                                                        context: meters.context,
+                                                                        update: meters
+                                                                            .update
+                                                                            .as_deref(),
+                                                                        mcp: &sidebar
+                                                                            .inventory
+                                                                            .mcp,
+                                                                    };
+                                                                crate::panels::doctor_rows(
+                                                                    &cfg,
+                                                                    &facts,
+                                                                )
+                                                            },
+                                                            scroll: None,
+                                                        },
+                                                        _ => Modal::Help { scroll: None },
+                                                    });
+                                                }
                                                 _ => {
                 modal = Some(match kind {
                     ModalKind::Session => {
@@ -7360,6 +7669,12 @@ async fn app(
                                         | ModalKind::Help => {
                                             Modal::Help { scroll: None }
                                         }
+                                        // Hooks/Permissions/Doctor are
+                                        // handled in their own outer arm —
+                                        // unreachable here
+                                        ModalKind::Hooks
+                                        | ModalKind::Permissions
+                                        | ModalKind::Doctor => Modal::Help { scroll: None },
                                         // unreachable in practice: /tasks and
                                         // /debug send events, and the modal is
                                         // built from the event payload — these
@@ -7367,6 +7682,7 @@ async fn app(
                                         ModalKind::Tasks => Modal::Tasks {
                                             entries: Vec::new(),
                                             selected: 0,
+                                            previews: Vec::new(),
                                         },
                                         ModalKind::Debug => Modal::Debug {
                                             rows: Vec::new(),
@@ -7487,6 +7803,18 @@ async fn app(
                                     slash_popup = update_suggestions(&input.text);
                                 }
                             } else if path_popup.is_none() {
+                                // TUI-09: ghost text acceptance first — the
+                                // dim continuation at the caret (slash
+                                // command or @-mention) completes on Tab
+                                // before the popup-openers get a chance
+                                let ghost =
+                                    ghost_suggestion(&input.text, input.cursor, &mut mention_cache);
+                                if let Some(ghost) = ghost {
+                                    crate::ghost::accept(&ghost, &mut input);
+                                    invalidate_custom_command_scan();
+                                    slash_popup = update_suggestions(&input.text);
+                                    continue;
+                                }
                                 // @-mention completion on an @-led token
                                 // (longer than the bare sigil)
                                 if let Some((start, token)) =
@@ -7865,7 +8193,10 @@ async fn app(
                             | Modal::CopyPick { .. }
                             | Modal::Search { .. }
                             | Modal::Changelog { .. }
-                            | Modal::Queue { .. } => {}
+                            | Modal::Queue { .. }
+                            | Modal::Hooks { .. }
+                            | Modal::Permissions { .. }
+                            | Modal::Doctor { .. } => {}
                         }
                     } else if path_popup.is_some() {
                         path_popup = None;
@@ -8204,11 +8535,23 @@ async fn app(
                     // shows this pane — with unfocused-only notifications
                     // armed, focus silences them
                     FOCUSED.store(true, std::sync::atomic::Ordering::Relaxed);
+                    // TUI-12: back after >5 min away — a one-line recap
+                    // (latest stored recap, else the local turn summary)
+                    if let Some(away) = focus_lost.take() {
+                        if away.elapsed() >= RECAP_GAP {
+                            if let Some(text) =
+                                crate::recap::recap_note(&meters.session, &session_cwd, &transcript)
+                            {
+                                transcript.push_separated(Line::Info(format!("recap · {text}")));
+                            }
+                        }
+                    }
                 } else if let Some(Ok(TermEvent::FocusLost)) = maybe_term {
                     // losing focus re-arms notifications; terminals that
                     // never report stay on the false default, which means
                     // they always notify
                     FOCUSED.store(false, std::sync::atomic::Ordering::Relaxed);
+                    focus_lost = Some(Instant::now());
                 }
             }
             maybe_evt = events.recv() => {
@@ -8225,9 +8568,25 @@ async fn app(
                             // prompts: seed the draft history with them
                             input.seed_history(replay_user_prompts(messages));
                         }
+                        // TUI-12: a resumed session recapits once, when the
+                        // engine announces the strand — the latest stored
+                        // x.ka.recap, else a local summary of the recorded
+                        // turns (only when the strand moved today)
+                        if let Event::SessionInfo { id } = &evt {
+                            if recap_on_open {
+                                recap_on_open = false;
+                                if let Some(text) =
+                                    crate::recap::recap_note(id, &session_cwd, &transcript)
+                                {
+                                    transcript
+                                        .push_separated(Line::Info(format!("recap · {text}")));
+                                }
+                            }
+                        }
                         // /tasks and /debug modals: a flagged roster event
                         // reroutes into the modal (skipping the transcript
-                        // fallback below); TaskDetail always pages
+                        // fallback below); TaskDetail pages only the id the
+                        // user asked for — everything else feeds previews
                         if pending_modal.is_some() {
                             match &evt {
                             // mode/model acks are transient, not transcript rows
@@ -8241,12 +8600,29 @@ async fn app(
                                     if pending_modal == Some(PendingModal::Tasks) =>
                                 {
                                     pending_modal = None;
+                                    last_task_rows = rows.clone();
+                                    meters.jobs = roster_pill(&last_task_rows);
+                                    // TUI-14: ask each task's result for the
+                                    // last-line preview (small rosters only —
+                                    // a flood of delegates pages politely)
+                                    let ids: Vec<u64> = rows
+                                        .iter()
+                                        .filter_map(|r| task_id_of_row(r))
+                                        .take(10)
+                                        .collect();
+                                    for id in ids {
+                                        let _ = commands.send(Command::TaskDetail { id }).await;
+                                    }
                                     modal = Some(Modal::Tasks {
                                         entries: rows
                                             .iter()
                                             .map(|r| (task_id_of_row(r), r.clone()))
                                             .collect(),
                                         selected: 0,
+                                        previews: task_previews
+                                            .iter()
+                                            .map(|(id, text)| (*id, text.clone()))
+                                            .collect(),
                                     });
                                     continue;
                                 }
@@ -8265,11 +8641,62 @@ async fn app(
                         }
                         match &evt {
                             Event::TaskDetail { id, text } => {
-                                modal = Some(Modal::TaskDetail {
-                                    id: *id,
-                                    text: text.clone(),
-                                    scroll: None,
-                                });
+                                // the roster's last line previews under the
+                                // row once the result is known to the surface
+                                let preview = text
+                                    .lines()
+                                    .rev()
+                                    .find(|l| !l.trim().is_empty())
+                                    .map(str::to_string);
+                                if let Some(prev) = preview {
+                                    task_previews.insert(*id, prev);
+                                }
+                                if pending_detail == Some(*id) {
+                                    pending_detail = None;
+                                    modal = Some(Modal::TaskDetail {
+                                        id: *id,
+                                        text: text.clone(),
+                                        scroll: None,
+                                    });
+                                } else if let Some(Modal::Tasks {
+                                    entries,
+                                    selected,
+                                    previews,
+                                }) = modal.as_mut()
+                                {
+                                    // TUI-15: a live /tasks modal refreshes in
+                                    // place as its previews land
+                                    *previews = task_previews
+                                        .iter()
+                                        .map(|(id, text)| (*id, text.clone()))
+                                        .collect();
+                                    let _ = (entries, selected);
+                                }
+                            }
+                            Event::Tasks { rows } => {
+                                // TUI-15: any roster snapshot feeds the pill;
+                                // no transcript noise (the modal path above
+                                // already handled the flagged case)
+                                last_task_rows = rows.clone();
+                                meters.jobs = roster_pill(&last_task_rows);
+                                if let Some(Modal::Tasks {
+                                    entries,
+                                    selected,
+                                    previews,
+                                }) = modal.as_mut()
+                                {
+                                    *entries = rows
+                                        .iter()
+                                        .map(|r| (task_id_of_row(r), r.clone()))
+                                        .collect();
+                                    *previews = task_previews
+                                        .iter()
+                                        .map(|(id, text)| (*id, text.clone()))
+                                        .collect();
+                                    if *selected >= entries.len() {
+                                        *selected = entries.len().saturating_sub(1);
+                                    }
+                                }
                             }
                             Event::DebugRoster { rows } => {
                                 // no pending modal: transcript fallback
@@ -8486,16 +8913,35 @@ async fn app(
                     toast = None;
                 }
             }
+            // TUI-15: ambient /tasks roster poll — keeps the status-line
+            // job pill live. 10 s cadence; the engine answers with an
+            // Event::Tasks that (without a pending modal) only refreshes
+            // the pill and any open /tasks modal.
+            _ = roster_poll.tick() => {
+                let _ = commands.send(Command::ListTasks).await;
+            }
         }
     }
     let exit = exit.unwrap_or(Exit::Quit);
+    // TUI-07: the armed handoff captures the dump text; run() prints it
+    // once the terminal is back on the primary screen in cooked mode
+    let dump = matches!(exit, Exit::Quit | Exit::EngineEnded)
+        .then(|| crate::screen::dump_text(&transcript, &meters.session, term_cols()))
+        .filter(|_| screen_dump);
     let resume = resume_hint(
         &meters.session,
         meters.turns,
         busy,
         !transcript.entries().is_empty(),
     );
-    Ok((exit, resume))
+    Ok((exit, resume, dump))
+}
+
+/// Current terminal width in columns (80 when the terminal is gone).
+fn term_cols() -> usize {
+    crossterm::terminal::size()
+        .map(|(w, _)| w as usize)
+        .unwrap_or(80)
 }
 
 /// The after-exit resume hint: the command that brings this session
@@ -8541,6 +8987,10 @@ fn tool_header(tool: &str, detail: &str) -> String {
 
 /// How long a toast stays on screen before it self-destructs.
 const TOAST_TTL: Duration = Duration::from_secs(4);
+
+/// TUI-12: a focus absence longer than this fires the recap note when
+/// the pane regains focus (`FocusGained`).
+const RECAP_GAP: Duration = Duration::from_secs(5 * 60);
 
 /// Set (or replace) the transient action toast.
 fn pop_toast(toast: &mut Option<(String, Instant)>, msg: impl Into<String>) {
@@ -9685,6 +10135,34 @@ fn builtin_slash_commands() -> Vec<(String, String)> {
             "browse spilled tool output in $PAGER".to_string(),
         ),
         (
+            "/vim".to_string(),
+            "toggle composer vim mode for this session".to_string(),
+        ),
+        (
+            "/screen".to_string(),
+            "dump the transcript to the scrollback when leaving".to_string(),
+        ),
+        (
+            "/plain".to_string(),
+            "screen-reader view: plain text, prefixes instead of glyphs".to_string(),
+        ),
+        (
+            "/recap".to_string(),
+            "one-line recap of this session (latest recap or local summary)".to_string(),
+        ),
+        (
+            "/hooks".to_string(),
+            "hooks panel: [[hooks]] + .ka/hooks scripts".to_string(),
+        ),
+        (
+            "/permissions".to_string(),
+            "permissions panel: mode, rules, protected paths, sandbox".to_string(),
+        ),
+        (
+            "/doctor".to_string(),
+            "live surface state (version, keys, sandbox; CLI owns network checks)".to_string(),
+        ),
+        (
             "/export".to_string(),
             "save this session to markdown [path]".to_string(),
         ),
@@ -9957,7 +10435,7 @@ pub fn complete_token(
 /// `/skill` starter — completing `/sk` lands on `/skill:` with the
 /// inventory names already in the popup, not on `/skill ` with the
 /// family closed.
-fn complete_slash(name: &str) -> String {
+pub(crate) fn complete_slash(name: &str) -> String {
     if name == "/skill" {
         "/skill:".to_string()
     } else {
@@ -9992,6 +10470,41 @@ pub fn update_suggestions(input: &str) -> Option<SlashPopup> {
         Some(SlashPopup { items, selected: 0 })
     }
 }
+
+/// TUI-09: the ghost continuation at the caret — a slash-command
+/// remainder while the draft is `/`-led, else the first @-mention match
+/// for the token the caret sits on (only when the caret ends the
+/// draft). The mention walk is cached with a short TTL: the recursive
+/// scan is too heavy per keystroke, and a stale listing for a few
+/// seconds is invisible next to the completion popup.
+fn ghost_suggestion(
+    text: &str,
+    cursor: usize,
+    cache: &mut Option<(Instant, Vec<(String, bool)>)>,
+) -> Option<crate::ghost::Ghost> {
+    if cursor < text.chars().count() {
+        return None;
+    }
+    if let Some(g) = crate::ghost::slash_ghost(text, &available_slash_commands()) {
+        return Some(g);
+    }
+    let mentionish = path_token(text, cursor).is_some_and(|(_, t)| mention_token(&t).is_some());
+    if !mentionish {
+        return None;
+    }
+    let entries = match cache {
+        Some((at, entries)) if at.elapsed() < MENTION_TTL => entries.clone(),
+        _ => {
+            let entries = walk_files(&std::env::current_dir().unwrap_or_default(), WALK_CAP);
+            *cache = Some((Instant::now(), entries.clone()));
+            entries
+        }
+    };
+    crate::ghost::mention_ghost(text, cursor, &entries)
+}
+
+/// How long the @-mention walk for the ghost text stays cached.
+const MENTION_TTL: Duration = Duration::from_secs(5);
 
 /// The user config path shown in the settings panel (mirrors
 /// ka-engine's `config::user_config_path`).
@@ -10051,6 +10564,12 @@ pub enum ModalKind {
     Tree,
     /// Help overlay.
     Help,
+    /// TUI-18: hooks panel (config + file hooks).
+    Hooks,
+    /// TUI-18: permissions panel (mode, rules, sandbox, grants).
+    Permissions,
+    /// TUI-18: doctor panel (live surface state).
+    Doctor,
 }
 
 /// Load a custom command body from `.ka/commands/<name>.md` (project) or
@@ -10365,6 +10884,13 @@ pub fn slash_command(text: &str) -> Option<Slash> {
             | "/memory"
             | "/tasks"
             | "/debug"
+            | "/vim"
+            | "/screen"
+            | "/plain"
+            | "/recap"
+            | "/hooks"
+            | "/permissions"
+            | "/doctor"
     ) {
         if let Some((fm, body)) = custom_command(head, rest) {
             return Some(Slash {
@@ -11087,6 +11613,40 @@ blocker > major > minor > nit, each as `file:line — issue — concrete fix`, \
             followup: None,
             modal: Some(ModalKind::Settings),
         }),
+        // TUI-18: read-only panels; the modal bodies are built in the
+        // app loop (they need cwd/config/runtime state)
+        "/hooks" => Some(Slash {
+            note: None,
+            event: None,
+            quit: false,
+            followup: None,
+            modal: Some(ModalKind::Hooks),
+        }),
+        "/permissions" => Some(Slash {
+            note: None,
+            event: None,
+            quit: false,
+            followup: None,
+            modal: Some(ModalKind::Permissions),
+        }),
+        "/doctor" => Some(Slash {
+            note: None,
+            event: None,
+            quit: false,
+            followup: None,
+            modal: Some(ModalKind::Doctor),
+        }),
+        // TUI-03/07/13/12: session-local toggles and the recap query.
+        // The real work happens in the app loop's intercepts (they own
+        // the composer/screen state); these honest rows keep the queue
+        // refusal and the popup classification correct.
+        "/vim" | "/screen" | "/plain" | "/recap" => Some(Slash {
+            note: None,
+            event: None,
+            quit: false,
+            followup: None,
+            modal: None,
+        }),
         "/usage" => Some(Slash {
             note: None,
             event: None,
@@ -11513,6 +12073,12 @@ fn modal_hints(open: &Modal) -> &'static [(&'static str, &'static str)] {
             ("home/end", "top/tail"),
             ("esc", "close"),
         ],
+        // TUI-18: read-only panels page like the debug overlay
+        Modal::Hooks { .. } | Modal::Permissions { .. } | Modal::Doctor { .. } => &[
+            ("pgup/pgdn", "scroll"),
+            ("home/end", "top/tail"),
+            ("esc", "close"),
+        ],
         Modal::Key(_) => &[("type", "value"), ("⏎", "save"), ("esc", "cancel")],
         Modal::Help { .. } => &[("↑↓/pgup/pgdn", "scroll"), ("⏎", "close")],
         Modal::Theme { .. } => &[("↑↓", "choose"), ("⏎", "apply live"), ("esc", "close")],
@@ -11726,7 +12292,40 @@ fn status_left(meters: &Meters) -> Vec<ratatui::text::Span<'static>> {
         // CTX-06: loop mode armed — the task re-runs on every settle
         push("↻ loop".to_string(), crate::palette::ACCENT);
     }
+    if let Some(pill) = job_pill(meters) {
+        // TUI-15: live background work (tasks · jobs · dap), fed by the
+        // /tasks roster snapshot
+        push(pill, crate::palette::TOOL);
+    }
     segs
+}
+
+/// The pill text for the status line, `None` (invisible) while no
+/// background work is running.
+fn job_pill(meters: &Meters) -> Option<String> {
+    let j = meters.jobs;
+    if j.tasks == 0 && j.jobs == 0 && j.dap == 0 {
+        return None;
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if j.tasks > 0 {
+        parts.push(format!(
+            "{} task{}",
+            j.tasks,
+            if j.tasks == 1 { "" } else { "s" }
+        ));
+    }
+    if j.jobs > 0 {
+        parts.push(format!(
+            "{} job{}",
+            j.jobs,
+            if j.jobs == 1 { "" } else { "s" }
+        ));
+    }
+    if j.dap > 0 {
+        parts.push(format!("{} dap", j.dap));
+    }
+    Some(parts.join(" · "))
 }
 
 /// Context-gauge cells on the status line.
@@ -11785,9 +12384,10 @@ fn status_right(meters: &Meters) -> Vec<ratatui::text::Span<'static>> {
 
 /// One status-line segment id ([tui] status_line): `model`, `mode`,
 /// `session`, `effort`, `context`, `cost`, `tokens`, `cache`,
-/// `toggles`, `update`.
+/// `toggles`, `update`, `jobs`.
 const STATUS_SEGMENT_IDS: &[&str] = &[
-    "model", "mode", "session", "effort", "context", "cost", "tokens", "cache", "toggles", "update",
+    "model", "mode", "session", "effort", "context", "cost", "tokens", "cache", "toggles",
+    "update", "jobs",
 ];
 
 /// Validate a `[tui] status_line` at the surface boundary: unknown ids
@@ -11915,6 +12515,11 @@ pub fn status_segments(meters: &Meters, order: &[String]) -> Vec<ratatui::text::
                         format!("\u{2934} {latest}"),
                         crate::palette::WARN,
                     );
+                }
+            }
+            "jobs" => {
+                if let Some(pill) = job_pill(meters) {
+                    push(&mut segs, pill, crate::palette::TOOL);
                 }
             }
             _ => {}
@@ -12233,6 +12838,246 @@ const COMET_STEP_MS: u128 = 24;
 /// Busy comet: half-width of the light band, in columns.
 const COMET_RADIUS: f32 = 10.0;
 
+/// TUI-13: the /plain renderer — no glyphs, no boxes, no color
+/// dependency. Structure rides prefixes (`user:`, `note:`,
+/// `tool: … → ok`) and a blank row between blocks; the composer reads
+/// `> draft`; the status line is one plain sentence. Modals and the
+/// permission ask textualize too (see [`crate::plain`]) so the
+/// screen-reader view never depends on the decorated chrome.
+#[allow(clippy::too_many_arguments)]
+fn render_plain(
+    frame: &mut ratatui::Frame,
+    transcript: &mut Transcript,
+    scroll: Option<usize>,
+    input: &str,
+    cursor: usize,
+    busy: bool,
+    _busy_since: Option<Instant>,
+    _now: Instant,
+    ask: Option<&PendingAsk>,
+    live: Option<&LiveBlock>,
+    modal: Option<&Modal>,
+    picker: Option<&InputPicker>,
+    rsearch: Option<&str>,
+    meters: &Meters,
+    sidebar: &SidebarState,
+    vim_label: Option<&'static str>,
+    header_glyph: &str,
+    _status_order: Option<&[String]>,
+) {
+    use ratatui::layout::Constraint::{Length, Min};
+    use ratatui::widgets::Paragraph;
+    // same 6-chunk skeleton as the decorated view: the viewport math
+    // (visible_rows, pager heights) must agree across renderers
+    let full = frame.area();
+    frame.render_widget(
+        ratatui::widgets::Block::new().style(crate::palette::CANVAS),
+        full,
+    );
+    let chunks = ratatui::layout::Layout::vertical([
+        Length(1),
+        Length(1),
+        Min(0),
+        Length(input_height(input_area_rows(
+            picker,
+            input,
+            input_inner_w(full.width),
+        ))),
+        Length(1),
+        Length(1),
+    ])
+    .split(full);
+    let tx_area = chunks[2].inner(ratatui::layout::Margin::new(1, 0));
+    let composer = chunks[3].inner(ratatui::layout::Margin::new(1, 0));
+    let status = chunks[5];
+    let width = tx_area.width as usize;
+
+    // ── header: one plain identity line ──
+    let header = format!(
+        "ka {} {} · {}",
+        env!("CARGO_PKG_VERSION"),
+        header_glyph,
+        meters.model
+    );
+    frame.render_widget(
+        Paragraph::new(ratatui::text::Line::raw(trunc_cols(
+            &header,
+            full.width as usize,
+        ))),
+        chunks[0],
+    );
+
+    // ── permission ask: plain lines above everything ──
+    if let Some(ask) = ask {
+        let rows = crate::plain::ask_lines(ask)
+            .into_iter()
+            .map(ratatui::text::Line::raw)
+            .collect::<Vec<_>>();
+        frame.render_widget(Paragraph::new(rows), tx_area);
+        return;
+    }
+
+    // ── transcript (plain rows) + live region ──
+    let mut rows: Vec<String> = crate::plain::transcript_rows(transcript);
+    if let Some(lb) = live {
+        if !lb.thought.is_empty() {
+            for line in lb
+                .thought
+                .lines()
+                .rev()
+                .take(3)
+                .collect::<Vec<_>>()
+                .iter()
+                .rev()
+            {
+                rows.push(format!("thinking: {line}"));
+            }
+        }
+        if !lb.tool_header.is_empty() {
+            let head = lb
+                .tool_header
+                .trim()
+                .strip_prefix("→ ")
+                .unwrap_or(&lb.tool_header);
+            let (name, detail) = match head.split_once(" · ") {
+                Some((n, d)) => (n.trim(), d.trim()),
+                None => (head.trim(), ""),
+            };
+            let mut row = format!("tool: {name}");
+            if !detail.is_empty() {
+                row.push_str(&format!(" {detail}"));
+            }
+            rows.push(format!("{row} → running"));
+            if let Some(lt) = &lb.live_tool {
+                for line in lt.preview.iter().take(PREVIEW_WINDOW) {
+                    rows.push(format!("  {line}"));
+                }
+            }
+        }
+        for line in lb.md.iter() {
+            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            if !text.trim().is_empty() {
+                rows.push(text);
+            }
+        }
+    }
+    if rows.is_empty() && !busy {
+        rows.push("plain view — send a prompt to begin".to_string());
+    }
+    let total = rows.len();
+    let visible = tx_area.height as usize;
+    let (start, _) = window_range(total, visible, scroll);
+    let end = (start + visible).min(total);
+    let window: Vec<ratatui::text::Line<'static>> = rows[start..end]
+        .iter()
+        .map(|r| ratatui::text::Line::raw(r.clone()))
+        .collect();
+    frame.render_widget(Paragraph::new(window), tx_area);
+
+    // ── modal (plain text, no chrome): header + rows at the pane top ──
+    if let Some(open) = modal {
+        let (title, body) = crate::plain::modal_lines(open, width, sidebar);
+        let mut text: Vec<ratatui::text::Line<'static>> =
+            vec![ratatui::text::Line::raw(format!("── {title} "))];
+        text.extend(body.into_iter().map(ratatui::text::Line::raw));
+        text.push(ratatui::text::Line::raw(String::new()));
+        let hint = tui_modal_hints(open);
+        text.push(ratatui::text::Line::raw(format!(
+            "(esc closes · {})",
+            hint.join(" · ")
+        )));
+        frame.render_widget(Paragraph::new(text), tx_area);
+        return;
+    }
+
+    // ── composer: `> draft` rows, vim tag, reverse-search line ──
+    let draft_w = composer.width.saturating_sub(2) as usize;
+    let mut text: Vec<ratatui::text::Line<'static>> = Vec::new();
+    if let Some(q) = rsearch {
+        text.push(ratatui::text::Line::raw(format!(
+            "search: {}",
+            q.strip_prefix("rsearch: ").unwrap_or(q)
+        )));
+    }
+    match picker {
+        Some(InputPicker::Mode(pk)) => {
+            for (i, (_, label, desc)) in MODE_CHOICES.iter().enumerate() {
+                let mark = if i == pk.selected { ">" } else { " " };
+                text.push(ratatui::text::Line::raw(format!("{mark} {label} — {desc}")));
+            }
+        }
+        Some(InputPicker::Thinking(tk)) => {
+            for (i, level) in tk.choices.iter().enumerate() {
+                let mark = if i == tk.selected { ">" } else { " " };
+                text.push(ratatui::text::Line::raw(format!(
+                    "{mark} {}",
+                    effort_label(*level)
+                )));
+            }
+        }
+        None => {
+            let lead = if busy { "· " } else { "> " };
+            let mut first = true;
+            for row in input.split('\n') {
+                if first {
+                    text.push(ratatui::text::Line::raw(format!("{lead}{row}")));
+                    first = false;
+                } else {
+                    text.push(ratatui::text::Line::raw(format!("  {row}")));
+                }
+            }
+            if input.is_empty() && rsearch.is_none() {
+                let hint = if busy {
+                    COMPOSER_PLACEHOLDER_BUSY
+                } else {
+                    COMPOSER_PLACEHOLDER
+                };
+                text.push(ratatui::text::Line::raw(format!(
+                    "{lead}{}",
+                    trunc_cols(hint, draft_w)
+                )));
+            }
+            if let Some(tag) = vim_label {
+                text.push(ratatui::text::Line::raw(format!("[vim: {tag}]")));
+            }
+        }
+    }
+    frame.render_widget(Paragraph::new(text), composer);
+    // hardware cursor: one col of padding + the lead, then the draft col
+    let (row, col) = cursor_row_col(input, cursor);
+    if ask.is_none() && picker.is_none() {
+        frame.set_cursor_position((
+            (composer.x + 1 + col as u16).min(composer.right().saturating_sub(1)),
+            composer.y + row as u16,
+        ));
+    }
+
+    // ── status: one plain sentence ──
+    let mut line = crate::plain::status_text(meters);
+    if busy {
+        line = format!("working · {line}");
+    }
+    frame.render_widget(
+        Paragraph::new(ratatui::text::Line::raw(trunc_cols(
+            &line,
+            status.width as usize,
+        ))),
+        status,
+    );
+}
+
+/// Plain-modal hint words for the parenthetical footer line (owned —
+/// the plain renderer formats them per frame; nothing outlives it).
+fn tui_modal_hints(open: &Modal) -> Vec<String> {
+    modal_hints(open)
+        .iter()
+        .filter(|(key, _)| *key != "esc")
+        .map(|(key, desc)| format!("{key} {desc}"))
+        .collect()
+}
+
+/// Decorated renderer: the full chrome — canvas, header bar, transcript
+/// bands, composer box, status line, popups, modals, hover affordances.
 #[allow(clippy::too_many_arguments)]
 fn render(
     frame: &mut ratatui::Frame,
@@ -12288,6 +13133,14 @@ fn render(
     // [tui] status_line: explicit segment order (None = the built-in
     // layout — meters left, gauge/cost/pill right)
     status_order: Option<&[String]>,
+    // TUI-13: /plain render — plain text lines, prefix structure, no
+    // glyphs/boxes (screen-reader view)
+    plain: bool,
+    // TUI-03: the vim mode tag for the composer title (None = off)
+    vim_label: Option<&'static str>,
+    // TUI-09: the ghost continuation at the caret, already resolved to
+    // the not-yet-typed remainder (None = nothing to suggest)
+    ghost: Option<String>,
 ) {
     use ratatui::layout::Constraint::{Length, Min};
     use ratatui::layout::Rect;
@@ -12295,6 +13148,29 @@ fn render(
     use ratatui::text::{Line as TuiLine, Span};
     use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
     use unicode_width::UnicodeWidthStr;
+    if plain {
+        render_plain(
+            frame,
+            transcript,
+            scroll,
+            input,
+            cursor,
+            busy,
+            busy_since,
+            now,
+            ask,
+            live,
+            modal,
+            picker,
+            rsearch,
+            meters,
+            sidebar,
+            vim_label,
+            header_glyph,
+            status_order,
+        );
+        return;
+    }
     // zones start empty each frame; the code below publishes the rects
     // it actually draws (nothing drawn → nothing to click)
     modal_zone.set(None);
@@ -12606,7 +13482,11 @@ fn render(
                 format!(" search · {} ", q.strip_prefix("rsearch: ").unwrap_or(q)),
                 crate::palette::ACCENT_STYLE,
             )),
-            None => busy_input_title(queued).map(padded_title),
+            // TUI-03: the vim tag rides the title so the mode is always
+            // visible; the queue count yields to it
+            None => vim_label
+                .map(|l| padded_title(format!("-- {l} --")))
+                .or_else(|| busy_input_title(queued).map(padded_title)),
         },
     };
     // picker rows: borders + horizontal padding
@@ -12702,6 +13582,18 @@ fn render(
                         .fg(crate::palette::FAINT)
                         .add_modifier(Modifier::ITALIC),
                 ));
+            }
+            // TUI-09: the dim continuation rides the cursor's visual row
+            // (Tab accepts it — see the Tab arm; typing discards it,
+            // the suggestion is recomputed from the draft every frame)
+            if let Some(ghost) = &ghost {
+                let idx = cur_row - first;
+                if idx < out.len() {
+                    out[idx].spans.push(Span::styled(
+                        ghost.clone(),
+                        Style::new().fg(crate::palette::FAINT),
+                    ));
+                }
             }
             out
         }
@@ -13226,25 +14118,98 @@ fn render(
                 }
                 (width, height, modal_title("prompts"), text)
             }
-            Modal::Tasks { entries, selected } => {
-                let height = (entries.len() as u16 + 5).clamp(7, 21);
+            Modal::Tasks {
+                entries,
+                selected,
+                previews,
+            } => {
+                // TUI-14 Agent Hub: roster rows plus a summed cost footer
+                // when any row carries a reported cost (the engine appends
+                // `$x.xxxx` once a runner's usage lands — nothing invented)
+                let mut rows: Vec<String> = Vec::new();
+                for (_, row) in entries.iter() {
+                    rows.push(row.clone());
+                }
+                let cost_note = crate::roster::cost_summary(&rows)
+                    .map(|(total, agents)| {
+                        format!(
+                            "Σ ${total:.4} reported · {agents} agent{}",
+                            if agents == 1 { "" } else { "s" }
+                        )
+                    })
+                    .map(|mut note| {
+                        note.insert_str(0, "── ");
+                        note.push_str(" ──");
+                        note
+                    });
+                let extra = usize::from(cost_note.is_some());
+                let height = ((rows.len() + extra) as u16 + 5).clamp(7, 21);
                 let width = 90.min(fw);
                 let mut text = Vec::new();
                 if entries.is_empty() {
                     text.push(TuiLine::styled("(no background tasks or jobs)", meta));
                 }
-                let cap = (height as usize).saturating_sub(5);
+                let cap = (height as usize)
+                    .saturating_sub(5)
+                    .saturating_sub(extra)
+                    .max(1);
                 let offset = window_of(*selected, entries.len(), cap);
-                for (i, (_, row)) in entries.iter().enumerate().skip(offset).take(cap) {
-                    text.push(list_row(
-                        row.clone(),
-                        i == *selected,
-                        inner(width),
-                        Style::new(),
-                    ));
+                let inner_w = inner(width);
+                for (i, (id, row)) in entries.iter().enumerate().skip(offset).take(cap) {
+                    text.push(list_row(row.clone(), i == *selected, inner_w, Style::new()));
+                    // TUI-15: the paged result's last line rides under the
+                    // row, dimmed, when the row has a preview at all
+                    if let Some((_, preview)) =
+                        id.and_then(|id| previews.iter().find(|(pid, _)| *pid == id))
+                    {
+                        text.push(TuiLine::styled(
+                            format!("    └ {}", trunc_cols(preview, inner_w.saturating_sub(6))),
+                            meta,
+                        ));
+                    }
+                }
+                if let Some(note) = cost_note {
+                    text.push(TuiLine::styled(trunc_cols(&note, inner_w), meta));
                 }
                 let title = format!("{} tasks", crate::icons::tool_icon("tasks"));
                 (width, height, title, text)
+            }
+            // TUI-18: read-only panels — same pager shape as Debug
+            Modal::Hooks { rows, scroll } => {
+                let height = (rows.len() as u16 + 5).clamp(7, 30).min(modal_area.height);
+                let width = 90.min(fw);
+                let visible = (height as usize).saturating_sub(5);
+                let (first, _) = window_range(rows.len(), visible, *scroll);
+                let body = rows[first..(first + visible).min(rows.len())]
+                    .iter()
+                    .map(|row| TuiLine::raw(row.clone()))
+                    .collect();
+                let title = format!("{} hooks", crate::icons::tool_icon("hooks"));
+                (width, height, title, body)
+            }
+            Modal::Permissions { rows, scroll } => {
+                let height = (rows.len() as u16 + 5).clamp(7, 30).min(modal_area.height);
+                let width = 90.min(fw);
+                let visible = (height as usize).saturating_sub(5);
+                let (first, _) = window_range(rows.len(), visible, *scroll);
+                let body = rows[first..(first + visible).min(rows.len())]
+                    .iter()
+                    .map(|row| TuiLine::raw(row.clone()))
+                    .collect();
+                let title = format!("{} permissions", crate::icons::tool_icon("permissions"));
+                (width, height, title, body)
+            }
+            Modal::Doctor { rows, scroll } => {
+                let height = (rows.len() as u16 + 5).clamp(7, 30).min(modal_area.height);
+                let width = 90.min(fw);
+                let visible = (height as usize).saturating_sub(5);
+                let (first, _) = window_range(rows.len(), visible, *scroll);
+                let body = rows[first..(first + visible).min(rows.len())]
+                    .iter()
+                    .map(|row| TuiLine::raw(row.clone()))
+                    .collect();
+                let title = format!("{} doctor", crate::icons::tool_icon("doctor"));
+                (width, height, title, body)
             }
             Modal::TaskDetail { id, text, scroll } => {
                 let lines: Vec<&str> = text.lines().collect();
@@ -14170,7 +15135,7 @@ fn frame_block(
 /// bold followed by a RULE line to the width; rows are a key column
 /// (GOLD_HI, as wide as the group's longest key plus two cols of air)
 /// and the description (META).
-fn help_modal_rows(width: usize) -> Vec<ratatui::text::Line<'static>> {
+pub(crate) fn help_modal_rows(width: usize) -> Vec<ratatui::text::Line<'static>> {
     use ratatui::text::{Line as TuiLine, Span};
     use unicode_width::UnicodeWidthStr;
     let key_style = ratatui::style::Style::new().fg(crate::palette::STRONG);
@@ -14263,6 +15228,7 @@ fn help_modal_rows(width: usize) -> Vec<ratatui::text::Line<'static>> {
             ("/rewind", "drop the last N exchanges"),
             ("/compactfrom", "rewind N turns, keep a summary [N] [focus]"),
             ("/btw", "side question — fast role, off the record"),
+            ("/recap", "one-line recap (latest stored recap, else local)"),
             ("/undo", "restore the last edited file"),
             ("/checkpoint", "snapshot the working tree (git)"),
             ("/restore", "restore a checkpoint [id | list]"),
@@ -14296,7 +15262,7 @@ fn help_modal_rows(width: usize) -> Vec<ratatui::text::Line<'static>> {
     rows(
         &mut text,
         &[
-            ("/tasks", "background tasks — ⏎ pages a result"),
+            ("/tasks", "background tasks — ⏎ pages a result, cost footer"),
             ("/debug", "live debug sessions"),
             ("/mcp", "refresh MCP tool lists (/mcp refresh)"),
             ("/prompt", "run an MCP prompt"),
@@ -14319,6 +15285,17 @@ fn help_modal_rows(width: usize) -> Vec<ratatui::text::Line<'static>> {
         key_style,
     );
     text.push(TuiLine::default());
+    section(&mut text, "panels");
+    rows(
+        &mut text,
+        &[
+            ("/hooks", "[[hooks]] + .ka/hooks scripts (read-only)"),
+            ("/permissions", "mode, rules, protected paths, sandbox"),
+            ("/doctor", "live surface state (CLI owns network checks)"),
+        ],
+        key_style,
+    );
+    text.push(TuiLine::default());
     section(&mut text, "appearance & notifications");
     rows(
         &mut text,
@@ -14326,6 +15303,8 @@ fn help_modal_rows(width: usize) -> Vec<ratatui::text::Line<'static>> {
             ("/theme", "switch the theme live: /theme [name|default]"),
             ("/changelog", "what's new in this build"),
             ("/queue", "pending follow-ups — ⏎/d dequeues"),
+            ("/screen", "dump the transcript to the scrollback on leave"),
+            ("/plain", "screen-reader view: plain text, prefixes"),
             (
                 "notify_on",
                 "[tui] subset of turn_finished|ask (default: both)",
@@ -14335,6 +15314,24 @@ fn help_modal_rows(width: usize) -> Vec<ratatui::text::Line<'static>> {
                 "[tui] notify only unfocused — terminals without focus reporting always notify",
             ),
             ("title", "[tui] terminal title (default on)"),
+        ],
+        key_style,
+    );
+    text.push(TuiLine::default());
+    section(&mut text, "composer vim (/vim)");
+    rows(
+        &mut text,
+        &[
+            ("h j k l w b", "move (chars, rows, words)"),
+            ("0 $ gg G", "line start/end · text start/end"),
+            ("x p u", "delete char · paste · undo"),
+            ("d c y + motion", "delete/change/yank a range"),
+            ("dd cc yy", "linewise delete/change/yank"),
+            ("iw aw", "text objects (with d/c/y or in visual)"),
+            ("v + motions", "visual select; d/y/c/x operate on it"),
+            ("i a I A o O", "enter insert (before/after/open line)"),
+            ("1-9 + op", "counts prefix motions and operators"),
+            ("esc", "insert → normal · normal → insert"),
         ],
         key_style,
     );
@@ -15681,6 +16678,9 @@ mod tests {
                     &std::cell::Cell::new(0u16),
                     None,
                     hover,
+                    None,
+                    false,
+                    None,
                     None,
                 );
             })
@@ -21432,6 +22432,9 @@ mod tests {
                         None,
                         None,
                         None,
+                        false,
+                        None,
+                        None,
                     )
                 })
                 .unwrap();
@@ -21492,6 +22495,7 @@ mod tests {
             Modal::Tasks {
                 entries: vec![],
                 selected: 0,
+                previews: vec![],
             },
             Modal::TaskDetail {
                 id: 1,
@@ -21624,6 +22628,9 @@ mod tests {
                         None,
                         None,
                         None,
+                        false,
+                        None,
+                        None,
                     )
                 })
                 .unwrap();
@@ -21717,6 +22724,9 @@ mod tests {
                         None,
                         None,
                         None,
+                        false,
+                        None,
+                        None,
                     )
                 })
                 .unwrap();
@@ -21779,6 +22789,9 @@ mod tests {
                         ),
                         &std::cell::Cell::new(0u16),
                         None,
+                        None,
+                        None,
+                        false,
                         None,
                         None,
                     )
@@ -21861,6 +22874,9 @@ mod tests {
                         ),
                         &std::cell::Cell::new(0u16),
                         None,
+                        None,
+                        None,
+                        false,
                         None,
                         None,
                     )
@@ -22125,6 +23141,9 @@ mod tests {
                         None,
                         None,
                         None,
+                        false,
+                        None,
+                        None,
                     )
                 })
                 .unwrap();
@@ -22195,6 +23214,9 @@ mod tests {
                     ),
                     &std::cell::Cell::new(0u16),
                     None,
+                    None,
+                    None,
+                    false,
                     None,
                     None,
                 )
@@ -22595,6 +23617,9 @@ mod tests {
                             ),
                             &std::cell::Cell::new(0u16),
                             sel,
+                            None,
+                            None,
+                            false,
                             None,
                             None,
                         )
