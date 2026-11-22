@@ -363,12 +363,62 @@ fn config_disable_rejects_unknown_specs() {
         "skill:pdf".to_string(),
         "tool:bash".to_string(),
         "agent:reviewer".to_string(),
+        // Lote 7 hands: cron / monitor / generate_image
+        "cron".to_string(),
+        "monitor".to_string(),
+        "generate_image".to_string(),
     ]);
-    assert_eq!(ok.expect("every grammar form parses").len(), 5);
+    assert_eq!(ok.expect("every grammar form parses").len(), 8);
     let err = ka_engine::features::parse_specs(&["bogus".to_string()])
         .expect_err("unknown specs must fail");
     assert!(err.contains("bogus"), "error names the spec: {err}");
     assert!(err.contains("agents"), "error carries the grammar: {err}");
+}
+
+/// The batch-7 specs hide exactly their hand when disabled and restore
+/// it when re-enabled. `generate_image` has nothing to restore without
+/// a `[generate_image]` provider — disabling is a no-op that must not
+/// error, and no hand ever appears from nowhere.
+#[tokio::test]
+async fn batch7_feature_toggles_hide_their_hands() {
+    let dir = tmp_dir("batch7");
+    let rec = Rec::new();
+    let mut handle = engine(&dir, rec.clone(), ka_engine::StrandChoice::New);
+    settle(&mut handle, prompt("hi"), on_idle).await;
+    let offered = || rec.tool_names.lock().last().cloned().unwrap_or_default();
+    assert!(
+        offered().contains(&"cron".to_string()) && offered().contains(&"monitor".to_string()),
+        "cron + monitor offered at start: {:?}",
+        offered()
+    );
+    assert!(
+        !offered().contains(&"generate_image".to_string()),
+        "generate_image stays unregistered without a provider: {:?}",
+        offered()
+    );
+    for spec in ["cron", "monitor", "generate_image"] {
+        settle(&mut handle, set_feature(spec, false), on_idle).await;
+    }
+    settle(&mut handle, prompt("again"), on_idle).await;
+    assert!(
+        !offered().contains(&"cron".to_string()),
+        "cron hidden after disable: {:?}",
+        offered()
+    );
+    assert!(
+        !offered().contains(&"monitor".to_string()),
+        "monitor hidden after disable: {:?}",
+        offered()
+    );
+    settle(&mut handle, set_feature("cron", true), on_idle).await;
+    settle(&mut handle, set_feature("monitor", true), on_idle).await;
+    settle(&mut handle, prompt("third"), on_idle).await;
+    assert!(
+        offered().contains(&"cron".to_string()) && offered().contains(&"monitor".to_string()),
+        "re-enable restores the hands: {:?}",
+        offered()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// `tool:<name>` hides one base tool; the model stops seeing it.

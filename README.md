@@ -91,6 +91,7 @@ Handy extras, all strict-TOML like everything else:
 - **`ka --safe-mode`** — the troubleshooting floor: every customization off, built-ins kept.
 - **`--tools read,edit`** — positive allowlist for the session; `--ignore-rules` runs without `[[rules]]` tables and rule files (hardstops always stay; they are not rules).
 - **Run caps** — `--max-budget-usd` asks to stop past a spend ceiling, `--max-cost`/`--max-time` exit with code 3 when crossed, `--warn-cost` warns on stderr.
+- **Session tools (opt-in)** — `checkpoint` (git snapshot on demand, restorable via `/restore`), `cron` (session-scoped scheduled prompts; dies with the session; off in safe-mode), `monitor` (run a command detached, poll its output with `read`, `kill` it), `tool_search` (keyword search over MCP catalogs and hands), `generate_image` (gated: only registered when `[generate_image]` provider + key are set). Toggle via the features grammar (`cron`/`monitor`/`generate_image`).
 
 Details — doom-loop rules, protected paths, project trust, runtime feature toggles: [safety model](https://ka-harness.dev/docs/concepts/safety/).
 

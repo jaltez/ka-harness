@@ -11,11 +11,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::Value;
 
 pub mod bash;
+pub mod checkpoint;
+pub mod cron;
 pub mod delegate;
 pub use bash::BashHand;
 pub mod bashp;
 pub mod debug;
 pub mod edit;
+pub mod generate_image;
 pub mod git;
 pub mod glob;
 pub mod grep;
@@ -23,6 +26,7 @@ pub mod jobs;
 pub mod lsp_tools;
 pub mod lsp_write;
 pub mod memory;
+pub mod monitor;
 pub mod pathfinder;
 pub mod protected;
 pub mod read;
@@ -30,6 +34,7 @@ pub mod secrets;
 pub mod snapshots;
 pub mod tasks;
 pub mod todo;
+pub mod tool_search;
 pub mod web;
 pub mod write;
 
@@ -493,18 +498,22 @@ pub fn registry() -> Vec<std::sync::Arc<dyn Hand>> {
             pathfinder::PathfinderSource::default(),
         )),
         todo::slot(),
-        std::sync::Arc::new(jobs::JobTable::new()),
+        Tables::new(),
     )
 }
 
 /// Registry with externally-owned pathfinder bootstrap slot (engine) and
-/// todo slot (voice — it forwards the list as `Event::Todos`); `jobs` is
-/// the shared auto-backgrounded-job table the bash hand promotes into and
-/// the jobs hand serves.
+/// todo slot (voice — it forwards the list as `Event::Todos`), plus the
+/// shared [`Tables`] the session-scoped hands serve: `jobs`
+/// (auto-backgrounded bash commands), `cron` (scheduled self-prompts;
+/// the engine tick fires), `monitors` (detached output streams; the
+/// engine tick notes), the session checkpoint log (the
+/// `Command::Checkpoint` arm and the hand record into ONE list so every
+/// taker is restorable), and the tool catalogs `tool_search` ranks.
 pub fn registry_with_pathfinder(
     slot: std::sync::Arc<parking_lot::RwLock<pathfinder::PathfinderSource>>,
     todos: todo::TodoSlot,
-    jobs: std::sync::Arc<jobs::JobTable>,
+    tables: Tables,
 ) -> Vec<std::sync::Arc<dyn Hand>> {
     vec![
         std::sync::Arc::new(read::ReadHand),
@@ -515,8 +524,57 @@ pub fn registry_with_pathfinder(
         std::sync::Arc::new(grep::GrepHand),
         std::sync::Arc::new(pathfinder::PathfinderHand::from_slot(slot)),
         std::sync::Arc::new(todo::TodoHand::new(todos)),
-        std::sync::Arc::new(jobs::JobsHand::new(jobs)),
+        std::sync::Arc::new(jobs::JobsHand::new(tables.jobs)),
+        std::sync::Arc::new(checkpoint::CheckpointHand::new(tables.checkpoints)),
+        std::sync::Arc::new(cron::CronHand::new(tables.cron)),
+        std::sync::Arc::new(monitor::MonitorHand::new(tables.monitors)),
+        std::sync::Arc::new(tool_search::ToolSearchHand::new(
+            tables.hand_catalog,
+            tables.mcp_catalog,
+        )),
     ]
+}
+
+/// Shared mutable state behind the always-on hands: one bundle per
+/// voice, cloned into the engine's `Ctx` so the tick loops and the
+/// tool catalog stay in lockstep with what the hands serve.
+#[derive(Clone)]
+pub struct Tables {
+    /// Auto-backgrounded bash jobs (bash hand promotes, jobs hand serves,
+    /// the engine kills the rest at shutdown).
+    pub jobs: std::sync::Arc<jobs::JobTable>,
+    /// Armed cron schedules (cron hand arms, engine tick fires).
+    pub cron: std::sync::Arc<cron::CronTable>,
+    /// Detached monitored processes (monitor hand serves, engine tick
+    /// drains notes).
+    pub monitors: std::sync::Arc<monitor::MonitorTable>,
+    /// Session checkpoint log: `(full commit id, timestamp)`.
+    pub checkpoints: std::sync::Arc<checkpoint::CheckpointLog>,
+    /// Registered hands for `tool_search` (refreshed with the tool
+    /// spec cache).
+    pub hand_catalog: std::sync::Arc<parking_lot::RwLock<Vec<tool_search::HandCatalogEntry>>>,
+    /// Connected MCP server handles for `tool_search`.
+    pub mcp_catalog: std::sync::Arc<parking_lot::RwLock<Vec<crate::mcp::McpShared>>>,
+}
+
+impl Default for Tables {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Tables {
+    /// A bundle of fresh, empty tables.
+    pub fn new() -> Self {
+        Self {
+            jobs: std::sync::Arc::new(jobs::JobTable::new()),
+            cron: std::sync::Arc::new(cron::CronTable::new()),
+            monitors: std::sync::Arc::new(monitor::MonitorTable::new()),
+            checkpoints: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
+            hand_catalog: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
+            mcp_catalog: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -664,10 +722,14 @@ mod tests {
                 pathfinder::PathfinderSource::default(),
             )),
             todo::slot(),
-            std::sync::Arc::new(jobs::JobTable::new()),
+            Tables::new(),
         );
         let names: Vec<String> = with.iter().map(|h| h.def().name).collect();
-        assert_eq!(names.len(), base.len() + 2, "todo + jobs grow the registry");
+        assert_eq!(
+            names.len(),
+            base.len() + 6,
+            "todo + jobs + checkpoint + cron + monitor + tool_search grow the registry"
+        );
         assert!(names.iter().any(|n| n == "todo"), "names: {names:?}");
         assert_eq!(registry().len(), with.len(), "both registries match");
         let todo = with.iter().find(|h| h.def().name == "todo").unwrap();

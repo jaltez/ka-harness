@@ -35,7 +35,8 @@ pub fn parse_specs(specs: &[String]) -> Result<Vec<FeatureSpec>, String> {
         Ok(parsed)
     } else {
         Err(format!(
-            "unknown feature spec(s) {} — expected agents|skills|mcp|hooks|web|lsp|debug \
+            "unknown feature spec(s) {} — expected \
+             agents|skills|mcp|hooks|web|lsp|debug|cron|monitor|generate_image \
              or mcp:<server>|skill:<name>|tool:<name>|agent:<name>",
             bad.join(", ")
         ))
@@ -178,6 +179,9 @@ impl FeatureToggles {
                 FeatureSpec::Web => tool == "web_search" || tool == "web_fetch",
                 FeatureSpec::Lsp => tool.starts_with("lsp_"),
                 FeatureSpec::Debug => tool == "debug",
+                FeatureSpec::Cron => tool == "cron",
+                FeatureSpec::Monitor => tool == "monitor",
+                FeatureSpec::GenerateImage => tool == "generate_image",
                 // the meta hand is named `mcp`; lazy calls go through
                 // `mcp_call`; eager hands are `server__tool` wire names
                 FeatureSpec::Mcp => tool == "mcp" || tool == "mcp_call" || self.is_eager_mcp(tool),

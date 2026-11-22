@@ -5,6 +5,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use ka_engine::conventions;
+use ka_engine::hands::Hand as _;
 use ka_engine::trust;
 
 /// The bare-mode flag is a process-global and this binary's tests all
@@ -182,6 +183,79 @@ async fn safe_mode_pins_feature_toggles_off() {
         }
     }
     conventions::set_bare_mode(false);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Lote 7: the cron hand NEVER arms in safe mode — `create` refuses
+/// (an unattended repeat executor is a customization-tier risk the
+/// bare surface pins off, like the loop) and the engine's tick path is
+/// guarded separately, so even a hypothetical entry could not fire.
+#[tokio::test]
+async fn safe_mode_never_arms_cron() {
+    {
+        let _guard = FLAG_LOCK.lock();
+        conventions::set_bare_mode(true);
+    }
+    let dir = std::env::temp_dir().join(format!("ka-bare-cron-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let table = std::sync::Arc::new(ka_engine::hands::cron::CronTable::new());
+    let hand = ka_engine::hands::cron::CronHand::new(table.clone());
+    let ctx = ka_engine::hands::HandContext {
+        cwd: dir.clone(),
+        ledger: std::sync::Arc::new(parking_lot::Mutex::new(ka_engine::hands::Ledger::default())),
+        spill: std::sync::Arc::new(ka_engine::hands::Spill::new()),
+        snapshots: std::sync::Arc::new(parking_lot::Mutex::new(
+            ka_engine::hands::snapshots::Snapshots::inert(),
+        )),
+        jobs: std::sync::Arc::new(ka_engine::hands::jobs::JobTable::new()),
+        bash_background_ms: 0,
+        max_image_mb: 5,
+        web_allow_private: false,
+        sandbox: ka_sandbox::Policy::Off,
+    };
+    conventions::set_bare_mode(true);
+    let out = hand
+        .execute(
+            &serde_json::json!({
+                "prompt": "run the checks",
+                "interval_secs": 1
+            }),
+            &ctx,
+        )
+        .await;
+    conventions::set_bare_mode(false);
+    assert!(
+        out.is_error,
+        "cron create must refuse in safe mode: {}",
+        out.content
+    );
+    assert!(
+        out.content.contains("safe mode"),
+        "the refusal names safe mode: {}",
+        out.content
+    );
+    assert!(
+        table.snapshot().is_empty(),
+        "nothing was armed despite the refusal"
+    );
+    // outside safe mode the same create arms normally (the tool exists
+    // — it is the BARE surface that pins it off)
+    let out = hand
+        .execute(
+            &serde_json::json!({
+                "prompt": "run the checks",
+                "interval_secs": 60
+            }),
+            &ctx,
+        )
+        .await;
+    assert!(
+        !out.is_error,
+        "cron works outside safe mode: {}",
+        out.content
+    );
+    assert_eq!(table.snapshot().len(), 1);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

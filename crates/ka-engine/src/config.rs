@@ -278,6 +278,28 @@ pub struct SearchProvider {
     pub base_url: Option<String>,
 }
 
+/// Image generation (`[generate_image]`). GATED: the `generate_image`
+/// hand registers only when `provider` names a supported provider AND
+/// its API key resolves (`api_key_env` override, else the provider's
+/// default env ladder) — an unkeyed config keeps the tool hidden.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct GenerateImage {
+    /// `gemini` | `openai` | `grok`. Absent = the hand stays unregistered.
+    pub provider: Option<String>,
+    /// Env var holding the API key. Defaults per provider:
+    /// gemini → `GEMINI_API_KEY`; openai → `OPENAI_API_KEY`;
+    /// grok → `GROK_API_KEY`, falling back to `XAI_API_KEY`.
+    pub api_key_env: Option<String>,
+    /// Model id. Defaults per provider (see
+    /// `ImageProvider::default_model`).
+    pub model: Option<String>,
+    /// Where generated images are saved. Default `<cwd>/.ka/images`.
+    pub output_dir: Option<String>,
+    /// API base override (fixture tests, proxies).
+    pub base_url: Option<String>,
+}
+
 /// Sandbox policy ([sandbox]).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, default)]
@@ -613,6 +635,9 @@ pub struct Config {
     /// Web-search providers ([[search]]; first entry is active).
     #[serde(default)]
     pub search: Vec<SearchProvider>,
+    /// Image generation ([generate_image]; gated on provider + key).
+    #[serde(default)]
+    pub generate_image: GenerateImage,
     /// Sandbox policy ([sandbox]).
     #[serde(default)]
     pub sandbox: Sandbox,
@@ -986,6 +1011,24 @@ impl Config {
     /// The active search provider, if any.
     pub fn effective_search(&self) -> Option<SearchProvider> {
         self.search.first().cloned()
+    }
+
+    /// The resolved image-generation config, `None` while the hand must
+    /// stay unregistered: no provider named, an unsupported provider
+    /// string, or no API key resolvable for it.
+    pub fn effective_generate_image(
+        &self,
+        cwd: &std::path::Path,
+    ) -> Option<crate::hands::generate_image::ResolvedImageGen> {
+        crate::hands::generate_image::resolve(
+            self.generate_image.provider.as_deref(),
+            self.generate_image.api_key_env.as_deref(),
+            self.generate_image.model.clone(),
+            self.generate_image.output_dir.clone(),
+            self.generate_image.base_url.clone(),
+            ka_dialect::auth::resolve_token,
+            cwd,
+        )
     }
 
     /// Whether overflow promotion is enabled (default true).

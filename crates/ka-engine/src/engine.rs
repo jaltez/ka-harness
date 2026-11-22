@@ -419,8 +419,11 @@ struct EngineState {
     /// Record ids of persisted history messages, aligned with
     /// voice.history[..record_ids.len()] (mod digest truncation).
     record_ids: Vec<ka_protocol::RecordId>,
-    /// Checkpoints taken this session: (commit id, timestamp).
-    checkpoints: Vec<(String, String)>,
+    /// Checkpoints taken this session: (commit id, timestamp). One
+    /// shared log — the `Command::Checkpoint` arm and the `checkpoint`
+    /// hand both append to it, so every taker is restorable via
+    /// `/restore`.
+    checkpoints: std::sync::Arc<crate::hands::checkpoint::CheckpointLog>,
     /// Spend/context guard thresholds + latches for this session.
     guards: crate::voice::GuardRuntime,
     /// Role selectors resolved against the catalog at engine start.
@@ -523,7 +526,7 @@ impl From<Config> for EngineState {
             queue: VecDeque::new(),
             steers: Vec::new(),
             record_ids: Vec::new(),
-            checkpoints: Vec::new(),
+            checkpoints: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
             guards: crate::voice::GuardRuntime::new(c.guards.spend_usd, c.guards.context_pct),
             roles: EngineRoles::default(),
             needs_title: false,
@@ -563,6 +566,11 @@ struct Ctx {
     strand: ka_strand::StrandFile,
     /// Shared handles to the connected MCP servers (watchdog + refresh).
     mcp_shared: Vec<crate::mcp::McpShared>,
+    /// Armed cron schedules (the cron hand arms; the tick fires).
+    cron: std::sync::Arc<crate::hands::cron::CronTable>,
+    /// Detached monitored processes (the monitor hand serves; the tick
+    /// drains notes).
+    monitors: std::sync::Arc<crate::hands::monitor::MonitorTable>,
     /// Watchdog/refresh bookkeeping from MCP supervisors.
     maintenance: mpsc::Receiver<crate::mcp::Maintenance>,
     /// [tools.mcp] discovery = "lazy": one mcp_call hand instead of a
@@ -635,6 +643,9 @@ async fn run(
     let pathfinder_catalog = catalog.clone();
     let search_provider = config.effective_search();
     let web_allow_private = config.effective_web_allow_private();
+    // resolve [generate_image] BEFORE the config is consumed by
+    // EngineState: provider + key gating happens once, at bootstrap
+    let gen_image_cfg = config.effective_generate_image(&cwd);
     let mut voice = Voice::new(catalog, cwd.clone(), mode, max_steps);
     if let Some((wire, speaker)) = speaker {
         voice = voice.with_speaker(wire, speaker);
@@ -700,6 +711,10 @@ async fn run(
     let sandbox_cfg = config.sandbox.clone();
     let mut state = EngineState::from(config);
     state.roles = roles;
+    // checkpoints live in ONE session log shared by the surface
+    // command, the `checkpoint` hand, and `/restore`: hand-taken
+    // snapshots are restorable exactly like surface-taken ones
+    state.checkpoints = voice.tables().checkpoints.clone();
     // strand attach also restores any recorded feature-toggle snapshot
     // (over the config baseline, like model/mode) — so the spawn
     // decisions below honor it
@@ -719,6 +734,7 @@ async fn run(
     }
     let agent_tasks = crate::hands::tasks::AgentTaskTable::new();
     let (maintenance_tx, maintenance_rx) = mpsc::channel(16);
+    let tables = voice.tables().clone();
     let mut ctx = Ctx {
         cwd,
         events,
@@ -726,6 +742,8 @@ async fn run(
         voice,
         strand,
         mcp_shared: Vec::new(),
+        cron: tables.cron.clone(),
+        monitors: tables.monitors.clone(),
         maintenance: maintenance_rx,
         mcp_lazy,
         agent_tasks: agent_tasks.clone(),
@@ -827,6 +845,15 @@ async fn run(
     for hand in crate::hands::web::hands(search_provider, web_allow_private) {
         ctx.voice.push_hand(hand);
     }
+    // generate_image hand: GATED on [generate_image] provider + API key
+    // resolution (env/dotenv/keyring ladder) — an unkeyed config never
+    // shows the tool; the `generate_image` feature toggle can still
+    // hide a registered one mid-session
+    if let Some(gen_cfg) = gen_image_cfg {
+        ctx.voice.push_hand(std::sync::Arc::new(
+            crate::hands::generate_image::GenerateImageHand::new(gen_cfg),
+        ));
+    }
     // lazy `mcp_call` + meta `mcp` hands: rebuild_mcp_meta_hands — run
     // by ensure_mcp_server on every path that grows the connected set —
     // is their sole registrar. Pushing either here used to register a
@@ -892,6 +919,9 @@ async fn run(
             }
             _ = idle_tick.tick() => {
                 idle_tick_work(&mut ctx).await;
+                // batch 7: cron schedules + monitor streams share this
+                // settle tick
+                session_tick(&mut ctx, &mut commands).await?;
                 if let Some(task) = loop_prompt_due(&mut ctx.state) {
                     handle_command(loop_prompt(&task), &mut commands, &mut ctx).await?;
                 }
@@ -1212,6 +1242,9 @@ fn rebuild_mcp_meta_hands(ctx: &mut Ctx) {
             ))],
         );
     }
+    // `tool_search` ranks whatever is connected right now (it runs on
+    // every path that grows the shared set)
+    *ctx.voice.tables().mcp_catalog.write() = ctx.mcp_shared.clone();
 }
 
 /// Emit the inventory card from live state (bootstrap and after every
@@ -2362,10 +2395,10 @@ async fn handle_command(
             ctx.events.send(Event::Idle).await.ok();
         }
         Command::Checkpoint => {
-            match crate::checkpoint::snapshot(&ctx.cwd) {
-                Ok(id) => {
-                    let ts = ka_strand::now_rfc3339();
-                    ctx.state.checkpoints.push((id.clone(), ts.clone()));
+            // same machinery + same session log as the `checkpoint` hand
+            // (crate::hands::checkpoint::take_recorded)
+            match crate::hands::checkpoint::take_recorded(&ctx.cwd, &ctx.state.checkpoints) {
+                Ok((id, ts)) => {
                     ctx.events
                         .send(Event::Note {
                             message: format!(
@@ -2391,24 +2424,30 @@ async fn handle_command(
         }
         Command::RestoreCheckpoint { id } => {
             if id.trim() == "list" {
-                let message = if ctx.state.checkpoints.is_empty() {
-                    "no checkpoints in this session yet".to_string()
-                } else {
-                    ctx.state
-                        .checkpoints
-                        .iter()
-                        .map(|(cid, ts)| format!("{}  {ts}", crate::checkpoint::short(cid)))
-                        .collect::<Vec<_>>()
-                        .join("\n")
+                let message = {
+                    let log = ctx.state.checkpoints.lock();
+                    if log.is_empty() {
+                        "no checkpoints in this session yet".to_string()
+                    } else {
+                        log.iter()
+                            .map(|(cid, ts)| format!("{}  {ts}", crate::checkpoint::short(cid)))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    }
                 };
                 ctx.events.send(Event::Note { message }).await.ok();
             } else {
-                let resolved = ctx.state.checkpoints.iter().find(|(cid, _)| {
-                    cid == &id
-                        || crate::checkpoint::short(cid) == id.trim()
-                        || cid.starts_with(id.trim())
-                });
-                match resolved.cloned() {
+                let resolved = {
+                    let log = ctx.state.checkpoints.lock();
+                    log.iter()
+                        .find(|(cid, _)| {
+                            cid == &id
+                                || crate::checkpoint::short(cid) == id.trim()
+                                || cid.starts_with(id.trim())
+                        })
+                        .cloned()
+                };
+                match resolved {
                     None => {
                         ctx.events
                             .send(Event::Error {
@@ -2981,7 +3020,7 @@ async fn attach_strand(
     let recovered = strand.synthesize_aborted().unwrap_or(false);
     // checkpoints and guard latches are session-scoped; re-arm them from
     // the strand we just attached to
-    state.checkpoints.clear();
+    state.checkpoints.lock().clear();
     // a steer is scoped to the strand it arrived in: replaying it into
     // the strand we are attaching to would present old operator input as
     // if it had been sent during that strand's next tool batch
@@ -3316,6 +3355,45 @@ fn idle_tick_period() -> Duration {
 /// Fast-role ask that summarizes where the session stands (CTX-07).
 const RECAP_SYSTEM: &str = "You write 1-2 sentence session-state recaps: what the session is working on and where \
      it stands. Reply with only the recap.";
+
+/// The 30s settle tick, batch 7: fire due cron schedules (each one a
+/// full self-prompt turn through the command channel, preceded by a
+/// `cron fired: <id>` note) and surface monitor stream notes (new
+/// lines, one-time process exits). Cron is NEVER armed in safe mode —
+/// the hand refuses creates there and this guard keeps a stray table
+/// inert. Monitor notes are pure surface work and always run.
+async fn session_tick(
+    ctx: &mut Ctx,
+    commands: &mut mpsc::Receiver<Command>,
+) -> Result<(), DynError> {
+    if !crate::conventions::bare_mode() {
+        for (id, prompt) in ctx.cron.take_due(std::time::Instant::now()) {
+            ctx.events
+                .send(Event::Note {
+                    message: format!("cron fired: {id}"),
+                })
+                .await
+                .ok();
+            handle_command(
+                Command::Prompt {
+                    text: prompt,
+                    schema: None,
+                    images: Vec::new(),
+                    allowed_tools: None,
+                    model: None,
+                    skills: Vec::new(),
+                },
+                commands,
+                ctx,
+            )
+            .await?;
+        }
+    }
+    for note in ctx.monitors.drain_notes() {
+        ctx.events.send(Event::Note { message: note }).await.ok();
+    }
+    Ok(())
+}
 
 /// The idle tick (CTX-07): runs only between commands (the turn runs
 /// inside the command arm, so ticks never race live work). When
@@ -6124,9 +6202,10 @@ mod tests {
                 tools: 0,
             }]
         );
-        // 7 built-ins + todo + jobs + delegate + web_fetch (search
+        // 7 built-ins + todo + jobs + checkpoint + cron + monitor +
+        // tool_search + delegate + tasks + remember + web_fetch (search
         // registers only with a configured [[search]] provider)
-        assert_eq!(tools.len(), 13, "tools: {tools:?}");
+        assert_eq!(tools.len(), 17, "tools: {tools:?}");
         assert!(tools.contains(&"delegate".to_string()), "tools: {tools:?}");
         assert!(tools.contains(&"todo".to_string()), "tools: {tools:?}");
         assert!(tools.contains(&"jobs".to_string()), "tools: {tools:?}");
@@ -6905,6 +6984,11 @@ mod tests {
 
     #[test]
     fn idle_gates_are_time_and_meter_injected() {
+        // these asserts assume the PRODUCTION 60 s unit: serialize
+        // against the shrink tests and pin the default while asserting
+        let _guard = IDLE_SER.lock();
+        use std::sync::atomic::Ordering::Relaxed;
+        super::IDLE_UNIT_SECS.store(60, Relaxed);
         // production unit: 60 s per configured minute
         assert!(
             super::recap_due(Duration::from_secs(0), None),
@@ -6979,6 +7063,27 @@ mod tests {
         "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"Sure thing.\"}}]}\n\n",
         "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
         "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5000,\"completion_tokens\":2}}\n\n",
+        "data: [DONE]\n\n",
+    );
+    /// A turn whose only output is one `cron` create tool call.
+    const CRON_CREATE_SSE: &str = concat!(
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"cron\",\"arguments\":\"{\\\"prompt\\\": \\\"check the CI\\\", \\\"interval_secs\\\": 1}\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2}}\n\n",
+        "data: [DONE]\n\n",
+    );
+    /// Same, one-shot.
+    const CRON_ONE_SHOT_SSE: &str = concat!(
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"cron\",\"arguments\":\"{\\\"prompt\\\": \\\"check the CI\\\", \\\"interval_secs\\\": 1, \\\"one_shot\\\": true}\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2}}\n\n",
+        "data: [DONE]\n\n",
+    );
+    /// A turn whose only output is one `monitor` spawn tool call.
+    const MONITOR_SPAWN_SSE: &str = concat!(
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"monitor\",\"arguments\":\"{\\\"command\\\": \\\"echo line1; echo line2\\\"}\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2}}\n\n",
         "data: [DONE]\n\n",
     );
 
@@ -7256,6 +7361,181 @@ mod tests {
             requests_after_first_span,
             "no extra wire calls in the second quiet span"
         );
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// Lote 7 · cron end to end: the model arms a schedule through the
+    /// `cron` hand, the settle tick fires it as a FULL self-prompt turn
+    /// (the `cron fired` note precedes it). Tick + interval factors are
+    /// shrunk like the idle tests.
+    #[tokio::test]
+    async fn cron_hand_tick_fires_a_full_self_prompt_turn() {
+        use crate::engine::{StrandChoice, spawn_full};
+        let _guard = IdleFactors::shrink();
+        let captured = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        // call order: arming turn → its tool-result turn → the cron-fired
+        // self-prompt turn
+        let addr = serve_sse(vec![CRON_CREATE_SSE, TURN_SSE, TURN_SSE], captured.clone());
+        let work = title_workdir("cron-tick");
+        let cfg = Config {
+            model: Some("test/main".into()),
+            cwd: Some(work.display().to_string()),
+            ..Config::default()
+        };
+        let mut h = spawn_full(cfg, live_catalog(addr, None), StrandChoice::New);
+        h.commands
+            .send(Command::Prompt {
+                allowed_tools: None,
+                model: None,
+                text: "watch the CI every second".into(),
+                schema: None,
+                images: Vec::new(),
+                skills: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let _ = drain_to_idle(&mut h).await;
+        // within a couple of ticks the cron entry fires as its own turn
+        let mut fired = false;
+        let mut post_fire_turn = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(300), h.events.recv()).await {
+                Ok(Some(Event::Note { message, .. })) => {
+                    if message.starts_with("cron fired: cron-1") {
+                        fired = true;
+                    }
+                }
+                Ok(Some(Event::TurnFinished { .. })) if fired => {
+                    post_fire_turn = true;
+                    break;
+                }
+                Ok(Some(_)) => continue,
+                Ok(None) => panic!("engine ended before the cron fired"),
+                Err(_) => {}
+            }
+        }
+        assert!(fired, "cron fired note never arrived");
+        assert!(post_fire_turn, "the fired prompt never ran as a turn");
+        // the fired prompt went through the wire as a THIRD request
+        let requests = captured.lock();
+        assert!(
+            requests.len() >= 3 && requests[2].contains("check the CI"),
+            "the self-prompt turn must carry the cron prompt"
+        );
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// Lote 7 · one-shot cron disarms after firing: a second quiet window
+    /// brings ticks but never a second `cron fired` note.
+    #[tokio::test]
+    async fn cron_one_shot_fires_exactly_once() {
+        use crate::engine::{StrandChoice, spawn_full};
+        let _guard = IdleFactors::shrink();
+        let captured = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let addr = serve_sse(
+            vec![CRON_ONE_SHOT_SSE, TURN_SSE, TURN_SSE],
+            captured.clone(),
+        );
+        let work = title_workdir("cron-once");
+        let cfg = Config {
+            model: Some("test/main".into()),
+            cwd: Some(work.display().to_string()),
+            ..Config::default()
+        };
+        let mut h = spawn_full(cfg, live_catalog(addr, None), StrandChoice::New);
+        h.commands
+            .send(Command::Prompt {
+                allowed_tools: None,
+                model: None,
+                text: "remind me once".into(),
+                schema: None,
+                images: Vec::new(),
+                skills: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let _ = drain_to_idle(&mut h).await;
+        let mut firings = 0usize;
+        let deadline = std::time::Instant::now() + Duration::from_secs(4);
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(300), h.events.recv()).await {
+                Ok(Some(Event::Note { message, .. }))
+                    if message.starts_with("cron fired: cron-1") =>
+                {
+                    firings += 1;
+                }
+                Ok(Some(_)) => continue,
+                Ok(None) => break,
+                Err(_) => {} // quiet window: keep waiting until the deadline
+            }
+        }
+        assert_eq!(firings, 1, "one-shot fires exactly once (got {firings})");
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// Lote 7 · monitor end to end: the model spawns a monitor through the
+    /// hand; the settle tick surfaces the new-line note and the one-time
+    /// exit note, and repeats neither.
+    #[tokio::test]
+    async fn monitor_hand_tick_reports_new_lines_and_exit_once() {
+        use crate::engine::{StrandChoice, spawn_full};
+        let _guard = IdleFactors::shrink();
+        let captured = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let addr = serve_sse(vec![MONITOR_SPAWN_SSE, TURN_SSE], captured.clone());
+        let work = title_workdir("mon-tick");
+        let cfg = Config {
+            model: Some("test/main".into()),
+            cwd: Some(work.display().to_string()),
+            ..Config::default()
+        };
+        let mut h = spawn_full(cfg, live_catalog(addr, None), StrandChoice::New);
+        h.commands
+            .send(Command::Prompt {
+                allowed_tools: None,
+                model: None,
+                text: "watch the build".into(),
+                schema: None,
+                images: Vec::new(),
+                skills: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let _ = drain_to_idle(&mut h).await;
+        let mut new_lines_notes = 0usize;
+        let mut exit_notes = 0usize;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(300), h.events.recv()).await {
+                Ok(Some(Event::Note { message, .. })) => {
+                    if message.starts_with("monitor mon-1: 2 new lines") {
+                        new_lines_notes += 1;
+                    }
+                    if message.starts_with("monitor mon-1: exited (0)") {
+                        exit_notes += 1;
+                    }
+                }
+                Ok(Some(_)) => continue,
+                Ok(None) => break,
+                Err(_) => {} // quiet window: keep waiting until the deadline
+            }
+        }
+        assert_eq!(new_lines_notes, 1, "exactly one new-lines note");
+        assert_eq!(exit_notes, 1, "the exit note lands exactly once");
+        // a further quiet window repeats neither note
+        let extra = std::time::Instant::now() + Duration::from_millis(1500);
+        while std::time::Instant::now() < extra {
+            match tokio::time::timeout(Duration::from_millis(200), h.events.recv()).await {
+                Ok(Some(Event::Note { message, .. })) => {
+                    assert!(
+                        !message.starts_with("monitor mon-1: exited"),
+                        "exit note repeated"
+                    );
+                }
+                Ok(Some(_)) => continue,
+                _ => break,
+            }
+        }
         let _ = std::fs::remove_dir_all(&work);
     }
 }

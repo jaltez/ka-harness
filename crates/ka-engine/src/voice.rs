@@ -320,6 +320,10 @@ pub struct Voice {
     /// wherever the visible hand set can change (`set_turn_tools`,
     /// `set_feature`, `restore_feature_snapshot`).
     specs_cache: parking_lot::Mutex<Option<Vec<ToolSpec>>>,
+    /// Shared session tables behind the always-on hands (cron,
+    /// monitors, checkpoints, tool catalogs). Cloned into the engine's
+    /// `Ctx` so the tick loops and `tool_search` see live state.
+    tables: crate::hands::Tables,
     /// Session feature toggles, shared with the hands that validate
     /// dynamically (delegate roster, lazy MCP calls). Filtering happens
     /// in `specs()` (hide) and `admit_call` (reject strays).
@@ -343,11 +347,12 @@ impl Voice {
             crate::hands::pathfinder::PathfinderSource::default(),
         ));
         let todos = crate::hands::todo::slot();
-        let jobs = std::sync::Arc::new(crate::hands::jobs::JobTable::new());
+        let tables = crate::hands::Tables::new();
+        let jobs = tables.jobs.clone();
         Self {
             catalog,
             speakers: Default::default(),
-            hands: registry_with_pathfinder(slot.clone(), todos.clone(), jobs.clone()),
+            hands: registry_with_pathfinder(slot.clone(), todos.clone(), tables.clone()),
             hand_ctx: HandContext {
                 cwd: cwd.clone(),
                 ledger: std::sync::Arc::new(parking_lot::Mutex::new(Ledger::default())),
@@ -397,6 +402,7 @@ impl Voice {
             turn_tools: None,
             turn_skills: None,
             specs_cache: parking_lot::Mutex::new(None),
+            tables,
             features: crate::features::FeatureToggles::slot(Vec::new()),
             pending_features: parking_lot::Mutex::new(Vec::new()),
         }
@@ -553,11 +559,9 @@ impl Voice {
             crate::hands::pathfinder::PathfinderSource::default(),
         ));
         let todos = crate::hands::todo::slot();
-        let mut hands = crate::hands::registry_with_pathfinder(
-            slot.clone(),
-            todos.clone(),
-            std::sync::Arc::new(crate::hands::jobs::JobTable::new()),
-        );
+        let tables = crate::hands::Tables::new();
+        let mut hands =
+            crate::hands::registry_with_pathfinder(slot.clone(), todos.clone(), tables.clone());
         // Research voices are read-only by contract even when the
         // engine runs them in Mode::Allow: keep the inspect-only hands
         // (read/glob/grep/pathfinder/todo/…), drop anything that
@@ -570,7 +574,7 @@ impl Voice {
             snapshots: std::sync::Arc::new(parking_lot::Mutex::new(
                 crate::hands::snapshots::Snapshots::inert(),
             )),
-            jobs: std::sync::Arc::new(crate::hands::jobs::JobTable::new()),
+            jobs: tables.jobs.clone(),
             bash_background_ms: 0,
             max_image_mb: 5,
             web_allow_private: false,
@@ -617,6 +621,7 @@ impl Voice {
             turn_tools: None,
             turn_skills: None,
             specs_cache: parking_lot::Mutex::new(None),
+            tables,
             features: crate::features::FeatureToggles::slot(Vec::new()),
             pending_features: parking_lot::Mutex::new(Vec::new()),
         }
@@ -984,6 +989,13 @@ impl Voice {
     /// remaining jobs at session shutdown).
     pub fn jobs(&self) -> std::sync::Arc<crate::hands::jobs::JobTable> {
         self.hand_ctx.jobs.clone()
+    }
+
+    /// The shared session tables (cron, monitors, checkpoints, tool
+    /// catalogs): the engine clones these into its `Ctx` so the tick
+    /// loops fire what the hands armed.
+    pub fn tables(&self) -> &crate::hands::Tables {
+        &self.tables
     }
     /// Run matching hooks for one event. Returns Err(reason) when a
     /// pre_tool_use hook blocked the call (exit 2, stderr as reason);
@@ -1932,6 +1944,15 @@ impl Voice {
                     description: def.description.clone(),
                     parameters: def.parameters.clone(),
                 }
+            })
+            .collect();
+        // keep the `tool_search` hand catalog in lockstep with the
+        // visible hand set (same rebuild that refreshes the spec cache)
+        *self.tables.hand_catalog.write() = specs
+            .iter()
+            .map(|s| crate::hands::tool_search::HandCatalogEntry {
+                name: s.name.clone(),
+                description: s.description.clone(),
             })
             .collect();
         *cache = Some(specs.clone());

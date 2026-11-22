@@ -79,7 +79,14 @@ pub enum FeatureSpec {
     Lsp,
     /// The debug (DAP) hand.
     Debug,
-    /// One MCP server by configured name.
+    /// The `cron` hand: session-scoped scheduled self-prompts.
+    Cron,
+    /// The `monitor` hand: detached process output streams.
+    Monitor,
+    /// The `generate_image` hand (registered only with a configured
+    /// provider + API key).
+    GenerateImage,
+    /// One MCP server by name.
     McpServer(String),
     /// One skill by name.
     Skill(String),
@@ -99,6 +106,9 @@ impl std::fmt::Display for FeatureSpec {
             FeatureSpec::Web => f.write_str("web"),
             FeatureSpec::Lsp => f.write_str("lsp"),
             FeatureSpec::Debug => f.write_str("debug"),
+            FeatureSpec::Cron => f.write_str("cron"),
+            FeatureSpec::Monitor => f.write_str("monitor"),
+            FeatureSpec::GenerateImage => f.write_str("generate_image"),
             FeatureSpec::McpServer(name) => write!(f, "mcp:{name}"),
             FeatureSpec::Skill(name) => write!(f, "skill:{name}"),
             FeatureSpec::Tool(name) => write!(f, "tool:{name}"),
@@ -120,6 +130,9 @@ impl std::str::FromStr for FeatureSpec {
             "web" => Ok(FeatureSpec::Web),
             "lsp" => Ok(FeatureSpec::Lsp),
             "debug" => Ok(FeatureSpec::Debug),
+            "cron" => Ok(FeatureSpec::Cron),
+            "monitor" => Ok(FeatureSpec::Monitor),
+            "generate_image" => Ok(FeatureSpec::GenerateImage),
             _ => {
                 let prefixed = [
                     ("mcp:", FeatureSpec::McpServer as fn(String) -> FeatureSpec),
@@ -131,7 +144,8 @@ impl std::str::FromStr for FeatureSpec {
                 .find_map(|(prefix, mk)| item(prefix).filter(|n| !n.is_empty()).map(mk));
                 prefixed.ok_or_else(|| {
                     format!(
-                        "unknown feature spec `{s}`: expected agents|skills|mcp|hooks|web|lsp|debug \
+                        "unknown feature spec `{s}`: expected \
+                         agents|skills|mcp|hooks|web|lsp|debug|cron|monitor|generate_image \
                          or mcp:<server>|skill:<name>|tool:<name>|agent:<name>"
                     )
                 })
@@ -161,7 +175,7 @@ impl schemars::JsonSchema for FeatureSpec {
     fn json_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
         schemars::json_schema!({
             "type": "string",
-            "description": "Feature toggle: agents|skills|mcp|hooks|web|lsp|debug, or one item as mcp:<server>, skill:<name>, tool:<name>, agent:<name>."
+            "description": "Feature toggle: agents|skills|mcp|hooks|web|lsp|debug|cron|monitor|generate_image, or one item as mcp:<server>, skill:<name>, tool:<name>, agent:<name>."
         })
     }
 }

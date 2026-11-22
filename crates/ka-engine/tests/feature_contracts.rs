@@ -221,6 +221,51 @@ fn fs_policy_for(allow: &[std::path::PathBuf]) -> ka_sandbox::Policy {
 
 // ---------------------------------------------------------------- registry
 
+/// The batch-7 feature specs parse through the shared grammar,
+/// round-trip via Display, hide exactly their hand, and are accepted
+/// by `[features] disable` (the `--disable` path — the same
+/// `parse_specs` runs on both).
+#[test]
+fn batch7_feature_specs_parse_hide_and_round_trip() {
+    for (spec_text, expected) in [
+        ("cron", ka_protocol::FeatureSpec::Cron),
+        ("monitor", ka_protocol::FeatureSpec::Monitor),
+        ("generate_image", ka_protocol::FeatureSpec::GenerateImage),
+    ] {
+        let parsed: ka_protocol::FeatureSpec = spec_text.parse().expect(spec_text);
+        assert_eq!(parsed, expected, "{spec_text}");
+        assert_eq!(parsed.to_string(), spec_text, "display round-trip");
+        // `[features] disable` / `--disable` accepts it
+        assert!(
+            ka_engine::features::parse_specs(&[spec_text.to_string()]).is_ok(),
+            "{spec_text} must parse through parse_specs"
+        );
+    }
+    // toggling off hides exactly the matching hand and nothing else
+    let mut toggles = ka_engine::features::FeatureToggles::default();
+    for spec in [
+        ka_protocol::FeatureSpec::Cron,
+        ka_protocol::FeatureSpec::Monitor,
+        ka_protocol::FeatureSpec::GenerateImage,
+    ] {
+        toggles.set(&spec, false);
+    }
+    assert_eq!(
+        toggles.hidden_reason("cron"),
+        Some(ka_protocol::FeatureSpec::Cron)
+    );
+    assert_eq!(
+        toggles.hidden_reason("monitor"),
+        Some(ka_protocol::FeatureSpec::Monitor)
+    );
+    assert_eq!(
+        toggles.hidden_reason("generate_image"),
+        Some(ka_protocol::FeatureSpec::GenerateImage)
+    );
+    assert_eq!(toggles.hidden_reason("bash"), None, "no collateral hiding");
+    assert_eq!(toggles.hidden_reason("jobs"), None);
+}
+
 /// The documented built-in tool set: names, clearance tiers, read-only
 /// flags. Changing these changes the model-facing surface — deliberate
 /// changes must update this test and the docs together.
@@ -231,7 +276,7 @@ fn registry_core_tools_contract() {
             hands::pathfinder::PathfinderSource::default(),
         )),
         ka_engine::hands::todo::slot(),
-        Arc::new(hands::jobs::JobTable::new()),
+        hands::Tables::new(),
     );
     let mut names: Vec<String> = registry.iter().map(|h| h.def().name).collect();
     names.sort();
@@ -239,13 +284,17 @@ fn registry_core_tools_contract() {
         names,
         vec![
             "bash",
+            "checkpoint",
+            "cron",
             "edit",
             "glob",
             "grep",
             "jobs",
+            "monitor",
             "pathfinder",
             "read",
             "todo",
+            "tool_search",
             "write"
         ],
         "the built-in tool registry changed — update docs + this contract"
@@ -569,6 +618,9 @@ fn config_schema_carries_every_documented_key() {
         // Phase 10: runtime feature toggles
         "features",
         "disable",
+        // Lote 7: [generate_image] (gated hand registration)
+        "generate_image",
+        "output_dir",
     ] {
         assert!(
             schema.contains(&format!("\"{key}\"")),
