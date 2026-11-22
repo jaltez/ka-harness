@@ -3,6 +3,7 @@
 # here fails `cargo xtask deps` in CI — additions are deliberate, reviewed
 # acts under the footprint contract. Boundary: research/ka-harness/agent-boundary.md.
 # Sorted; one name per line; '#' comments.
+adler2
 aho-corasick
 allocator-api2
 anstream
@@ -25,6 +26,7 @@ clap_lex
 colorchoice
 compact_str
 cpufeatures
+crc32fast
 crossbeam-deque
 crossbeam-epoch
 crossbeam-utils
@@ -45,6 +47,7 @@ enumflags2
 enumflags2_derive
 equivalent
 errno
+flate2
 fnv
 foldhash
 form_urlencoded
@@ -99,6 +102,7 @@ lock_api
 log
 lru
 memchr
+miniz_oxide
 mio
 once_cell
 parking_lot
@@ -139,6 +143,7 @@ signal-hook
 signal-hook-mio
 signal-hook-registry
 signature
+simd-adler32
 slab
 smallvec
 socket2

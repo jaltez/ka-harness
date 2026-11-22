@@ -641,7 +641,7 @@ async fn run(
     // main model uses (discovery overlays already applied by the caller)
     let roles = resolve_roles(&catalog, &config.roles, config.model.as_deref());
     let pathfinder_catalog = catalog.clone();
-    let search_provider = config.effective_search();
+    let search_providers = config.effective_search();
     let web_allow_private = config.effective_web_allow_private();
     // resolve [generate_image] BEFORE the config is consumed by
     // EngineState: provider + key gating happens once, at bootstrap
@@ -842,7 +842,7 @@ async fn run(
     );
 
     // web search + fetch hands (search only when a provider is set)
-    for hand in crate::hands::web::hands(search_provider, web_allow_private) {
+    for hand in crate::hands::web::hands(search_providers, web_allow_private) {
         ctx.voice.push_hand(hand);
     }
     // generate_image hand: GATED on [generate_image] provider + API key

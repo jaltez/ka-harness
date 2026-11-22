@@ -325,18 +325,19 @@ fn registry_core_tools_contract() {
 /// LSP navigation, MCP call-front, remember, tasks, delegate.
 #[test]
 fn conditional_hands_contract() {
-    // web: fetch always, search only with a provider
-    let fetch_only = hands::web::hands(None, false);
+    // web: fetch always, search only with a provider entry
+    let fetch_only = hands::web::hands(Vec::new(), false);
     assert_eq!(
         fetch_only.iter().map(|h| h.def().name).collect::<Vec<_>>(),
         vec!["web_fetch"]
     );
     let both = hands::web::hands(
-        Some(ka_engine::config::SearchProvider {
+        vec![ka_engine::config::SearchProvider {
             provider: "tavily".into(),
-            api_key_env: "K".into(),
+            api_key_env: Some("K".into()),
             base_url: None,
-        }),
+            sites: Vec::new(),
+        }],
         false,
     );
     assert_eq!(
@@ -582,6 +583,10 @@ fn config_schema_carries_every_documented_key() {
         "provider",
         "api_key_env",
         "base_url",
+        // Lote 8: multi-backend search ([[search.sites]] site-scoping)
+        "sites",
+        "site",
+        "handler",
         "sandbox",
         "lsp",
         "enable",

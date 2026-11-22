@@ -1170,6 +1170,98 @@ fn ghost_text_suggests_and_accepts() {
     assert_eq!(buf.text, "see @src/lib.rs ");
 }
 
+/// The argument-bearing commands ghost their syntax past the bare
+/// name (/goal, /loop — where the command-name ghost is done at an
+/// exact match); typed arguments end the hint, Tab accepts the
+/// template into the draft.
+#[test]
+fn goal_and_loop_ghost_their_argument_syntax() {
+    use ka_term::ghost;
+    use ka_term::tui::InputBuffer;
+
+    let g = ghost::syntax_ghost("/goal").expect("bare /goal ghosts");
+    assert_eq!(g.suffix("/goal"), " <condición>");
+    let g = ghost::syntax_ghost("/loop").expect("bare /loop ghosts");
+    assert_eq!(g.suffix("/loop"), " [--every <secs>] <task>");
+    // trailing space: the template continues at the caret
+    let g = ghost::syntax_ghost("/goal ").expect("prefix + space ghosts");
+    assert_eq!(g.suffix("/goal "), "<condición>");
+    // typed arguments own their syntax — no template parked after them
+    assert!(ghost::syntax_ghost("/goal status").is_none());
+    assert!(ghost::syntax_ghost("/goal tests stay green").is_none());
+    assert!(ghost::syntax_ghost("/loop --every 30 rerun").is_none());
+    assert!(
+        ghost::syntax_ghost("/model").is_none(),
+        "other commands stay quiet"
+    );
+    // Tab accepts: the template lands in the draft
+    let g = ghost::syntax_ghost("/loop").expect("ghost");
+    let mut buf = InputBuffer::default();
+    buf.insert_str("/loop");
+    buf.cursor = buf.text.chars().count();
+    ghost::accept(&g, &mut buf);
+    assert_eq!(buf.text, "/loop [--every <secs>] <task>");
+}
+
+/// SES-01: `/spills <id>` opens the spill viewer preselected on that
+/// spill (bare id or the full `spill://` pointer); bare `/spills`
+/// stays head-anchored. Notes carrying `spill://` pointers land their
+/// id in /spills with a once-per-id hint (src unit tests).
+#[test]
+fn spills_opens_preselected_via_focus() {
+    let s = slash_command("/spills").expect("/spills parses");
+    assert!(matches!(s.modal, Some(ModalKind::Spills { focus: None })));
+    let s = slash_command("/spills 1730000000-3").expect("/spills <id> parses");
+    assert!(matches!(
+        s.modal,
+        Some(ModalKind::Spills { focus }) if focus.as_deref() == Some("1730000000-3")
+    ));
+    let s = slash_command("/spills spill://1730000000-3").expect("/spills <pointer> parses");
+    assert!(matches!(
+        s.modal,
+        Some(ModalKind::Spills { focus }) if focus.as_deref() == Some("spill://1730000000-3")
+    ));
+}
+
+/// Image attachments ride as positional chips: staging drops a plain
+/// `[Image #N]` chip in the draft (no protocol change) and the send
+/// pass turns chip order into ImagePart order, consuming the chips;
+/// unchipped staging leftovers ride last.
+#[test]
+fn image_chips_order_the_outgoing_parts() {
+    use ka_term::tui::{image_chip, resolve_image_chips};
+
+    // the chip spells the staging slot
+    assert_eq!(image_chip(1), "[Image #1]");
+    assert_eq!(image_chip(2), "[Image #2]");
+
+    let part = |tag: &str| ka_protocol::ImagePart {
+        data: tag.to_string(),
+        media_type: "image/png".to_string(),
+    };
+    // chip order beats staging order; chips are consumed from the text
+    let (text, ordered) = resolve_image_chips(
+        "look [Image #2] then [Image #1] ok",
+        vec![part("a"), part("b"), part("c")],
+    );
+    assert_eq!(text, "look then ok");
+    let tags: Vec<&str> = ordered.iter().map(|p| p.data.as_str()).collect();
+    assert_eq!(tags, vec!["b", "a", "c"], "chips order, unchipped c last");
+
+    // no chips: staging order is the send order, text untouched
+    let (text, ordered) = resolve_image_chips("describe this", vec![part("a"), part("b")]);
+    assert_eq!(text, "describe this");
+    assert_eq!(
+        ordered.iter().map(|p| p.data.as_str()).collect::<Vec<_>>(),
+        vec!["a", "b"]
+    );
+
+    // a chips-only draft resolves to an image-only prompt
+    let (text, ordered) = resolve_image_chips("[Image #1]", vec![part("a")]);
+    assert_eq!(text, "");
+    assert_eq!(ordered.len(), 1);
+}
+
 /// TUI-13: the /plain renderer textualizes every block kind with
 /// prefixes and block separators — the screen-reader contract.
 #[test]

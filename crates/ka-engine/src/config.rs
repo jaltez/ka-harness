@@ -266,16 +266,38 @@ impl Update {
     }
 }
 
-/// One web-search provider (`[[search]]`; first entry is active).
+/// One web-search provider (`[[search]]`; entries form a fallback
+/// chain — the first entry that fails (no key, network error, parse
+/// error) falls through to the next). Layered arrays keep the more
+/// specific layer's entries first, so a project `[[search]]` is tried
+/// before the user's.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct SearchProvider {
-    /// `tavily` | `brave` | `bing`.
+    /// `tavily` | `brave` | `bing` (keyed) | `duckduckgo` | `searxng`
+    /// (keyless).
     pub provider: String,
-    /// Env var holding the API key.
-    pub api_key_env: String,
-    /// API base override (fixture tests, proxies).
+    /// Env var holding the API key. Required for tavily/brave/bing;
+    /// ignored by the keyless duckduckgo/searxng backends.
+    pub api_key_env: Option<String>,
+    /// API base override (fixture tests, proxies). REQUIRED for
+    /// `searxng`: the instance URL to query.
     pub base_url: Option<String>,
+    /// Optional `[[search.sites]]` entries: each appends `site:<site>`
+    /// to this provider's queries.
+    pub sites: Vec<SearchSite>,
+}
+
+/// One `[[search.sites]]` entry. v1 handlers are site-scoping only —
+/// no per-site scraping logic.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct SearchSite {
+    /// Host to scope to (`docs.rs` → `site:docs.rs` in the query).
+    pub site: String,
+    /// Handler id. Only `auto` (plain site-scoping) exists in v1;
+    /// anything else is a per-provider search error.
+    pub handler: Option<String>,
 }
 
 /// Image generation (`[generate_image]`). GATED: the `generate_image`
@@ -632,7 +654,8 @@ pub struct Config {
     /// Context-window policy ([context]).
     #[serde(default)]
     pub context: Context,
-    /// Web-search providers ([[search]]; first entry is active).
+    /// Web-search provider fallback chain ([[search]]; entries tried in
+    /// order, first success wins; `[[search.sites]]` scopes queries).
     #[serde(default)]
     pub search: Vec<SearchProvider>,
     /// Image generation ([generate_image]; gated on provider + key).
@@ -1008,9 +1031,11 @@ impl Config {
         self.tools.web.allow_private_hosts.unwrap_or(false)
     }
 
-    /// The active search provider, if any.
-    pub fn effective_search(&self) -> Option<SearchProvider> {
-        self.search.first().cloned()
+    /// The search provider fallback chain (every `[[search]]` entry, in
+    /// layer order — most specific first). Empty = the web_search hand
+    /// stays unregistered.
+    pub fn effective_search(&self) -> Vec<SearchProvider> {
+        self.search.clone()
     }
 
     /// The resolved image-generation config, `None` while the hand must
@@ -1557,6 +1582,49 @@ mod tests {
         assert!(
             err.contains("unknown field") || err.contains("modle"),
             "got: {err}"
+        );
+    }
+
+    /// Lote 8 (TOOL-14): keyless backends need no api_key_env, and
+    /// `[[search.sites]]` rides inside its `[[search]]` entry. Strict
+    /// TOML still rejects unknown keys at every level, including the
+    /// new sites table.
+    #[test]
+    fn keyless_search_and_sites_parse_strictly() {
+        let layer = Config::parse_layer(
+            "[[search]]\nprovider = \"duckduckgo\"\n\n[[search.sites]]\nsite = \"docs.rs\"\n\n[[search]]\nprovider = \"searxng\"\nbase_url = \"https://searx.example.org\"\n",
+            "user",
+        )
+        .unwrap();
+        assert_eq!(layer.search.len(), 2);
+        let ddg = &layer.search[0];
+        assert_eq!(ddg.provider, "duckduckgo");
+        assert!(ddg.api_key_env.is_none(), "keyless backends omit the key");
+        assert_eq!(ddg.sites.len(), 1);
+        assert_eq!(ddg.sites[0].site, "docs.rs");
+        assert_eq!(ddg.sites[0].handler, None, "handler defaults to auto");
+        assert_eq!(
+            layer.search[1].base_url.as_deref(),
+            Some("https://searx.example.org")
+        );
+        // sites entries are strict too
+        let err = Config::parse_layer(
+            "[[search]]\nprovider = \"duckduckgo\"\n[[search.sites]]\nsite = \"docs.rs\"\nscraper = true\n",
+            "user",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("unknown field") || err.contains("scraper"),
+            "{err}"
+        );
+        // and so are providers
+        let err = Config::parse_layer("[[search]]\nprovider = \"ddg\"\nkay = \"X\"\n", "user")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("unknown field") || err.contains("kay"),
+            "{err}"
         );
     }
 

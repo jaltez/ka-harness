@@ -22,6 +22,10 @@ pub enum Ghost {
     /// An @-mention file: the walk-relative path the token completes
     /// to, plus whether it is a directory (dirs get no trailing space).
     Mention { rel: String, is_dir: bool },
+    /// An argument-syntax template (` <condición>`): what the command
+    /// still expects once the bare name is typed and the slash ghost
+    /// has nothing left to suggest.
+    Syntax { rest: String },
 }
 
 impl Ghost {
@@ -39,6 +43,9 @@ impl Ghost {
                     None => String::new(),
                 }
             }
+            // the template is the remainder itself: the draft ends at
+            // the command name (or its trailing space)
+            Ghost::Syntax { rest } => rest.clone(),
         }
     }
 }
@@ -55,6 +62,33 @@ pub fn slash_ghost(input: &str, commands: &[(String, String)]) -> Option<Ghost> 
         .iter()
         .find(|(name, _)| name.starts_with(input) && name.len() > input.len())
         .map(|(name, _)| Ghost::Slash { name: name.clone() })
+}
+
+/// The argument-syntax ghost for the two flag-bearing commands: once
+/// the bare name is typed (`/goal`, `/loop` — where the slash ghost
+/// has nothing left to suggest), the dim remainder shows the shape of
+/// the arguments. Any typed argument ends the hint — subcommands
+/// (`/goal status`) and flags (`/loop --every 30 …`) read better
+/// without a template parked after them.
+pub fn syntax_ghost(input: &str) -> Option<Ghost> {
+    let (name, args) = match input.split_once(' ') {
+        Some((name, args)) => (name, Some(args)),
+        None => (input, None),
+    };
+    let template = match name {
+        "/goal" => "<condición>",
+        "/loop" => "[--every <secs>] <task>",
+        _ => return None,
+    };
+    match args {
+        None => Some(Ghost::Syntax {
+            rest: format!(" {template}"),
+        }),
+        Some("") => Some(Ghost::Syntax {
+            rest: template.to_string(),
+        }),
+        Some(_) => None,
+    }
 }
 
 /// The @-mention ghost for the token at the caret (cursor at the text
@@ -110,9 +144,11 @@ pub fn accept(ghost: &Ghost, input: &mut InputBuffer) {
                 input.cursor = cursor;
             }
         }
+        // insert the template right after the typed prefix
+        // (insert_str leaves the cursor parked at its end)
+        Ghost::Syntax { rest } => input.insert_str(rest),
     }
 }
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -200,5 +236,37 @@ mod tests {
         let mut b = draft("@sr");
         b.cursor = 1;
         assert!(mention_ghost(&b.text, b.cursor, &[]).is_none());
+    }
+
+    #[test]
+    fn syntax_ghost_shows_the_argument_shape_at_the_prefix() {
+        // bare name: the template rides a separating space
+        let g = syntax_ghost("/goal").expect("prefix matches");
+        assert_eq!(g.suffix("/goal"), " <condición>");
+        let g = syntax_ghost("/loop").expect("prefix matches");
+        assert_eq!(g.suffix("/loop"), " [--every <secs>] <task>");
+        // trailing space: the template continues right at the caret
+        let g = syntax_ghost("/goal ").expect("prefix matches");
+        assert_eq!(g.suffix("/goal "), "<condición>");
+    }
+
+    #[test]
+    fn syntax_ghost_stays_quiet_once_arguments_start() {
+        // subcommands and flags read their own syntax
+        assert!(syntax_ghost("/goal status").is_none());
+        assert!(syntax_ghost("/goal all tests green").is_none());
+        assert!(syntax_ghost("/loop --every 30 rerun").is_none());
+        // nothing to do with these commands
+        assert!(syntax_ghost("/model").is_none());
+        assert!(syntax_ghost("goal").is_none());
+    }
+
+    #[test]
+    fn syntax_ghost_accept_inserts_the_template() {
+        let mut b = draft("/loop");
+        let g = syntax_ghost("/loop").expect("ghost");
+        accept(&g, &mut b);
+        assert_eq!(b.text, "/loop [--every <secs>] <task>");
+        assert_eq!(b.cursor, b.text.chars().count());
     }
 }

@@ -19,6 +19,7 @@ tokio = { workspace = true }
 schemars = { workspace = true }
 ignore = { workspace = true }
 regex = { workspace = true }
+flate2 = { workspace = true }
 ka-sandbox = { workspace = true }
 parking_lot = { workspace = true }
 

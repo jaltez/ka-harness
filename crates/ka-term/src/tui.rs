@@ -5097,9 +5097,10 @@ async fn app(
     let mut last_tool_ref: Option<(usize, usize)> = None;
     // transient action feedback: (message, shown-at); auto-expires
     let mut toast: Option<(String, Instant)> = None;
-    // pending image attachment: staged by `/image <path>`, consumed by
-    // the next sent prompt
-    let mut pending_image: Option<ka_protocol::ImagePart> = None;
+    // pending image attachments: staged by `/image <path>`, `/clip`,
+    // and image-path pastes; each staging drops an `[Image #N]` chip
+    // at the caret and the chips order the outgoing parts on send
+    let mut pending_images: Vec<ka_protocol::ImagePart> = Vec::new();
     let mut sidebar = SidebarState {
         cwd: shorten_cwd(&std::env::current_dir().unwrap_or_default()),
         // branch detection is a git subprocess — run it off the first
@@ -6186,13 +6187,18 @@ async fn app(
                                     }
                                 }
                                 KeyCode::Enter => {
-                                    if let Some(path) = items.get(*selected).cloned() {
+                                    if let Some(entry) = items.get(*selected).cloned() {
                                         modal = None;
-                                        if !std::path::Path::new(&path).exists() {
+                                        // spill:// pointers resolve under the
+                                        // engine's spill root; entries stay ids
+                                        let path = spill_entry_path(&entry);
+                                        if !path.exists() {
                                             transcript.push_separated(Line::Info(format!(
-                                                "spill file is gone: {path}"
+                                                "spill file is gone: {}",
+                                                path.display()
                                             )));
                                         } else {
+                                            let path_str = path.to_string_lossy().into_owned();
                                             let opened =
                                                 match std::env::var("PAGER")
                                                     .ok()
@@ -6200,13 +6206,13 @@ async fn app(
                                                 {
                                                     Some(pager) => run_external(
                                                         &pager,
-                                                        &[path.as_str()],
+                                                        &[path_str.as_str()],
                                                         terminal,
                                                         capture_now,
                                                     ),
                                                     None => run_external(
                                                         "less",
-                                                        &["-R", path.as_str()],
+                                                        &["-R", path_str.as_str()],
                                                         terminal,
                                                         capture_now,
                                                     ),
@@ -7260,15 +7266,27 @@ async fn app(
                             }
                             // /image: stage an attachment instead of a prompt
                             if text.starts_with("/image ") || text == "/image" {
-                                match handle_image_command(&text, &mut pending_image) {
+                                match handle_image_command(&text, &mut pending_images) {
                                     Some(Ok(note)) => {
+                                        // the command text itself is
+                                        // consumed; the staged slot drops
+                                        // its chip at the caret
+                                        input.text.clear();
+                                        input.cursor = 0;
+                                        input.insert_str(&image_chip(pending_images.len()));
                                         pop_toast(&mut toast, note);
                                     }
-                                    Some(Err(e)) => transcript.push_separated(Line::Info(e)),
-                                    None => {}
+                                    Some(Err(e)) => {
+                                        transcript.push_separated(Line::Info(e));
+                                        input.text.clear();
+                                        input.cursor = 0;
+                                    }
+                                    // bare /image: not staged, just clear
+                                    None => {
+                                        input.text.clear();
+                                        input.cursor = 0;
+                                    }
                                 }
-                                input.text.clear();
-                                input.cursor = 0;
                                 continue;
                             }
                             // /clip: paste a clipboard image as the
@@ -7284,7 +7302,7 @@ async fn app(
                                                 "[clip attachment · {} · {kb}KB]",
                                                 part.media_type
                                             );
-                                            pending_image = Some(part);
+                                            pending_images.push(part);
                                             Ok(note)
                                         }
                                         Err(e) => Err(e),
@@ -7292,7 +7310,11 @@ async fn app(
                                     Err(e) => Err(e),
                                 };
                                 match staged {
-                                    Ok(note) => pop_toast(&mut toast, note),
+                                    Ok(note) => {
+                                        pop_toast(&mut toast, note);
+                                        // the staged slot drops its chip at the caret
+                                        input.insert_str(&image_chip(pending_images.len()));
+                                    }
                                     Err(e) => transcript.push_separated(Line::Info(e)),
                                 }
                                 continue;
@@ -7543,9 +7565,9 @@ async fn app(
                                             providers: providers.clone(),
                                             config_path: ka_config_path(),
                                         }),
-                                        ModalKind::Spills => Modal::Spills {
+                                        ModalKind::Spills { focus } => Modal::Spills {
                                             items: spills.clone(),
-                                            selected: 0,
+                                            selected: spill_focus_index(&spills, focus.as_deref()),
                                         },
                                         ModalKind::Prompts => Modal::Prompts {
                                             items: sidebar.inventory.prompts.clone(),
@@ -7756,32 +7778,52 @@ async fn app(
                                 let _ = commands.send(Command::Shell { command }).await;
                                 continue;
                             }
-                            transcript.push_separated(Line::User(text.clone()));
+                            // image chips resolve on send: chip order becomes
+                            // part order, unchipped staging leftovers ride
+                            // last, and the chips are consumed from the text.
+                            // A steer carries no parts — its staged set (and
+                            // the chips naming them) waits for the next
+                            // real prompt.
+                            let (text, outgoing) = if busy {
+                                (text, Vec::new())
+                            } else {
+                                let (clean, outgoing) =
+                                    resolve_image_chips(&text, std::mem::take(&mut pending_images));
+                                (clean, outgoing)
+                            };
+                            if !text.is_empty() {
+                                transcript.push_separated(Line::User(text.clone()));
+                            }
                             let cmd = if busy {
                                 let mut note = "steering this turn".to_string();
-                                if pending_image.is_some() {
-                                    note.push_str(" (1 staged image waits for the next prompt)");
+                                if !pending_images.is_empty() {
+                                    note.push_str(&format!(
+                                        " ({} staged image{} wait{} for the next prompt)",
+                                        pending_images.len(),
+                                        if pending_images.len() == 1 { "" } else { "s" },
+                                        if pending_images.len() == 1 { "s" } else { "" },
+                                    ));
                                 }
                                 transcript.push_separated(Line::Info(note));
                                 Command::Steer { text }
                             } else {
-                                // plain new turn: the /retry target; a
-                                // staged /image attachment rides along
+                                // plain new turn: the /retry target; staged
+                                // attachments ride in chip order
                                 last_user = Some(text.clone());
-                                if let Some(img) = &pending_image {
+                                for img in &outgoing {
                                     let kb = img.data.len() * 3 / 4 / 1024;
                                     transcript.push_separated(Line::Info(format!(
                                         "[img attachment · {} · {kb}KB]",
                                         img.media_type
                                     )));
                                 }
-                                images_sent += pending_image.iter().count();
+                                images_sent += outgoing.len();
                                 Command::Prompt {
                                     allowed_tools: None,
                                     model: None,
                                     text,
                                     schema: None,
-                                    images: pending_image.take().into_iter().collect(),
+                                    images: outgoing,
                                     skills: Vec::new(),
                                 }
                             };
@@ -8216,11 +8258,13 @@ async fn app(
                                             .file_name()
                                             .map(|n| n.to_string_lossy().into_owned())
                                             .unwrap_or_default();
-                                        pending_image = Some(part);
+                                        pending_images.push(part);
                                         pop_toast(
                                             &mut toast,
                                             format!("[img {name} · {kb}KB] — press enter to send"),
                                         );
+                                        // sequential pastes stack chips at the caret
+                                        input.insert_str(&image_chip(pending_images.len()));
                                         slash_popup = None;
                                         continue;
                                     }
@@ -8844,10 +8888,18 @@ async fn app(
                                         )));
                                         continue;
                                     } else {
-                                        transcript.push_separated(Line::User(next.clone()));
-                                        last_user = Some(next.clone());
+                                        // queued drafts resolve their image
+                                        // chips too: referenced staged parts
+                                        // ride in chip order and leave the
+                                        // staging set; unchipped ones stay
+                                        let (clean, outgoing) =
+                                            take_chipped_images(&next, &mut pending_images);
+                                        if !clean.is_empty() {
+                                            transcript.push_separated(Line::User(clean.clone()));
+                                        }
+                                        last_user = Some(clean.clone());
                                         busy = true;
-                                        let _ = commands.send(Command::Prompt { text: next, schema: None, images: Vec::new(), allowed_tools: None, model: None, skills: Vec::new() }).await;
+                                        let _ = commands.send(Command::Prompt { text: clean, schema: None, images: outgoing, allowed_tools: None, model: None, skills: Vec::new() }).await;
                                         break;
                                     }
                                 }
@@ -9513,10 +9565,11 @@ fn apply_event(
                 transcript.rewind_user(turns as usize);
             }
             transcript.push_separated(Line::Info(message.clone()));
-            // SES-01: a note carrying a spill pointer has a full
-            // rendering parked in a spill file — point at /spills
-            if message.contains("spill://") {
-                transcript.push_separated(Line::Info("  ↳ full output: /spills".into()));
+            // SES-01: notes carrying spill pointers (/diff, big edits)
+            // record them for /spills and hint below the note — once
+            // per spill id (the spill list is the dedup memory)
+            if let Some(hint) = note_spill_hints(message, spills) {
+                transcript.push_separated(Line::Info(hint.into()));
             }
         }
         Event::Inventory {
@@ -9684,14 +9737,80 @@ fn pack_row(label: &str, items: &[String], cap: usize) -> String {
     row
 }
 
-fn record_spill(spills: &mut Vec<String>, path: &str) {
-    if spills.contains(&path.to_string()) {
-        return;
+/// Record a spill for /spills. Returns whether it was new — the
+/// callers use that to render the `/spills` hint exactly once per
+/// spill id.
+fn record_spill(spills: &mut Vec<String>, entry: &str) -> bool {
+    if spills.iter().any(|s| s == entry) {
+        return false;
     }
-    spills.push(path.to_string());
+    spills.push(entry.to_string());
     if spills.len() > 50 {
         spills.remove(0);
     }
+    true
+}
+
+/// Every `spill://<id>` pointer in a note, id part only, in order of
+/// appearance.
+fn spill_ids(note: &str) -> Vec<String> {
+    let mut ids = Vec::new();
+    let mut rest = note;
+    while let Some(at) = rest.find("spill://") {
+        let after = &rest[at + "spill://".len()..];
+        let end = after
+            .char_indices()
+            .find(|(_, c)| !(c.is_ascii_alphanumeric() || *c == '-' || *c == '_'))
+            .map_or(after.len(), |(i, _)| i);
+        if end > 0 {
+            ids.push(after[..end].to_string());
+            rest = &after[end..];
+        } else {
+            rest = after;
+        }
+    }
+    ids
+}
+
+/// SES-01: notes carrying `spill://<id>` pointers (the /diff diff, big
+/// edits) have their full output parked in a spill file. Every pointer
+/// lands in the spill list so /spills can browse it; the dim
+/// `↳ full output: /spills` hint renders only on a pointer's first
+/// sighting — the spill list doubles as the dedup memory.
+fn note_spill_hints(note: &str, spills: &mut Vec<String>) -> Option<&'static str> {
+    let mut fresh = false;
+    for id in spill_ids(note) {
+        fresh |= record_spill(spills, &format!("spill://{id}"));
+    }
+    fresh.then_some("  ↳ full output: /spills")
+}
+
+/// The file behind a spill list entry: `spill://<id>` pointers resolve
+/// under the engine's spill root (ids are file names there); anything
+/// else is already a path.
+fn spill_entry_path(entry: &str) -> std::path::PathBuf {
+    match entry.strip_prefix("spill://") {
+        Some(id) => ka_engine::hands::spills_root().join(id),
+        None => std::path::PathBuf::from(entry),
+    }
+}
+
+/// The row a `/spills <id>` focus preselects: the first entry whose id
+/// matches (the `spill://` prefix is optional on either side); 0 with
+/// no focus or no match.
+fn spill_focus_index(items: &[String], focus: Option<&str>) -> usize {
+    let Some(focus) = focus.map(str::trim).filter(|f| !f.is_empty()) else {
+        return 0;
+    };
+    let bare = focus.strip_prefix("spill://").unwrap_or(focus);
+    items
+        .iter()
+        .position(|item| {
+            item.strip_prefix("spill://") == Some(bare)
+                || item == bare
+                || item.ends_with(&format!("/{bare}"))
+        })
+        .unwrap_or(0)
 }
 
 /// Suspend the TUI (flush, leave raw mode and the alternate screen), run
@@ -9808,7 +9927,7 @@ fn image_part_from_path(path: &std::path::Path) -> Result<ka_protocol::ImagePart
 /// transcript. Returns `None` when the text is not an /image command.
 fn handle_image_command(
     text: &str,
-    pending_image: &mut Option<ka_protocol::ImagePart>,
+    pending_images: &mut Vec<ka_protocol::ImagePart>,
 ) -> Option<Result<String, String>> {
     let rest = text.strip_prefix("/image ")?;
     let path = std::path::PathBuf::from(rest.trim());
@@ -9819,11 +9938,120 @@ fn handle_image_command(
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
             let kb = part.data.len() * 3 / 4 / 1024;
-            *pending_image = Some(part);
-            Some(Ok(format!("[img {name} · {} · {kb}KB]", "attached")))
+            pending_images.push(part);
+            Some(Ok(format!("[img {name} · attached · {kb}KB]")))
         }
         Err(e) => Some(Err(e)),
     }
+}
+
+/// The composer chip for the nth staged image: plain text, inserted at
+/// the caret so the draft spells out where each attachment goes.
+pub fn image_chip(n: usize) -> String {
+    format!("[Image #{n}]")
+}
+
+/// The staged-image numbers a draft references via `[Image #N]` chips,
+/// in order of first appearance, deduped, and clamped to what is
+/// actually staged (a chip pointing past the staging set is plain
+/// text and stays one).
+fn image_chip_refs(text: &str, staged: usize) -> Vec<usize> {
+    if staged == 0 {
+        return Vec::new();
+    }
+    let mut refs = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find("[Image #") {
+        let after = &rest[at + "[Image #".len()..];
+        match after.find(']') {
+            Some(end) => {
+                if let Ok(n) = after[..end].parse::<usize>() {
+                    if (1..=staged).contains(&n) && !refs.contains(&n) {
+                        refs.push(n);
+                    }
+                }
+                rest = &after[end..];
+            }
+            // no closing bracket: resume past the opener
+            None => rest = after,
+        }
+    }
+    refs
+}
+
+/// The draft with its valid image chips removed; one padding space
+/// goes with each chip so removal never leaves doubles behind.
+fn strip_image_chips(text: &str, staged: usize) -> String {
+    if staged == 0 || !text.contains("[Image #") {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("[Image #") {
+        let after = &rest[at + "[Image #".len()..];
+        match after.find(']') {
+            Some(end) => {
+                let valid = after[..end]
+                    .parse::<usize>()
+                    .is_ok_and(|n| (1..=staged).contains(&n));
+                if valid {
+                    out.push_str(&rest[..at]);
+                    let tail = &after[end + 1..];
+                    // a space on both sides of the cut loses one
+                    let pad = usize::from(out.ends_with(' ') && tail.starts_with(' '));
+                    rest = &tail[pad..];
+                } else {
+                    // keep the literal chip text, resume past it
+                    out.push_str(&rest[..at + "[Image #".len() + end + 1]);
+                    rest = &after[end + 1..];
+                }
+            }
+            None => {
+                out.push_str(rest);
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The outgoing images for a draft: chip-referenced ones first, in
+/// chip order of first appearance, then unchipped staging leftovers
+/// in staging order. The chips are consumed from the text.
+pub fn resolve_image_chips(
+    text: &str,
+    images: Vec<ka_protocol::ImagePart>,
+) -> (String, Vec<ka_protocol::ImagePart>) {
+    let staged = images.len();
+    let refs = image_chip_refs(text, staged);
+    let mut slots: Vec<Option<ka_protocol::ImagePart>> = images.into_iter().map(Some).collect();
+    let mut ordered = Vec::with_capacity(slots.len());
+    for n in &refs {
+        // refs are deduped and clamped to 1..=staged: every slot hit
+        // is still stocked
+        if let Some(part) = slots[n - 1].take() {
+            ordered.push(part);
+        }
+    }
+    ordered.extend(slots.into_iter().flatten());
+    (strip_image_chips(text, staged), ordered)
+}
+
+/// The chip-referenced staged images for a draft, removed from the
+/// staging set in chip order (queued drafts ride this path — the
+/// staging set keeps whatever no chip asked for).
+fn take_chipped_images(
+    text: &str,
+    staged: &mut Vec<ka_protocol::ImagePart>,
+) -> (String, Vec<ka_protocol::ImagePart>) {
+    let staged_n = staged.len();
+    let refs = image_chip_refs(text, staged_n);
+    // descending removal keeps the remaining indices valid
+    let mut taken: Vec<ka_protocol::ImagePart> =
+        refs.iter().rev().map(|n| staged.remove(n - 1)).collect();
+    taken.reverse();
+    (strip_image_chips(text, staged_n), taken)
 }
 
 /// True under WSL (Windows Subsystem for Linux).
@@ -10103,8 +10331,14 @@ fn builtin_slash_commands() -> Vec<(String, String)> {
             "/copy".to_string(),
             "copy a transcript block (OSC52) — picker, w saves to a file".to_string(),
         ),
-        ("/clip".to_string(), "attach a clipboard image".to_string()),
-        ("/image".to_string(), "attach an image [path]".to_string()),
+        (
+            "/clip".to_string(),
+            "attach a clipboard image — drops an [Image #N] chip in the draft".to_string(),
+        ),
+        (
+            "/image".to_string(),
+            "attach an image [path] — drops an [Image #N] chip in the draft".to_string(),
+        ),
         ("/agents".to_string(), "list available agents".to_string()),
         (
             "/find".to_string(),
@@ -10132,7 +10366,7 @@ fn builtin_slash_commands() -> Vec<(String, String)> {
         ),
         (
             "/spills".to_string(),
-            "browse spilled tool output in $PAGER".to_string(),
+            "browse spilled tool output in $PAGER — /spills <id> preselects".to_string(),
         ),
         (
             "/vim".to_string(),
@@ -10488,6 +10722,11 @@ fn ghost_suggestion(
     if let Some(g) = crate::ghost::slash_ghost(text, &available_slash_commands()) {
         return Some(g);
     }
+    // past the command name, /goal and /loop ghost their argument
+    // syntax (the slash ghost is done at an exact match)
+    if let Some(g) = crate::ghost::syntax_ghost(text) {
+        return Some(g);
+    }
     let mentionish = path_token(text, cursor).is_some_and(|(_, t)| mention_token(&t).is_some());
     if !mentionish {
         return None;
@@ -10548,8 +10787,9 @@ pub enum ModalKind {
     Provider,
     /// API key prompt.
     Key,
-    /// Spill-file viewer.
-    Spills,
+    /// Spill-file viewer; the carried id (`/spills <id>`, bare or
+    /// `spill://`-prefixed) preselects its row when the modal opens.
+    Spills { focus: Option<String> },
     /// MCP prompt picker.
     Prompts,
     /// Memory viewer.
@@ -11500,7 +11740,11 @@ blocker > major > minor > nit, each as `file:line — issue — concrete fix`, \
             event: None,
             quit: false,
             followup: None,
-            modal: Some(ModalKind::Spills),
+            modal: Some(ModalKind::Spills {
+                // `/spills <id>` preselects that spill's row (bare id
+                // or the full `spill://` pointer)
+                focus: rest.map(str::to_string),
+            }),
         }),
         "/agents" => Some(Slash {
             event: None,
@@ -15266,7 +15510,7 @@ pub(crate) fn help_modal_rows(width: usize) -> Vec<ratatui::text::Line<'static>>
             ("/debug", "live debug sessions"),
             ("/mcp", "refresh MCP tool lists (/mcp refresh)"),
             ("/prompt", "run an MCP prompt"),
-            ("/spills", "browse spilled tool output"),
+            ("/spills", "browse spilled tool output (/spills <id> jumps)"),
             ("/diff", "session file diff (excerpt + spill pointer)"),
             ("/context", "context usage breakdown + tips"),
             ("/shake", "trim stale output now [+ thinking|images]"),
@@ -20423,9 +20667,9 @@ mod tests {
     #[test]
     fn record_spill_dedupes_and_caps_at_50() {
         let mut spills: Vec<String> = Vec::new();
-        record_spill(&mut spills, "/tmp/a");
-        record_spill(&mut spills, "/tmp/b");
-        record_spill(&mut spills, "/tmp/a");
+        assert!(record_spill(&mut spills, "/tmp/a"), "first is new");
+        assert!(record_spill(&mut spills, "/tmp/b"));
+        assert!(!record_spill(&mut spills, "/tmp/a"), "duplicate is not new");
         assert_eq!(spills, vec!["/tmp/a".to_string(), "/tmp/b".to_string()]);
         for i in 0..60 {
             record_spill(&mut spills, &format!("/tmp/x{i}"));
@@ -20436,6 +20680,96 @@ mod tests {
             !spills.contains(&"/tmp/a".to_string()),
             "oldest entries dropped"
         );
+    }
+
+    #[test]
+    fn spill_ids_extract_pointers_in_order() {
+        assert_eq!(
+            spill_ids("session diff: 2 file(s) — full: spill://abc-1 tail spill://job-9_2"),
+            vec!["abc-1".to_string(), "job-9_2".to_string()]
+        );
+        // no id right after the scheme: nothing to extract
+        assert_eq!(
+            spill_ids("see spill:// and spill:///x"),
+            Vec::<String>::new()
+        );
+        assert_eq!(spill_ids("plain note"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn note_spill_hints_land_diff_spills_and_hint_once_per_id() {
+        let mut spills: Vec<String> = Vec::new();
+        // first sighting: hint + the pointer lands in /spills
+        assert_eq!(
+            note_spill_hints("session diff — full: spill://s3", &mut spills),
+            Some("  ↳ full output: /spills")
+        );
+        assert_eq!(spills, vec!["spill://s3".to_string()]);
+        // same id again: recorded, no second hint
+        assert_eq!(
+            note_spill_hints("again spill://s3", &mut spills),
+            None,
+            "hint only on the first sighting"
+        );
+        assert_eq!(spills.len(), 1);
+        // a fresh id hints again
+        assert_eq!(
+            note_spill_hints("more spill://s4", &mut spills),
+            Some("  ↳ full output: /spills")
+        );
+        assert_eq!(
+            spills,
+            vec!["spill://s3".to_string(), "spill://s4".to_string()]
+        );
+        // notes without pointers stay hint-free
+        assert_eq!(note_spill_hints("goal paused", &mut spills), None);
+    }
+
+    #[test]
+    fn spill_focus_index_matches_bare_or_pointed_ids() {
+        let items = vec![
+            "spill://1000-0".to_string(),
+            "spill://1000-1".to_string(),
+            "/tmp/ka/spills/1000-2".to_string(),
+        ];
+        assert_eq!(spill_focus_index(&items, None), 0, "no focus: head");
+        assert_eq!(spill_focus_index(&items, Some("")), 0, "blank focus: head");
+        assert_eq!(spill_focus_index(&items, Some("1000-1")), 1);
+        assert_eq!(spill_focus_index(&items, Some("spill://1000-1")), 1);
+        assert_eq!(
+            spill_focus_index(&items, Some("/tmp/ka/spills/1000-2")),
+            2,
+            "raw path entries match exactly"
+        );
+        assert_eq!(spill_focus_index(&items, Some("nope")), 0, "no match: head");
+    }
+
+    #[test]
+    fn spill_entry_path_resolves_pointers_to_the_spill_root() {
+        assert_eq!(
+            spill_entry_path("spill://abc-1"),
+            ka_engine::hands::spills_root().join("abc-1")
+        );
+        assert_eq!(
+            spill_entry_path("/tmp/plain/path"),
+            std::path::PathBuf::from("/tmp/plain/path"),
+            "non-pointers pass through"
+        );
+    }
+
+    #[test]
+    fn ghost_suggestion_routes_prefix_then_syntax_then_mention() {
+        let mut cache: Option<(Instant, Vec<(String, bool)>)> = None;
+        // partial command name: the command-name ghost wins
+        let g = ghost_suggestion("/goa", 4, &mut cache).expect("command ghost");
+        assert!(matches!(g, crate::ghost::Ghost::Slash { .. }));
+        // bare /goal: the slash ghost is done at an exact match — the
+        // argument-syntax ghost takes over
+        let g = ghost_suggestion("/goal", 5, &mut cache).expect("syntax ghost");
+        assert!(matches!(g, crate::ghost::Ghost::Syntax { .. }));
+        assert_eq!(g.suffix("/goal"), " <condición>");
+        // typed argument: no ghost, not even the mention walk
+        assert!(ghost_suggestion("/goal status", 12, &mut cache).is_none());
     }
     #[test]
     fn slash_commands_fork_checkpoint_restore() {
@@ -24476,26 +24810,109 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let png: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
         std::fs::write(dir.join("p.png"), png).unwrap();
-        let mut pending: Option<ka_protocol::ImagePart> = None;
+        let mut pending: Vec<ka_protocol::ImagePart> = Vec::new();
         let out = handle_image_command(
             &format!("/image {}", dir.join("p.png").display()),
             &mut pending,
         );
         assert!(out.is_some());
         assert!(out.unwrap().is_ok());
-        assert!(pending.is_some(), "image staged");
-        assert_eq!(pending.unwrap().media_type, "image/png");
+        assert_eq!(pending.len(), 1, "image staged");
+        assert_eq!(pending[0].media_type, "image/png");
+
+        // a second /image stacks: the chips number by staging order
+        let out = handle_image_command(
+            &format!("/image {}", dir.join("p.png").display()),
+            &mut pending,
+        );
+        assert!(out.unwrap().is_ok());
+        assert_eq!(pending.len(), 2);
 
         // non-image paths error without staging
-        let mut pending: Option<ka_protocol::ImagePart> = None;
+        let mut pending: Vec<ka_protocol::ImagePart> = Vec::new();
         let out = handle_image_command("/image /definitely/absent.png", &mut pending);
         assert!(matches!(out, Some(Err(_))));
-        assert!(pending.is_none());
+        assert!(pending.is_empty());
 
         // bare /image (no path) is not this command
-        let mut pending: Option<ka_protocol::ImagePart> = None;
+        let mut pending: Vec<ka_protocol::ImagePart> = Vec::new();
         assert!(handle_image_command("/image", &mut pending).is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn image_chip_refs_read_order_and_clamp() {
+        // appearance order, deduped
+        assert_eq!(
+            image_chip_refs("see [Image #2] then [Image #1] again [Image #2]", 2),
+            vec![2, 1]
+        );
+        // chips past the staging set (or malformed) are plain text
+        assert_eq!(
+            image_chip_refs("[Image #3] [Image x] [Image #", 2),
+            Vec::<usize>::new()
+        );
+        assert_eq!(image_chip_refs("no chips", 2), Vec::<usize>::new());
+        assert_eq!(image_chip_refs("[Image #1]", 0), Vec::<usize>::new());
+    }
+
+    fn chip_part(tag: &str) -> ka_protocol::ImagePart {
+        ka_protocol::ImagePart {
+            data: tag.to_string(),
+            media_type: "image/png".to_string(),
+        }
+    }
+
+    #[test]
+    fn resolve_image_chips_orders_consumes_and_appends() {
+        // chip order beats staging order; unchipped leftovers ride last
+        let images = vec![chip_part("a"), chip_part("b"), chip_part("c")];
+        let (text, ordered) = resolve_image_chips("look [Image #2] then [Image #1] ok", images);
+        assert_eq!(text, "look then ok");
+        let tags: Vec<&str> = ordered.iter().map(|p| p.data.as_str()).collect();
+        assert_eq!(tags, vec!["b", "a", "c"]);
+
+        // no chips: staging order is the send order, text untouched
+        let images = vec![chip_part("a"), chip_part("b")];
+        let (text, ordered) = resolve_image_chips("describe this", images);
+        assert_eq!(text, "describe this");
+        let tags: Vec<&str> = ordered.iter().map(|p| p.data.as_str()).collect();
+        assert_eq!(tags, vec!["a", "b"]);
+
+        // chips-only draft resolves to an empty prompt
+        let images = vec![chip_part("a")];
+        let (text, ordered) = resolve_image_chips("[Image #1]", images);
+        assert_eq!(text, "");
+        assert_eq!(ordered.len(), 1);
+    }
+
+    #[test]
+    fn strip_image_chips_keeps_invalid_and_collapses_pads() {
+        // a chip pointing past the staging set stays literal
+        assert_eq!(
+            strip_image_chips("see [Image #9] now", 1),
+            "see [Image #9] now"
+        );
+        // doubled spaces around a cut collapse to one
+        assert_eq!(strip_image_chips("a [Image #1] b", 1), "a b");
+        // no leading/trailing surprise at the edges
+        assert_eq!(strip_image_chips("[Image #1] lead", 1), " lead");
+        assert_eq!(strip_image_chips("tail [Image #1]", 1), "tail ");
+        assert_eq!(strip_image_chips("plain", 1), "plain");
+        assert_eq!(strip_image_chips("[Image #1] x", 0), "[Image #1] x");
+    }
+
+    #[test]
+    fn take_chipped_images_leaves_unchipped_staged() {
+        let mut staged = vec![chip_part("a"), chip_part("b"), chip_part("c")];
+        let (clean, taken) = take_chipped_images("fix [Image #3] first", &mut staged);
+        assert_eq!(clean, "fix first");
+        assert_eq!(taken.len(), 1);
+        assert_eq!(taken[0].data, "c");
+        // b and a never referenced: they stay in staging order
+        assert_eq!(staged.len(), 2);
+        assert_eq!(staged[0].data, "a");
+        assert_eq!(staged[1].data, "b");
     }
 
     #[test]

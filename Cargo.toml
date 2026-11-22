@@ -54,6 +54,9 @@ regex = { version = "1", default-features = false, features = [
 ] }
 ignore = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+# Pure-Rust inflate backend only: PDF FlateDecode + ZIP deflate +
+# gzip for the read hand's rich readers (no C miniz, no zlib-ng).
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 unicode-width = "0.2"
 schemars = "1"
 keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native", "linux-native"] }
