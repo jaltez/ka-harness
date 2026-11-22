@@ -107,6 +107,7 @@ pub fn mode_icon(mode: Mode) -> &'static str {
         Mode::AcceptEdits => "\u{270e}", // ✎
         Mode::Allow => "\u{21af}",       // ↯
         Mode::Readonly => "\u{25ce}",    // ◎
+        Mode::DontAsk => "\u{29bc}",     // ⦼
     }
 }
 
@@ -116,6 +117,7 @@ pub fn mode_word(mode: Mode) -> &'static str {
         Mode::AcceptEdits => "accept_edits",
         Mode::Allow => "allow",
         Mode::Readonly => "readonly",
+        Mode::DontAsk => "dontask",
     }
 }
 

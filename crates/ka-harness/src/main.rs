@@ -453,6 +453,11 @@ enum CliCommand {
         #[command(subcommand)]
         cmd: ConfigCommand,
     },
+    /// Dry-run permission rules against a command
+    Rules {
+        #[command(subcommand)]
+        cmd: RulesCommand,
+    },
 
     /// Hidden trampoline: apply a landlock policy to self, then exec.
     /// Not for humans — ka-sandbox's wrap_command builds this argv.
@@ -494,6 +499,24 @@ enum ConfigCommand {
     },
     /// Print the config layer paths ka reads
     Path,
+}
+
+/// `ka rules …`: dry-run access to the permission gate.
+#[derive(Subcommand, Clone)]
+enum RulesCommand {
+    /// Evaluate the effective rules against a command, showing which
+    /// rule matches first and the verdict the gate would apply
+    Check {
+        /// The bash command line to test
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+        /// Tool to evaluate against (default: bash)
+        #[arg(long, default_value = "bash")]
+        tool: String,
+        /// Extra strict-TOML config layer (repeatable)
+        #[arg(long = "config")]
+        configs: Vec<PathBuf>,
+    },
 }
 
 /// `ka session …`: one-session management backed by the strand store.
@@ -917,9 +940,10 @@ fn parse_mode(s: &str) -> Result<ka_protocol::Mode, String> {
         "accept-edits" | "accept_edits" | "accept edits" => Ok(ka_protocol::Mode::AcceptEdits),
         "allow" | "free" | "full-access" | "full_access" => Ok(ka_protocol::Mode::Allow),
         "readonly" | "read-only" | "read_only" | "plan" => Ok(ka_protocol::Mode::Readonly),
+        "dontask" | "dont-ask" | "dont_ask" => Ok(ka_protocol::Mode::DontAsk),
         other => Err(format!(
             "unknown mode {other:?} (expected \
-ask|accept_edits|allow|readonly — guarded/free/plan still parse as aliases)"
+ask|accept_edits|allow|readonly|dontask — guarded/free/plan still parse as aliases)"
         )),
     }
 }
@@ -1699,6 +1723,74 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             );
             for note in &report.notes {
                 println!("note: {note}");
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Some(CliCommand::Rules {
+            cmd:
+                RulesCommand::Check {
+                    command,
+                    tool,
+                    configs,
+                },
+        }) => {
+            let trust = trust_for_cwd(false);
+            let cfg = load_config(
+                &configs,
+                None,
+                None,
+                trusted_project_cwd(trust),
+                &FeatureFlags::default(),
+                false,
+                None,
+            )?;
+            let joined = command.join(" ");
+            let rules = cfg.effective_rules();
+            if rules.is_empty() {
+                println!("no rules configured — the gate falls through to mode logic");
+                return Ok(ExitCode::SUCCESS);
+            }
+            println!(
+                "evaluating {} rule(s) for {} `{}`:",
+                rules.len(),
+                tool,
+                joined
+            );
+            // the gate's first-match-wins, replayed rule by rule: the
+            // first suffix that still yields a verdict identifies the
+            // matching rule
+            let mut matched: Option<(usize, &ka_engine::config::Rule)> = None;
+            for (idx, rule) in rules.iter().enumerate() {
+                if ka_engine::config::evaluate_rules(&rules[idx..], &tool, &joined).is_some() {
+                    matched = Some((idx, rule));
+                    break;
+                }
+            }
+            match matched {
+                Some((idx, rule)) => {
+                    println!(
+                        "  rule #{}: {} {} → {}",
+                        idx + 1,
+                        rule.tool,
+                        rule.pattern.as_deref().unwrap_or("(any)"),
+                        match rule.verdict {
+                            ka_engine::config::Verdict::Allow => "allow",
+                            ka_engine::config::Verdict::Ask => "ask",
+                            ka_engine::config::Verdict::Deny => "deny",
+                        }
+                    );
+                    println!(
+                        "  gate verdict: {}",
+                        match rule.verdict {
+                            ka_engine::config::Verdict::Allow => "allow (runs without asking)",
+                            ka_engine::config::Verdict::Ask => "ask",
+                            ka_engine::config::Verdict::Deny => "deny",
+                        }
+                    );
+                }
+                None => {
+                    println!("  no rule matches — falls through to mode logic");
+                }
             }
             Ok(ExitCode::SUCCESS)
         }
@@ -3623,6 +3715,15 @@ mod feature_flag_tests {
 
     #[test]
     fn parse_mode_accepts_new_and_old_vocabularies() {
+        assert!(matches!(
+            parse_mode("dontask").unwrap(),
+            ka_protocol::Mode::DontAsk
+        ));
+        assert!(matches!(
+            parse_mode("dont-ask").unwrap(),
+            ka_protocol::Mode::DontAsk
+        ));
+        assert!(parse_mode("dontknow").is_err());
         // the new canonical words
         for (word, want) in [
             ("ask", ka_protocol::Mode::Ask),

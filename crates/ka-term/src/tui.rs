@@ -4036,6 +4036,7 @@ fn mode_from_label(label: &str) -> ka_protocol::Mode {
             ka_protocol::Mode::Allow
         }
         "readonly" | "read-only" | "read_only" | "plan" => ka_protocol::Mode::Readonly,
+        "dontask" | "dont-ask" | "dont_ask" => ka_protocol::Mode::DontAsk,
         _ => ka_protocol::Mode::Ask,
     }
 }

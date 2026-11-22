@@ -126,6 +126,9 @@ impl BashHand {
             };
             let mut cmd = Command::new(&argv[0]);
             cmd.args(&argv[1..]).current_dir(&cwd);
+            // [shell] env policy: all (default) inherits everything;
+            // core/none start from the documented floor plus keep/set
+            ctx.shell_env.apply_to(&mut cmd);
             let mut child = match child_spawn(&mut cmd) {
                 Ok(c) => c,
                 Err(e) => return ToolOutput::err(format!("bash spawn: {e}")),
@@ -472,6 +475,7 @@ mod tests {
             max_image_mb: 5,
             web_allow_private: false,
             sandbox: ka_sandbox::Policy::Off,
+            shell_env: Default::default(),
         }
     }
 
@@ -488,6 +492,148 @@ mod tests {
         let out = BashHand.execute(&json!({"command": "exit 3"}), &ctx).await;
         assert!(out.is_error);
         assert!(out.content.contains("(exit 3)"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -------------------------------------------- [shell] env policy
+    // Fixture: `sh -c` expansions — `echo` is a builtin, so a stripped
+    // environment cannot break the fixture itself.
+
+    async fn probe(ctx: &HandContext, expr: &str) -> String {
+        let out = BashHand
+            .execute(&json!({"command": format!("echo {expr}")}), ctx)
+            .await;
+        assert!(!out.is_error, "{expr}: {}", out.content);
+        // the hand echoes the command line; the expansion is the tail
+        out.content
+            .lines()
+            .rev()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// printenv's value for `var` inside the child, None when the
+    /// child lacks it (printenv exits 1; the hand's echoed command
+    /// line is skipped). CARGO_PKG_NAME is the inheritance probe: the
+    /// test process always has it and a stripped shell never
+    /// fabricates it (unlike PATH, which bash rebuilds when absent).
+    async fn child_env(ctx: &HandContext, var: &str) -> Option<String> {
+        let out = BashHand
+            .execute(&json!({"command": format!("printenv {var}")}), ctx)
+            .await;
+        if out.is_error {
+            return None;
+        }
+        out.content
+            .lines()
+            .rev()
+            .find(|l| !l.starts_with("$ "))
+            .map(|l| l.trim().to_string())
+    }
+
+    /// `all` (the default) keeps today's behavior: the child inherits
+    /// the full parent environment, and `env_set` rides on top.
+    /// CARGO_PKG_NAME is the inheritance probe — the test process
+    /// always has it and a stripped child shell never fabricates it
+    /// (unlike PATH/HOME, which bash rebuilds when absent).
+    #[tokio::test]
+    async fn env_policy_all_inherits_and_set_injects() {
+        let dir = std::env::temp_dir().join(format!("ka-bash-env-all-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ctx = ctx_for(&dir);
+        assert_eq!(
+            child_env(&ctx, "CARGO_PKG_NAME").await.as_deref(),
+            Some("ka-engine"),
+            "parent env inherited by default"
+        );
+        ctx.shell_env
+            .set
+            .insert("KA_PERM_PROBE".into(), "via-set".into());
+        assert_eq!(probe(&ctx, "\"$KA_PERM_PROBE\"").await, "via-set");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `none` strips everything except `env_keep` and `env_set`.
+    #[tokio::test]
+    async fn env_policy_none_keeps_only_keep_and_set() {
+        let dir = std::env::temp_dir().join(format!("ka-bash-env-none-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ctx = ctx_for(&dir);
+        ctx.shell_env.mode = crate::config::ShellEnvMode::None;
+        ctx.shell_env.keep.push("CARGO_PKG_NAME".into());
+        ctx.shell_env
+            .set
+            .insert("KA_PERM_PROBE".into(), "via-set".into());
+        assert_eq!(
+            probe(&ctx, "\"$KA_PERM_PROBE\"").await,
+            "via-set",
+            "env_set still injects"
+        );
+        assert_eq!(
+            child_env(&ctx, "CARGO_PKG_NAME").await.as_deref(),
+            Some("ka-engine"),
+            "env_keep passes the named var through"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `none` without keep/set is an empty environment: an inherited
+    /// parent var (CARGO_PKG_NAME — present in the test process, never
+    /// fabricated by a stripped shell) is gone.
+    #[tokio::test]
+    async fn env_policy_none_strips_the_floor() {
+        let dir = std::env::temp_dir().join(format!("ka-bash-env-bare-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ctx = ctx_for(&dir);
+        ctx.shell_env.mode = crate::config::ShellEnvMode::None;
+        assert_eq!(
+            child_env(&ctx, "CARGO_PKG_NAME").await,
+            None,
+            "inherited vars stripped under none"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `core` carries exactly the documented floor (plus set); a var
+    /// outside the floor and not in keep/set is absent.
+    #[tokio::test]
+    async fn env_policy_core_carries_the_documented_floor() {
+        let dir = std::env::temp_dir().join(format!("ka-bash-env-core-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ctx = ctx_for(&dir);
+        ctx.shell_env.mode = crate::config::ShellEnvMode::Core;
+        ctx.shell_env
+            .set
+            .insert("KA_PERM_PROBE".into(), "via-set".into());
+        assert_ne!(
+            probe(&ctx, "\"[${PATH:-}]\"").await,
+            "[]",
+            "PATH inherited under core"
+        );
+        assert_eq!(probe(&ctx, "\"[$KA_PERM_PROBE]\"").await, "[via-set]");
+        assert_eq!(
+            child_env(&ctx, "CARGO_PKG_NAME").await,
+            None,
+            "non-core vars stay out"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `env_keep` passes an extra parent var through `core`.
+    #[tokio::test]
+    async fn env_policy_core_keep_passes_extra_vars() {
+        let dir = std::env::temp_dir().join(format!("ka-bash-env-keep-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ctx = ctx_for(&dir);
+        ctx.shell_env.mode = crate::config::ShellEnvMode::Core;
+        ctx.shell_env.keep.push("CARGO_PKG_NAME".into());
+        assert_eq!(
+            child_env(&ctx, "CARGO_PKG_NAME").await.as_deref(),
+            Some("ka-engine"),
+            "kept var present"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

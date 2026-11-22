@@ -279,6 +279,9 @@ pub struct HandContext {
     pub web_allow_private: bool,
     /// Sandbox policy for bash children ([sandbox]).
     pub sandbox: ka_sandbox::Policy,
+    /// Shell environment policy for spawned children ([shell]; bash
+    /// hand + monitor spawns).
+    pub shell_env: crate::config::ShellEnvPolicy,
 }
 
 /// The read ledger: files the model has read, with their stamps. Edits

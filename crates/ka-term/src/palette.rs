@@ -101,6 +101,7 @@ pub fn mode_color(mode: Mode) -> Color {
         Mode::AcceptEdits => TOOL,
         Mode::Allow => USER,
         Mode::Readonly => ACCENT,
+        Mode::DontAsk => ERR,
     }
 }
 

@@ -75,15 +75,19 @@ impl MonitorTable {
     }
 
     /// Spawn `cmd` under `sh -c` with combined output captured by
-    /// reader threads; returns (id, pid).
-    pub fn spawn(&self, cmd: &str) -> Result<(String, u32), String> {
-        let mut child = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(cmd)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("monitor spawn: {e}"))?;
+    /// reader threads; returns (id, pid). The caller's [shell] env
+    /// policy applies (bash hand parity).
+    pub fn spawn_with_env(
+        &self,
+        cmd: &str,
+        env: &crate::config::ShellEnvPolicy,
+    ) -> Result<(String, u32), String> {
+        let mut command = std::process::Command::new("sh");
+        command.arg("-c").arg(cmd);
+        command.stdout(std::process::Stdio::piped());
+        command.stderr(std::process::Stdio::piped());
+        env.apply_to_std(&mut command);
+        let mut child = command.spawn().map_err(|e| format!("monitor spawn: {e}"))?;
         let pid = child.id();
         let stdout = child.stdout.take().ok_or("monitor spawn: no stdout")?;
         let stderr = child.stderr.take().ok_or("monitor spawn: no stderr")?;
@@ -325,7 +329,7 @@ impl Hand for MonitorHand {
     fn execute<'a>(
         &'a self,
         args: &'a Value,
-        _ctx: &'a HandContext,
+        ctx: &'a HandContext,
     ) -> std::pin::Pin<Box<dyn Future<Output = ToolOutput> + Send + 'a>> {
         Box::pin(async move {
             match args
@@ -337,7 +341,7 @@ impl Hand for MonitorHand {
                     let Some(cmd) = args.get("command").and_then(Value::as_str) else {
                         return ToolOutput::err("monitor spawn: missing required 'command'");
                     };
-                    match self.table.spawn(cmd) {
+                    match self.table.spawn_with_env(cmd, &ctx.shell_env) {
                         Ok((id, pid)) => ToolOutput::ok(format!(
                             "monitor {id} started (pid {pid}): `{cmd}` — read it with \
                              monitor {{\"action\": \"read\", \"id\": \"{id}\"}}"
@@ -409,6 +413,7 @@ mod tests {
             max_image_mb: 5,
             web_allow_private: false,
             sandbox: ka_sandbox::Policy::Off,
+            shell_env: Default::default(),
         }
     }
 
@@ -491,7 +496,9 @@ mod tests {
     #[tokio::test]
     async fn read_caps_lines_and_bytes() {
         let table = Arc::new(MonitorTable::new());
-        table.spawn("yes a | head -300").unwrap();
+        table
+            .spawn_with_env("yes a | head -300", &Default::default())
+            .unwrap();
         let id = table.snapshot()[0].0.clone();
         wait_for(|| {
             let snap = table.snapshot();
@@ -502,7 +509,10 @@ mod tests {
         assert!(r.truncated);
         // byte cap bites with one huge line
         let (id2, _) = table
-            .spawn("head -c 40000 /dev/zero | tr '\\0' 'a'")
+            .spawn_with_env(
+                "head -c 40000 /dev/zero | tr '\\0' 'a'",
+                &Default::default(),
+            )
             .unwrap();
         wait_for(|| {
             table
@@ -513,6 +523,41 @@ mod tests {
         let r2 = table.read(&id2, 0).unwrap();
         assert!(r2.text.len() <= READ_BYTE_CAP + 16, "{}", r2.text.len());
         assert!(r2.truncated);
+    }
+
+    /// The [shell] env policy applies to monitor spawns: env_set rides
+    /// through, a stripped mode hides parent vars (bash hand parity).
+    #[tokio::test]
+    async fn spawn_applies_the_shell_env_policy() {
+        let table = Arc::new(MonitorTable::new());
+        let policy = crate::config::ShellEnvPolicy {
+            mode: crate::config::ShellEnvMode::None,
+            keep: Vec::new(),
+            set: [("KA_PERM_PROBE".to_string(), "mon-set".to_string())]
+                .into_iter()
+                .collect(),
+        };
+        table
+            .spawn_with_env("echo probe=[$KA_PERM_PROBE] home=[$HOME]", &policy)
+            .unwrap();
+        let id = table.snapshot()[0].0.clone();
+        wait_for(|| {
+            table
+                .read(&id, 0)
+                .map(|r| r.exit_code.is_some())
+                .unwrap_or(false)
+        });
+        let r = table.read(&id, 0).unwrap();
+        assert!(
+            r.text.contains("probe=[mon-set]"),
+            "env_set injects: {}",
+            r.text
+        );
+        assert!(
+            r.text.contains("home=[]"),
+            "none strips the parent env: {}",
+            r.text
+        );
     }
 
     #[tokio::test]
@@ -546,7 +591,9 @@ mod tests {
     #[tokio::test]
     async fn drain_notes_report_new_lines_and_exit_once() {
         let table = Arc::new(MonitorTable::new());
-        table.spawn("printf 'x\\n'").unwrap();
+        table
+            .spawn_with_env("printf 'x\\n'", &Default::default())
+            .unwrap();
         let id = table.snapshot()[0].0.clone();
         wait_for(|| {
             table

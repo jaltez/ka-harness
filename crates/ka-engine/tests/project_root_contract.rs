@@ -35,6 +35,7 @@ fn ctx_for(cwd: &Path) -> HandContext {
         max_image_mb: 0,
         web_allow_private: false,
         sandbox: ka_sandbox::Policy::Off,
+        shell_env: Default::default(),
     }
 }
 

@@ -90,6 +90,12 @@ Handy extras, all strict-TOML like everything else:
 - **Optional fs sandbox** for bash children (bwrap / firejail / landlock), fail-closed; the landlock backend exposes only an enumerated `/dev` surface (`null`, `zero`, `full`, `random`, `urandom`, `shm`) rather than the host `/dev`.
 - **`ka --safe-mode`** — the troubleshooting floor: every customization off, built-ins kept.
 - **`--tools read,edit`** — positive allowlist for the session; `--ignore-rules` runs without `[[rules]]` tables and rule files (hardstops always stay; they are not rules).
+- **Permission profiles** — `[permissions.profiles.<name>]` named rule bundles with one-level `extends`, activated by `[permissions] profile`; profile rules evaluate before `[[rules]]` (more specific first). `ka rules check <command>` dry-runs your rules against a command.
+- **dontAsk mode** — `--mode dontask` denies everything that would ask (hardstops still confirm); for CI and unattended runs.
+- **Prompt policy** — `[permissions] prompt_policy = "deny"` auto-denies reviewable asks for serve/CI sessions.
+- **Auto-review tier** — `[guards] auto_review_tier = "exec+write"` extends the fast-role reviewer to write-tier asks (auto-allow only, every decision noted).
+- **Injection screening** — web results are scanned for known prompt-injection markers and flagged on the transcript; `[guards] injection_check = true` adds a fast-role classifier.
+- **Shell env policy** — `[shell] env = "core"|"none"|"all"`, `env_keep`, `env_set` control exactly what environment bash children see.
 - **Run caps** — `--max-budget-usd` asks to stop past a spend ceiling, `--max-cost`/`--max-time` exit with code 3 when crossed, `--warn-cost` warns on stderr.
 - **Session tools (opt-in)** — `checkpoint` (git snapshot on demand, restorable via `/restore`), `cron` (session-scoped scheduled prompts; dies with the session; off in safe-mode), `monitor` (run a command detached, poll its output with `read`, `kill` it), `tool_search` (keyword search over MCP catalogs and hands), `generate_image` (gated: only registered when `[generate_image]` provider + key are set). Toggle via the features grammar (`cron`/`monitor`/`generate_image`).
 

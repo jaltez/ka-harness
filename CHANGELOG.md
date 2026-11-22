@@ -33,3 +33,6 @@
 
 ### Batch 7 — cheap session tools
 - `checkpoint` hand (git snapshot on demand, restorable) · `cron` hand (session-scoped scheduled prompts; off in safe-mode) · `monitor` hand (detached command with pollable output + kill) · `tool_search` hand (keyword search over MCP catalogs + hands) · `generate_image` hand (gated: provider + key required). Feature toggles: `cron`/`monitor`/`generate_image`. PowerShell tool deferred (Windows not a current target).
+
+### Batch 9 — permissions
+- Named permission profiles with one-level `extends`, activated by `[permissions] profile`; profile rules sort before `[[rules]]` · `ka rules check <command>` dry-runs your rules · `dontAsk` mode denies reviewable asks (hardstops still confirm) · `[permissions] prompt_policy = "deny"` for serve/CI · auto-review extended to write-tier asks (`auto_review_tier = "exec+write"`) · web-result prompt-injection screening (heuristic always, optional fast-role classifier) · `[shell]` env policy (all/core/none + keep/set).

@@ -55,6 +55,14 @@ pub enum Mode {
     /// Research mode: read-only except the plans directory.
     #[serde(alias = "plan")]
     Readonly,
+    /// Deny-first: every action the gate would normally ask about is
+    /// refused outright (`dontAsk mode denies: …`); only read-only work
+    /// and explicitly allowed rules/allowlists run. Hardstops are the
+    /// one exception — they keep asking, because they are never
+    /// auto-decided in any mode. Sessions run unattended without ever
+    /// auto-approving.
+    #[serde(alias = "dont-ask", alias = "dontask")]
+    DontAsk,
 }
 
 /// A feature-toggle selector — the one grammar shared by the
@@ -1046,6 +1054,43 @@ mod tests {
         );
         let evt = Event::ModeChanged {
             mode: Mode::AcceptEdits,
+        };
+        let line = to_line(&evt).unwrap();
+        let back: Event = from_line(&line).unwrap();
+        assert_eq!(
+            serde_json::to_string(&back).unwrap(),
+            serde_json::to_string(&evt).unwrap()
+        );
+    }
+
+    #[test]
+    fn mode_dont_ask_wire_name_aliases_and_roundtrip() {
+        // the wire name is snake_case; both hyphenless and hyphenated
+        // spellings parse back (config + CLI friendliness)
+        for spelling in ["dont_ask", "dont-ask", "dontask"] {
+            let line = format!(r#"{{"type":"set_mode","mode":"{spelling}"}}"#);
+            let cmd: Command = from_line(&line).unwrap();
+            match cmd {
+                Command::SetMode {
+                    mode: Mode::DontAsk,
+                } => {}
+                other => panic!("spelling {spelling:?} must decode to DontAsk, got {other:?}"),
+            }
+        }
+        // serialization is the canonical snake_case name; a recorded
+        // strand line must round-trip byte-stable
+        let cmd = Command::SetMode {
+            mode: Mode::DontAsk,
+        };
+        let line = to_line(&cmd).unwrap();
+        assert!(line.contains("\"dont_ask\""), "wire name: {line}");
+        let back: Command = from_line(&line).unwrap();
+        assert_eq!(
+            serde_json::to_string(&back).unwrap(),
+            serde_json::to_string(&cmd).unwrap()
+        );
+        let evt = Event::ModeChanged {
+            mode: Mode::DontAsk,
         };
         let line = to_line(&evt).unwrap();
         let back: Event = from_line(&line).unwrap();

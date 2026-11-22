@@ -630,7 +630,11 @@ async fn run(
     };
     let mode = config.effective_mode();
     let max_steps = config.effective_max_steps();
-    let rules = config.rules.clone();
+    // profiles activate ahead of [[rules]] (PERM-01/06): the gate list
+    // is the resolved effective order, and `ka rules check` uses the
+    // same fn
+    let rules = config.effective_rules();
+    let prompt_policy = config.effective_prompt_policy();
     let allowed_tools = config.permissions.allow.clone();
     let hooks = if crate::conventions::bare_mode() {
         Vec::new()
@@ -682,15 +686,25 @@ async fn run(
     voice.set_fallbacks(config.fallback.models.clone());
     voice.set_max_image_mb(config.effective_max_image_mb());
     voice.set_context_promote(config.effective_context_promote());
+    voice.set_shell_env(config.effective_shell_env());
     let sandbox_policy = ka_sandbox::policy_from_config(&config.sandbox.to_policy_config(), &cwd)?;
     voice.set_sandbox(sandbox_policy);
+    // [permissions] prompt_policy: reviewable asks pose or are refused
+    // (PERM-07; a config-authored posture, active in safe mode too)
+    voice.set_prompt_policy(prompt_policy);
     // [guards] auto_review: the fast-role reviewer pre-screens reviewable
-    // exec asks (opt-in; inert in safe mode — hooks-class customization)
+    // asks (opt-in; inert in safe mode — hooks-class customization)
     let auto_review = config.guards.auto_review.unwrap_or(false);
     voice.set_auto_review(
         auto_review && !crate::conventions::bare_mode(),
         roles.fast.clone(),
+        config.guards.auto_review_tier.unwrap_or_default(),
     );
+    // [guards] injection_check: the fast-role classifier's verdict rides
+    // heuristic-flagged web results (PERM-08b; the heuristic itself is
+    // always on; the classifier is hooks-class customization → inert in
+    // safe mode, and degrades to heuristic-only without a fast role)
+    voice.set_injection_check(config.guards.injection_check.unwrap_or(false));
     // safe mode: [lsp] spawns user-configured executables — same risk
     // class as hooks/MCP, so the diagnostics tier is inert there too.
     // The manager is always constructed (cheap, inert until started);

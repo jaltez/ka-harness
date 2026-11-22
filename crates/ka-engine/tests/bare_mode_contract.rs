@@ -213,6 +213,7 @@ async fn safe_mode_never_arms_cron() {
         max_image_mb: 5,
         web_allow_private: false,
         sandbox: ka_sandbox::Policy::Off,
+        shell_env: Default::default(),
     };
     conventions::set_bare_mode(true);
     let out = hand
@@ -317,6 +318,196 @@ async fn safe_mode_never_arms_the_loop() {
         }
     }
     assert!(!fired, "loop fired despite safe mode");
+    conventions::set_bare_mode(false);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------- Lote 9 posture
+
+/// A speaker that pops one scripted tool call per tool-bearing request
+/// and answers tool-less (reviewer) probes from `verdict` — the same
+/// contract as feature_contracts' ReviewSpeaker, local to this binary.
+struct BareReviewSpeaker {
+    calls: parking_lot::Mutex<std::collections::VecDeque<(&'static str, serde_json::Value)>>,
+    verdict: &'static str,
+}
+
+impl ka_dialect::speaker::Speaker for BareReviewSpeaker {
+    fn speak<'a>(
+        &'a self,
+        req: ka_dialect::speaker::SpeakRequest,
+        out: tokio::sync::mpsc::Sender<ka_dialect::speaker::StreamEvent>,
+    ) -> ka_dialect::speaker::SpeakFuture<'a> {
+        Box::pin(async move {
+            use ka_dialect::speaker::{StreamEvent, ToolCall};
+            use ka_protocol::Stop;
+            if req.tools.is_empty() {
+                out.send(StreamEvent::Text(self.verdict.into())).await.ok();
+            } else {
+                let next = self.calls.lock().pop_front();
+                if let Some((tool, args)) = next {
+                    out.send(StreamEvent::Call(ToolCall {
+                        id: "c1".into(),
+                        tool: tool.into(),
+                        arguments: args,
+                    }))
+                    .await
+                    .ok();
+                } else {
+                    out.send(StreamEvent::Text("done".into())).await.ok();
+                }
+            }
+            out.send(StreamEvent::Finished {
+                stop: Stop::Done,
+                usage: ka_protocol::Usage {
+                    input: 1,
+                    output: 1,
+                    ..Default::default()
+                },
+            })
+            .await
+            .ok();
+        })
+    }
+}
+
+/// Drive one turn with a single scripted call (asks answered 0=allow /
+/// 2=deny; None leaves them standing).
+async fn run_bare_turn(
+    voice: &mut ka_engine::voice::Voice,
+    prompt: &str,
+    answer: Option<usize>,
+) -> Vec<ka_protocol::Event> {
+    use std::collections::VecDeque;
+    let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<ka_protocol::Command>(16);
+    let (evt_tx, mut evt_rx) = tokio::sync::mpsc::channel::<ka_protocol::Event>(256);
+    let mut steers = Vec::new();
+    let mut queue = VecDeque::new();
+    let mut guards = ka_engine::voice::GuardRuntime::default();
+    let fut = voice.turn(
+        "test/m",
+        prompt.to_string(),
+        &mut cmd_rx,
+        &evt_tx,
+        &mut steers,
+        &mut queue,
+        &mut guards,
+        None,
+        Vec::new(),
+    );
+    tokio::pin!(fut);
+    let mut events = Vec::new();
+    loop {
+        tokio::select! {
+            biased;
+            evt = evt_rx.recv() => match evt {
+                Some(e) => {
+                    if let ka_protocol::Event::Ask { id, .. } = &e {
+                        if let Some(choice) = answer {
+                            cmd_tx
+                                .send(ka_protocol::Command::Answer {
+                                    question: id.clone(),
+                                    choice,
+                                })
+                                .await
+                                .ok();
+                        }
+                    }
+                    events.push(e);
+                }
+                None => break,
+            },
+            _ = &mut fut => {
+                while let Ok(e) = evt_rx.try_recv() {
+                    events.push(e);
+                }
+                break;
+            }
+        }
+    }
+    events
+}
+
+fn bare_catalog() -> ka_dialect::Catalog {
+    ka_dialect::Catalog::parse(
+        "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000000\n",
+    )
+    .unwrap()
+}
+
+/// Lote 9: the new permission features keep the bare-mode split — the
+/// pure gate posture (`[permissions] prompt_policy`, rules-class
+/// config) stays enforced, while the LLM tiers (`[guards]
+/// auto_review`, the injection classifier) stay dark: an ask armed
+/// with a confident reviewer still reaches the human, with no
+/// auto_review note.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn safe_mode_keeps_llm_guards_dark_and_gate_posture_on() {
+    use ka_engine::config::{AutoReviewTier, PromptPolicy};
+    use ka_protocol::Event;
+
+    let _guard = FLAG_LOCK.lock();
+    let dir = std::env::temp_dir().join(format!("ka-bare-perms-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    conventions::set_bare_mode(true);
+
+    // prompt_policy deny refuses the reviewable exec ask in safe mode
+    let mut voice =
+        ka_engine::voice::Voice::new(bare_catalog(), dir.clone(), ka_protocol::Mode::Ask, 5)
+            .with_speaker(
+                ka_dialect::Wire::OpenaiChat,
+                std::sync::Arc::new(BareReviewSpeaker {
+                    calls: parking_lot::Mutex::new(std::collections::VecDeque::from([(
+                        "bash",
+                        serde_json::json!({"command": "touch bare.txt"}),
+                    )])),
+                    verdict: "allow",
+                }),
+            );
+    voice.set_prompt_policy(PromptPolicy::Deny);
+    let events = run_bare_turn(&mut voice, "build", None).await;
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::CallOutput { is_error: true, .. })),
+        "prompt policy denies in safe mode too: {events:?}"
+    );
+    assert!(!dir.join("bare.txt").exists());
+    drop(voice);
+
+    // auto_review never consults the reviewer in safe mode: the ask
+    // reaches the human (answered allow here), no auto_review note
+    let marker = dir.join("human-bare.txt");
+    let mut voice =
+        ka_engine::voice::Voice::new(bare_catalog(), dir.clone(), ka_protocol::Mode::Ask, 5)
+            .with_speaker(
+                ka_dialect::Wire::OpenaiChat,
+                std::sync::Arc::new(BareReviewSpeaker {
+                    calls: parking_lot::Mutex::new(std::collections::VecDeque::from([(
+                        "bash",
+                        serde_json::json!({"command": format!("touch {}", marker.display())}),
+                    )])),
+                    verdict: "allow",
+                }),
+            );
+    voice.set_auto_review(true, Some("test/m".to_string()), AutoReviewTier::ExecWrite);
+    voice.set_injection_check(true);
+    let events = run_bare_turn(&mut voice, "build", Some(0)).await;
+    let asked = events.iter().any(|e| matches!(e, Event::Ask { .. }));
+    assert!(
+        asked,
+        "bare mode never lets the reviewer decide: {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, Event::Note { message, .. }
+            if message.contains("auto_review"))),
+        "no reviewer notes in safe mode: {events:?}"
+    );
+    assert!(marker.exists(), "the human's allow runs the command");
     conventions::set_bare_mode(false);
     let _ = std::fs::remove_dir_all(&dir);
 }

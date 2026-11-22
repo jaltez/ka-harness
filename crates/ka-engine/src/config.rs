@@ -107,6 +107,53 @@ pub enum Verdict {
     Deny,
 }
 
+/// Ask-vs-deny policy for reviewable permission asks
+/// (`[permissions] prompt_policy`). The default asks; `deny` refuses
+/// every reviewable ask outright (headless serve/CI runs stay
+/// unattended without `--dangerously`). Hardstops, protected paths and
+/// rule-authored asks are NOT reviewable — they keep their own course.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum PromptPolicy {
+    /// Pose reviewable asks to the surface (the default).
+    #[default]
+    Ask,
+    /// Deny every reviewable ask (`prompt policy denies: …`).
+    Deny,
+}
+
+/// Which clearance tiers the `[guards] auto_review` fast-role reviewer
+/// pre-screens (`[guards] auto_review_tier`).
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum AutoReviewTier {
+    /// Only exec-tier asks (the default).
+    #[default]
+    Exec,
+    /// Exec-tier asks plus reviewable write-tier asks.
+    #[serde(rename = "exec+write")]
+    ExecWrite,
+}
+
+/// One named permission profile (`[permissions.profiles.<name>]`):
+/// a reusable rule set a `[permissions] profile = "<name>"` activation
+/// puts ahead of the global `[[rules]]`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct PermissionProfile {
+    /// Rules of this profile (same shape as `[[rules]]`).
+    pub rules: Vec<Rule>,
+    /// Inherit another profile's rules (resolved through arbitrary
+    /// chains at activation; a cycle or unknown name is a config
+    /// error). The extending profile's own rules sort FIRST — a child
+    /// overrides its parent under first-match-wins.
+    pub extends: Option<String>,
+}
+
 /// Persistent tool allowlist (`[permissions] allow = [...]` in a ka.toml
 /// layer). Listed tools skip the permission ask for the rest of the
 /// session; picking "always" on an ask appends here (project layer).
@@ -115,6 +162,15 @@ pub enum Verdict {
 pub struct Permissions {
     /// Tool names auto-allowed without asking.
     pub allow: Vec<String>,
+    /// Activate a named profile from `profiles` (None = no profile).
+    /// Unknown names are a config error at parse time.
+    pub profile: Option<String>,
+    /// Named rule sets (`[permissions.profiles.<name>]`). The active
+    /// profile's rules evaluate BEFORE `[[rules]]` (more specific
+    /// first, CFG-03-coherent).
+    pub profiles: std::collections::BTreeMap<String, PermissionProfile>,
+    /// Ask-vs-deny policy for reviewable asks (default ask).
+    pub prompt_policy: Option<PromptPolicy>,
 }
 
 /// Spend/context guard thresholds.
@@ -133,6 +189,126 @@ pub struct Guards {
     /// (anything short of confident falls through to you) and every
     /// auto-allow surfaces as a transcript note. Inert in --safe-mode.
     pub auto_review: Option<bool>,
+    /// Which tiers auto_review pre-screens: `"exec"` (default) or
+    /// `"exec+write"` (reviewable write-tier asks — the plain
+    /// "modify files?" asks — also pass the reviewer, same
+    /// auto-allow-only contract).
+    pub auto_review_tier: Option<AutoReviewTier>,
+    /// Opt-in second opinion on flagged web results (default false):
+    /// when true, the `fast`-role model classifies every web result the
+    /// always-on deterministic heuristic flagged and its verdict rides
+    /// the warning. The heuristic itself is always on; this only arms
+    /// the classifier. Inert in --safe-mode.
+    pub injection_check: Option<bool>,
+}
+
+/// Shell environment policy ([shell]): what environment bash (and
+/// monitor-spawned) children inherit. Default `all` — today's
+/// behavior, the full parent environment.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct Shell {
+    /// `"all"` (default: inherit everything), `"core"` (only the
+    /// core shell vars: PATH/HOME/SHELL/TERM/TMPDIR/USER/LOGNAME/LANG)
+    /// or `"none"` (empty environment).
+    pub env: Option<ShellEnvMode>,
+    /// Extra vars to pass through under `"core"`/`"none"` (names, not
+    /// values — the parent's value for each name is inherited). Under
+    /// `"all"` this is a no-op.
+    pub env_keep: Vec<String>,
+    /// Vars injected into every child regardless of mode, overriding
+    /// inherited values (`env_set = { CARGO_TERM_COLOR = "always" }`).
+    pub env_set: std::collections::BTreeMap<String, String>,
+}
+
+/// `[shell] env` values.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum ShellEnvMode {
+    /// The child inherits the full parent environment (the default).
+    #[default]
+    All,
+    /// Only the core shell vars (plus `env_keep`/`env_set`).
+    Core,
+    /// An empty environment (plus `env_keep`/`env_set`).
+    None,
+}
+
+/// The vars a `"core"` environment always carries.
+pub const CORE_ENV_VARS: &[&str] = &[
+    "PATH", "HOME", "SHELL", "TERM", "TMPDIR", "USER", "LOGNAME", "LANG",
+];
+
+/// A resolved [shell] environment policy, ready to apply to child
+/// processes (bash hand, monitor spawns).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ShellEnvPolicy {
+    /// Inheritance mode.
+    pub mode: ShellEnvMode,
+    /// Extra passthrough var names (`env_keep`).
+    pub keep: Vec<String>,
+    /// Injected vars (`env_set`), applied last so they win.
+    pub set: std::collections::BTreeMap<String, String>,
+}
+
+impl ShellEnvPolicy {
+    /// Apply to a tokio child command (bash hand).
+    pub fn apply_to(&self, cmd: &mut tokio::process::Command) {
+        match self.mode {
+            ShellEnvMode::All => {}
+            ShellEnvMode::Core => {
+                cmd.env_clear();
+                for name in CORE_ENV_VARS {
+                    if let Some(v) = std::env::var_os(name) {
+                        cmd.env(name, v);
+                    }
+                }
+            }
+            ShellEnvMode::None => {
+                cmd.env_clear();
+            }
+        }
+        if self.mode != ShellEnvMode::All {
+            for name in &self.keep {
+                if let Some(v) = std::env::var_os(name) {
+                    cmd.env(name, v);
+                }
+            }
+        }
+        for (k, v) in &self.set {
+            cmd.env(k, v);
+        }
+    }
+
+    /// Apply to a std child command (monitor spawns).
+    pub fn apply_to_std(&self, cmd: &mut std::process::Command) {
+        match self.mode {
+            ShellEnvMode::All => {}
+            ShellEnvMode::Core => {
+                cmd.env_clear();
+                for name in CORE_ENV_VARS {
+                    if let Some(v) = std::env::var_os(name) {
+                        cmd.env(name, v);
+                    }
+                }
+            }
+            ShellEnvMode::None => {
+                cmd.env_clear();
+            }
+        }
+        if self.mode != ShellEnvMode::All {
+            for name in &self.keep {
+                if let Some(v) = std::env::var_os(name) {
+                    cmd.env(name, v);
+                }
+            }
+        }
+        for (k, v) in &self.set {
+            cmd.env(k, v);
+        }
+    }
 }
 
 /// Git automation settings.
@@ -618,9 +794,11 @@ pub struct Config {
     pub model: Option<String>,
     /// Default reasoning effort.
     pub effort: Option<Effort>,
-    /// Permission mode: `ask` | `accept_edits` | `allow` | `readonly`
-    /// (defaults to allow when absent everywhere; the pre-v0.5 names
-    /// `guarded`/`free`/`plan` still parse as aliases).
+    /// Permission mode: `ask` | `accept_edits` | `allow` | `readonly` |
+    /// `dont_ask` (defaults to allow when absent everywhere; the
+    /// pre-v0.5 names `guarded`/`free`/`plan` still parse as aliases).
+    /// `dont_ask` refuses every ask-class action instead of prompting
+    /// (hardstops keep asking).
     pub mode: Option<Mode>,
     /// Role mappings.
     pub roles: Roles,
@@ -679,6 +857,9 @@ pub struct Config {
     /// Per-tool settings ([tools]).
     #[serde(default)]
     pub tools: Tools,
+    /// Shell environment policy ([shell]).
+    #[serde(default)]
+    pub shell: Shell,
     /// Git automation ([git]).
     #[serde(default)]
     pub git: Git,
@@ -757,6 +938,51 @@ impl Config {
                 }
             }
         }
+        // [permissions] profile graph: unknown extends names and
+        // cycles are config errors (strict-TOML philosophy extends to
+        // the profile graph, not just the keys), active or not; the
+        // activation name itself must exist
+        for (name, profile) in &self.permissions.profiles {
+            if let Some(parent) = &profile.extends {
+                if !self.permissions.profiles.contains_key(parent) {
+                    return Err(format!(
+                        "[permissions] profiles.{name}: extends unknown profile {parent:?}"
+                    ));
+                }
+            }
+        }
+        for name in self.permissions.profiles.keys() {
+            let mut visited = vec![name.clone()];
+            let mut cursor = name.clone();
+            while let Some(parent) = self
+                .permissions
+                .profiles
+                .get(&cursor)
+                .and_then(|p| p.extends.clone())
+            {
+                if visited.contains(&parent) {
+                    return Err(format!(
+                        "[permissions] profiles: extends cycle {} -> {parent}",
+                        visited.join(" -> ")
+                    ));
+                }
+                visited.push(parent.clone());
+                cursor = parent;
+            }
+        }
+        if let Some(active) = &self.permissions.profile {
+            if !self.permissions.profiles.contains_key(active) {
+                return Err(format!(
+                    "[permissions] profile: unknown profile {active:?} (defined: {})",
+                    self.permissions
+                        .profiles
+                        .keys()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -793,6 +1019,20 @@ impl Config {
         }
         if !other.permissions.allow.is_empty() {
             Self::merge_dedupe(&mut self.permissions.allow, &other.permissions.allow);
+        }
+        if other.permissions.profile.is_some() {
+            self.permissions.profile = other.permissions.profile;
+        }
+        if !other.permissions.profiles.is_empty() {
+            // union by name; the upper layer wins a name collision
+            let mut merged = other.permissions.profiles;
+            for (name, profile) in std::mem::take(&mut self.permissions.profiles) {
+                merged.entry(name).or_insert(profile);
+            }
+            self.permissions.profiles = merged;
+        }
+        if other.permissions.prompt_policy.is_some() {
+            self.permissions.prompt_policy = other.permissions.prompt_policy;
         }
         if other.guards.context_pct.is_some() {
             self.guards.context_pct = other.guards.context_pct;
@@ -875,6 +1115,12 @@ impl Config {
         if other.guards.auto_review.is_some() {
             self.guards.auto_review = other.guards.auto_review;
         }
+        if other.guards.auto_review_tier.is_some() {
+            self.guards.auto_review_tier = other.guards.auto_review_tier;
+        }
+        if other.guards.injection_check.is_some() {
+            self.guards.injection_check = other.guards.injection_check;
+        }
         if other.tui.bell.is_some() {
             self.tui.bell = other.tui.bell;
         }
@@ -889,6 +1135,19 @@ impl Config {
         }
         if other.tools.mcp.discovery.is_some() {
             self.tools.mcp.discovery = other.tools.mcp.discovery;
+        }
+        if other.shell.env.is_some() {
+            self.shell.env = other.shell.env;
+        }
+        if !other.shell.env_keep.is_empty() {
+            Self::merge_dedupe(&mut self.shell.env_keep, &other.shell.env_keep);
+        }
+        if !other.shell.env_set.is_empty() {
+            let mut merged = other.shell.env_set;
+            for (k, v) in std::mem::take(&mut self.shell.env_set) {
+                merged.entry(k).or_insert(v);
+            }
+            self.shell.env_set = merged;
         }
         if other.verify.test.is_some() {
             self.verify.test = other.verify.test;
@@ -1076,6 +1335,47 @@ impl Config {
         self.mode.unwrap_or(Mode::Allow)
     }
 
+    /// Effective ask-vs-deny policy for reviewable asks (default ask).
+    pub fn effective_prompt_policy(&self) -> PromptPolicy {
+        self.permissions.prompt_policy.unwrap_or_default()
+    }
+
+    /// The gate-order rule list: the active profile's rules (resolved
+    /// through its `extends` chain, own rules first) followed by the
+    /// global `[[rules]]`. Profiles are more specific than global
+    /// rules, so they sort ahead (first-match-wins). Callers without a
+    /// parsed-and-validated config (the engine always validates) get a
+    /// cycle-safe best effort: a cycle simply stops inheritance.
+    pub fn effective_rules(&self) -> Vec<Rule> {
+        let mut rules = Vec::new();
+        if let Some(active) = &self.permissions.profile {
+            let mut visited = vec![active.clone()];
+            let mut cursor = active.clone();
+            while let Some(profile) = self.permissions.profiles.get(&cursor) {
+                rules.extend(profile.rules.iter().cloned());
+                let Some(parent) = profile.extends.clone() else {
+                    break;
+                };
+                if visited.contains(&parent) {
+                    break;
+                }
+                visited.push(parent.clone());
+                cursor = parent;
+            }
+        }
+        rules.extend(self.rules.iter().cloned());
+        rules
+    }
+
+    /// Effective [shell] environment policy (default: inherit all).
+    pub fn effective_shell_env(&self) -> ShellEnvPolicy {
+        ShellEnvPolicy {
+            mode: self.shell.env.unwrap_or_default(),
+            keep: self.shell.env_keep.clone(),
+            set: self.shell.env_set.clone(),
+        }
+    }
+
     /// Effective auto-poke rounds per user prompt (default 3; 0
     /// disables — the documented opt-out must survive layering).
     pub fn effective_pokes_max(&self) -> u32 {
@@ -1110,6 +1410,24 @@ impl Config {
         let schema = schemars::schema_for!(Config);
         serde_json::to_string_pretty(&schema)
     }
+}
+
+/// First matching rule's verdict for a call — the exact matching the
+/// gate uses (shipped semantics): the FIRST rule naming the tool is
+/// decisive; when its pattern doesn't match the call's primary
+/// argument, NO rule applies (a pattern-less rule always matches).
+/// Web tools match the URL host with domain semantics. Public so
+/// `ka rules check <command>` can pre-flight a call against the same
+/// list the engine will evaluate.
+pub fn evaluate_rules(rules: &[Rule], tool: &str, arg: &str) -> Option<Verdict> {
+    rules
+        .iter()
+        .find(|r| r.tool == tool)
+        .filter(|r| match &r.pattern {
+            None => true,
+            Some(pat) => crate::voice::rule_pattern_matches(pat, tool, arg),
+        })
+        .map(|r| r.verdict)
 }
 
 /// Does a [[model_pins]] glob match the session cwd? Full-path match,
@@ -2215,6 +2533,238 @@ mod tests {
         );
         assert!(dir.join("custom.schema.json").is_file());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ------------------------------------------------ Lote 9: permissions
+
+    /// PERM-01: `[permissions.profiles.<name>]` parse, `extends`
+    /// resolution (own rules first), activation error surface, and the
+    /// exact `effective_rules` gate order (profile ahead of [[rules]]).
+    #[test]
+    fn permission_profiles_parse_extend_activate_and_order() {
+        let c = Config::parse_layer(
+            r#"
+[[rules]]
+tool = "bash"
+pattern = "cargo *"
+verdict = "allow"
+
+[permissions]
+profile = "strict"
+
+[permissions.profiles.strict]
+extends = "base"
+rules = [
+  { tool = "bash", pattern = "rm -rf *", verdict = "deny" },
+]
+
+[permissions.profiles.base]
+rules = [
+  { tool = "bash", pattern = "git *", verdict = "ask" },
+]
+"#,
+            "user",
+        )
+        .unwrap();
+        assert_eq!(c.permissions.profile.as_deref(), Some("strict"));
+        // gate order: strict's own rules, then base's (extends, one
+        // chain), then the global [[rules]]
+        let rules = c.effective_rules();
+        assert_eq!(rules.len(), 3, "{rules:?}");
+        assert_eq!(rules[0].pattern.as_deref(), Some("rm -rf *"));
+        assert_eq!(rules[1].pattern.as_deref(), Some("git *"));
+        assert_eq!(rules[2].pattern.as_deref(), Some("cargo *"));
+        // the same matching the gate uses, driven through the pub fn
+        // (shipped semantics: the first rule naming the tool decides)
+        assert_eq!(
+            evaluate_rules(&rules, "bash", "rm -rf /tmp/x"),
+            Some(Verdict::Deny),
+            "profile rules outrank the global [[rules]]"
+        );
+        assert_eq!(evaluate_rules(&rules, "bash", "make all"), None);
+        assert_eq!(
+            evaluate_rules(&rules[1..], "bash", "git status"),
+            Some(Verdict::Ask),
+            "the inherited parent rule applies when first"
+        );
+
+        // no profile: exactly the global rules
+        let plain =
+            Config::parse_layer("[[rules]]\ntool = \"write\"\nverdict = \"deny\"\n", "u").unwrap();
+        assert_eq!(plain.effective_rules().len(), 1);
+
+        // unknown activation name is a config error naming the profile
+        let err = Config::parse_layer("[permissions]\nprofile = \"ghost\"\n", "u")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ghost"), "{err}");
+
+        // unknown extends is a config error naming the parent
+        let err = Config::parse_layer(
+            "[permissions]\nprofile = \"a\"\n\n[permissions.profiles.a]\nextends = \"ghost\"\n",
+            "u",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("ghost"), "{err}");
+
+        // a cycle is a config error
+        let err = Config::parse_layer(
+            "[permissions]\nprofile = \"a\"\n\n[permissions.profiles.a]\nextends = \"b\"\n\n[permissions.profiles.b]\nextends = \"a\"\n",
+            "u",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("cycle"), "{err}");
+
+        // unknown keys under a profile hard-error (strict shape)
+        let err = Config::parse_layer("[permissions.profiles.a]\npattern = \"x\"\n", "u")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("pattern") || err.contains("unknown"), "{err}");
+
+        // profiles merge across layers (union by name, upper wins)
+        let mut merged = c;
+        merged.overlay(
+            Config::parse_layer(
+                "[permissions.profiles.strict]\nrules = [{ tool = \"write\", verdict = \"ask\" }]\n\n[permissions.profiles.extra]\nrules = [{ tool = \"read\", verdict = \"deny\" }]\n",
+                "project",
+            )
+            .unwrap(),
+        );
+        assert_eq!(merged.permissions.profiles.len(), 3, "union by name");
+        assert_eq!(
+            merged.permissions.profiles["strict"].rules.len(),
+            1,
+            "upper layer replaces the profile wholesale"
+        );
+        assert_eq!(
+            merged.effective_rules().first().map(|r| r.tool.clone()),
+            Some("write".into()),
+            "activated profile picks up the upper layer's rules"
+        );
+    }
+
+    /// PERM-06: `evaluate_rules` is the gate's matcher — shipped
+    /// semantics: the FIRST rule naming the tool is decisive, and when
+    /// its pattern doesn't match, no rule applies at all (a
+    /// pattern-less rule always matches). Web tools use host semantics.
+    #[test]
+    fn evaluate_rules_matches_first_and_web_hosts() {
+        let rules = vec![
+            Rule {
+                tool: "web_fetch".into(),
+                pattern: Some("evil.example".into()),
+                verdict: Verdict::Deny,
+            },
+            Rule {
+                tool: "web_fetch".into(),
+                pattern: None,
+                verdict: Verdict::Ask,
+            },
+        ];
+        assert_eq!(
+            evaluate_rules(&rules, "web_fetch", "https://sub.evil.example/x"),
+            Some(Verdict::Deny),
+            "first match wins, subdomain covered"
+        );
+        // first-rule-for-tool semantics: a non-matching pattern on the
+        // first web_fetch rule means NO rule applies (the gate ships
+        // this; `ka rules check` must pre-flight identically)
+        assert_eq!(
+            evaluate_rules(&rules, "web_fetch", "https://docs.rs/x"),
+            None
+        );
+        assert_eq!(evaluate_rules(&rules, "bash", "git status"), None);
+
+        // pattern-less rules match every call of their tool
+        let catch_all = vec![Rule {
+            tool: "bash".into(),
+            pattern: None,
+            verdict: Verdict::Ask,
+        }];
+        assert_eq!(
+            evaluate_rules(&catch_all, "bash", "cargo test"),
+            Some(Verdict::Ask)
+        );
+    }
+
+    /// PERM-05: [shell] env policy parses strictly, defaults to
+    /// inherit-all, overlays across layers, resolves to a policy.
+    #[test]
+    fn shell_env_policy_parses_overlays_and_resolves() {
+        let defaults = Config::default();
+        let policy = defaults.effective_shell_env();
+        assert_eq!(policy.mode, ShellEnvMode::All);
+        assert!(policy.keep.is_empty() && policy.set.is_empty());
+
+        let c = Config::parse_layer(
+            "[shell]\nenv = \"none\"\nenv_keep = [\"CI\"]\nenv_set = { KA_A = \"1\" }\n",
+            "user",
+        )
+        .unwrap();
+        let policy = c.effective_shell_env();
+        assert_eq!(policy.mode, ShellEnvMode::None);
+        assert_eq!(policy.keep, vec!["CI".to_string()]);
+        assert_eq!(policy.set.get("KA_A").map(String::as_str), Some("1"));
+
+        // core mode + upper layer narrows mode, adds keep + set keys
+        let mut merged = c;
+        merged.overlay(
+            Config::parse_layer(
+                "[shell]\nenv = \"core\"\nenv_keep = [\"NO_COLOR\"]\nenv_set = { KA_B = \"2\" }\n",
+                "project",
+            )
+            .unwrap(),
+        );
+        let policy = merged.effective_shell_env();
+        assert_eq!(policy.mode, ShellEnvMode::Core);
+        assert_eq!(policy.keep, vec!["CI".to_string(), "NO_COLOR".to_string()]);
+        assert_eq!(policy.set.len(), 2, "set keys merge across layers");
+
+        // unknown vocabulary stays a hard error
+        assert!(Config::parse_layer("[shell]\nenv = \"some\"\n", "u").is_err());
+        assert!(Config::parse_layer("[shell]\nnonsense = 1\n", "u").is_err());
+    }
+
+    /// PERM-02/07/08: guard + permission vocabulary parses; unknown
+    /// values hard-error through the typed enums.
+    #[test]
+    fn guard_tier_prompt_policy_and_injection_parse() {
+        let c = Config::parse_layer(
+            "[guards]\nauto_review = true\nauto_review_tier = \"exec+write\"\ninjection_check = true\n\n[permissions]\nprompt_policy = \"deny\"\n",
+            "u",
+        )
+        .unwrap();
+        assert_eq!(c.guards.auto_review_tier, Some(AutoReviewTier::ExecWrite));
+        assert_eq!(c.guards.injection_check, Some(true));
+        assert_eq!(
+            c.effective_prompt_policy(),
+            PromptPolicy::Deny,
+            "deny covers serve/CI without --dangerously"
+        );
+        // defaults: exec tier, ask policy, classifier off
+        let d = Config::default();
+        assert_eq!(
+            d.guards.auto_review_tier.unwrap_or_default(),
+            AutoReviewTier::Exec
+        );
+        assert_eq!(d.effective_prompt_policy(), PromptPolicy::Ask);
+        assert_eq!(d.guards.injection_check, None);
+        // upper layer overrides the tier and the policy
+        let mut m = c;
+        m.overlay(
+            Config::parse_layer(
+                "[guards]\nauto_review_tier = \"exec\"\n\n[permissions]\nprompt_policy = \"ask\"\n",
+                "p",
+            )
+            .unwrap(),
+        );
+        assert_eq!(m.guards.auto_review_tier, Some(AutoReviewTier::Exec));
+        assert_eq!(m.effective_prompt_policy(), PromptPolicy::Ask);
+        // unknown values are parse errors (strict vocabulary)
+        assert!(Config::parse_layer("[guards]\nauto_review_tier = \"everything\"\n", "u").is_err());
+        assert!(Config::parse_layer("[permissions]\nprompt_policy = \"silent\"\n", "u").is_err());
     }
 }
 
