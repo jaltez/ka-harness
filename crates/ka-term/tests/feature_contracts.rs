@@ -835,3 +835,160 @@ fn session_picker_pins_names_and_recaps() {
     miss.filter_typed("zzz");
     assert_eq!(miss.pick(), None, "no match leaves only new-session");
 }
+
+/// Batch 5 surface contracts: the input-layer commands shipped by the
+/// TUI loop (intercepted before slash_command, no engine roundtrip)
+/// stay listed in the popup catalog, and the [keybindings] action
+/// table keeps its documented ids and defaults.
+#[test]
+fn input_layer_commands_stay_in_the_catalog() {
+    use ka_term::tui::available_slash_commands;
+    let catalog = available_slash_commands();
+    for cmd in [
+        "/copy",
+        "/theme",
+        "/search",
+        "/changelog",
+        "/queue",
+        "/find",
+        "/focus",
+    ] {
+        assert!(
+            catalog.iter().any(|(n, _)| n == cmd),
+            "input-layer command {cmd} vanished from the catalog"
+        );
+    }
+    let themes = catalog
+        .iter()
+        .find(|(n, _)| n == "/theme")
+        .map(|(_, d)| d.clone())
+        .expect("/theme entry");
+    assert!(
+        themes.contains("default"),
+        "the catalog teaches `default`: {themes}"
+    );
+}
+
+#[test]
+fn keybinding_actions_keep_their_documented_ids_and_defaults() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ka_term::keys::{ACTIONS, Bindings};
+    let ids: Vec<_> = ACTIONS.iter().map(|a| a.id).collect();
+    for id in [
+        "composer.send",
+        "composer.newline",
+        "composer.steer",
+        "session.abort",
+        "session.rewind",
+        "session.quit",
+        "popups.skills",
+        "popups.todos",
+        "popups.info",
+        "composer.external_editor",
+        "mouse.toggle",
+        "theme.picker",
+        "changelog",
+        "queue.open",
+        "copy.picker",
+        "session.search",
+    ] {
+        assert!(ids.contains(&id), "action id {id} vanished: {ids:?}");
+    }
+    // /help renders the effective chords, so the defaults must round-trip
+    let b = Bindings::default();
+    assert_eq!(b.display("popups.skills"), "ctrl+t");
+    assert_eq!(b.display("popups.todos"), "alt+o");
+    assert_eq!(b.display("popups.info"), "alt+i");
+    assert_eq!(b.display("composer.external_editor"), "alt+e");
+    assert_eq!(b.display("mouse.toggle"), "ctrl+m");
+    assert_eq!(b.display("theme.picker"), "ctrl+g");
+    assert_eq!(b.display("changelog"), "alt+c");
+    assert_eq!(b.display("queue.open"), "alt+u");
+    assert_eq!(b.display("copy.picker"), "alt+y");
+    assert_eq!(b.display("session.search"), "alt+s");
+    assert_eq!(b.display("session.rewind"), "esc esc");
+    // no table = today's keyboard, intact
+    assert!(Bindings::resolve(None).is_ok());
+    let send = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+    let newline = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL);
+    assert!(b.matches(&send, "composer.send"));
+    assert!(b.matches(&newline, "composer.newline"));
+}
+
+/// Theme TOML contract: every palette token is settable, glyphs ride
+/// [symbols], unknown keys degrade to notes (never a hard failure),
+/// and applying a theme rebuilds the live tint map the render backend
+/// consults.
+#[test]
+fn theme_files_contract() {
+    use ka_term::theme::{apply, from_toml, tint};
+    use ratatui::style::Color;
+    let theme = from_toml(
+        "contract",
+        "[color]\naccent = \"#102030\"\nbg_panel = 8\n\n[symbols]\nprompt = \">\"\n",
+    )
+    .expect("a well-formed theme parses");
+    assert_eq!(
+        theme.colors.get("accent"),
+        Some(&Color::Rgb(0x10, 0x20, 0x30))
+    );
+    assert_eq!(theme.colors.get("bg_panel"), Some(&Color::Indexed(8)));
+    assert_eq!(theme.symbols.get("prompt").map(String::as_str), Some(">"));
+    assert!(
+        theme.notes.is_empty(),
+        "no invented keys: {:?}",
+        theme.notes
+    );
+
+    apply(Some(&theme));
+    let map = tint().expect("theme active after apply");
+    assert_eq!(
+        map.get(&ka_term::palette::ACCENT),
+        Some(&Color::Rgb(0x10, 0x20, 0x30))
+    );
+    apply(None);
+    assert!(tint().is_none(), "default restores Nocturne");
+}
+
+/// Emoji shortcodes: a small curated table, `:`-led words only, Tab
+/// completion via ka_term::emoji::complete.
+#[test]
+fn emoji_shortcodes_contract() {
+    use ka_term::emoji::{EMOJI, complete};
+    assert!(EMOJI.len() >= 80, "the table is the feature");
+    assert_eq!(complete(":fire"), Some("🔥".to_string()));
+    assert_eq!(complete(":fire:"), Some("🔥".to_string()));
+    assert_eq!(complete(":fir"), Some(":fire".to_string()), "grows first");
+    assert_eq!(complete("hello"), None, "non-: words untouched");
+    assert_eq!(complete(":"), None, "bare colon is too broad");
+}
+
+/// [tui] status_line: the documented ids build the bar; goal/loop
+/// badges survive any custom order.
+#[test]
+fn status_line_segments_contract() {
+    use ka_term::tui::{Meters, status_ids_valid, status_segments};
+    let order: Vec<String> = ["cost", "context", "cache"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    assert!(status_ids_valid(&order).is_ok());
+    assert!(status_ids_valid(&["bogus".to_string()]).is_err());
+
+    let m = Meters {
+        cost: 0.5,
+        context: (42_000, 100_000),
+        cache_hit: Some(0.75),
+        goal: Some(ka_term::tui::GoalState {
+            condition: "done".into(),
+            paused: false,
+            budget_usd: None,
+        }),
+        ..Default::default()
+    };
+    let text: String = status_segments(&m, &order)
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect();
+    assert_eq!(text, "$0.5000 42% cache 75% ◎ goal");
+}

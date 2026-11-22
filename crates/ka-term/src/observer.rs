@@ -350,7 +350,7 @@ fn draw(
             let busy = if state.busy { "busy" } else { "idle" };
             let mut footer = format!(
                 " ◉ {busy} · {} {} attached",
-                crate::icons::AGENTS,
+                crate::icons::agents(),
                 state.attached
             );
             if !state.model.is_empty() {

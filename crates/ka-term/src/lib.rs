@@ -6,12 +6,15 @@ use std::io;
 
 use crossterm::event::{Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
+pub mod emoji;
 pub mod fx;
 pub mod icons;
+pub mod keys;
 pub mod markdown;
 pub mod mermaid;
 pub mod observer;
 pub mod palette;
+pub mod theme;
 pub mod tui;
 
 /// A decoded keypress, surface-agnostic.

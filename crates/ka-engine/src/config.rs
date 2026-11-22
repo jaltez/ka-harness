@@ -314,6 +314,27 @@ pub enum MouseMode {
 pub struct Tui {
     /// Title glyph for the transcript window (default ◆).
     pub header_glyph: Option<String>,
+    /// Theme name: `.ka/themes/<name>.toml` (project, trust-gated) or
+    /// `~/.config/ka/themes/<name>.toml` (user), TOML with `color` and
+    /// optional `symbols` tables over the palette tokens. Unknown = the
+    /// built-in Nocturne palette. `/theme` switches live.
+    pub theme: Option<String>,
+    /// Set the terminal title (tab/window label) to
+    /// `ka · <session title>` and update it as the session state
+    /// changes. None = true; `false` keeps your title untouched.
+    pub title: Option<bool>,
+    /// Status-line segments in draw order. Recognized ids: `model`,
+    /// `mode`, `session`, `effort`, `context`, `cost`, `tokens`,
+    /// `cache`, `toggles`, `update`. None = the built-in order; unknown
+    /// ids are a hard config error.
+    pub status_line: Option<Vec<String>>,
+    /// Which events notify: subset of `turn_finished` | `ask`
+    /// (default: both — exactly today's bell/notify behavior).
+    pub notify_on: Option<Vec<String>>,
+    /// Only notify when the terminal is unfocused (focus reporting via
+    /// CSI u / DECSET 1004, where the terminal supports it). None =
+    /// false (always notify, like today).
+    pub notify_unfocused: Option<bool>,
     /// Ring the terminal bell when a turn finishes or a permission ask
     /// appears (None = true; terminals mute bells by user choice).
     pub bell: Option<bool>,
@@ -622,6 +643,15 @@ pub struct Config {
     /// Prompt assembly ([prompt]).
     #[serde(default)]
     pub prompt: PromptSettings,
+    /// Key remapping ([keybindings]): action id → key chord
+    /// (`\"session.new\" = \"ctrl+n\"` — quote action ids that carry dots,
+    /// TOML dotted-key syntax otherwise applies). Chords are lowercase modifier
+    /// chains (`ctrl`, `alt`, `shift`, `super`) plus a key name
+    /// (`letters`, `f1`…, `enter`, `esc`, `tab`, …) joined by `+`.
+    /// Values are validated at startup: unknown action ids or chords
+    /// are a hard config error.
+    #[serde(default)]
+    pub keybindings: Option<std::collections::BTreeMap<String, String>>,
     /// Strand persistence policy ([history]).
     #[serde(default)]
     pub history: History,
@@ -639,10 +669,47 @@ pub struct Config {
 impl Config {
     /// Parse one strict TOML layer. `origin` names the source in errors.
     pub fn parse_layer(text: &str, origin: &str) -> Result<Self, ConfigError> {
-        toml::from_str(text).map_err(|e| ConfigError::Parse {
+        let layer: Self = toml::from_str(text).map_err(|e| ConfigError::Parse {
             origin: origin.to_string(),
             message: e.to_string(),
-        })
+        })?;
+        layer.validate().map_err(|message| ConfigError::Parse {
+            origin: origin.to_string(),
+            message,
+        })?;
+        Ok(layer)
+    }
+
+    /// Cross-field value validation for keys whose VALUES must be from
+    /// a known set but whose shape is a plain list of strings
+    /// (strict-TOML covers the keys; this covers the vocabulary).
+    fn validate(&self) -> Result<(), String> {
+        const STATUS_SEGMENTS: &[&str] = &[
+            "model", "mode", "session", "effort", "context", "cost", "tokens", "cache", "toggles",
+            "update",
+        ];
+        if let Some(segments) = &self.tui.status_line {
+            for segment in segments {
+                if !STATUS_SEGMENTS.contains(&segment.as_str()) {
+                    return Err(format!(
+                        "[tui] status_line: unknown segment {segment:?} (expected one of: {})",
+                        STATUS_SEGMENTS.join(", ")
+                    ));
+                }
+            }
+        }
+        const NOTIFY_EVENTS: &[&str] = &["turn_finished", "ask"];
+        if let Some(events) = &self.tui.notify_on {
+            for event in events {
+                if !NOTIFY_EVENTS.contains(&event.as_str()) {
+                    return Err(format!(
+                        "[tui] notify_on: unknown event {event:?} (expected one of: {})",
+                        NOTIFY_EVENTS.join(", ")
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Apply `other` on top of `self`: set fields win, unset fields keep.
@@ -799,6 +866,35 @@ impl Config {
         }
         if other.tui.header_glyph.is_some() {
             self.tui.header_glyph = other.tui.header_glyph;
+        }
+        if other.tui.theme.is_some() {
+            self.tui.theme = other.tui.theme;
+        }
+        if other.tui.title.is_some() {
+            self.tui.title = other.tui.title;
+        }
+        if other
+            .tui
+            .status_line
+            .as_ref()
+            .is_some_and(|s| !s.is_empty())
+        {
+            self.tui.status_line = other.tui.status_line;
+        }
+        if other.tui.notify_on.as_ref().is_some_and(|s| !s.is_empty()) {
+            self.tui.notify_on = other.tui.notify_on;
+        }
+        if other.tui.notify_unfocused.is_some() {
+            self.tui.notify_unfocused = other.tui.notify_unfocused;
+        }
+        if other.keybindings.as_ref().is_some_and(|k| !k.is_empty()) {
+            let mut merged = other.keybindings.clone().unwrap_or_default();
+            if let Some(base) = &mut self.keybindings {
+                for (k, v) in base.iter() {
+                    merged.entry(k.clone()).or_insert_with(|| v.clone());
+                }
+            }
+            self.keybindings = Some(merged);
         }
         if !other.features.disable.is_empty() {
             Self::merge_dedupe(&mut self.features.disable, &other.features.disable);
@@ -2008,5 +2104,68 @@ mod tests {
         );
         assert!(dir.join("custom.schema.json").is_file());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod tui_config_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    /// Batch 5: [tui] theme/status_line/title/notify vocabulary is
+    /// strict; [keybindings] merges across layers (upper wins).
+    #[test]
+    fn tui_keys_parse_validate_and_merge() {
+        let c = Config::parse_layer(
+            "[tui]\ntheme = \"solarized\"\ntitle = false\nstatus_line = [\"model\", \"context\", \"cost\"]\nnotify_on = [\"ask\"]\nnotify_unfocused = true\n\n[keybindings]\n\"session.new\" = \"ctrl+n\"\n\"theme.next\" = \"f4\"\n",
+            "user",
+        )
+        .unwrap();
+        assert_eq!(c.tui.theme.as_deref(), Some("solarized"));
+        assert_eq!(c.tui.title, Some(false));
+        assert_eq!(
+            c.tui.status_line,
+            Some(vec!["model".into(), "context".into(), "cost".into()])
+        );
+        assert_eq!(c.tui.notify_on, Some(vec!["ask".into()]));
+        assert_eq!(c.tui.notify_unfocused, Some(true));
+        assert_eq!(
+            c.keybindings.as_ref().map(|k| k.get("session.new")),
+            Some(Some(&"ctrl+n".to_string()))
+        );
+        // unknown vocabulary is a hard error naming the value
+        let err = Config::parse_layer("[tui]\nstatus_line = [\"model\", \"vibes\"]\n", "u")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("vibes"), "{err}");
+        let err = Config::parse_layer("[tui]\nnotify_on = [\"turn_started\"]\n", "u")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("turn_started"), "{err}");
+        // merge: an upper [keybindings] adds/remaps, keeps lower keys
+        let mut base = c;
+        base.overlay(
+            Config::parse_layer(
+                "[keybindings]\n\"session.new\" = \"ctrl+alt+n\"\n\"composer.abort\" = \"f8\"\n",
+                "o",
+            )
+            .unwrap(),
+        );
+        let kb = base.keybindings.as_ref().unwrap();
+        assert_eq!(
+            kb.get("session.new").map(String::as_str),
+            Some("ctrl+alt+n"),
+            "upper remaps"
+        );
+        assert_eq!(
+            kb.get("composer.abort").map(String::as_str),
+            Some("f8"),
+            "upper adds"
+        );
+        assert_eq!(
+            kb.get("theme.next").map(String::as_str),
+            Some("f4"),
+            "lower keys survive"
+        );
     }
 }

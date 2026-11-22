@@ -4,6 +4,7 @@
 
 use std::collections::VecDeque;
 use std::io::Write;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
@@ -1703,7 +1704,7 @@ fn thought_head(
     use unicode_width::UnicodeWidthStr;
     let think = Style::new().fg(crate::palette::THINK);
     let faint = Style::new().fg(crate::palette::FAINT);
-    let mut spans = vec![Span::styled(format!("{} ", crate::icons::THOUGHT), think)];
+    let mut spans = vec![Span::styled(format!("{} ", crate::icons::thought()), think)];
     match shimmer_ms {
         Some(ms) => spans.extend(crate::fx::shimmer(
             "Thinking",
@@ -1992,6 +1993,22 @@ fn wrap_cols(line: &str, room: usize) -> Vec<String> {
     segs
 }
 
+/// The word (non-whitespace run) the cursor sits in or just after:
+/// `(char index of the word's start, the word itself)`. Emoji
+/// completion (Tab on a `:`-led word) works on this.
+fn word_token(text: &str, cursor_chars: usize) -> Option<(usize, String)> {
+    let chars: Vec<char> = text.chars().collect();
+    let cursor = cursor_chars.min(chars.len());
+    let start = (0..cursor)
+        .rev()
+        .find(|&i| chars[i].is_whitespace())
+        .map_or(0, |i| i + 1);
+    if start >= cursor {
+        return None;
+    }
+    Some((start, chars[start..cursor].iter().collect()))
+}
+
 /// Viewport window over `total` rendered rows for `visible` rows given the
 /// scroll anchor (None = pinned to tail). Returns `(start_row, pinned)`;
 /// an anchor at or past the tail re-pins.
@@ -2200,7 +2217,7 @@ fn ask_modal_body(ask: &PendingAsk, width: usize) -> Vec<ratatui::text::Line<'st
             let room = width.saturating_sub(2 + cap.width());
             rows.push(TuiLine::from(vec![
                 Span::styled(
-                    format!("{} ", crate::icons::RAIL),
+                    format!("{} ", crate::icons::rail()),
                     sel_bg.fg(crate::palette::ACCENT),
                 ),
                 Span::styled(cap, sel_bg.fg(crate::palette::FAINT)),
@@ -2620,6 +2637,9 @@ pub fn b64encode(data: impl AsRef<[u8]>) -> String {
 /// encoding): terminals treat megabyte payloads as abuse, and a huge
 /// selection base64'd inline on the UI thread freezes a slow pty.
 const OSC52_MAX_RAW: usize = 64 * 1024;
+
+/// Blocks the /copy picker offers (newest first).
+const COPY_BLOCK_LIMIT: usize = 40;
 
 /// Copy `text` to the clipboard via OSC 52, dropping any write past
 /// [`OSC52_MAX_RAW`]. Returns false (nothing written) when over the
@@ -3154,12 +3174,12 @@ fn inventory_rows(sidebar: &SidebarState, width: usize) -> Vec<ratatui::text::Li
             .collect::<Vec<_>>()
     };
     let mut out = names(
-        crate::icons::STRIP_SKILLS,
+        &crate::icons::strip_skills(),
         "skills",
         &sidebar.inventory.skills,
     );
     out.extend(names(
-        crate::icons::AGENTS,
+        &crate::icons::agents(),
         "agents",
         &sidebar.inventory.agents,
     ));
@@ -3181,8 +3201,8 @@ fn inventory_rows(sidebar: &SidebarState, width: usize) -> Vec<ratatui::text::Li
         out.push(row);
     }
     let headers = [
-        format!("{} skills", crate::icons::STRIP_SKILLS),
-        format!("{} agents", crate::icons::AGENTS),
+        format!("{} skills", crate::icons::strip_skills()),
+        format!("{} agents", crate::icons::agents()),
         format!("{} mcp", crate::icons::tool_icon("mcp.")),
     ];
     if out.iter().all(|l| {
@@ -3298,7 +3318,7 @@ fn info_rows(
     let mut rows = Vec::new();
     match &sidebar.branch {
         Some(b) => rows.push(plain(trunc_cols(
-            &format!("{} {} {b}", sidebar.cwd, crate::icons::BRANCH),
+            &format!("{} {} {b}", sidebar.cwd, crate::icons::branch()),
             width,
         ))),
         None if !sidebar.cwd.is_empty() => {
@@ -3463,9 +3483,38 @@ pub struct NotifySettings {
     pub command: Option<String>,
 }
 
+/// `[tui] notify_on` → (turn_finished?, ask?). Defaults to both (the
+/// pre-config behavior); unknown values are already a hard config
+/// error (ka-engine validates the subset).
+fn notify_events(notify_on: Option<&[String]>) -> (bool, bool) {
+    match notify_on {
+        None => (true, true),
+        Some(events) => (
+            events.iter().any(|e| e == "turn_finished"),
+            events.iter().any(|e| e == "ask"),
+        ),
+    }
+}
+
 /// Fire turn-completion/ask notifications: bell byte first (terminals
-/// mute it by user choice), then the optional command detached.
+/// mute it by user choice), then the optional command detached. Gated
+/// by the startup policy ([tui] notify_on — subset of
+/// `turn_finished`/`ask`) and, with `[tui] notify_unfocused`, by the
+/// terminal's focus state (DECSET 1004; terminals without reporting
+/// stay "unfocused", so they always notify).
 fn fire_notifications(event: &str, stop: &str) {
+    let policy = NOTIFY_POLICY.get().copied().unwrap_or_default();
+    let allowed = match event {
+        "turn_finished" => policy.turn_finished,
+        "permission_ask" | "ask" => policy.ask,
+        _ => true,
+    };
+    if !allowed {
+        return;
+    }
+    if policy.unfocused_only && FOCUSED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     let settings = NOTIFY.get().cloned().unwrap_or_default();
     if settings.bell {
         let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\x07");
@@ -4108,7 +4157,7 @@ fn model_row(m: &ModelInfo, ctx: &str, key: &str) -> String {
     let think = if m.efforts.is_empty() {
         String::new()
     } else {
-        let mut s = format!(" {}", crate::icons::THOUGHT);
+        let mut s = format!(" {}", crate::icons::thought());
         for e in &m.efforts {
             match crate::icons::effort_glyph(e) {
                 Some(g) => s.push_str(g),
@@ -4397,8 +4446,56 @@ pub enum Modal {
         /// Rendered fact rows.
         rows: Vec<ratatui::text::Line<'static>>,
     },
-    /// Help overlay.
-    Help,
+    /// Help overlay (scrollable: the full key + command table exceeds
+    /// one pane).
+    Help {
+        /// Top offset into the rows (None = top).
+        scroll: Option<usize>,
+    },
+    /// Theme picker (/theme, ctrl+g): "default" plus every discovered
+    /// theme; ⏎ applies live (palette rebuild + full repaint).
+    Theme {
+        /// Available theme names (the default palette is selected 0).
+        names: Vec<String>,
+        /// Selected row index (0 = Nocturne default).
+        selected: usize,
+    },
+    /// Copy picker (/copy, alt+y): the transcript's text blocks, newest
+    /// first; ⏎ copies the selection via OSC 52, `w` walks an inline
+    /// save-path prompt and writes the block to a file.
+    CopyPick {
+        /// (role, text) blocks, newest first — `user` or `ka`.
+        blocks: Vec<(&'static str, String)>,
+        /// Selected row index.
+        selected: usize,
+        /// When Some, keys type into the save path instead of navigating.
+        save: Option<String>,
+    },
+    /// Transcript search (/search, alt+s): hits as (row, snippet);
+    /// ⏎ jumps to the selected hit.
+    Search {
+        /// Live query (editable in the modal).
+        query: String,
+        /// Matching rows: (scroll row, snippet).
+        hits: Vec<(usize, String)>,
+        /// Selected hit.
+        selected: usize,
+    },
+    /// Changelog pager (/changelog, alt+c): the vendored CHANGELOG.md.
+    Changelog {
+        /// Changelog lines (accented heads).
+        rows: Vec<String>,
+        /// Scroll anchor (None = pinned to the top — it reads forward).
+        scroll: Option<usize>,
+    },
+    /// Queued follow-ups (/queue, alt+u): the pending prompts with
+    /// their positions; ⏎/d dequeues the selected one.
+    Queue {
+        /// Queue snapshot (oldest first, position 1..n).
+        items: Vec<String>,
+        /// Selected row index.
+        selected: usize,
+    },
 }
 
 /// Which modal the next roster event should open instead of rendering
@@ -4556,12 +4653,113 @@ fn startup_keyboard_flags() -> crossterm::event::KeyboardEnhancementFlags {
 // write, which a per-delta draw cadence turns into a per-glyph syscall
 // storm (cheap pty traps on native Linux, expensive under WSL2/ConPTY).
 // Nothing buffers across frames: each draw flushes.
-type TuiTerminal =
-    ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::BufWriter<std::io::Stdout>>>;
+//
+// Wrapped in [`ThemeBackend`]: the active theme ([`theme`]) recolors
+// palette colors at the last possible moment — per cell, as the frame
+// leaves for the terminal — so a `/theme` switch needs no re-render of
+// anything, only a full repaint (`terminal.clear()`).
+type TuiTerminal = ratatui::Terminal<ThemeBackend>;
+
+/// Delegates to the crossterm backend and remaps every cell's
+/// fg/bg/underline color through the active theme's default→override
+/// map (Nocturne RGB values are the keys — anything else, content
+/// colors included, passes through untouched). Modifiers and symbols
+/// are the cell's own.
+struct ThemeBackend {
+    inner: ratatui::backend::CrosstermBackend<std::io::BufWriter<std::io::Stdout>>,
+}
+
+impl ratatui::backend::Backend for ThemeBackend {
+    fn draw<'a, I>(&mut self, content: I) -> std::io::Result<()>
+    where
+        I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+    {
+        let Some(map) = crate::theme::tint() else {
+            return self.inner.draw(content);
+        };
+        let tinted: Vec<(u16, u16, ratatui::buffer::Cell)> = content
+            .map(|(x, y, cell)| {
+                let style = cell.style();
+                if style.fg.is_none() && style.bg.is_none() && style.underline_color.is_none() {
+                    (x, y, cell.clone())
+                } else {
+                    let mut owned = cell.clone();
+                    owned.set_style(ratatui::style::Style {
+                        fg: style.fg.map(|c| map.get(&c).copied().unwrap_or(c)),
+                        bg: style.bg.map(|c| map.get(&c).copied().unwrap_or(c)),
+                        underline_color: style
+                            .underline_color
+                            .map(|c| map.get(&c).copied().unwrap_or(c)),
+                        ..style
+                    });
+                    (x, y, owned)
+                }
+            })
+            .collect();
+        self.inner.draw(tinted.iter().map(|(x, y, c)| (*x, *y, c)))
+    }
+
+    fn hide_cursor(&mut self) -> std::io::Result<()> {
+        self.inner.hide_cursor()
+    }
+
+    fn show_cursor(&mut self) -> std::io::Result<()> {
+        self.inner.show_cursor()
+    }
+
+    fn get_cursor_position(&mut self) -> std::io::Result<ratatui::layout::Position> {
+        self.inner.get_cursor_position()
+    }
+
+    fn set_cursor_position<P: Into<ratatui::layout::Position>>(
+        &mut self,
+        position: P,
+    ) -> std::io::Result<()> {
+        self.inner.set_cursor_position(position)
+    }
+
+    fn clear(&mut self) -> std::io::Result<()> {
+        self.inner.clear()
+    }
+
+    fn size(&self) -> std::io::Result<ratatui::layout::Size> {
+        self.inner.size()
+    }
+
+    fn window_size(&mut self) -> std::io::Result<ratatui::backend::WindowSize> {
+        self.inner.window_size()
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        ratatui::backend::Backend::flush(&mut self.inner)
+    }
+}
 
 /// How long a busy turn batches redraws: the spinner's own frame step.
 /// Streamed deltas coalesce onto this cadence; idle input draws at once.
 const DRAW_COALESCE: Duration = Duration::from_millis(80);
+
+/// Notification policy ([tui] notify_on / notify_unfocused), resolved
+/// at startup and consulted by [`fire_notifications`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NotifyPolicy {
+    /// Bell/notify when a turn finishes (`notify_on` ⊇ turn_finished).
+    pub turn_finished: bool,
+    /// Bell/notify when a permission ask appears (`notify_on` ⊇ ask).
+    pub ask: bool,
+    /// Only ring when the terminal is unfocused (DECSET 1004 focus
+    /// reporting; terminals without support never report, so
+    /// notifications still land — see [`FOCUSED`]).
+    pub unfocused_only: bool,
+}
+
+/// The notification policy for this process (startup config).
+pub static NOTIFY_POLICY: OnceLock<NotifyPolicy> = OnceLock::new();
+
+/// Terminal focus, tracked when focus reporting is enabled (DECSET
+/// 1004). Defaults to "unfocused": a terminal that never reports
+/// focus (no DECSET 1004 support) therefore always notifies.
+pub static FOCUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Run the TUI over an engine handle. Blocks until exit.
 #[allow(clippy::too_many_arguments)]
@@ -4581,7 +4779,45 @@ pub async fn run(
 ) -> std::io::Result<Exit> {
     let _ = AGENTS.set(agents.clone());
     let _ = NOTIFY.set(notify);
-    let _ = PLAN_CWD.set(session_cwd);
+    let _ = PLAN_CWD.set(session_cwd.clone());
+    // Surface-owned config ([tui] theme/title/status_line/notify_*,
+    // [keybindings]): the files main already validated, re-read here so
+    // the TUI applies its own layer without widening run()'s signature.
+    let surface = crate::theme::surface_config(&session_cwd).map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("config: {e}"))
+    })?;
+    // Notification policy + focus reporting ([tui] notify_on,
+    // notify_unfocused); the bell/notify command come in via `notify`.
+    let (on_turn, on_ask) = notify_events(surface.tui.notify_on.as_deref());
+    let _ = NOTIFY_POLICY.set(NotifyPolicy {
+        turn_finished: on_turn,
+        ask: on_ask,
+        unfocused_only: surface.tui.notify_unfocused.unwrap_or(false),
+    });
+    // The keyboard: resolve [keybindings] (hard error naming the
+    // offenders when chords collide or ids don't exist), then the
+    // startup theme ([tui] theme; a broken or missing theme file
+    // degrades to Nocturne with a note the app loop prints).
+    let bindings = crate::keys::Bindings::resolve(surface.keybindings.as_ref())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let mut startup_notes: Vec<String> = Vec::new();
+    if let Some(name) = &surface.tui.theme {
+        match crate::theme::load(
+            name,
+            &session_cwd,
+            crate::theme::surface_trusted(&session_cwd),
+        ) {
+            Ok(theme) => {
+                startup_notes.extend(theme.notes.clone());
+                crate::theme::apply(Some(&theme));
+            }
+            Err(e) => startup_notes.push(e),
+        }
+    }
+    let _ = crate::keys::ACTIVE.set(bindings);
+    // The terminal title ([tui] title, default true).
+    let title_enabled = surface.tui.title.unwrap_or(true);
+    let status_order = surface.tui.status_line.clone();
     // Register raw mode in THIS crate's crossterm before ratatui flips
     // it through its own (0.28) copy: crossterm's parser decides whether
     // `\n` means Enter or Ctrl+J by reading its own per-crate raw-mode
@@ -4596,9 +4832,9 @@ pub async fn run(
     // dropped: ours wraps the writer in a BufWriter so a frame is one
     // write() (see TuiTerminal).
     let _ = ratatui::init();
-    let mut terminal = match ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(
-        std::io::BufWriter::new(std::io::stdout()),
-    )) {
+    let mut terminal = match ratatui::Terminal::new(ThemeBackend {
+        inner: ratatui::backend::CrosstermBackend::new(std::io::BufWriter::new(std::io::stdout())),
+    }) {
         Ok(t) => t,
         Err(e) => {
             ratatui::restore();
@@ -4617,10 +4853,16 @@ pub async fn run(
     // releases it on close. Ctrl+M toggles the base at runtime
     // (kitty-protocol terminals only — plain terminals read Ctrl+M as
     // Enter) and persists it.
+    //
+    // Focus reporting (DECSET 1004) rides along for
+    // `[tui] notify_unfocused`: terminals that answer keep FOCUSED
+    // truthful; terminals that never report leave it "unfocused", which
+    // means notifications always fire.
     let _ = crossterm::execute!(
         std::io::stdout(),
         crossterm::event::PushKeyboardEnhancementFlags(startup_keyboard_flags()),
         crossterm::event::EnableBracketedPaste,
+        crossterm::event::EnableFocusChange,
     );
     // capture is the default; `[tui] mouse = "native"` starts native —
     // plain drag selection, full-width chat, wheel via alternate-scroll.
@@ -4645,13 +4887,17 @@ pub async fn run(
         header_glyph,
         mouse_capture,
         fresh,
+        startup_notes,
+        title_enabled,
+        status_order,
     )
     .await;
     let _ = crossterm::execute!(
         std::io::stdout(),
         crossterm::event::PopKeyboardEnhancementFlags,
         crossterm::event::DisableBracketedPaste,
-        crossterm::event::DisableMouseCapture
+        crossterm::event::DisableMouseCapture,
+        crossterm::event::DisableFocusChange
     );
     // native sessions leave DECSET 1007 set and capture sessions leave
     // 1003 (any-motion) on; release both so the next alt-screen app
@@ -4688,12 +4934,28 @@ async fn app(
     header_glyph: &str,
     mut mouse_captured: bool,
     mut fresh: bool,
+    mut startup_notes: Vec<String>,
+    title_enabled: bool,
+    status_order: Option<Vec<String>>,
 ) -> std::io::Result<(Exit, Option<String>)> {
     use crossterm::event::{Event as TermEvent, KeyCode, KeyModifiers};
     let _ = agents.clone();
 
     let mut scroll: Option<usize> = None;
     let mut transcript = Transcript::default();
+    // startup notes from the surface config (theme notes, missing
+    // theme files): printed once, ahead of everything else
+    for note in startup_notes.drain(..) {
+        transcript.push_separated(Line::Info(note));
+    }
+    // a /theme switch invalidates every cached color on screen: set to
+    // force one full repaint (terminal.clear()) before the next draw
+    let mut needs_repaint = false;
+    // the terminal title last pushed (SetTitle only fires on change)
+    let mut applied_title: Option<String> = None;
+    // the effective keyboard ([keybindings], resolved at startup):
+    // every remappable arm below consults this, never a hardcoded chord
+    let bindings = crate::keys::active().clone();
 
     // zero until the first frame sizes it (draw coalescing can defer
     // that to the first wakeup; nothing scrolls before then)
@@ -4877,9 +5139,32 @@ async fn app(
             }
             reported = Some((activity, session_now));
         }
+        // Terminal title ([tui] title, default true): session name/id,
+        // model, and the working state. SetTitle fires only on change.
+        if title_enabled {
+            let title = session_title(
+                sidebar.title.as_deref(),
+                &meters.session,
+                &meters.model,
+                busy_now,
+            );
+            if applied_title.as_deref() != Some(title.as_str()) {
+                let _ = crossterm::execute!(
+                    std::io::stdout(),
+                    crossterm::terminal::SetTitle(title.clone())
+                );
+                applied_title = Some(title);
+            }
+        }
         let draw_now =
             dirty && last_draw.is_none_or(|at| !busy_now || at.elapsed() >= DRAW_COALESCE);
         if draw_now {
+            // a theme switch landed since the last frame: wipe so every
+            // cell — cached pixels included — re-tints
+            if needs_repaint {
+                let _ = terminal.clear();
+                needs_repaint = false;
+            }
             let input_snapshot = input.text.clone();
             let rsearch = input.search_title();
             let (term_w, term_h) = match terminal.size() {
@@ -4968,6 +5253,7 @@ async fn app(
                     &tx_width,
                     sel,
                     hover,
+                    status_order.as_deref(),
                 );
             })?;
 
@@ -4998,7 +5284,11 @@ async fn app(
                     // popups all swallow chars): busy aborts the run; a
                     // reverse search is cancelled; a non-empty input is
                     // cleared; an empty input quits on the second press
-                    if (key.code, key.modifiers) == (KeyCode::Char('c'), KeyModifiers::CONTROL) {
+                    // (session.quit — a config override adds a chord)
+                    let quit_chord = (key.code, key.modifiers)
+                        == (KeyCode::Char('c'), KeyModifiers::CONTROL)
+                        || bindings.matches_custom(&key, "session.quit");
+                    if quit_chord {
                         if busy {
                             let _ = commands.send(Command::Abort).await;
                             quit_armed = None;
@@ -5133,7 +5423,7 @@ async fn app(
                                         features: None,
                                         })
                                         .await;
-                                    pop_toast(&mut toast, format!("{} {}", crate::icons::THOUGHT, effort_label(level)));
+                                    pop_toast(&mut toast, format!("{} {}", crate::icons::thought(), effort_label(level)));
                                 }
                                 _ => {}
                             },
@@ -5173,11 +5463,24 @@ async fn app(
                                 }
                                 _ => {}
                             },
-                            Modal::Help => {
-                                if key.code == KeyCode::Esc || key.code == KeyCode::Enter {
-                                    modal = None;
+                            Modal::Help { scroll } => match key.code {
+                                KeyCode::Esc | KeyCode::Enter => modal = None,
+                                KeyCode::Up => {
+                                    *scroll = Some(scroll.unwrap_or(0).saturating_sub(1));
                                 }
-                            }
+                                KeyCode::Down => {
+                                    *scroll = Some(scroll.unwrap_or(0) + 1);
+                                }
+                                KeyCode::PageUp => {
+                                    *scroll =
+                                        Some(scroll.unwrap_or(0).saturating_sub(10));
+                                }
+                                KeyCode::PageDown => {
+                                    *scroll = Some(scroll.unwrap_or(0) + 10);
+                                }
+                                KeyCode::Home => *scroll = Some(0),
+                                _ => {}
+                            },
                             Modal::Key(prompt) => match key.code {
                                 KeyCode::Esc => modal = None,
                                 KeyCode::Backspace => {
@@ -5836,6 +6139,224 @@ async fn app(
                                     modal = None;
                                 }
                             }
+                            Modal::Theme { names, selected } => match key.code {
+                                KeyCode::Esc => modal = None,
+                                KeyCode::Up => {
+                                    *selected = selected.saturating_sub(1);
+                                }
+                                KeyCode::Down => {
+                                    if *selected + 1 < names.len() + 1 {
+                                        *selected += 1;
+                                    }
+                                }
+                                // 0 / "default" restores Nocturne; n picks a
+                                // theme. Loading is best-effort: a broken file
+                                // keeps the old palette and explains itself.
+                                KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
+                                    let n = c.to_digit(10).unwrap_or(1) as usize - 1;
+                                    if n < names.len() + 1 {
+                                        *selected = n;
+                                    }
+                                }
+                                KeyCode::Enter => {
+                                    let picked = if *selected == 0 {
+                                        None
+                                    } else {
+                                        names.get(*selected - 1).cloned()
+                                    };
+                                    modal = None;
+                                    let applied = match picked.as_deref() {
+                                        None => {
+                                            crate::theme::apply(None);
+                                            Ok("theme · default (Nocturne)".to_string())
+                                        }
+                                        Some(name) => {
+                                            let cwd = PLAN_CWD.get().cloned().unwrap_or_default();
+                                            match crate::theme::load(
+                                                name,
+                                                &cwd,
+                                                crate::theme::surface_trusted(&cwd),
+                                            ) {
+                                                Ok(theme) => {
+                                                    for note in &theme.notes {
+                                                        transcript
+                                                            .push_separated(Line::Info(note.clone()));
+                                                    }
+                                                    crate::theme::apply(Some(&theme));
+                                                    Ok(format!("theme · {name}"))
+                                                }
+                                                Err(e) => Err(e),
+                                            }
+                                        }
+                                    };
+                                    match applied {
+                                        Ok(note) => {
+                                            // the palette changed under the
+                                            // frame cache: force a full repaint
+                                            needs_repaint = true;
+                                            pop_toast(&mut toast, note);
+                                        }
+                                        Err(e) => transcript.push_separated(Line::Warn(e)),
+                                    }
+                                }
+                                _ => {}
+                            },
+                            Modal::CopyPick {
+                                blocks,
+                                selected,
+                                save,
+                            } => {
+                                if let Some(path) = save.as_mut() {
+                                    // inline save-path prompt: type the target,
+                                    // ⏎ writes the selected block, esc returns
+                                    match key.code {
+                                        KeyCode::Esc => *save = None,
+                                        KeyCode::Backspace => {
+                                            path.pop();
+                                        }
+                                        KeyCode::Enter => {
+                                            let (_, text) = blocks
+                                                .get(*selected)
+                                                .cloned()
+                                                .unwrap_or(("", String::new()));
+                                            let target = path.trim().to_string();
+                                            *save = None;
+                                            if target.is_empty() {
+                                                transcript.push_separated(Line::Warn(
+                                                    "usage: type a path, then ⏎".into(),
+                                                ));
+                                            } else {
+                                                modal = None;
+                                                match std::fs::write(&target, &text) {
+                                                    Ok(()) => pop_toast(
+                                                        &mut toast,
+                                                        format!("✓ wrote {target}"),
+                                                    ),
+                                                    Err(e) => transcript.push_separated(
+                                                        Line::Warn(format!("write {target}: {e}")),
+                                                    ),
+                                                }
+                                            }
+                                        }
+                                        KeyCode::Char(c) => path.push(c),
+                                        _ => {}
+                                    }
+                                } else {
+                                    match key.code {
+                                        KeyCode::Esc => modal = None,
+                                        KeyCode::Up => {
+                                            *selected = selected.saturating_sub(1);
+                                        }
+                                        KeyCode::Down => {
+                                            if *selected + 1 < blocks.len() {
+                                                *selected += 1;
+                                            }
+                                        }
+                                        // ⏎ copies the picked block (OSC 52); w
+                                        // starts the inline save-path prompt
+                                        KeyCode::Enter => {
+                                            if let Some((role, text)) = blocks.get(*selected) {
+                                                let mut stdout = std::io::BufWriter::new(
+                                                    std::io::stdout().lock(),
+                                                );
+                                                if osc52_copy(&mut stdout, text) {
+                                                    pop_toast(
+                                                        &mut toast,
+                                                        format!("✓ copied {role} block"),
+                                                    );
+                                                } else {
+                                                    pop_toast(
+                                                        &mut toast,
+                                                        "selection too large for OSC 52",
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        KeyCode::Char('w') => {
+                                            *save = Some(String::new());
+                                        }
+                                        KeyCode::Char(c)
+                                            if c.is_ascii_digit() && c != '0' =>
+                                        {
+                                            let n = c.to_digit(10).unwrap_or(1) as usize - 1;
+                                            if n < blocks.len() {
+                                                *selected = n;
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            Modal::Search {
+                                query,
+                                hits,
+                                selected,
+                            } => match key.code {
+                                KeyCode::Esc => modal = None,
+                                KeyCode::Up => {
+                                    *selected = selected.saturating_sub(1);
+                                }
+                                KeyCode::Down => {
+                                    if *selected + 1 < hits.len() {
+                                        *selected += 1;
+                                    }
+                                }
+                                KeyCode::Backspace => {
+                                    query.pop();
+                                    *hits = search_hits(&transcript, query);
+                                    *selected = 0;
+                                }
+                                KeyCode::Enter => {
+                                    if let Some((at, _)) = hits.get(*selected) {
+                                        scroll = Some(*at);
+                                        dirty = true;
+                                    }
+                                    modal = None;
+                                }
+                                KeyCode::Char(c) => {
+                                    query.push(c);
+                                    *hits = search_hits(&transcript, query);
+                                    *selected = 0;
+                                }
+                                _ => {}
+                            },
+                            Modal::Changelog { rows, scroll } => {
+                                let visible = pager_visible(view_rows);
+                                if pager_keys(key.code, rows.len(), scroll, visible) {
+                                    modal = None;
+                                }
+                            }
+                            Modal::Queue { items, selected } => match key.code {
+                                KeyCode::Esc => modal = None,
+                                KeyCode::Up => {
+                                    *selected = selected.saturating_sub(1);
+                                }
+                                KeyCode::Down => {
+                                    if *selected + 1 < items.len() {
+                                        *selected += 1;
+                                    }
+                                }
+                                // ⏎/d dequeues the picked prompt: it leaves the
+                                // FIFO without being sent (ctrl+q recalls the
+                                // LAST item into the draft; this just drops)
+                                KeyCode::Enter | KeyCode::Char('d') => {
+                                    if *selected < items.len() && *selected < queue.len() {
+                                        let dropped = items.remove(*selected);
+                                        let _ = queue.remove(*selected);
+                                        if *selected >= items.len() && *selected > 0 {
+                                            *selected -= 1;
+                                        }
+                                        pop_toast(
+                                            &mut toast,
+                                            format!("✗ dequeued: {}", trunc_cols(&dropped, 40)),
+                                        );
+                                    }
+                                    if items.is_empty() {
+                                        modal = None;
+                                    }
+                                }
+                                _ => {}
+                            },
                         }
                         continue;
                     }
@@ -5972,10 +6493,11 @@ async fn app(
                     match (key.code, key.modifiers) {
                         (KeyCode::Char('l'), KeyModifiers::CONTROL) => {
                             // viewport wipe; transcript state untouched
+                            // (fixed chord — not a [keybindings] action)
                             let _ = terminal.clear();
                             continue;
                         }
-                        (KeyCode::Char('t'), KeyModifiers::CONTROL) => {
+                        _ if bindings.matches(&key, "popups.skills") => {
                             // skills & inventory popup (button on the strip)
                             modal = Some(Modal::Skills {
                                 rows: inventory_rows(&sidebar, 64),
@@ -5991,7 +6513,7 @@ async fn app(
                             }
                             continue;
                         }
-                        (KeyCode::Char('o'), KeyModifiers::ALT) => {
+                        _ if bindings.matches(&key, "popups.todos") => {
                             // todos popup (button on the strip) — works
                             // mid-turn too, like Ctrl+T
                             modal = Some(Modal::Todos {
@@ -5999,10 +6521,91 @@ async fn app(
                             });
                             continue;
                         }
-                        (KeyCode::Char('i'), KeyModifiers::ALT) => {
+                        _ if bindings.matches(&key, "popups.info") => {
                             // session info popup (button on the strip)
                             modal = Some(Modal::Info {
                                 rows: info_rows(&sidebar, &meters, 64),
+                            });
+                            continue;
+                        }
+                        // the four surface pickers: theme (/theme),
+                        // changelog, queue, copy — same openers their
+                        // slash commands run
+                        _ if bindings.matches(&key, "theme.picker") => {
+                            let cwd = PLAN_CWD.get().cloned().unwrap_or_default();
+                            modal = Some(Modal::Theme {
+                                names: crate::theme::available(
+                                    &cwd,
+                                    crate::theme::surface_trusted(&cwd),
+                                ),
+                                selected: 0,
+                            });
+                            continue;
+                        }
+                        _ if bindings.matches(&key, "changelog") => {
+                            modal = Some(Modal::Changelog {
+                                rows: changelog_rows(),
+                                scroll: None,
+                            });
+                            continue;
+                        }
+                        _ if bindings.matches(&key, "queue.open") => {
+                            modal = if queue.is_empty() {
+                                pop_toast(
+                                    &mut toast,
+                                    "queue is empty — + or alt+q while busy queues a prompt",
+                                );
+                                None
+                            } else {
+                                Some(Modal::Queue {
+                                    items: queue.clone(),
+                                    selected: 0,
+                                })
+                            };
+                            continue;
+                        }
+                        _ if bindings.matches(&key, "copy.picker") => {
+                            let blocks = copy_blocks(&transcript, COPY_BLOCK_LIMIT);
+                            modal = if blocks.is_empty() {
+                                pop_toast(&mut toast, "nothing to copy yet — send a prompt first");
+                                None
+                            } else {
+                                Some(Modal::CopyPick {
+                                    blocks,
+                                    selected: 0,
+                                    save: None,
+                                })
+                            };
+                            continue;
+                        }
+                        _ if bindings.matches(&key, "session.search") => {
+                            modal = Some(Modal::Search {
+                                query: String::new(),
+                                hits: Vec::new(),
+                                selected: 0,
+                            });
+                            continue;
+                        }
+                        // config-remapped abort/rewind chords fire here —
+                        // with the default esc chords the esc chain below
+                        // keeps owning the key (matches_custom only
+                        // answers overrides)
+                        _ if busy && bindings.matches_custom(&key, "session.abort") => {
+                            let _ = commands.send(Command::Abort).await;
+                            quit_armed = None;
+                            continue;
+                        }
+                        _ if !busy
+                            && input.text.is_empty()
+                            && slash_popup.is_none()
+                            && path_popup.is_none()
+                            && bindings.matches_custom(&key, "session.rewind") =>
+                        {
+                            modal = Some(Modal::Rewind {
+                                items: rewind_items(
+                                    Some(meters.session.as_str()).filter(|s| !s.is_empty()),
+                                ),
+                                selected: 0,
                             });
                             continue;
                         }
@@ -6024,8 +6627,10 @@ async fn app(
                         // Reverse history search: while active it captures
                         // editing keys, so its arms sit ahead of the
                         // standard Esc/Enter/Backspace/char handling.
-                        (KeyCode::Char('m'), KeyModifiers::CONTROL)
-                            if !busy && slash_popup.is_none() && path_popup.is_none() =>
+                        _ if !busy
+                            && slash_popup.is_none()
+                            && path_popup.is_none()
+                            && bindings.matches(&key, "mouse.toggle") =>
                         {
                             // Ctrl+M: the runtime mouse toggle — capture
                             // (dashboard: sidebar + click zones + ⇧drag)
@@ -6097,9 +6702,15 @@ async fn app(
                             )
                             .await;
                         }
-                        (KeyCode::Enter, KeyModifiers::SHIFT) => input.newline(),
-                        (KeyCode::Char('j'), KeyModifiers::CONTROL) => input.newline(),
-                        (KeyCode::Enter, _) => {
+                        _ if bindings.matches(&key, "composer.newline") => {
+                            // ⇧⏎ / ctrl+j by default ([keybindings]
+                            // composer.newline) — sits ahead of the send
+                            // arm, which tolerates the extra SHIFT flag
+                            input.newline()
+                        }
+                        // composer.send (⏎ by default): mid-turn the same
+                        // key steers — see the busy branch (composer.steer)
+                        _ if bindings.matches(&key, "composer.send") => {
                             let text = input.take();
                             // a submitted line invalidates any completion popup
                             slash_popup = None;
@@ -6297,35 +6908,115 @@ async fn app(
                                 }
                                 continue;
                             }
-                            if text.trim() == "/copy" {
-                                let last = transcript
-                                    .entries()
-                                    .iter()
-                                    .rev()
-                                    .find_map(|l| match l {
-                                        Line::Assistant(s) => Some(s.clone()),
-                                        _ => None,
+                            // /copy: block picker over the transcript's
+                            // text (user prompts + assistant replies,
+                            // newest first) — ⏎ copies via OSC 52, w
+                            // writes the block to a file
+                            if text.trim() == "/copy" || text.trim().starts_with("/copy ") {
+                                let blocks = copy_blocks(&transcript, COPY_BLOCK_LIMIT);
+                                if blocks.is_empty() {
+                                    transcript.push_separated(Line::Info(
+                                        "nothing to copy yet — send a prompt first".into(),
+                                    ));
+                                } else {
+                                    modal = Some(Modal::CopyPick {
+                                        blocks,
+                                        selected: 0,
+                                        save: None,
                                     });
-                                match last {
-                                    None => transcript.push_separated(Line::Info(
-                                        "no assistant reply to copy".into(),
-                                    )),
-                                    Some(s) => {
-                                        // OSC52 into the clipboard (capped);
-                                        // the ack is a toast, or the cap's
-                                        // notice instead of a frozen pty
-                                        let mut stdout = std::io::BufWriter::new(
-                                            std::io::stdout().lock(),
-                                        );
-                                        if osc52_copy(&mut stdout, &s) {
-                                            pop_toast(&mut toast, "✓ copied last reply");
-                                        } else {
-                                            pop_toast(
-                                                &mut toast,
-                                                "selection too large for OSC 52",
-                                            );
+                                }
+                                continue;
+                            }
+                            // /theme [name]: the picker, or a direct live
+                            // switch — palette rebuild + full repaint, no
+                            // engine roundtrip
+                            if text.trim() == "/theme" || text.trim().starts_with("/theme ") {
+                                let name = text
+                                    .trim()
+                                    .strip_prefix("/theme")
+                                    .map(str::trim)
+                                    .filter(|n| !n.is_empty());
+                                match name {
+                                    None => {
+                                        let cwd = PLAN_CWD.get().cloned().unwrap_or_default();
+                                        modal = Some(Modal::Theme {
+                                            names: crate::theme::available(
+                                                &cwd,
+                                                crate::theme::surface_trusted(&cwd),
+                                            ),
+                                            selected: 0,
+                                        });
+                                    }
+                                    Some("default") => {
+                                        crate::theme::apply(None);
+                                        needs_repaint = true;
+                                        pop_toast(&mut toast, "theme · default (Nocturne)");
+                                    }
+                                    Some(name) => {
+                                        let cwd = PLAN_CWD.get().cloned().unwrap_or_default();
+                                        match crate::theme::load(
+                                            name,
+                                            &cwd,
+                                            crate::theme::surface_trusted(&cwd),
+                                        ) {
+                                            Ok(theme) => {
+                                                for note in &theme.notes {
+                                                    transcript
+                                                        .push_separated(Line::Info(note.clone()));
+                                                }
+                                                crate::theme::apply(Some(&theme));
+                                                needs_repaint = true;
+                                                pop_toast(&mut toast, format!("theme · {name}"));
+                                            }
+                                            Err(e) => transcript.push_separated(Line::Warn(e)),
                                         }
                                     }
+                                }
+                                continue;
+                            }
+                            // /search [text]: transcript hit list — ⏎ jumps
+                            // to the picked hit (purely local, like /find)
+                            if text.trim() == "/search" || text.trim().starts_with("/search ") {
+                                let query = text
+                                    .trim()
+                                    .strip_prefix("/search")
+                                    .map(str::trim)
+                                    .unwrap_or_default()
+                                    .to_string();
+                                let hits = if query.is_empty() {
+                                    Vec::new()
+                                } else {
+                                    search_hits(&transcript, &query)
+                                };
+                                modal = Some(Modal::Search {
+                                    query,
+                                    hits,
+                                    selected: 0,
+                                });
+                                continue;
+                            }
+                            // /changelog: the vendored CHANGELOG.md pager
+                            if text.trim() == "/changelog" {
+                                modal = Some(Modal::Changelog {
+                                    rows: changelog_rows(),
+                                    scroll: None,
+                                });
+                                continue;
+                            }
+                            // /queue: pending follow-ups, ⏎/d dequeues the
+                            // picked one (ctrl+q recalls the last into the
+                            // draft; this drops it from the FIFO)
+                            if text.trim() == "/queue" {
+                                if queue.is_empty() {
+                                    transcript.push_separated(Line::Info(
+                                        "queue is empty — + or alt+q while busy queues a prompt"
+                                            .into(),
+                                    ));
+                                } else {
+                                    modal = Some(Modal::Queue {
+                                        items: queue.clone(),
+                                        selected: 0,
+                                    });
                                 }
                                 continue;
                             }
@@ -6525,7 +7216,6 @@ async fn app(
                                                     .then(|| meters.session.clone()),
                                             })
                                         }
-                                        ModalKind::Help => Modal::Help,
                                         ModalKind::Model(vendor) => Modal::Model(ModelPicker {
                                             models: models.clone(),
                                             vendor: vendor.clone(),
@@ -6664,8 +7354,11 @@ async fn app(
                                         // input box, Key the outer arm
                                         // above: none ever becomes a
                                         // modal
-                                        ModalKind::Mode | ModalKind::Key | ModalKind::Thinking => {
-                                            Modal::Help
+                                        ModalKind::Mode
+                                        | ModalKind::Thinking
+                                        | ModalKind::Key
+                                        | ModalKind::Help => {
+                                            Modal::Help { scroll: None }
                                         }
                                         // unreachable in practice: /tasks and
                                         // /debug send events, and the modal is
@@ -6866,6 +7559,25 @@ async fn app(
                                                 mentions: false,
                                             });
                                         }
+                                    } else {
+                                        // emoji shortcodes: a `:`-led word
+                                        // expands on Tab (":fir" → ":fire" →
+                                        // 🔥; ambiguous prefixes grow or wait)
+                                        if let Some((start, token)) = word_token(&input.text, input.cursor)
+                                            .filter(|(_, t)| t.starts_with(':'))
+                                            && let Some(expanded) =
+                                                crate::emoji::complete(&token)
+                                            && expanded != token
+                                        {
+                                            let (text, cursor) = complete_token(
+                                                &input.text,
+                                                start,
+                                                token.chars().count(),
+                                                &expanded,
+                                            );
+                                            input.text = text;
+                                            input.cursor = cursor;
+                                        }
                                     }
                                 }
                             }
@@ -7042,7 +7754,7 @@ async fn app(
                             input.kill_push(del);
                             slash_popup = update_suggestions(&input.text);
                         }
-                        (KeyCode::Char('e'), KeyModifiers::ALT) if !busy => {
+                        _ if !busy && bindings.matches(&key, "composer.external_editor") => {
                             // draft → temp file → $EDITOR → read back
                             let stamp = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
@@ -7139,7 +7851,7 @@ async fn app(
                                     edit.extend(text.chars().filter(|c| !c.is_whitespace()));
                                 }
                             }
-                            Modal::Help
+                            Modal::Help { .. }
                             | Modal::Spills { .. }
                             | Modal::Usage { .. }
                             | Modal::Context { .. }
@@ -7148,7 +7860,12 @@ async fn app(
                             | Modal::Debug { .. }
                             | Modal::Todos { .. }
                             | Modal::Skills { .. }
-                            | Modal::Info { .. } => {}
+                            | Modal::Info { .. }
+                            | Modal::Theme { .. }
+                            | Modal::CopyPick { .. }
+                            | Modal::Search { .. }
+                            | Modal::Changelog { .. }
+                            | Modal::Queue { .. } => {}
                         }
                     } else if path_popup.is_some() {
                         path_popup = None;
@@ -7481,6 +8198,17 @@ async fn app(
                             _ => {}
                         }
                     }
+                } else if let Some(Ok(TermEvent::FocusGained)) = maybe_term {
+                    // DECSET 1004 focus reporting ([tui]
+                    // notify_unfocused): the terminal tells us when it
+                    // shows this pane — with unfocused-only notifications
+                    // armed, focus silences them
+                    FOCUSED.store(true, std::sync::atomic::Ordering::Relaxed);
+                } else if let Some(Ok(TermEvent::FocusLost)) = maybe_term {
+                    // losing focus re-arms notifications; terminals that
+                    // never report stay on the false default, which means
+                    // they always notify
+                    FOCUSED.store(false, std::sync::atomic::Ordering::Relaxed);
                 }
             }
             maybe_evt = events.recv() => {
@@ -7632,6 +8360,11 @@ async fn app(
                             // reach this arm; an unanswered ask holds the
                             // queue until answered.
                             if pending.is_none() {
+                                // an open /queue modal now shows a stale
+                                // snapshot — close it with the drain
+                                if matches!(modal, Some(Modal::Queue { .. })) {
+                                    modal = None;
+                                }
                                 while let Some(next) = pop_queue_head(&mut queue) {
                                     if let Some(cmd) = slash_command(&next) {
                                         transcript.push_separated(Line::User(next));
@@ -8918,7 +9651,7 @@ fn builtin_slash_commands() -> Vec<(String, String)> {
         ("/retry".to_string(), "resend the last prompt".to_string()),
         (
             "/copy".to_string(),
-            "copy the last reply (OSC52)".to_string(),
+            "copy a transcript block (OSC52) — picker, w saves to a file".to_string(),
         ),
         ("/clip".to_string(), "attach a clipboard image".to_string()),
         ("/image".to_string(), "attach an image [path]".to_string()),
@@ -8926,6 +9659,22 @@ fn builtin_slash_commands() -> Vec<(String, String)> {
         (
             "/find".to_string(),
             "search the transcript: /find <text>, bare repeats".to_string(),
+        ),
+        (
+            "/search".to_string(),
+            "search the transcript as a hit list: /search <text>, ⏎ jumps".to_string(),
+        ),
+        (
+            "/theme".to_string(),
+            "switch the theme live: /theme [name|default]".to_string(),
+        ),
+        (
+            "/changelog".to_string(),
+            "what's new in this build (vendored CHANGELOG)".to_string(),
+        ),
+        (
+            "/queue".to_string(),
+            "pending follow-up prompts — ⏎/d dequeues the picked one".to_string(),
         ),
         (
             "/focus".to_string(),
@@ -9526,7 +10275,7 @@ pub fn skill_invocation(text: &str, inventory: &Inventory) -> Option<Result<Comm
             if inventory.skills.is_empty() {
                 return Some(Err(format!(
                     "no skills discovered ({} skills lists what ka found)",
-                    crate::icons::STRIP_SKILLS
+                    crate::icons::strip_skills()
                 )));
             }
             return Some(Err(format!(
@@ -9560,7 +10309,7 @@ pub fn skill_invocation(text: &str, inventory: &Inventory) -> Option<Result<Comm
         }
         return Some(Err(format!(
             "no such skill: {name} ({} skills lists what ka found)",
-            crate::icons::STRIP_SKILLS
+            crate::icons::strip_skills()
         )));
     }
     Some(Ok(Command::Prompt {
@@ -10765,7 +11514,19 @@ fn modal_hints(open: &Modal) -> &'static [(&'static str, &'static str)] {
             ("esc", "close"),
         ],
         Modal::Key(_) => &[("type", "value"), ("⏎", "save"), ("esc", "cancel")],
-        Modal::Help => &[("⏎", "close")],
+        Modal::Help { .. } => &[("↑↓/pgup/pgdn", "scroll"), ("⏎", "close")],
+        Modal::Theme { .. } => &[("↑↓", "choose"), ("⏎", "apply live"), ("esc", "close")],
+        Modal::CopyPick { save: Some(_), .. } => {
+            &[("type", "path"), ("⏎", "write"), ("esc", "back")]
+        }
+        Modal::CopyPick { .. } => &[("↑↓", "choose"), ("⏎", "copy"), ("w", "save to file")],
+        Modal::Search { .. } => &[("type", "refine"), ("↑↓", "choose"), ("⏎", "jump")],
+        Modal::Changelog { .. } => &[
+            ("pgup/pgdn", "scroll"),
+            ("home/end", "top/tail"),
+            ("esc", "close"),
+        ],
+        Modal::Queue { .. } => &[("↑↓", "choose"), ("⏎/d", "dequeue"), ("esc", "close")],
     }
 }
 
@@ -10802,22 +11563,30 @@ fn paint_hints(
 }
 
 /// The composer's bottom-border buttons in drawn order:
-/// `(button, icon, label, key)`.
-const STRIP_BUTTONS: [(StripButton, &str, &str, &str); 3] = [
-    (
-        StripButton::Todos,
-        crate::icons::STRIP_TODOS,
-        "todos",
-        "alt+o",
-    ),
-    (
-        StripButton::Skills,
-        crate::icons::STRIP_SKILLS,
-        "skills",
-        "^t",
-    ),
-    (StripButton::Info, crate::icons::STRIP_INFO, "info", "alt+i"),
-];
+/// `(button, icon, label, key)`. Icons are themeable ([symbols] table),
+/// so this is a function, not a const.
+fn strip_buttons() -> [(StripButton, String, &'static str, &'static str); 3] {
+    [
+        (
+            StripButton::Todos,
+            crate::icons::strip_todos(),
+            "todos",
+            "alt+o",
+        ),
+        (
+            StripButton::Skills,
+            crate::icons::strip_skills(),
+            "skills",
+            "^t",
+        ),
+        (
+            StripButton::Info,
+            crate::icons::strip_info(),
+            "info",
+            "alt+i",
+        ),
+    ]
+}
 
 /// Draw the strip buttons ` {icon} {label} {key} ` (icon ACCENT, label
 /// META, key FAINT) on a border row from column `x0`, one border cell
@@ -10834,7 +11603,7 @@ fn paint_strip(
     use ratatui::text::{Line as TuiLine, Span};
     let mut zones = StripZones::default();
     let mut x = x0;
-    for (button, icon, label, key) in STRIP_BUTTONS {
+    for (button, icon, label, key) in strip_buttons() {
         let line = TuiLine::from(vec![
             Span::raw(" "),
             Span::styled(icon, crate::palette::ACCENT_STYLE),
@@ -10906,8 +11675,8 @@ fn mode_pill(meters: &Meters) -> Vec<ratatui::text::Span<'static>> {
 /// glyph, `✻ {level}` otherwise (unknown levels hide the glyph).
 fn effort_segment(level: &str) -> String {
     match crate::icons::effort_glyph(level) {
-        Some(g) => format!("{} {g} {level}", crate::icons::THOUGHT),
-        None => format!("{} {level}", crate::icons::THOUGHT),
+        Some(g) => format!("{} {g} {level}", crate::icons::thought()),
+        None => format!("{} {level}", crate::icons::thought()),
     }
 }
 
@@ -11014,6 +11783,226 @@ fn status_right(meters: &Meters) -> Vec<ratatui::text::Span<'static>> {
     segs
 }
 
+/// One status-line segment id ([tui] status_line): `model`, `mode`,
+/// `session`, `effort`, `context`, `cost`, `tokens`, `cache`,
+/// `toggles`, `update`.
+const STATUS_SEGMENT_IDS: &[&str] = &[
+    "model", "mode", "session", "effort", "context", "cost", "tokens", "cache", "toggles", "update",
+];
+
+/// Validate a `[tui] status_line` at the surface boundary: unknown ids
+/// name themselves (ka-engine already hard-errors at config parse —
+/// this guards programmatic callers and keeps the ids in one list).
+pub fn status_ids_valid(order: &[String]) -> Result<(), String> {
+    let unknown: Vec<_> = order
+        .iter()
+        .filter(|s| !STATUS_SEGMENT_IDS.contains(&s.as_str()))
+        .cloned()
+        .collect();
+    if unknown.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "[tui] status_line: unknown segment(s) {} (expected one of: {})",
+            unknown
+                .iter()
+                .map(|s| format!("{s:?}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            STATUS_SEGMENT_IDS.join(", ")
+        ))
+    }
+}
+
+/// Status line from an explicit `[tui] status_line` order: each id
+/// renders its segment (or nothing when the fact is unknown — a
+/// segment that has nothing to say is skipped, never a bare label),
+/// goal/loop badges still close the row (state badges, not segments).
+/// The default order lives in [`status_left`]/[`status_right`].
+pub fn status_segments(meters: &Meters, order: &[String]) -> Vec<ratatui::text::Span<'static>> {
+    use ratatui::text::Span;
+    let mut segs: Vec<Span<'static>> = Vec::new();
+    fn push(
+        segs: &mut Vec<ratatui::text::Span<'static>>,
+        text: String,
+        color: ratatui::style::Color,
+    ) {
+        let lead = if segs.is_empty() { "" } else { " " };
+        segs.push(ratatui::text::Span::styled(format!("{lead}{text}"), color));
+    }
+    for id in order {
+        match id.as_str() {
+            "model" if !meters.model.is_empty() => {
+                push(&mut segs, meters.model.clone(), crate::palette::INK_DIM);
+            }
+            "mode" => {
+                let pill = mode_pill(meters);
+                if !pill.is_empty() {
+                    if !segs.is_empty() {
+                        segs.push(Span::raw(" "));
+                    }
+                    segs.extend(pill);
+                }
+            }
+            "session" if !meters.session.is_empty() => {
+                let label = short_session(&meters.session).unwrap_or(&meters.session);
+                push(&mut segs, label.to_string(), crate::palette::FAINT);
+            }
+            "effort" if meters.effort_supported => {
+                let level = if meters.effort.is_empty() {
+                    "off"
+                } else {
+                    meters.effort.as_str()
+                };
+                push(&mut segs, effort_segment(level), crate::palette::META);
+            }
+            "context" => {
+                let (used, window) = meters.context;
+                if window > 0 {
+                    let pct = (used as f64 / window as f64 * 100.0) as u64;
+                    let color = if pct >= 95 {
+                        crate::palette::ERR
+                    } else if pct >= 80 {
+                        crate::palette::WARN
+                    } else {
+                        crate::palette::OK
+                    };
+                    push(&mut segs, format!("{pct}%"), color);
+                } else if used > 0 {
+                    push(
+                        &mut segs,
+                        format!("~{} tok", fmt_tok(used)),
+                        crate::palette::FAINT,
+                    );
+                }
+            }
+            "cost" => push(
+                &mut segs,
+                format!("${:.4}", meters.cost),
+                crate::palette::META,
+            ),
+            "tokens" if meters.tokens_in > 0 || meters.tokens_out > 0 => {
+                push(
+                    &mut segs,
+                    format!(
+                        "{} in · {} out",
+                        fmt_tok(meters.tokens_in),
+                        fmt_tok(meters.tokens_out)
+                    ),
+                    crate::palette::FAINT,
+                );
+            }
+            "cache" => {
+                if let Some(hit) = meters.cache_hit {
+                    push(
+                        &mut segs,
+                        format!("cache {}%", (hit * 100.0) as u64),
+                        crate::palette::FAINT,
+                    );
+                }
+            }
+            "toggles" if meters.toggles > 0 => {
+                push(
+                    &mut segs,
+                    format!("\u{2298}{}", meters.toggles),
+                    crate::palette::WARN,
+                );
+            }
+            "update" => {
+                if let Some(latest) = &meters.update {
+                    push(
+                        &mut segs,
+                        format!("\u{2934} {latest}"),
+                        crate::palette::WARN,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    // goal/loop are state badges, not segments: they survive any order
+    // so an armed goal/loop never hides behind a custom layout
+    if let Some(goal) = &meters.goal {
+        if goal.paused {
+            push(
+                &mut segs,
+                "◎ goal (paused)".to_string(),
+                crate::palette::WARN,
+            );
+        } else {
+            push(&mut segs, "◎ goal".to_string(), crate::palette::OK);
+        }
+    }
+    if meters.loop_task.is_some() {
+        push(&mut segs, "↻ loop".to_string(), crate::palette::ACCENT);
+    }
+    segs
+}
+
+/// Terminal title: `ka · {what} — {model}` (+ `· working` mid-turn),
+/// driven by [tui] title (default true).
+pub fn session_title(name: Option<&str>, session: &str, model: &str, busy: bool) -> String {
+    let what = match name.filter(|n| !n.trim().is_empty()) {
+        Some(n) => n.trim().to_string(),
+        None => match short_session(session) {
+            Some(s) if !session.is_empty() => s.to_string(),
+            _ => "new session".to_string(),
+        },
+    };
+    let mut title = format!("ka · {what}");
+    if !model.is_empty() {
+        title.push_str(&format!(" — {model}"));
+    }
+    if busy {
+        title.push_str(" · working");
+    }
+    title
+}
+
+/// Text blocks a `/copy` pick can take: user prompts and assistant
+/// replies, newest first, at most `limit` of them.
+pub fn copy_blocks(transcript: &Transcript, limit: usize) -> Vec<(&'static str, String)> {
+    let mut blocks: Vec<(&'static str, String)> = Vec::new();
+    for line in transcript.entries().iter().rev() {
+        match line {
+            Line::User(s) => blocks.push(("user", s.clone())),
+            Line::Assistant(s) if !s.trim().is_empty() => blocks.push(("ka", s.clone())),
+            _ => {}
+        }
+        if blocks.len() >= limit {
+            break;
+        }
+    }
+    blocks
+}
+
+/// The /changelog body: the vendored CHANGELOG.md, markdown-tinted
+/// (version heads accent, top head bold). Ships in the binary — the
+/// modal needs no file access.
+pub fn changelog_rows() -> Vec<String> {
+    const CHANGELOG: &str =
+        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../CHANGELOG.md"));
+    CHANGELOG.lines().map(str::to_string).collect()
+}
+
+/// All transcript hits for a query: (row offset to scroll to, entry
+/// text head), capped so a hot word doesn't build a ten-thousand-row
+/// modal. Reuses the transcript's own finder — same matching the
+/// pinned-scroll search uses, focus view included.
+pub fn search_hits(transcript: &Transcript, query: &str) -> Vec<(usize, String)> {
+    let mut hits = Vec::new();
+    let mut from = 0usize;
+    while let Some((entry, at)) = transcript.find_from(from, query) {
+        let text = line_text(&transcript.entries()[entry]).to_string();
+        hits.push((at, trunc_cols(&text, 56)));
+        from = at + 1;
+        if hits.len() >= 200 {
+            break;
+        }
+    }
+    hits
+}
+
 /// The welcome logo: "KA" in the ANSI Shadow face (one column per
 /// glyph, every row the same width).
 const WELCOME_LOGO: [&str; 6] = [
@@ -11059,9 +12048,9 @@ fn welcome_rows(
     let bold = Style::new().add_modifier(Modifier::BOLD);
     let faint = Style::new().fg(crate::palette::FAINT);
     let glyph = if glyph.is_empty() {
-        crate::icons::BRAND
+        crate::icons::brand()
     } else {
-        glyph
+        glyph.to_string()
     };
     let mut rows: Vec<TuiLine<'static>> = Vec::new();
     if width >= 44 && height >= 16 {
@@ -11099,7 +12088,7 @@ fn welcome_rows(
         let mut place = vec![Span::styled(sidebar.cwd.clone(), faint)];
         if let Some(branch) = &sidebar.branch {
             place.push(Span::styled(
-                format!(" {} ", crate::icons::BRANCH),
+                format!(" {} ", crate::icons::branch()),
                 crate::palette::OK,
             ));
             place.push(Span::styled(branch.clone(), crate::palette::INK_DIM));
@@ -11150,7 +12139,7 @@ fn list_row(
     if selected {
         TuiLine::from(vec![
             Span::styled(
-                format!("{} ", crate::icons::RAIL),
+                format!("{} ", crate::icons::rail()),
                 Style::new()
                     .fg(crate::palette::ACCENT)
                     .bg(crate::palette::SEL_BG),
@@ -11168,7 +12157,7 @@ fn filter_row(filter: &str) -> ratatui::text::Line<'static> {
     use ratatui::style::{Modifier, Style};
     use ratatui::text::{Line as TuiLine, Span};
     let lead = Span::styled(
-        format!("{} ", crate::icons::PROMPT),
+        format!("{} ", crate::icons::prompt()),
         crate::palette::ACCENT_STYLE,
     );
     if filter.is_empty() {
@@ -11185,7 +12174,7 @@ fn filter_row(filter: &str) -> ratatui::text::Line<'static> {
         TuiLine::from(vec![
             lead,
             Span::styled(filter.to_string(), crate::palette::ACCENT_STYLE),
-            Span::styled(crate::icons::RAIL, crate::palette::ACCENT_STYLE),
+            Span::styled(crate::icons::rail(), crate::palette::ACCENT_STYLE),
         ])
     }
 }
@@ -11296,6 +12285,9 @@ fn render(
     // what the pointer currently hovers (capture mode only): the
     // hovered rows/chips paint the hover band / gold emphasis
     hover: Option<Hover>,
+    // [tui] status_line: explicit segment order (None = the built-in
+    // layout — meters left, gauge/cost/pill right)
+    status_order: Option<&[String]>,
 ) {
     use ratatui::layout::Constraint::{Length, Min};
     use ratatui::layout::Rect;
@@ -11429,9 +12421,9 @@ fn render(
     {
         let panel = Style::new().bg(crate::palette::BG_PANEL);
         let glyph = if header_glyph.is_empty() {
-            crate::icons::BRAND
+            crate::icons::brand()
         } else {
-            header_glyph
+            header_glyph.to_string()
         };
         let mut left: Vec<Span<'static>> = crate::fx::gradient(
             &format!(" {glyph} ka "),
@@ -11449,7 +12441,7 @@ fn render(
             place.push(Span::styled(sidebar.cwd.clone(), crate::palette::FAINT));
             if let Some(branch) = &sidebar.branch {
                 place.push(Span::styled(
-                    format!(" {} ", crate::icons::BRANCH),
+                    format!(" {} ", crate::icons::branch()),
                     crate::palette::OK,
                 ));
                 place.push(Span::styled(branch.clone(), crate::palette::INK_DIM));
@@ -11688,7 +12680,7 @@ fn render(
                 .enumerate()
                 .map(|(i, r)| {
                     let lead = if i == 0 {
-                        Span::styled(format!("{} ", crate::icons::PROMPT), lead_style)
+                        Span::styled(format!("{} ", crate::icons::prompt()), lead_style)
                     } else {
                         Span::raw("  ")
                     };
@@ -11784,10 +12776,12 @@ fn render(
     }
 
     // ── status line: mode pill + model/effort/badges left, context
-    // gauge + cost right ──
+    // gauge + cost right — or the configured [tui] status_line order ──
     {
-        let left = status_left(meters);
-        let right = status_right(meters);
+        let (left, right) = match status_order {
+            Some(order) => (status_segments(meters, order), Vec::new()),
+            None => (status_left(meters), status_right(meters)),
+        };
         let lw: usize = left.iter().map(|s| s.content.width()).sum();
         let rw: usize = right.iter().map(|s| s.content.width()).sum();
         // one col of air at each end
@@ -11845,7 +12839,7 @@ fn render(
             if i + offset == popup.selected {
                 text.push(TuiLine::from(vec![
                     Span::styled(
-                        format!("{} ", crate::icons::RAIL),
+                        format!("{} ", crate::icons::rail()),
                         Style::new()
                             .fg(crate::palette::ACCENT)
                             .bg(crate::palette::SEL_BG),
@@ -12005,19 +12999,27 @@ fn render(
                 text.push(TuiLine::from(vec![
                     Span::styled("value     ", meta),
                     Span::raw(masked),
-                    Span::styled(crate::icons::RAIL, crate::palette::ACCENT_STYLE),
+                    Span::styled(crate::icons::rail(), crate::palette::ACCENT_STYLE),
                 ]));
                 (width, height, modal_title("api key"), text)
             }
-            Modal::Help => {
+            Modal::Help { scroll } => {
                 let height = 34u16.min(fh.saturating_sub(2));
                 let width = 80.min(fw);
-                (
-                    width,
-                    height,
-                    modal_title("help"),
-                    help_modal_rows(inner(width)),
-                )
+                // the table exceeds one pane: window the rows by the
+                // top offset (the key handler clamps against the length
+                // the last frame knew; this re-clamps for real)
+                let all = help_modal_rows(inner(width));
+                let total = all.len();
+                let cap = (height as usize).saturating_sub(4);
+                let offset = scroll.unwrap_or(0).min(total.saturating_sub(cap));
+                let mut rows: Vec<TuiLine<'static>> =
+                    all.into_iter().skip(offset).take(cap).collect::<Vec<_>>();
+                let more = total.saturating_sub(offset + cap);
+                if more > 0 {
+                    rows.push(TuiLine::styled(format!("… ↓ +{more} more"), meta));
+                }
+                (width, height, modal_title("help"), rows)
             }
             Modal::Model(picker) => {
                 let rows = picker.rows();
@@ -12411,6 +13413,148 @@ fn render(
                     .collect();
                 (width, height, modal_title(title), text)
             }
+            Modal::Theme { names, selected } => {
+                // "default" + one row per theme; borders(2)+padding(2)
+                let height = ((names.len() + 1) as u16 + 4).clamp(6, 20);
+                let width = 60.min(fw);
+                let cap = (height as usize).saturating_sub(4);
+                let offset = window_of(*selected, names.len() + 1, cap);
+                let mut text = Vec::new();
+                let row = |label: String, on: bool| -> TuiLine<'static> {
+                    list_row(label, on, inner(width), Style::new())
+                };
+                for i in offset..(names.len() + 1).min(offset + cap) {
+                    let label = if i == 0 {
+                        "default (Nocturne)".to_string()
+                    } else {
+                        names[i - 1].clone()
+                    };
+                    text.push(row(label, i == *selected));
+                }
+                if names.is_empty() {
+                    text.push(TuiLine::styled(
+                        "no themes found — drop .toml files in .ka/themes/ or ~/.config/ka/themes/",
+                        meta,
+                    ));
+                }
+                (width, height, modal_title("theme"), text)
+            }
+            Modal::CopyPick {
+                blocks,
+                selected,
+                save,
+            } => {
+                if let Some(path) = save {
+                    // inline save prompt: a two-row mini-form
+                    let height = 8u16.min(fh.saturating_sub(2));
+                    let width = 68.min(fw);
+                    let mut text = vec![
+                        TuiLine::styled("save block to file", crate::palette::ACCENT_BOLD),
+                        TuiLine::default(),
+                    ];
+                    text.push(TuiLine::from(vec![
+                        Span::styled("path ", meta),
+                        Span::raw(path.clone()),
+                        Span::styled(crate::icons::prompt(), crate::palette::ACCENT_STYLE),
+                    ]));
+                    text.push(TuiLine::default());
+                    text.push(TuiLine::styled(
+                        "⏎ writes the selected block · esc back to the list",
+                        meta,
+                    ));
+                    (width, height, modal_title("copy · save"), text)
+                } else {
+                    let height = (blocks.len() as u16 + 4).clamp(6, 26);
+                    let width = 90.min(fw);
+                    let cap = (height as usize).saturating_sub(4);
+                    let offset = window_of(*selected, blocks.len(), cap);
+                    let mut text = Vec::new();
+                    for (i, (role, body)) in blocks.iter().enumerate().skip(offset).take(cap) {
+                        // one-line preview with the role tag leading
+                        let head = format!(
+                            "{role:>4}  {}",
+                            trunc_cols(&body.replace('\n', " ⏎ "), inner(width) - 9)
+                        );
+                        text.push(list_row(head, i == *selected, inner(width), Style::new()));
+                    }
+                    (width, height, modal_title("copy"), text)
+                }
+            }
+            Modal::Search {
+                query,
+                hits,
+                selected,
+            } => {
+                let height = (hits.len() as u16 + 6).clamp(7, 26);
+                let width = 90.min(fw);
+                let cap = (height as usize).saturating_sub(6);
+                let mut text = vec![filter_row(query)];
+                if hits.is_empty() {
+                    let note = if query.is_empty() {
+                        "type to search the transcript…"
+                    } else {
+                        "no matches"
+                    };
+                    text.push(TuiLine::styled(note, crate::palette::FAINT));
+                }
+                let offset = window_of(*selected, hits.len(), cap);
+                for (i, (_, snippet)) in hits.iter().enumerate().skip(offset).take(cap) {
+                    text.push(list_row(
+                        snippet.clone(),
+                        i == *selected,
+                        inner(width),
+                        Style::new(),
+                    ));
+                }
+                text.push(TuiLine::styled("⏎ jumps to the hit · type refines", meta));
+                (width, height, modal_title("search"), text)
+            }
+            Modal::Changelog { rows, scroll } => {
+                let height = 34u16.min(fh.saturating_sub(2));
+                let width = 88.min(fw);
+                let cap = (height as usize).saturating_sub(4);
+                let total = rows.len();
+                let offset = scroll.unwrap_or(0).min(total.saturating_sub(cap));
+                let mut text: Vec<TuiLine<'static>> = rows
+                    .iter()
+                    .skip(offset)
+                    .take(cap)
+                    .map(|row| {
+                        if row.starts_with("## ") || row.starts_with("# ") {
+                            TuiLine::styled(row.clone(), crate::palette::ACCENT_BOLD)
+                        } else if row.starts_with("### ") {
+                            TuiLine::styled(row.clone(), crate::palette::ACCENT_STYLE)
+                        } else {
+                            TuiLine::raw(row.clone())
+                        }
+                    })
+                    .collect();
+                let more = total.saturating_sub(offset + cap);
+                if more > 0 {
+                    text.push(TuiLine::styled(format!("… ↓ +{more} more"), meta));
+                }
+                (width, height, modal_title("changelog"), text)
+            }
+            Modal::Queue { items, selected } => {
+                let height = (items.len() as u16 + 5).clamp(6, 22);
+                let width = 84.min(fw);
+                let cap = (height as usize).saturating_sub(5);
+                let offset = window_of(*selected, items.len(), cap);
+                let mut text = Vec::new();
+                for (i, item) in items.iter().enumerate().skip(offset).take(cap) {
+                    text.push(list_row(
+                        format!("#{}  {}", i + 1, item.replace('\n', " ⏎ ")),
+                        i == *selected,
+                        inner(width),
+                        Style::new(),
+                    ));
+                }
+                text.push(TuiLine::styled(
+                    "⏎/d dequeues the picked prompt · esc close",
+                    meta,
+                ));
+                (width, height, modal_title("queue"), text)
+            }
             Modal::Tree {
                 items,
                 actions,
@@ -12488,7 +13632,7 @@ fn render(
         let rect = centered(width, height, modal_area);
         frame.render_widget(ratatui::widgets::Clear, rect);
         let title = TuiLine::styled(
-            format!(" {} permission ", crate::icons::BRAND),
+            format!(" {} permission ", crate::icons::brand()),
             Style::new()
                 .fg(crate::palette::WARN)
                 .add_modifier(Modifier::BOLD),
@@ -12519,7 +13663,7 @@ fn render(
             let body = trunc_cols(msg, room - 3);
             let pill = TuiLine::from(vec![
                 Span::styled(
-                    crate::icons::RAIL,
+                    crate::icons::rail(),
                     Style::new()
                         .fg(crate::palette::ACCENT)
                         .bg(crate::palette::BG_SURFACE),
@@ -12652,7 +13796,7 @@ fn push_block(out: &mut Vec<ratatui::text::Line<'static>>, text: &str, width: u1
             let seg = trunc_cols(&row.text, room);
             let pad = w.saturating_sub(2 + seg.width());
             let mut spans = vec![
-                Span::styled(crate::icons::RAIL, rail),
+                Span::styled(crate::icons::rail(), rail),
                 Span::styled(" ", body),
                 Span::styled(seg, body),
             ];
@@ -12984,7 +14128,7 @@ fn modal_title(title: &str) -> String {
 fn modal_frame(title: impl Into<String>) -> ratatui::widgets::Block<'static> {
     surface_frame(title).title(
         ratatui::text::Line::styled(
-            format!(" {} ", crate::icons::CLOSE),
+            format!(" {} ", crate::icons::close()),
             ratatui::style::Style::new().fg(crate::palette::FAINT),
         )
         .right_aligned(),
@@ -13054,33 +14198,58 @@ fn help_modal_rows(width: usize) -> Vec<ratatui::text::Line<'static>> {
         }
     }
     section(&mut text, "keys");
-    let keys: &[(&str, &str)] = &[
-        ("enter", "send · steer mid-turn"),
-        ("⇧⏎ / ctrl+j", "newline in the draft"),
-        ("+text · alt+q", "queue until the turn ends"),
-        ("!cmd", "run a shell command directly"),
-        ("esc", "close popups & modals · unpin scroll first"),
-        ("esc (busy)", "abort the turn (unscrolled)"),
-        ("esc esc", "rewind menu (empty input)"),
-        ("ctrl+c", "quit · clear draft · twice to exit"),
-        ("↑ ↓", "prompt history · navigate pickers"),
-        ("ctrl+p / ctrl+n", "prompt history"),
-        ("ctrl+q", "recall the last queued item"),
-        ("ctrl+s", "park/recall the draft (stash)"),
-        ("ctrl+r", "search the transcript"),
-        ("ctrl+o", "expand/collapse the last tool call"),
-        ("ctrl+m", "toggle mouse capture ⇄ native"),
-        ("ctrl+t / alt+o / alt+i", "popups: skills · todos · info"),
-        ("alt+t", "fold/unfold thinking"),
-        ("alt+e", "edit the draft in $EDITOR"),
-        ("ctrl+↑ / ctrl+↓", "jump between your messages"),
-        ("pgup / pgdn", "scroll the transcript"),
-        ("tab", "complete slash command or path"),
-        ("1-9", "pick a row in pickers & asks"),
-        ("ctrl+l", "clear screen"),
-        ("ctrl+u/k/w · y · z", "kill to start/end/word · yank · undo"),
-    ];
-    rows(&mut text, keys, key_style);
+    // the remappable actions with their EFFECTIVE chords
+    // ([keybindings] applied); fixed keys follow
+    let b = crate::keys::active();
+    let mut keys: Vec<(String, String)> = [
+        ("composer.send", "send · steer mid-turn"),
+        ("composer.newline", "newline in the draft"),
+        ("session.abort", "abort the turn (unscrolled)"),
+        ("session.rewind", "rewind menu (empty input)"),
+        ("session.quit", "quit · clear draft · twice to exit"),
+        ("session.search", "search the transcript as a hit list"),
+        ("copy.picker", "copy a transcript block (OSC52)"),
+        ("queue.open", "browse the follow-up queue (d dequeues)"),
+        ("theme.picker", "theme picker (live switch)"),
+        ("changelog", "what's new in this build"),
+        ("mouse.toggle", "toggle mouse capture ⇄ native"),
+        ("popups.skills", "skills · agents · mcp popup"),
+        ("popups.todos", "todos popup"),
+        ("popups.info", "session info popup"),
+        ("composer.external_editor", "edit the draft in $EDITOR"),
+    ]
+    .into_iter()
+    .map(|(id, desc)| (b.display(id), desc.to_string()))
+    .collect();
+    keys.extend([
+        ("+text · alt+q".into(), "queue until the turn ends".into()),
+        ("!cmd".into(), "run a shell command directly".into()),
+        (
+            "esc".into(),
+            "close popups & modals · unpin scroll first".into(),
+        ),
+        ("↑ ↓".into(), "prompt history · navigate pickers".into()),
+        ("ctrl+p / ctrl+n".into(), "prompt history".into()),
+        ("ctrl+q".into(), "recall the last queued item".into()),
+        ("ctrl+s".into(), "park/recall the draft (stash)".into()),
+        ("ctrl+r".into(), "incremental transcript search".into()),
+        ("ctrl+o".into(), "expand/collapse the last tool call".into()),
+        ("alt+t".into(), "fold/unfold thinking".into()),
+        (
+            "ctrl+↑ / ctrl+↓".into(),
+            "jump between your messages".into(),
+        ),
+        ("pgup / pgdn".into(), "scroll the transcript".into()),
+        ("tab".into(), "complete slash command, path, :emoji:".into()),
+        ("1-9".into(), "pick a row in pickers & asks".into()),
+        ("ctrl+l".into(), "clear screen".into()),
+        (
+            "ctrl+u/k/w · y · z".into(),
+            "kill to start/end/word · yank · undo".into(),
+        ),
+    ]);
+    let key_pairs: Vec<(&str, &str)> = keys.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    rows(&mut text, &key_pairs, key_style);
     text.push(TuiLine::default());
     section(&mut text, "session");
     rows(
@@ -13142,9 +14311,30 @@ fn help_modal_rows(width: usize) -> Vec<ratatui::text::Line<'static>> {
             ("/focus", "collapse old turns to one line each"),
             ("/usage", "usage & cost: session + recent"),
             ("/find", "search the transcript: /find <text>"),
-            ("/copy", "copy the last reply (OSC52)"),
+            ("/search", "transcript hits with jump: /search <text>"),
+            ("/copy", "copy a transcript block — ⏎, w saves to file"),
             ("/clip", "attach a clipboard image"),
             ("/image", "attach an image [path]"),
+        ],
+        key_style,
+    );
+    text.push(TuiLine::default());
+    section(&mut text, "appearance & notifications");
+    rows(
+        &mut text,
+        &[
+            ("/theme", "switch the theme live: /theme [name|default]"),
+            ("/changelog", "what's new in this build"),
+            ("/queue", "pending follow-ups — ⏎/d dequeues"),
+            (
+                "notify_on",
+                "[tui] subset of turn_finished|ask (default: both)",
+            ),
+            (
+                "notify_unfocused",
+                "[tui] notify only unfocused — terminals without focus reporting always notify",
+            ),
+            ("title", "[tui] terminal title (default on)"),
         ],
         key_style,
     );
@@ -14491,6 +15681,7 @@ mod tests {
                     &std::cell::Cell::new(0u16),
                     None,
                     hover,
+                    None,
                 );
             })
             .unwrap();
@@ -14543,7 +15734,7 @@ mod tests {
         assert!(header.contains("new session"), "{header}");
         let flat = header.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(
-            flat.contains(&format!("/tmp/ka {} main", crate::icons::BRANCH)),
+            flat.contains(&format!("/tmp/ka {} main", crate::icons::branch())),
             "{flat}"
         );
         // row 1: a row of canvas air
@@ -14744,7 +15935,7 @@ mod tests {
             None,
         );
         let buf = f.terminal.backend().buffer().clone();
-        assert_eq!(buf[(3, 20)].symbol(), crate::icons::PROMPT);
+        assert_eq!(buf[(3, 20)].symbol(), crate::icons::prompt());
         assert_eq!(buf[(5, 20)].symbol(), "h");
         let pos = f.terminal.get_cursor_position().unwrap();
         assert_eq!((pos.x, pos.y), (5 + 5, 20), "cursor sits after `hello`");
@@ -14759,7 +15950,7 @@ mod tests {
         );
         let buf = f.terminal.backend().buffer().clone();
         // two rows grow the composer: y18..=21, content on y19 and y20
-        assert_eq!(buf[(3, 19)].symbol(), crate::icons::PROMPT);
+        assert_eq!(buf[(3, 19)].symbol(), crate::icons::prompt());
         assert_eq!(buf[(5, 19)].symbol(), "a");
         assert_eq!(buf[(3, 20)].symbol(), " ");
         assert_eq!(buf[(5, 20)].symbol(), "b");
@@ -14799,21 +15990,21 @@ mod tests {
             (
                 zones.todos,
                 StripButton::Todos,
-                crate::icons::STRIP_TODOS,
+                crate::icons::strip_todos(),
                 "todos",
                 "alt+o",
             ),
             (
                 zones.skills,
                 StripButton::Skills,
-                crate::icons::STRIP_SKILLS,
+                crate::icons::strip_skills(),
                 "skills",
                 "^t",
             ),
             (
                 zones.info,
                 StripButton::Info,
-                crate::icons::STRIP_INFO,
+                crate::icons::strip_info(),
                 "info",
                 "alt+i",
             ),
@@ -14956,7 +16147,7 @@ mod tests {
         assert!(big.contains("██╗"), "the big logo: {big}");
         assert!(big.contains("new conversation"));
         assert!(big.contains("readonly") && big.contains("mock-5"));
-        assert!(big.contains(&format!("~/src/ka {} main", crate::icons::BRANCH)));
+        assert!(big.contains(&format!("~/src/ka {} main", crate::icons::branch())));
         for (key, desc) in WELCOME_TIPS {
             assert!(big.contains(key) && big.contains(desc), "tip {key}");
         }
@@ -15387,7 +16578,8 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        // the previously undocumented keys are taught
+        // the previously undocumented keys are taught — remappable
+        // actions render their EFFECTIVE chords (defaults here)
         for key in [
             "ctrl+r",
             "ctrl+p / ctrl+n",
@@ -15395,17 +16587,32 @@ mod tests {
             "ctrl+s",
             "ctrl+o",
             "ctrl+m",
-            "ctrl+t / alt+o / alt+i",
+            "ctrl+t",
+            "alt+o",
+            "alt+i",
             "alt+t",
             "alt+e",
             "+text · alt+q",
             "ctrl+↑ / ctrl+↓",
             "esc esc",
+            "alt+s",
+            "alt+y",
+            "alt+u",
+            "alt+c",
+            "ctrl+g",
         ] {
             assert!(text.contains(key), "help lacks {key}");
         }
         // the context-trim commands and the focus view are taught too
-        for cmd in ["/shake", "/autocompact", "/focus"] {
+        for cmd in [
+            "/shake",
+            "/autocompact",
+            "/focus",
+            "/theme",
+            "/search",
+            "/changelog",
+            "/queue",
+        ] {
             assert!(text.contains(cmd), "help lacks {cmd}");
         }
         // command groups in order
@@ -16376,7 +17583,7 @@ mod tests {
         };
         assert_eq!(
             text(&status_left(&high)),
-            format!("{} ◕ high", crate::icons::THOUGHT)
+            format!("{} ◕ high", crate::icons::thought())
         );
         assert_eq!(text(&status_right(&high)), "$0.5000");
         let odd = Meters {
@@ -16386,7 +17593,7 @@ mod tests {
         };
         assert_eq!(
             text(&status_left(&odd)),
-            format!("{} turbo", crate::icons::THOUGHT)
+            format!("{} turbo", crate::icons::thought())
         );
         // a supported model with no level yet reads as off
         let unset = Meters {
@@ -16395,7 +17602,7 @@ mod tests {
         };
         assert_eq!(
             text(&status_left(&unset)),
-            format!("{} ○ off", crate::icons::THOUGHT)
+            format!("{} ○ off", crate::icons::thought())
         );
         // unsupported: no segment even with a stale level string
         let unsupported = Meters {
@@ -16512,7 +17719,7 @@ mod tests {
 
         // an unbreakable token hard-wraps at the width; continuation
         // rows hang under the text by the prefix's display width
-        let prefix = format!("{} ", crate::icons::THOUGHT);
+        let prefix = format!("{} ", crate::icons::thought());
         let indent = " ".repeat(prefix.width());
         let mut out2: Vec<TuiLine> = Vec::new();
         push_gutter(
@@ -19550,7 +20757,7 @@ mod tests {
         assert!(
             text.contains(&format!(
                 "\u{2026}/projects/ka {} main",
-                crate::icons::BRANCH
+                crate::icons::branch()
             )),
             "{text:?}"
         );
@@ -19665,11 +20872,11 @@ mod tests {
         let text = plain_text(&inventory_rows(&sidebar, 60));
         // each section opens with its glyph header
         assert!(
-            text.contains(&format!("{} skills", crate::icons::STRIP_SKILLS)),
+            text.contains(&format!("{} skills", crate::icons::strip_skills())),
             "{text:?}"
         );
         assert!(
-            text.contains(&format!("{} agents", crate::icons::AGENTS)),
+            text.contains(&format!("{} agents", crate::icons::agents())),
             "{text:?}"
         );
         assert!(
@@ -19900,7 +21107,7 @@ mod tests {
         assert!(collapsed[0].spans.is_empty() && collapsed[6].spans.is_empty());
         let head = text_of(&collapsed[1]);
         assert!(
-            head.starts_with(&format!("{} Thinking ▸", crate::icons::THOUGHT)),
+            head.starts_with(&format!("{} Thinking ▸", crate::icons::thought())),
             "{head}"
         );
         assert!(head.ends_with("5 lines"), "right-aligned count: {head}");
@@ -19930,7 +21137,7 @@ mod tests {
         assert_eq!(one.len(), 4, "blank + head + the line + blank");
         assert_eq!(
             text_of(&one[1]),
-            format!("{} Thinking", crate::icons::THOUGHT),
+            format!("{} Thinking", crate::icons::thought()),
             "no fold cue, no count"
         );
         assert_eq!(text_of(&one[2]), "│ just one");
@@ -19956,7 +21163,7 @@ mod tests {
             .filter(|l| {
                 l.spans
                     .iter()
-                    .any(|s| s.content.contains(crate::icons::THOUGHT))
+                    .any(|s| s.content.contains(crate::icons::thought().as_str()))
             })
             .count();
         assert_eq!(icon_rows, 1, "exactly one ✻ row (the head)");
@@ -20224,6 +21431,7 @@ mod tests {
                         &std::cell::Cell::new(0u16),
                         None,
                         None,
+                        None,
                     )
                 })
                 .unwrap();
@@ -20236,7 +21444,7 @@ mod tests {
                 filter: String::new(),
                 current: None,
             }),
-            Modal::Help,
+            Modal::Help { scroll: None },
             Modal::Model(ModelPicker {
                 models: vec![],
                 vendor: None,
@@ -20342,7 +21550,7 @@ mod tests {
             // every modal frame carries the ✕ close chip (the
             // permission ask, which shares no frame, is not in this list)
             assert!(
-                flat.contains(crate::icons::CLOSE),
+                flat.contains(crate::icons::close().as_str()),
                 "{m:?} must render the ✕ close chip: {flat}"
             );
         }
@@ -20413,6 +21621,7 @@ mod tests {
                             None::<(ratatui::layout::Rect, usize, usize, usize, usize)>,
                         ),
                         &std::cell::Cell::new(0u16),
+                        None,
                         None,
                         None,
                     )
@@ -20507,6 +21716,7 @@ mod tests {
                         &std::cell::Cell::new(0u16),
                         None,
                         None,
+                        None,
                     )
                 })
                 .unwrap();
@@ -20568,6 +21778,7 @@ mod tests {
                             None::<(ratatui::layout::Rect, usize, usize, usize, usize)>,
                         ),
                         &std::cell::Cell::new(0u16),
+                        None,
                         None,
                         None,
                     )
@@ -20651,6 +21862,7 @@ mod tests {
                         &std::cell::Cell::new(0u16),
                         None,
                         None,
+                        None,
                     )
                 })
                 .unwrap();
@@ -20696,7 +21908,7 @@ mod tests {
             "strip buttons visible in native mode: {native}"
         );
         assert!(
-            flat(&native).contains(&format!("/tmp/ka {} main", crate::icons::BRANCH)),
+            flat(&native).contains(&format!("/tmp/ka {} main", crate::icons::branch())),
             "header carries cwd ⎇ branch: {native}"
         );
         assert!(
@@ -20912,6 +22124,7 @@ mod tests {
                         &tx_width,
                         None,
                         None,
+                        None,
                     )
                 })
                 .unwrap();
@@ -20981,6 +22194,7 @@ mod tests {
                         None::<(ratatui::layout::Rect, usize, usize, usize, usize)>,
                     ),
                     &std::cell::Cell::new(0u16),
+                    None,
                     None,
                     None,
                 )
@@ -21382,6 +22596,7 @@ mod tests {
                             &std::cell::Cell::new(0u16),
                             sel,
                             None,
+                            None,
                         )
                     })
                     .unwrap();
@@ -21560,7 +22775,7 @@ mod tests {
             .map(|c| c.symbol().to_string())
             .collect();
         assert!(
-            !text.contains(crate::icons::CLOSE),
+            !text.contains(crate::icons::close().as_str()),
             "the permission frame must not render a ✕ chip"
         );
     }

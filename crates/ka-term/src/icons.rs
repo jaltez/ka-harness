@@ -5,29 +5,101 @@
 //! blocks every common monospace/fallback font covers — terminals
 //! without a glyph degrade here, and only here.
 
+use std::sync::RwLock;
+
 use ka_protocol::Mode;
 
-/// ✻ thinking head + effort segment lead
-pub const THOUGHT: &str = "\u{273b}";
-/// ⎇ git branch
-pub const BRANCH: &str = "\u{2387}";
-/// ✕ overlay close chip
-pub const CLOSE: &str = "\u{2715}";
-/// ◆ brand mark fallback (the configurable header glyph)
-pub const BRAND: &str = "\u{25c6}";
-/// ❯ prompt glyph: composer lead + user-turn lead
-pub const PROMPT: &str = "\u{276f}";
-/// ▌ rails: user turns, the selection pointer
-pub const RAIL: &str = "\u{258c}";
+// ── theme overrides ───────────────────────────────────────────────
+// Themes may re-glyph the named symbols below via their `[symbols]`
+// table (see [`SYMBOL_KEYS`]); everything else — tool icons, mode
+// icons, modal title glyphs — stays fixed. Accessors read through the
+// override map so a `/theme` switch relabels every call site at once.
+
+/// Symbol keys a theme's `[symbols]` table may override, in stable
+/// order (also the doc list for unknown-key notes).
+pub const SYMBOL_KEYS: &[&str] = &[
+    "prompt",
+    "rail",
+    "thought",
+    "branch",
+    "close",
+    "brand",
+    "strip_todos",
+    "strip_skills",
+    "strip_info",
+    "agents",
+];
+
+static SYMBOLS: RwLock<Vec<String>> = RwLock::new(Vec::new());
+
+/// Install a theme's glyph overrides (keyed by [`SYMBOL_KEYS`]).
+pub fn set_symbols(overrides: Option<&std::collections::HashMap<String, String>>) {
+    let Ok(mut slots) = SYMBOLS.write() else {
+        return;
+    };
+    slots.clear();
+    let Some(overrides) = overrides else { return };
+    for key in SYMBOL_KEYS {
+        slots.push(overrides.get(*key).cloned().unwrap_or_default());
+    }
+}
+
+/// The glyph for slot `i`: the theme override when set, else the
+/// Nocturne default. Owned — the override lives in the lock, the
+/// default in static storage, and callers embed the text into spans.
+fn sym(i: usize, default: &'static str) -> String {
+    let slot = SYMBOLS.read().ok().and_then(|s| s.get(i).cloned());
+    match slot {
+        Some(s) if !s.is_empty() => s,
+        _ => default.to_string(),
+    }
+}
+
+/// ✻ thinking head + effort segment lead (theme: `thought`)
+pub fn thought() -> String {
+    sym(2, "\u{273b}")
+}
+/// ⎇ git branch (theme: `branch`)
+pub fn branch() -> String {
+    sym(3, "\u{2387}")
+}
+/// ✕ overlay close chip (theme: `close`)
+pub fn close() -> String {
+    sym(4, "\u{2715}")
+}
+/// ◆ brand mark fallback (the configurable header glyph; theme: `brand`)
+pub fn brand() -> String {
+    sym(5, "\u{25c6}")
+}
+/// ❯ prompt glyph: composer lead + user-turn lead (theme: `prompt`)
+pub fn prompt() -> String {
+    sym(0, "\u{276f}")
+}
+/// ▌ rails: user turns, the selection pointer (theme: `rail`)
+pub fn rail() -> String {
+    sym(1, "\u{258c}")
+}
 
 /// ≣ todos button — a stacked-line glyph whose column width is stable
 /// across Unicode tables (☰ is 1 col under unicode-width 0.2.0 and 2
 /// under 0.2.2+, so it silently shifted every row it rode on).
-pub const STRIP_TODOS: &str = "\u{2263}";
-/// ✦ skills button
-pub const STRIP_SKILLS: &str = "\u{2726}";
+/// (theme: `strip_todos`)
+pub fn strip_todos() -> String {
+    sym(6, "\u{2263}")
+}
+/// ✦ skills button (theme: `strip_skills`)
+pub fn strip_skills() -> String {
+    sym(7, "\u{2726}")
+}
 /// ? info button — ASCII, so no terminal can disagree about its width
-pub const STRIP_INFO: &str = "?";
+/// (theme: `strip_info`)
+pub fn strip_info() -> String {
+    sym(8, "?")
+}
+/// ◎ skills-popup agents section header (theme: `agents`)
+pub fn agents() -> String {
+    sym(9, "\u{25ce}")
+}
 
 pub fn mode_icon(mode: Mode) -> &'static str {
     match mode {
@@ -105,9 +177,6 @@ pub const MODAL_ICONS: &[(&str, &str)] = &[
     ("help", "?"),
 ];
 
-/// ◎ skills-popup agents section header
-pub const AGENTS: &str = "\u{25ce}";
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,10 +189,10 @@ mod tests {
         // the strip's click zones and alignment are computed from these
         // widths; an East-Asian-Ambiguous glyph (☰, ⓘ) renders 1 col in
         // one table/terminal and 2 in another, shifting the whole row
-        for g in [STRIP_TODOS, STRIP_SKILLS, STRIP_INFO] {
-            assert_eq!(UnicodeWidthStr::width(g), 1, "strip glyph {g:?}");
+        for g in [strip_todos(), strip_skills(), strip_info()] {
+            assert_eq!(UnicodeWidthStr::width(g.as_str()), 1, "strip glyph {g:?}");
             assert_eq!(
-                UnicodeWidthStr::width_cjk(g),
+                UnicodeWidthStr::width_cjk(g.as_str()),
                 1,
                 "strip glyph {g:?} is ambiguous-width"
             );
@@ -132,34 +201,34 @@ mod tests {
 
     #[test]
     fn every_glyph_is_one_column() {
-        let mut all: Vec<&str> = vec![
-            THOUGHT,
-            BRANCH,
-            CLOSE,
-            BRAND,
-            PROMPT,
-            RAIL,
-            STRIP_TODOS,
-            STRIP_SKILLS,
-            STRIP_INFO,
-            AGENTS,
+        let mut all: Vec<String> = vec![
+            thought(),
+            branch(),
+            close(),
+            brand(),
+            prompt(),
+            rail(),
+            strip_todos(),
+            strip_skills(),
+            strip_info(),
+            agents(),
         ];
         for m in [Mode::Ask, Mode::AcceptEdits, Mode::Allow, Mode::Readonly] {
-            all.push(mode_icon(m));
+            all.push(mode_icon(m).to_string());
         }
         for t in [
             "bash", "read", "grep", "glob", "edit", "write", "web", "delegate", "todo", "remember",
             "tasks", "debug", "undo", "mcp.x", "lsp_y", "unknown",
         ] {
-            all.push(tool_icon(t));
+            all.push(tool_icon(t).to_string());
         }
         for level in ["off", "low", "medium", "high", "max"] {
-            all.extend(effort_glyph(level));
+            all.extend(effort_glyph(level).map(str::to_string));
         }
-        all.extend(MODAL_ICONS.iter().map(|(_, g)| *g));
+        all.extend(MODAL_ICONS.iter().map(|(_, g)| (*g).to_string()));
         for g in all {
             assert_eq!(
-                UnicodeWidthStr::width(g),
+                UnicodeWidthStr::width(g.as_str()),
                 1,
                 "glyph {g:?} must be one column"
             );

@@ -1088,6 +1088,7 @@ dependencies = [
  "ka-strand",
  "ratatui",
  "tokio",
+ "toml",
  "unicode-width 0.2.0",
 ]
 
