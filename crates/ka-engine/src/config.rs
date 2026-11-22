@@ -172,15 +172,27 @@ pub struct Tools {
     pub mcp: McpTools,
 }
 
+/// `[tools.mcp] discovery`: how server tools reach the model.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum McpDiscovery {
+    /// Every server tool becomes its own hand in context (the default).
+    #[default]
+    Eager,
+    /// One `mcp_call` hand stands in for all of them — the model lists
+    /// a server's tools on demand. Prefer lazy when servers expose many
+    /// tools.
+    Lazy,
+}
+
 /// MCP tool tuning (`[tools.mcp]`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct McpTools {
-    /// `"eager"` (default): every server tool becomes its own hand in
-    /// context. `"lazy"`: one `mcp_call` hand stands in for all of them
-    /// — the model lists a server's tools on demand. Prefer lazy when
-    /// servers expose many tools.
-    pub discovery: Option<String>,
+    /// `"eager"` (default) or `"lazy"`; see [`McpDiscovery`].
+    pub discovery: Option<McpDiscovery>,
 }
 
 /// Read tool tuning (`[tools.read]`).
@@ -279,6 +291,23 @@ pub struct Sandbox {
     pub allow_write: Vec<String>,
 }
 
+/// `[tui] mouse`: terminal mouse handling.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum MouseMode {
+    /// SGR button reporting (the default): wheel scrolls, bottom-strip
+    /// buttons are clickable, ⇧drag still selects. Ctrl+M toggles at
+    /// runtime.
+    #[default]
+    Capture,
+    /// No capture at all: plain drag selects and pastes with the
+    /// terminal's own bindings, the wheel scrolls via alternate-scroll.
+    /// kitty has no alternate-scroll — keep `capture` there.
+    Native,
+}
+
 /// TUI appearance and notifications ([tui]).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, default)]
@@ -292,14 +321,14 @@ pub struct Tui {
     /// `{"event":"turn_finished","stop":"done"}`. Example:
     /// `notify-send ka "turn done"`.
     pub notify: Option<String>,
-    /// Mouse mode: `"native"` (default) — no capture at all, so plain
-    /// drag selects and pastes with the terminal's own bindings and the
-    /// wheel scrolls the chat via alternate-scroll; or `"capture"` —
-    /// SGR button reporting: the wheel scrolls and the bottom-strip
-    /// buttons become clickable, ⇧drag still selects. Ctrl+M toggles
-    /// at runtime either way. kitty has no alternate-scroll — keep
+    /// Mouse mode: `"capture"` (default) — SGR button reporting, so
+    /// the wheel scrolls, the bottom-strip buttons are clickable and
+    /// ⇧drag still selects; or `"native"` — no capture at all, plain
+    /// drag selects and pastes with the terminal's own bindings and
+    /// the wheel scrolls via alternate-scroll. Ctrl+M toggles at
+    /// runtime either way. kitty has no alternate-scroll — keep
     /// `"capture"` there for the wheel.
-    pub mouse: Option<String>,
+    pub mouse: Option<MouseMode>,
     /// Report this agent's state (`idle`/`working`/`blocked`), resume
     /// command, and exit to the Herdr pane hosting it (opt-in; requires
     /// `HERDR_ENV=1` and its pane variables, so it is inert outside
@@ -411,7 +440,7 @@ pub struct Context {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct Fallback {
-    /// Fallback selectors (`vendor/model[:effort]`) in try-order; at
+    /// Fallback selectors (`vendor/model[@effort]`) in try-order; at
     /// most 2 hops are taken per turn.
     pub models: Vec<String>,
 }
@@ -433,7 +462,7 @@ pub struct Features {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct Config {
-    /// Default model selector (`vendor/model:effort`).
+    /// Default model selector (`vendor/model[@effort]`).
     pub model: Option<String>,
     /// Default reasoning effort.
     pub effort: Option<Effort>,
@@ -455,7 +484,7 @@ pub struct Config {
     /// Tool-call hooks (exit-2 block contract).
     #[serde(default)]
     pub hooks: Vec<Hook>,
-    /// MCP servers (stdio): tools appear as `<name>.<tool>` hands.
+    /// MCP servers (stdio): tools appear as `<name>__<tool>` hands.
     #[serde(default)]
     pub mcp: Vec<crate::mcp::McpServerConfig>,
     /// Persistent tool allowlist ([permissions] allow).
@@ -582,6 +611,15 @@ impl Config {
         if other.lsp.commands.as_ref().is_some_and(|c| !c.is_empty()) {
             self.lsp.commands = other.lsp.commands;
         }
+        if other.lsp.write_through.is_some() {
+            self.lsp.write_through = other.lsp.write_through;
+        }
+        if other.debug.enable.is_some() {
+            self.debug.enable = other.debug.enable;
+        }
+        if other.debug.adapters.as_ref().is_some_and(|a| !a.is_empty()) {
+            self.debug.adapters = other.debug.adapters;
+        }
         if other.sandbox.mode.is_some() {
             self.sandbox.mode = other.sandbox.mode;
         }
@@ -670,7 +708,7 @@ impl Config {
     /// affordances — though overlay clicks still work: tracking turns
     /// on while a popup or modal is open).
     pub fn effective_mouse_capture(&self) -> bool {
-        self.tui.mouse.as_deref() != Some("native")
+        self.tui.mouse.unwrap_or_default() == MouseMode::Capture
     }
 
     /// Whether web fetches may target private hosts (default false).
@@ -695,7 +733,7 @@ impl Config {
 
     /// Whether MCP tool discovery is lazy (`[tools.mcp] discovery`).
     pub fn effective_mcp_lazy(&self) -> bool {
-        matches!(self.tools.mcp.discovery.as_deref(), Some("lazy"))
+        self.tools.mcp.discovery.unwrap_or_default() == McpDiscovery::Lazy
     }
 
     /// The effective permission mode (free unless set in a layer).
@@ -857,12 +895,16 @@ pub fn save_settings_to(
         // strict-TOML philosophy at the writer too: only the two
         // documented values ever land in the layer (an unknown value
         // would parse back as capture silently)
-        if mouse != "capture" && mouse != "native" {
-            return Err(format!(
-                "invalid [tui] mouse {mouse:?} — expected \"capture\" or \"native\""
-            ));
-        }
-        layer.tui.mouse = Some(mouse.to_string());
+        let mode = match mouse {
+            "capture" => MouseMode::Capture,
+            "native" => MouseMode::Native,
+            other => {
+                return Err(format!(
+                    "invalid [tui] mouse {other:?} — expected \"capture\" or \"native\""
+                ));
+            }
+        };
+        layer.tui.mouse = Some(mode);
     }
     if let Some(features) = features {
         layer.features.disable = features.to_vec();
@@ -992,11 +1034,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("ka.toml");
         std::fs::write(&path, "model = \"a/x\"\n[tui]\nbell = false\n").unwrap();
-        // /mouse toggled to native: the key lands under [tui], the
-        // unrelated bell setting survives
+        // /settings mouse toggle to native: the key lands under [tui],
+        // the unrelated bell setting survives
         save_settings_to(&path, None, None, None, Some("native"), None).unwrap();
         let layer = Config::parse_layer(&std::fs::read_to_string(&path).unwrap(), "saved").unwrap();
-        assert_eq!(layer.tui.mouse.as_deref(), Some("native"));
+        assert_eq!(layer.tui.mouse, Some(MouseMode::Native));
         assert_eq!(layer.tui.bell, Some(false), "unrelated [tui] keys survive");
         assert_eq!(layer.model.as_deref(), Some("a/x"));
         assert!(
@@ -1006,13 +1048,13 @@ mod tests {
         // toggling back rewrites the value (no [tui] duplication)
         save_settings_to(&path, None, None, None, Some("capture"), None).unwrap();
         let layer = Config::parse_layer(&std::fs::read_to_string(&path).unwrap(), "saved").unwrap();
-        assert_eq!(layer.tui.mouse.as_deref(), Some("capture"));
+        assert_eq!(layer.tui.mouse, Some(MouseMode::Capture));
         assert!(layer.effective_mouse_capture());
         // mouse=None is the model/mode-picker path: an existing mouse
         // choice (here "capture") must survive untouched
         save_settings_to(&path, Some("b/y"), None, None, None, None).unwrap();
         let layer = Config::parse_layer(&std::fs::read_to_string(&path).unwrap(), "saved").unwrap();
-        assert_eq!(layer.tui.mouse.as_deref(), Some("capture"));
+        assert_eq!(layer.tui.mouse, Some(MouseMode::Capture));
         assert_eq!(layer.model.as_deref(), Some("b/y"));
         // non-canonical values are rejected at the writer
         let err = save_settings_to(&path, None, None, None, Some("bogus"), None).unwrap_err();
@@ -1022,8 +1064,7 @@ mod tests {
                 .unwrap()
                 .tui
                 .mouse
-                .as_deref()
-                == Some("capture"),
+                == Some(MouseMode::Capture),
             "failed save leaves the layer untouched"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -1198,7 +1239,7 @@ mod tests {
         let mut cfg = Config::default();
         cfg.overlay(
             Config::parse_layer(
-                "[guards]\nspend_usd = 2.5\ncontext_pct = 80\n\n[[search]]\nprovider = \"tavily\"\napi_key_env = \"TAVILY_KEY\"\n\n[tools.web]\nallow_private_hosts = true\n\n[tools.mcp]\ndiscovery = \"lazy\"\n\n[tui]\nheader_glyph = \"*\"\nbell = false\nnotify = \"notify-send ka done\"\nherdr = true\n\n[verify]\ntest = \"cargo test\"\n\n[[verify.lints]]\npattern = \"*.rs\"\ncommand = \"rustfmt --check {file}\"\n\n[features]\ndisable = [\"agents\", \"mcp:github\"]\n\n[prompt]\nidentity_file = \"/tmp/IDENTITY.md\"\n",
+                "[guards]\nspend_usd = 2.5\ncontext_pct = 80\n\n[[search]]\nprovider = \"tavily\"\napi_key_env = \"TAVILY_KEY\"\n\n[tools.web]\nallow_private_hosts = true\n\n[tools.mcp]\ndiscovery = \"lazy\"\n\n[tui]\nheader_glyph = \"*\"\nbell = false\nnotify = \"notify-send ka done\"\nherdr = true\n\n[verify]\ntest = \"cargo test\"\n\n[[verify.lints]]\npattern = \"*.rs\"\ncommand = \"rustfmt --check {file}\"\n\n[features]\ndisable = [\"agents\", \"mcp:github\"]\n\n[prompt]\nidentity_file = \"/tmp/IDENTITY.md\"\n\n[lsp]\nwrite_through = true\n\n[debug]\nenable = true\n\n[debug.adapters]\ncodelldb = \"/opt/codelldb/adapter\"\n",
                 "project",
             )
             .unwrap(),
@@ -1236,6 +1277,25 @@ mod tests {
             cfg.features.disable,
             vec!["agents".to_string(), "mcp:github".to_string()],
             "[features] disable survives the overlay"
+        );
+        assert_eq!(
+            cfg.lsp.write_through,
+            Some(true),
+            "[lsp] write_through survives the overlay"
+        );
+        assert_eq!(
+            cfg.debug.enable,
+            Some(true),
+            "[debug] enable survives the overlay"
+        );
+        assert_eq!(
+            cfg.debug
+                .adapters
+                .as_ref()
+                .and_then(|a| a.get("codelldb"))
+                .map(String::as_str),
+            Some("/opt/codelldb/adapter"),
+            "[debug] adapters survive the overlay"
         );
     }
 

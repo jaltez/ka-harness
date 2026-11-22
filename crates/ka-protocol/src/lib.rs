@@ -346,7 +346,7 @@ pub enum Command {
     DebugRoster,
     /// Switch the active model.
     SetModel {
-        /// Model selector, e.g. `vendor/model:effort`.
+        /// Model selector, e.g. `vendor/model@effort`.
         selector: String,
     },
     /// Set the reasoning effort.

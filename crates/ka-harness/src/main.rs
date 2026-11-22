@@ -74,7 +74,7 @@ enum CliCommand {
     Run {
         /// Prompt text (omitted: read from stdin)
         prompt: Option<String>,
-        /// Model selector override (vendor/model:effort)
+        /// Model selector override (vendor/model[@effort])
         #[arg(long)]
         model: Option<String>,
         /// Permission mode override (ask|accept_edits|allow|readonly)

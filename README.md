@@ -27,7 +27,7 @@ cd your-project
 ka --model ollama/qwen3.5:9b        # TUI, fresh session — fully local works
 ka -c                               # continue this terminal's last session
 ka --session 3f9c2a81               # resume by id prefix or name
-ka run "summarize the build error"  # one headless turn, NDJSON events on stdout
+ka run "summarize the build error"  # one headless turn; final text on stdout (--print ndjson for events)
 ```
 
 Essential keys: `Enter` send or steer mid-turn · `⇧Enter` newline (`Ctrl+J` fallback) · `Esc` unpin scroll, then abort · `Ctrl-C` abort · `/help` for the rest.
@@ -74,7 +74,7 @@ Details — doom-loop rules, protected paths, project trust, runtime feature tog
 | Surface      | Use                                                           |
 | ------------ | ------------------------------------------------------------- |
 | `ka`         | terminal UI                                                   |
-| `ka run "…"` | headless one-turn, NDJSON events, exit 0/1/2                  |
+| `ka run "…"` | headless one-turn, final text (`--print ndjson`/`stream-json` for events), exit 0/1/2 |
 | `ka serve`   | HTTP: prompt via POST, SSE event streams, read-only observers |
 | `ka acp`     | Agent Client Protocol for editors                             |
 
@@ -85,7 +85,7 @@ Also: `ka sessions` · `ka export` (markdown/HTML) · `ka rewind` · `ka attach`
 - **Skills** — SKILL.md directories, project or user scope ([docs](https://ka-harness.dev/docs/extending/skills/))
 - **Subagents** — markdown agents with frontmatter, incl. background delegates ([docs](https://ka-harness.dev/docs/extending/subagents/))
 - **Hooks** — lifecycle hooks that block, patch, or steer a turn ([docs](https://ka-harness.dev/docs/extending/hooks/))
-- **MCP servers** — stdio and HTTP; tools appear as `<server>.<tool>` hands ([docs](https://ka-harness.dev/docs/extending/mcp/))
+- **MCP servers** — stdio and HTTP; tools appear as `<server>__<tool>` hands ([docs](https://ka-harness.dev/docs/extending/mcp/))
 
 Opt-in integrations, all config tables: **LSP** (diagnostics, navigation, rename/format), **DAP debugging**, the **verify loop** (auto-lint / auto-test after edits), **runtime feature toggles** (`ka --disable agents,mcp:github,tool:bash` — fail-closed), and **Herdr** (`[tui] herdr = true` — reports the agent's `idle`/`working`/`blocked` state, its resume command, and exit to the pane that hosts it; inert outside Herdr). See the [config reference](https://ka-harness.dev/docs/reference/config/).
 

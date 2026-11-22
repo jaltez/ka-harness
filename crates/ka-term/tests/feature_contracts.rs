@@ -63,10 +63,11 @@ fn every_documented_slash_command_parses() {
         "documented slash commands no longer parse: {missing:?}"
     );
     // input-layer commands are intercepted before slash_command (local
-    // transcript/copy/mouse state, no engine roundtrip): /find /retry
-    // /copy /clip /mouse, and the /skill:<name> family (validated
+    // transcript/copy state, no engine roundtrip): /find /retry
+    // /copy /clip, and the /skill:<name> family (validated
     // against the inventory, dispatched as a scoped Prompt — see
-    // skill_invocation_scopes_the_turn). They are covered by the
+    // skill_invocation_scopes_the_turn). Mouse capture toggles with
+    // Ctrl+M, not a slash command. They are covered by the
     // input-layer unit tests in src; if you move one into
     // slash_command, add it above.
 }
