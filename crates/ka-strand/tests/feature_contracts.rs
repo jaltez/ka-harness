@@ -312,3 +312,71 @@ fn fork_parent_pointer_survives_listing() {
         "the fork edge must survive a listing"
     );
 }
+
+/// `[history] persistence = "none"` keeps the strand in memory only
+/// (the file never materializes); `max_bytes` stops persisting once the
+/// on-disk ceiling is reached while the session continues in memory.
+#[test]
+fn history_persistence_and_ceiling_honor_the_policy() {
+    let dir = temp_data_dir("history-policy");
+    let cwd = dir.join("proj");
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    // persistence off: nothing ever lands on disk
+    let mut strand = StrandFile::create(&cwd, None).unwrap();
+    strand.set_persist(false);
+    strand
+        .append(Record::Message {
+            images: Vec::new(),
+            id: ka_strand::new_record_id(),
+            role: Role::User,
+            content: "unpersisted".into(),
+            calls: Vec::new(),
+            results: Vec::new(),
+            thinking: None,
+        })
+        .unwrap();
+    assert!(
+        strand.path().is_none(),
+        "a memory-only strand must not materialize"
+    );
+    assert_eq!(strand.records().len(), 2, "records stay in memory");
+
+    // ceiling: the first append materializes, the next one is skipped
+    let mut capped = StrandFile::create(&cwd, None).unwrap();
+    capped.set_max_bytes(Some(1));
+    capped
+        .append(Record::Message {
+            images: Vec::new(),
+            id: ka_strand::new_record_id(),
+            role: Role::User,
+            content: "fits".into(),
+            calls: Vec::new(),
+            results: Vec::new(),
+            thinking: None,
+        })
+        .unwrap();
+    let path = capped
+        .path()
+        .expect("first append materializes")
+        .to_path_buf();
+    capped
+        .append(Record::Message {
+            images: Vec::new(),
+            id: ka_strand::new_record_id(),
+            role: Role::User,
+            content: "over the ceiling".into(),
+            calls: Vec::new(),
+            results: Vec::new(),
+            thinking: None,
+        })
+        .unwrap();
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    assert!(on_disk.contains("fits"), "{on_disk:?}");
+    assert!(
+        !on_disk.contains("over the ceiling"),
+        "ceiling reached: further records must not persist: {on_disk:?}"
+    );
+    assert_eq!(capped.records().len(), 3, "the session continues in memory");
+    let _ = std::fs::remove_dir_all(&dir);
+}

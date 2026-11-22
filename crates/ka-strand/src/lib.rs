@@ -427,6 +427,14 @@ pub struct StrandFile {
     cwd: PathBuf,
     records: Vec<Record>,
     settings: Settings,
+    /// `[history] persistence = "none"`: records stay in memory only —
+    /// `append` never materializes the file, so the session leaves no
+    /// persistent trace (default: persist).
+    persist: bool,
+    /// `[history] max_bytes`: once the on-disk strand reaches this
+    /// ceiling, appends stop writing (the session continues in
+    /// memory). `None` = unlimited.
+    max_bytes: Option<u64>,
 }
 
 /// Replayed session settings.
@@ -501,6 +509,8 @@ impl StrandFile {
             cwd: cwd.to_path_buf(),
             records: vec![header],
             settings: Settings::default(),
+            persist: true,
+            max_bytes: None,
         })
     }
 
@@ -574,6 +584,8 @@ impl StrandFile {
             cwd: path.parent().map(|p| p.to_path_buf()).unwrap_or_default(),
             records,
             settings,
+            persist: true,
+            max_bytes: None,
         })
     }
 
@@ -596,7 +608,8 @@ impl StrandFile {
         Ok(true)
     }
 
-    /// Append a record (writes through to disk).
+    /// Append a record (writes through to disk; memory-only when
+    /// persistence is off, skipped past the `max_bytes` ceiling).
     pub fn append(&mut self, record: Record) -> std::io::Result<()> {
         self.settings.apply(&record);
         if matches!(
@@ -610,11 +623,39 @@ impl StrandFile {
         } else if matches!(record, Record::Message { .. }) {
             self.settings.dangling = false;
         }
+        if !self.persist {
+            self.records.push(record);
+            return Ok(());
+        }
+        if let Some(max) = self.max_bytes {
+            let size = self
+                .path
+                .as_deref()
+                .and_then(|p| std::fs::metadata(p).ok())
+                .map(|m| m.len())
+                .unwrap_or(0);
+            if size >= max {
+                // the ceiling is a policy, not an error: the session
+                // continues, further records stay in memory
+                self.records.push(record);
+                return Ok(());
+            }
+        }
         let path = self.materialize()?;
         let mut writer = StrandWriter::open(&path)?;
         writer.append(&record)?;
         self.records.push(record);
         Ok(())
+    }
+
+    /// Set the persistence policy (`[history] persistence`).
+    pub fn set_persist(&mut self, persist: bool) {
+        self.persist = persist;
+    }
+
+    /// Set the strand byte ceiling (`[history] max_bytes`).
+    pub fn set_max_bytes(&mut self, max: Option<u64>) {
+        self.max_bytes = max;
     }
 
     /// The strand's file path (None until the first append).

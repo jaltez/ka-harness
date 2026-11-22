@@ -141,25 +141,30 @@ fn spawn_speaked(
     }
 }
 
-/// Resolve a strand choice into an open strand (creating when allowed).
+/// Resolve a strand choice into an open strand (creating when allowed),
+/// applying the session's `[history]` persistence policy.
 fn resolve_strand(
     choice: &StrandChoice,
     cwd: &std::path::Path,
+    history: &crate::config::History,
 ) -> std::io::Result<ka_strand::StrandFile> {
-    match choice {
+    let mut strand = match choice {
         StrandChoice::New => {
             let repo = repo_snapshot(cwd);
-            ka_strand::StrandFile::create(cwd, repo)
+            ka_strand::StrandFile::create(cwd, repo)?
         }
         StrandChoice::Latest => match ka_strand::latest(cwd)? {
-            Some(summary) => ka_strand::StrandFile::open(&summary.path),
+            Some(summary) => ka_strand::StrandFile::open(&summary.path)?,
             None => {
                 let repo = repo_snapshot(cwd);
-                ka_strand::StrandFile::create(cwd, repo)
+                ka_strand::StrandFile::create(cwd, repo)?
             }
         },
-        StrandChoice::Path(path) => ka_strand::StrandFile::open(path),
-    }
+        StrandChoice::Path(path) => ka_strand::StrandFile::open(path)?,
+    };
+    strand.set_persist(history.persistence != Some(crate::config::HistoryPersistence::None));
+    strand.set_max_bytes(history.max_bytes);
+    Ok(strand)
 }
 
 /// Capture the repo snapshot in ka-strand's shape.
@@ -412,6 +417,8 @@ struct EngineState {
     verify_round_done: bool,
     /// `[pokes] max`: auto-poke rounds allowed per user prompt.
     poke_max: u32,
+    /// `[history]` persistence policy: strand writes honor it at attach.
+    history: crate::config::History,
     /// Auto-poke rounds spent on the current user prompt.
     pokes_used: u32,
     /// Pending-todo set observed at the last poke check: an unchanged
@@ -436,6 +443,7 @@ impl From<Config> for EngineState {
             needs_title: false,
             auto_commit: c.git.auto_commit.unwrap_or(false),
             poke_max: c.pokes.max.unwrap_or(3),
+            history: c.history,
             verify_test: c.verify.test.clone(),
             pokes_used: 0,
             poke_pending: None,
@@ -2441,8 +2449,8 @@ async fn attach_strand(
     cwd: &std::path::Path,
     choice: &StrandChoice,
 ) -> Result<ka_strand::StrandFile, DynError> {
-    let mut strand =
-        resolve_strand(choice, cwd).map_err(|e| -> DynError { format!("strand: {e}").into() })?;
+    let mut strand = resolve_strand(choice, cwd, &state.history)
+        .map_err(|e| -> DynError { format!("strand: {e}").into() })?;
     // interrupted-turn synthesis — observable when something was recovered
     let recovered = strand.synthesize_aborted().unwrap_or(false);
     // checkpoints and guard latches are session-scoped; re-arm them from
