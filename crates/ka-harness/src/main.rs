@@ -66,8 +66,47 @@ struct Cli {
     /// (`ka -i "fix the tests"` — the TUI resumes on that strand)
     #[arg(short = 'i', long = "interactive-prompt", value_name = "PROMPT")]
     interactive_prompt: Option<String>,
+    /// Reasoning-effort override (off|low|medium|high|max)
+    #[arg(long)]
+    effort: Option<String>,
+    /// Attach an image to the initial prompt (repeatable, png/jpg/webp/gif,
+    /// 5 MB cap each; needs `-i` for the TUI or a `ka run` prompt)
+    #[arg(long, value_name = "PATH")]
+    image: Vec<PathBuf>,
+    /// Hermetic run: no local discovery, no update check, no web tools,
+    /// no telemetry-adjacent traffic — nothing but the model call
+    #[arg(long)]
+    offline: bool,
+    /// Replace ka's built-in identity sentence with this text for the
+    /// session (config `[prompt] identity_file` still wins)
+    #[arg(long)]
+    system_prompt: Option<String>,
+    /// Positive tool allowlist for the session, comma-separated hand
+    /// names (read, edit, bash, ...): everything else is hidden from the
+    /// model and rejected at admit time
+    #[arg(long, value_delimiter = ',')]
+    tools: Vec<String>,
+    /// Tools to disable for the session, comma-separated hand names
+    /// (same as `--disable tool:<name>`)
+    #[arg(long, value_delimiter = ',')]
+    exclude_tools: Vec<String>,
+    /// Skip the user config layer (~/.config/ka/ka.toml) for this run
+    #[arg(long)]
+    ignore_user_config: bool,
+    /// Ignore permission rules for this run: `[[rules]]` tables and the
+    /// `.ka/rules/*.md` conventions (hardstops still apply)
+    #[arg(long)]
+    ignore_rules: bool,
+    /// Leave no persistent trace: strands, spills and snapshots go to a
+    /// temp data dir removed at exit (TUI and `ka run` only)
+    #[arg(long)]
+    ephemeral: bool,
 }
 
+/// The Run variant carries the whole headless flag surface and dwarfs
+/// the other arms; the enum lives on the stack once per process, so
+/// boxing fields to shrink the discriminant buys nothing real.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Clone)]
 enum CliCommand {
     /// Run one headless turn; prints the final answer (see --print)
@@ -121,6 +160,55 @@ enum CliCommand {
         /// changes (like the TUI's /review)
         #[arg(long)]
         review: bool,
+        /// Reasoning-effort override (off|low|medium|high|max)
+        #[arg(long)]
+        effort: Option<String>,
+        /// Attach an image to the prompt (repeatable, png/jpg/webp/gif)
+        #[arg(long, value_name = "PATH")]
+        image: Vec<PathBuf>,
+        /// Hermetic run: no discovery, no update check, no web tools
+        #[arg(long)]
+        offline: bool,
+        /// Replace ka's built-in identity sentence with this text
+        #[arg(long)]
+        system_prompt: Option<String>,
+        /// Positive tool allowlist, comma-separated hand names
+        #[arg(long, value_delimiter = ',')]
+        tools: Vec<String>,
+        /// Tools to disable, comma-separated hand names
+        #[arg(long, value_delimiter = ',')]
+        exclude_tools: Vec<String>,
+        /// Skip the user config layer for this run
+        #[arg(long)]
+        ignore_user_config: bool,
+        /// Ignore permission rules for this run (hardstops still apply)
+        #[arg(long)]
+        ignore_rules: bool,
+        /// Leave no persistent trace (temp data dir, removed at exit)
+        #[arg(long)]
+        ephemeral: bool,
+        /// Write the final answer to this file instead of stdout
+        /// (text mode only)
+        #[arg(short = 'o', long, value_name = "FILE")]
+        out: Option<PathBuf>,
+        /// Cap tool-execution steps for this run (default: config max_steps)
+        #[arg(long, value_name = "N")]
+        max_turns: Option<u32>,
+        /// Ask to stop once session cost crosses this many USD
+        /// (headless: the ask auto-denies, so the run stops)
+        #[arg(long, value_name = "USD")]
+        max_budget_usd: Option<f64>,
+        /// Hard cost cap: when the session's final cost exceeds this,
+        /// the run exits with code 3
+        #[arg(long, value_name = "USD")]
+        max_cost: Option<f64>,
+        /// Warn on stderr when the session's final cost crosses this
+        #[arg(long, value_name = "USD")]
+        warn_cost: Option<f64>,
+        /// Wall-clock cap for the whole run in seconds; on elapse the
+        /// turn is aborted and the run exits with code 3
+        #[arg(long, value_name = "SECS")]
+        max_time: Option<u64>,
     },
     /// Serve the Agent Client Protocol on stdin/stdout
     Acp {
@@ -181,6 +269,9 @@ enum CliCommand {
         /// Extra dialect catalog overlay (strict TOML, repeatable)
         #[arg(long = "dialects")]
         dialects: Vec<PathBuf>,
+        /// Fuzzy filter: case-insensitive substring on the model id
+        #[arg(value_name = "QUERY")]
+        query: Option<String>,
     },
     /// Rewind the newest strand N user turns (default 1)
     Rewind {
@@ -199,6 +290,9 @@ enum CliCommand {
         /// Render a self-contained HTML page instead of markdown
         #[arg(long)]
         html: bool,
+        /// Export the raw strand records as JSONL (roundtrippable)
+        #[arg(long)]
+        jsonl: bool,
     },
     /// Manage user skills (~/.config/ka/skills)
     Skill {
@@ -292,6 +386,23 @@ enum ConfigCommand {
         #[arg(long = "config")]
         configs: Vec<PathBuf>,
     },
+    /// Set one scalar key in the user layer (~/.config/ka/ka.toml)
+    Set {
+        /// Key name (model, effort, mode, tui.mouse, guards.spend_usd, ...)
+        key: String,
+        /// Value (parsed by the key's type; list keys take commas)
+        value: String,
+    },
+    /// Print one key's effective value from the resolved config
+    Get {
+        /// Key name (same table as `ka config set`)
+        key: String,
+        /// Extra strict-TOML config layer (repeatable)
+        #[arg(long = "config")]
+        configs: Vec<PathBuf>,
+    },
+    /// Print the config layer paths ka reads
+    Path,
 }
 
 /// Ed25519 public key embedded at build time (`KA_PUBKEY=<base64>`); the
@@ -396,6 +507,33 @@ fn startup_args(cli: &Cli) -> Vec<(&'static str, Option<std::ffi::OsString>)> {
     if cli.trust {
         out.push(("--trust", None));
     }
+    if let Some(effort) = &cli.effort {
+        out.push(("--effort", Some(effort.into())));
+    }
+    for path in &cli.image {
+        out.push(("--image", Some(path.clone().into_os_string())));
+    }
+    if cli.offline {
+        out.push(("--offline", None));
+    }
+    if let Some(text) = &cli.system_prompt {
+        out.push(("--system-prompt", Some(text.into())));
+    }
+    if !cli.tools.is_empty() {
+        out.push(("--tools", Some(cli.tools.join(",").into())));
+    }
+    if !cli.exclude_tools.is_empty() {
+        out.push(("--exclude-tools", Some(cli.exclude_tools.join(",").into())));
+    }
+    if cli.ignore_user_config {
+        out.push(("--ignore-user-config", None));
+    }
+    if cli.ignore_rules {
+        out.push(("--ignore-rules", None));
+    }
+    if cli.ephemeral {
+        out.push(("--ephemeral", None));
+    }
     out
 }
 
@@ -435,7 +573,12 @@ fn main() -> ExitCode {
             eprintln!("ka: failed to start runtime: {e}");
             std::process::exit(1);
         });
-    match runtime.block_on(dispatch(cli)) {
+    let outcome = runtime.block_on(dispatch(cli));
+    if let Some(dir) = ephemeral_dir {
+        ka_strand::set_data_dir_override(None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    match outcome {
         Ok(code) => code,
         Err(e) => {
             eprintln!("ka: {e}");
@@ -476,6 +619,29 @@ impl FeatureFlags {
     }
 }
 
+/// Build the startup flags from the CLI fields, mapping
+/// `--exclude-tools <name>` onto `tool:<name>` disable specs (the same
+/// grammar as `--disable`).
+fn feature_flags(
+    disable: Vec<ka_protocol::FeatureSpec>,
+    enable: Vec<ka_protocol::FeatureSpec>,
+    sandbox: Option<String>,
+    exclude_tools: &[String],
+) -> Result<FeatureFlags, String> {
+    let mut disable = disable;
+    for name in exclude_tools {
+        let spec: ka_protocol::FeatureSpec = format!("tool:{name}")
+            .parse()
+            .map_err(|e| format!("--exclude-tools {name}: {e}"))?;
+        disable.push(spec);
+    }
+    Ok(FeatureFlags {
+        disable,
+        enable,
+        sandbox,
+    })
+}
+
 /// Project-layer anchor for an interactive trust decision: Some(cwd)
 /// when trusted, else None (no project layer).
 fn trusted_project_cwd(trusted: bool) -> Option<PathBuf> {
@@ -496,17 +662,19 @@ fn load_surface_config(configs: &[PathBuf], cwd: &std::path::Path) -> Result<Con
     load_config(configs, None, None, project, &FeatureFlags::default())
 }
 
-/// Defaults < user < project (if trusted) < extra files < env < flags.
+/// Defaults < user (unless skipped) < project (if trusted) < extra files
+/// < env < flags.
 fn load_config(
     configs: &[PathBuf],
     flag_model: Option<String>,
     flag_mode: Option<String>,
     project_cwd: Option<PathBuf>,
     features: &FeatureFlags,
+    skip_user: bool,
 ) -> Result<Config, String> {
     let mut cfg = Config::default();
 
-    let user = Some(ka_engine::config::user_config_path());
+    let user = (!skip_user).then(ka_engine::config::user_config_path);
     // the project layer anchors at the root project (nearest .git
     // ancestor, else cwd), symmetric with where "always allow" saves it;
     // the caller owns the trust decision (Some = trusted anchor, None =
@@ -656,15 +824,24 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
         session: cli.session,
         model: cli.model,
         mode: cli.mode,
+        disable: cli.disable,
+        enable: cli.enable,
+        sandbox: cli.sandbox,
         configs: cli.configs,
         dialects: cli.dialects,
         no_discovery: cli.no_discovery,
         trust: cli.trust,
         safe_mode: cli.safe_mode,
         interactive_prompt: cli.interactive_prompt,
-        disable: cli.disable,
-        enable: cli.enable,
-        sandbox: cli.sandbox,
+        effort: cli.effort,
+        image: cli.image,
+        offline: cli.offline,
+        system_prompt: cli.system_prompt,
+        tools: cli.tools,
+        exclude_tools: cli.exclude_tools,
+        ignore_user_config: cli.ignore_user_config,
+        ignore_rules: cli.ignore_rules,
+        ephemeral: cli.ephemeral,
     };
     match cli.command {
         Some(CliCommand::Run {
@@ -683,6 +860,21 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             schema,
             print,
             review,
+            effort,
+            image,
+            offline,
+            system_prompt,
+            tools,
+            exclude_tools,
+            ignore_user_config,
+            ignore_rules,
+            ephemeral: _,
+            out,
+            max_turns,
+            max_budget_usd,
+            max_cost,
+            warn_cost,
+            max_time,
         }) => {
             // --review wraps the prompt (or a default) as a read-only
             // review of the working tree — same preset as /review
@@ -706,10 +898,30 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
                 }
                 None => None,
             };
-            let features = FeatureFlags {
-                disable,
-                enable,
-                sandbox,
+            let images = image_parts(&image)?;
+            if !image.is_empty()
+                && prompt.is_none()
+                && std::io::IsTerminal::is_terminal(&std::io::stdin())
+            {
+                return Err(
+                    "--image needs a prompt: pass one positionally or pipe it on stdin".to_string(),
+                );
+            }
+            let features = feature_flags(disable, enable, sandbox, &exclude_tools)?;
+            let opts = RunOpts {
+                images,
+                out,
+                max_turns,
+                max_budget_usd,
+                max_cost,
+                warn_cost,
+                max_time,
+                effort: parse_effort(effort.as_deref())?,
+                system_prompt,
+                tools_allow: tools,
+                offline,
+                ignore_user_config,
+                ignore_rules,
             };
             run_headless(
                 prompt,
@@ -722,9 +934,9 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
                 session,
                 trust,
                 schema_value,
-                Vec::new(),
                 print,
                 features,
+                opts,
             )
             .await
         }
@@ -771,6 +983,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
                 None,
                 trusted_project_cwd(trust),
                 &FeatureFlags::default(),
+                false,
             )?;
             let repo = cfg
                 .update
@@ -784,12 +997,22 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
         Some(CliCommand::Models {
             no_discovery,
             dialects,
+            query,
         }) => {
             let mut catalog = load_catalog(&dialects)?;
             if !no_discovery {
                 ka_dialect::discovery::overlay_discovered(&mut catalog).await;
             }
-            let mut rows: Vec<(&String, &ka_dialect::Dialect)> = catalog.dialects.iter().collect();
+            let needle = query.as_deref().map(str::to_lowercase);
+            let mut rows: Vec<(&String, &ka_dialect::Dialect)> = catalog
+                .dialects
+                .iter()
+                .filter(|(id, _)| {
+                    needle
+                        .as_deref()
+                        .is_none_or(|q| id.to_lowercase().contains(q))
+                })
+                .collect();
             rows.sort_by_key(|(id, _)| {
                 let vendor = id.split('/').next().unwrap_or(id.as_str());
                 (ka_dialect::providers::vendor_rank(vendor), (*id).clone())
@@ -817,7 +1040,12 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
         Some(CliCommand::Init) => run_init(),
         Some(CliCommand::Sessions { json }) => run_sessions(json),
         Some(CliCommand::Rewind { turns }) => run_rewind(turns).await,
-        Some(CliCommand::Export { out, session, html }) => run_export(out, session, html),
+        Some(CliCommand::Export {
+            out,
+            session,
+            html,
+            jsonl,
+        }) => run_export(out, session, html, jsonl),
         Some(CliCommand::Skill { cmd }) => skills::run_skill(cmd),
         Some(CliCommand::Install { cmd }) => skills::run_install(cmd),
         Some(CliCommand::Import {
@@ -862,6 +1090,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
                     None,
                     trusted_project_cwd(trust),
                     &FeatureFlags::default(),
+                    false,
                 )?;
                 let text =
                     toml::to_string_pretty(&cfg).map_err(|e| format!("serialize config: {e}"))?;
@@ -900,6 +1129,32 @@ minor > nit, each as `file:line — issue — concrete fix`, (3) what is missing
     )
 }
 
+/// Per-run options for `ka run` beyond the shared model/mode/features
+/// flags: cost/time caps, output file, and session-shaping overrides
+/// (effort, system prompt, tool allowlist). `offline` implies no
+/// discovery and no web tools; `ignore_user_config` drops the user
+/// config layer for this run.
+#[derive(Debug, Default)]
+struct RunOpts {
+    images: Vec<ka_protocol::ImagePart>,
+    out: Option<PathBuf>,
+    max_turns: Option<u32>,
+    max_budget_usd: Option<f64>,
+    max_cost: Option<f64>,
+    warn_cost: Option<f64>,
+    max_time: Option<u64>,
+    effort: Option<ka_protocol::Effort>,
+    system_prompt: Option<String>,
+    tools_allow: Vec<String>,
+    offline: bool,
+    ignore_user_config: bool,
+    ignore_rules: bool,
+}
+
+/// Exit code for a cost/time cap breach (distinct from abort=2 and
+/// error=1 so scripts can tell "I hit my own cap" from failures).
+const EXIT_CAP: u8 = 3;
+
 #[allow(clippy::too_many_arguments)]
 async fn run_headless(
     prompt: Option<String>,
@@ -912,13 +1167,22 @@ async fn run_headless(
     session: Option<String>,
     force_trust: bool,
     schema: Option<serde_json::Value>,
-    images: Vec<ka_protocol::ImagePart>,
     print: String,
     features: FeatureFlags,
+    opts: RunOpts,
 ) -> Result<ExitCode, String> {
     let trust = trust_for_cwd(force_trust);
     warn_untrusted_conventions(&std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    let cfg = load_config(configs, model, mode, trusted_project_cwd(trust), &features)?;
+    let mut cfg = load_config(
+        configs,
+        model,
+        mode,
+        trusted_project_cwd(trust),
+        &features,
+        opts.ignore_user_config,
+    )?;
+    apply_run_opts(&mut cfg, &opts);
+    let with_discovery = with_discovery && !opts.offline;
     let prompt = match prompt {
         Some(p) => p,
         None => read_stdin()?,
@@ -951,7 +1215,7 @@ async fn run_headless(
             model: None,
             text: prompt,
             schema,
-            images,
+            images: opts.images,
             skills: Vec::new(),
         })
         .await
@@ -961,6 +1225,7 @@ async fn run_headless(
     let mut final_stop: Option<Stop> = None;
     let mut idle_seen = false;
     let mut final_text = String::new();
+    let mut total_cost = 0.0f64;
     let mut sj = StreamJsonPrinter::with_model(cfg_model.clone());
     while let Some(event) = handle.events.recv().await {
         // headless policy: permission asks auto-deny (last option = deny)
@@ -975,7 +1240,10 @@ async fn run_headless(
                 .map_err(|_| "engine closed during ask")?;
         }
         match &event {
-            Event::TurnFinished { stop, .. } => final_stop = Some(*stop),
+            Event::TurnFinished { stop, usage } => {
+                final_stop = Some(*stop);
+                total_cost += usage.cost;
+            }
             Event::Idle => {
                 idle_seen = true;
                 break;
@@ -998,6 +1266,13 @@ async fn run_headless(
             }
         }
     }
+    if deadline.is_some() && !idle_seen {
+        // the timeout fired: abort whatever is still running and report
+        // the cap (the events channel may still carry the abort's tail)
+        let _ = handle.commands.send(Command::Abort).await;
+        eprintln!("ka: --max-time reached; run aborted");
+        return Ok(ExitCode::from(EXIT_CAP));
+    }
     // stream-json: the terminating result line (after the loop so cost
     // and stop reason are final)
     if print == "stream-json" {
@@ -1006,15 +1281,69 @@ async fn run_headless(
             writeln!(stdout, "{line}").map_err(|e| format!("stdout: {e}"))?;
         }
     }
-    // text: the final answer only
+    // text: the final answer only — to --out when given, else stdout
     if print == "text" && !final_text.is_empty() {
-        use std::io::Write;
-        writeln!(stdout, "{final_text}").map_err(|e| format!("stdout: {e}"))?;
+        if let Some(out) = &opts.out {
+            std::fs::write(out, &final_text)
+                .map_err(|e| format!("--out {}: {e}", out.display()))?;
+        } else {
+            use std::io::Write;
+            writeln!(stdout, "{final_text}").map_err(|e| format!("stdout: {e}"))?;
+        }
     }
     std::io::Write::flush(&mut stdout).map_err(|e| format!("stdout: {e}"))?;
+    if let Some(warn) = opts.warn_cost {
+        if total_cost > warn {
+            eprintln!("ka: cost ${warn:.2} exceeded (session: ${total_cost:.4})");
+        }
+    }
+    if let Some(max) = opts.max_cost {
+        if total_cost > max {
+            eprintln!("ka: --max-cost ${max:.2} exceeded (session: ${total_cost:.4})");
+            return Ok(ExitCode::from(EXIT_CAP));
+        }
+    }
     // the loop only exits without Idle when the events channel closed
     // (engine task gone) — same "no final stop" condition
     exit_code_for(final_stop, idle_seen, idle_seen)
+}
+
+/// Apply the run-level overrides onto the merged config, before spawn:
+/// effort/system-prompt/tool-allowlist shape the session, the cost
+/// budget rides the existing spend guard, max_turns caps steps, and
+/// offline drops the web hands entirely.
+fn apply_run_opts(cfg: &mut Config, opts: &RunOpts) {
+    if let Some(effort) = opts.effort {
+        cfg.effort = Some(effort);
+    }
+    if let Some(text) = &opts.system_prompt {
+        cfg.prompt.identity_inline = Some(text.clone());
+    }
+    if !opts.tools_allow.is_empty() {
+        cfg.features.allow = opts.tools_allow.clone();
+    }
+    if let Some(budget) = opts.max_budget_usd {
+        cfg.guards.spend_usd = Some(budget);
+    }
+    if let Some(turns) = opts.max_turns {
+        cfg.max_steps = Some(turns);
+    }
+    if opts.ignore_rules {
+        // `--ignore-rules`: [[rules]] tables and the rule-file
+        // conventions both out (the conventions gate is set in main
+        // before the runtime spawns); hardstops are untouched
+        cfg.rules.clear();
+    }
+    if opts.offline {
+        cfg.update.check = Some(ka_engine::config::UpdateCheck::Off);
+        let spec = "web".parse::<ka_protocol::FeatureSpec>();
+        if let Ok(spec) = spec {
+            let s = spec.to_string();
+            if !cfg.features.disable.contains(&s) {
+                cfg.features.disable.push(s);
+            }
+        }
+    }
 }
 
 /// Terminal exit status of a headless run. A missing final stop with no
@@ -1245,18 +1574,34 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
 
     let trust = trust_for_cwd(cli.trust);
     warn_untrusted_conventions(&cwd);
-    let features = FeatureFlags {
-        disable: cli.disable.clone(),
-        enable: cli.enable.clone(),
-        sandbox: cli.sandbox.clone(),
-    };
-    let cfg = load_config(
+    if !cli.image.is_empty() && cli.interactive_prompt.is_none() {
+        return Err("--image needs a prompt: pass -i \"<prompt>\" with it".to_string());
+    }
+    let features = feature_flags(
+        cli.disable.clone(),
+        cli.enable.clone(),
+        cli.sandbox.clone(),
+        &cli.exclude_tools,
+    )?;
+    let mut cfg = load_config(
         &cli.configs,
         cli.model.clone(),
         cli.mode.clone(),
         trusted_project_cwd(trust),
         &features,
+        cli.ignore_user_config,
     )?;
+    let run_opts = RunOpts {
+        images: image_parts(&cli.image)?,
+        effort: parse_effort(cli.effort.as_deref())?,
+        system_prompt: cli.system_prompt.clone(),
+        tools_allow: cli.tools.clone(),
+        offline: cli.offline,
+        ignore_user_config: cli.ignore_user_config,
+        ignore_rules: cli.ignore_rules,
+        ..RunOpts::default()
+    };
+    apply_run_opts(&mut cfg, &run_opts);
     // the engine resolves its cwd as config cwd else process cwd; the
     // TUI must see the same value or plan-file paths, memory roots, and
     // custom-command roots drift from what the engine anchors to
@@ -1359,7 +1704,7 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
                 model: None,
                 text: prompt,
                 schema: None,
-                images: Vec::new(),
+                images: run_opts.images,
                 skills: Vec::new(),
             })
             .await
@@ -1381,6 +1726,7 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
             cli.mode.clone(),
             trusted_project_cwd(trust),
             &features,
+            cli.ignore_user_config,
         )
         .map(|c| {
             (
@@ -1448,6 +1794,7 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
                 None,
                 trusted_project_cwd(trust),
                 &FeatureFlags::default(),
+                false,
             )?;
             let repo = cfg
                 .update
@@ -1686,6 +2033,7 @@ async fn run_mcp() -> Result<ExitCode, String> {
         None,
         trusted_project_cwd(trust),
         &FeatureFlags::default(),
+        false,
     )?;
     if cfg.mcp.is_empty() {
         println!("no [[mcp]] servers configured (~/.config/ka/ka.toml or .ka/ka.toml)");
@@ -1925,7 +2273,7 @@ async fn run_rewind(turns: u32) -> Result<ExitCode, String> {
     };
     // rewind only reads strand files — it must not silently approve the
     // project's .ka layer (trust is a side effect no reader should trip)
-    let cfg = load_config(&[], None, None, None, &FeatureFlags::default())?;
+    let cfg = load_config(&[], None, None, None, &FeatureFlags::default(), false)?;
     let catalog = build_catalog(&[], true).await?;
     let mut handle = ka_engine::spawn_full(cfg, catalog, choice);
     handle
@@ -1952,7 +2300,11 @@ fn run_export(
     out: Option<PathBuf>,
     session: Option<String>,
     html: bool,
+    jsonl: bool,
 ) -> Result<ExitCode, String> {
+    if html && jsonl {
+        return Err("--html and --jsonl are mutually exclusive".to_string());
+    }
     let cwd = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
     let target = match session {
         Some(id) => match resolve_session(&cwd, &id)? {

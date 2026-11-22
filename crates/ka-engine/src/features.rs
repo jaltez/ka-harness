@@ -43,10 +43,13 @@ pub fn parse_specs(specs: &[String]) -> Result<Vec<FeatureSpec>, String> {
 }
 
 /// The live toggle set. `disabled` is a snapshot (persisted whole); the
-/// live-MCP names feed the `server__tool` prefix matching.
+/// live-MCP names feed the `server__tool` prefix matching. `allow` is
+/// the positive allowlist (`[features] allow`): empty = everything,
+/// non-empty = only those hands; `disable` wins over `allow`.
 #[derive(Debug, Clone, Default)]
 pub struct FeatureToggles {
     disabled: BTreeSet<FeatureSpec>,
+    allow: Vec<String>,
     live_mcp: Vec<String>,
     sandbox: Option<String>,
 }
@@ -54,8 +57,15 @@ pub struct FeatureToggles {
 impl FeatureToggles {
     /// A slot primed with the given disabled specs (engine bootstrap).
     pub fn slot(disabled: Vec<FeatureSpec>) -> FeatureSlot {
+        Self::slot_with(disabled, Vec::new())
+    }
+
+    /// A slot primed with disabled specs AND the positive allowlist
+    /// (engine bootstrap: `[features] disable` + `[features] allow`).
+    pub fn slot_with(disabled: Vec<FeatureSpec>, allow: Vec<String>) -> FeatureSlot {
         std::sync::Arc::new(parking_lot::RwLock::new(Self {
             disabled: disabled.into_iter().collect(),
+            allow,
             live_mcp: Vec::new(),
             sandbox: None,
         }))
@@ -64,6 +74,12 @@ impl FeatureToggles {
     /// The disabled specs, display-ordered (snapshot form).
     pub fn disabled_specs(&self) -> Vec<String> {
         self.disabled.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The positive allowlist entries (snapshot form; empty = no
+    /// restriction).
+    pub fn allow_entries(&self) -> Vec<String> {
+        self.allow.clone()
     }
 
     /// Whether a spec is switched off.
@@ -80,12 +96,25 @@ impl FeatureToggles {
         }
     }
 
-    /// Replace the whole disabled set + sandbox override (strand
-    /// restore). Live MCP names describe the world, not the toggles —
-    /// they stay.
-    pub fn replace_snapshot(&mut self, disabled: Vec<FeatureSpec>, sandbox: Option<String>) {
+    /// Replace the whole toggle snapshot + allowlist (strand restore).
+    /// Live MCP names describe the world, not the toggles — they stay.
+    pub fn replace_snapshot(
+        &mut self,
+        disabled: Vec<FeatureSpec>,
+        allow: Vec<String>,
+        sandbox: Option<String>,
+    ) {
         self.disabled = disabled.into_iter().collect();
+        self.allow = allow;
         self.sandbox = sandbox;
+    }
+
+    /// Snapshot strings for the strand `Change` record: the disabled
+    /// specs plus one `allow:<entry>` string per allowlist entry.
+    /// `allow:` is not a feature-spec grammar prefix, so the combined
+    /// list round-trips unambiguously ([`split_snapshot`]).
+    pub fn snapshot_specs(&self) -> Vec<String> {
+        encode_snapshot(&self.disabled_specs(), &self.allow)
     }
 
     /// Names of the connected MCP servers (prefix matching for eager
@@ -174,6 +203,30 @@ impl FeatureToggles {
     }
 }
 
+/// Snapshot strings for the strand `Change` record: disabled specs
+/// plus one `allow:<entry>` string per `[features] allow` entry.
+/// `allow:` is not a feature-spec grammar prefix, so the combined list
+/// round-trips unambiguously ([`split_snapshot`]).
+pub fn encode_snapshot(disabled: &[String], allow: &[String]) -> Vec<String> {
+    let mut out = disabled.to_vec();
+    out.extend(allow.iter().map(|a| format!("allow:{a}")));
+    out
+}
+
+/// Split a recorded snapshot list back into (disabled specs,
+/// allowlist entries) — inverse of [`encode_snapshot`].
+pub fn split_snapshot(list: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut specs = Vec::new();
+    let mut allow = Vec::new();
+    for s in list {
+        match s.strip_prefix("allow:") {
+            Some(entry) if !entry.is_empty() => allow.push(entry.to_string()),
+            _ => specs.push(s.clone()),
+        }
+    }
+    (specs, allow)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -183,6 +236,16 @@ mod tests {
     fn toggles(specs: &[FeatureSpec]) -> FeatureToggles {
         FeatureToggles {
             disabled: specs.iter().cloned().collect(),
+            allow: Vec::new(),
+            live_mcp: vec!["github".into(), "jira".into()],
+            sandbox: None,
+        }
+    }
+
+    fn allowed(specs: &[FeatureSpec], allow: &[&str]) -> FeatureToggles {
+        FeatureToggles {
+            disabled: specs.iter().cloned().collect(),
+            allow: allow.iter().map(|s| s.to_string()).collect(),
             live_mcp: vec!["github".into(), "jira".into()],
             sandbox: None,
         }

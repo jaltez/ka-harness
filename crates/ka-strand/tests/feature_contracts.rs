@@ -88,6 +88,64 @@ fn render_markdown_includes_roles_and_content() {
     assert!(md.contains("ka"), "{md:?}");
 }
 
+/// JSONL export: the render re-parses through the same reader and
+/// replays the same strand — same records, same tip — so exported
+/// output is a strand file again (the `ka export --jsonl` contract).
+#[test]
+fn render_jsonl_reparses_to_the_same_records_and_tip() {
+    let records = vec![
+        Record::Header {
+            id: ka_strand::new_strand_id(),
+            ts: "2026-11-22T00:00:00Z".into(),
+            cwd: "/tmp/proj".into(),
+            version: 1,
+            repo: None,
+            parent: Some("s-origin".into()),
+        },
+        Record::Message {
+            id: ka_strand::new_record_id(),
+            images: Vec::new(),
+            role: Role::User,
+            content: "export me".into(),
+            calls: Vec::new(),
+            results: Vec::new(),
+            thinking: None,
+        },
+        Record::Message {
+            id: ka_strand::new_record_id(),
+            images: Vec::new(),
+            role: Role::Assistant,
+            content: "rendered back".into(),
+            calls: Vec::new(),
+            results: Vec::new(),
+            thinking: None,
+        },
+        Record::Change {
+            id: ka_strand::new_record_id(),
+            model: Some("ka-model-2".into()),
+            effort: None,
+            mode: None,
+            features: None,
+            sandbox: None,
+        },
+        Record::Title {
+            id: ka_strand::new_record_id(),
+            title: "export me (fork)".into(),
+        },
+    ];
+    let rendered = ka_strand::render_jsonl(&records).unwrap();
+    // one line per record, header fork carried
+    assert_eq!(rendered.lines().count(), records.len());
+    assert!(rendered.contains("\"parent\":\"s-origin\""), "{rendered}");
+
+    let path = std::env::temp_dir().join(format!("ka-strand-jsonl-{}.jsonl", std::process::id()));
+    std::fs::write(&path, &rendered).unwrap();
+    let reparsed = ka_strand::read(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(reparsed, records);
+    assert_eq!(reparsed.last(), records.last());
+}
+
 /// Resume by id: unique prefixes resolve; ambiguous prefixes report the
 /// candidates; unknown ids report none — the `ka --session <prefix>`
 /// contract.

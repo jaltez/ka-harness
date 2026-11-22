@@ -246,6 +246,13 @@ pub struct Voice {
     /// `[prompt] identity_file`: a file whose text replaces the
     /// built-in identity sentence (re-read every turn; None = default).
     identity_file: Option<String>,
+    /// `[prompt] identity_inline`: inline identity text for when no
+    /// `identity_file` is configured (or it is unreadable); capped at
+    /// 8 KiB like the file. Lower precedence than the file.
+    identity_inline: Option<String>,
+    /// `project_doc_fallback_filenames`: extra instruction filenames
+    /// conventions search per directory after AGENTS.md/CLAUDE.md.
+    project_doc_fallbacks: Vec<String>,
     /// One unreadable-identity Note per session (not one per turn).
     identity_warned: bool,
     /// Auto-promote to a bigger-context sibling on overflow
@@ -346,6 +353,8 @@ impl Voice {
             last_digest: None,
             fallbacks: Vec::new(),
             identity_file: None,
+            identity_inline: None,
+            project_doc_fallbacks: Vec::new(),
             identity_warned: false,
             context_promote: true,
             promoted: false,
@@ -412,7 +421,7 @@ impl Voice {
         self.hands
             .iter()
             .map(|h| h.def().name)
-            .filter(|n| features.hidden_reason(n).is_none())
+            .filter(|n| features.tool_visible(n))
             .collect()
     }
 
@@ -467,16 +476,22 @@ impl Voice {
     pub fn restore_feature_snapshot(
         &mut self,
         disabled: Vec<ka_protocol::FeatureSpec>,
+        allow: Vec<String>,
         sandbox: Option<String>,
     ) {
         self.features.write().replace_snapshot(disabled, sandbox);
         self.specs_cache.lock().take();
     }
 
-    /// The current toggle snapshot: disabled specs + sandbox override.
-    pub fn features_snapshot(&self) -> (Vec<String>, Option<String>) {
+    /// The current toggle snapshot: disabled specs, the positive
+    /// allowlist, and the sandbox override.
+    pub fn features_snapshot(&self) -> (Vec<String>, Vec<String>, Option<String>) {
         let f = self.features.read();
-        (f.disabled_specs(), f.sandbox_override().map(str::to_string))
+        (
+            f.disabled_specs(),
+            f.allow_entries(),
+            f.sandbox_override().map(str::to_string),
+        )
     }
 
     /// Whether hooks run at all (the `hooks` feature toggle). Engine
@@ -560,6 +575,8 @@ impl Voice {
             last_digest: None,
             fallbacks: Vec::new(),
             identity_file: None,
+            identity_inline: None,
+            project_doc_fallbacks: Vec::new(),
             identity_warned: false,
             context_promote: true,
             promoted: false,
@@ -803,42 +820,67 @@ impl Voice {
         self.identity_warned = false;
     }
 
-    /// Read the identity file for this turn's prompt: `None` keeps the
-    /// built-in identity (no file configured, safe mode, unreadable —
-    /// with one Note per session for the failure — or empty file).
-    /// Content over 8 KiB is cut on a char boundary and marked.
+    /// Set `[prompt] identity_inline` (engine bootstrap): inline
+    /// identity text used when no `identity_file` is configured (or it
+    /// is unreadable).
+    pub fn set_identity_inline(&mut self, text: Option<String>) {
+        self.identity_inline = text;
+    }
+
+    /// Set `project_doc_fallback_filenames` (engine bootstrap): extra
+    /// instruction filenames conventions search per directory after
+    /// AGENTS.md/CLAUDE.md.
+    pub fn set_project_doc_fallbacks(&mut self, names: Vec<String>) {
+        self.project_doc_fallbacks = names;
+    }
+
+    /// This turn's identity text: `[prompt] identity_file` wins, then
+    /// `[prompt] identity_inline`, then the built-in sentence (None).
+    /// The file is re-read every prompt assembly so edits apply
+    /// without a restart; an unreadable file warns once per session
+    /// and falls through to the inline text. Content over 8 KiB is cut
+    /// on a char boundary and marked. Safe mode keeps the built-in
+    /// identity.
     async fn load_identity(&mut self, events: &mpsc::Sender<Event>) -> Option<String> {
         if crate::conventions::bare_mode() {
             return None;
         }
-        let path = self.identity_file.as_deref()?;
-        match std::fs::read_to_string(path) {
-            Ok(text) => {
-                const CAP: usize = 8192;
-                if text.len() <= CAP {
-                    return Some(text);
-                }
-                let mut cut = CAP;
-                while cut > 0 && !text.is_char_boundary(cut) {
-                    cut -= 1;
-                }
-                Some(format!("{}\n[identity truncated at 8 KiB]", &text[..cut]))
+        fn cap_8kib(mut text: String) -> String {
+            const CAP: usize = 8192;
+            if text.len() <= CAP {
+                return text;
             }
-            Err(err) => {
-                if !self.identity_warned {
-                    self.identity_warned = true;
-                    events
-                        .send(Event::Note {
-                            message: format!(
-                                "identity file {path}: {err} — using ka's default identity"
-                            ),
-                        })
-                        .await
-                        .ok();
+            let mut cut = CAP;
+            while cut > 0 && !text.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            text.truncate(cut);
+            format!("{text}\n[identity truncated at 8 KiB]")
+        }
+        if let Some(path) = self.identity_file.as_deref() {
+            match std::fs::read_to_string(path) {
+                Ok(text) => return Some(cap_8kib(text)),
+                Err(err) => {
+                    if !self.identity_warned {
+                        self.identity_warned = true;
+                        let fallback = if self.identity_inline.is_some() {
+                            "[prompt] identity_inline"
+                        } else {
+                            "ka's default identity"
+                        };
+                        events
+                            .send(Event::Note {
+                                message: format!("identity file {path}: {err} — using {fallback}"),
+                            })
+                            .await
+                            .ok();
+                    }
                 }
-                None
             }
         }
+        self.identity_inline
+            .as_deref()
+            .map(|text| cap_8kib(text.to_string()))
     }
 
     /// Set the LSP diagnostics manager (engine bootstrap).
@@ -1661,13 +1703,14 @@ impl Voice {
             return cached.clone();
         }
         // two filters stack: session feature toggles hide disabled
-        // capabilities outright, and a per-turn allowlist
-        // (custom-command `allowed-tools`) narrows what remains
+        // capabilities outright, the positive allowlist ([features]
+        // allow) narrows what remains, and a per-turn allowlist
+        // (custom-command `allowed-tools`) narrows it further
         let features = self.features.read();
         let specs: Vec<ToolSpec> = self
             .hands
             .iter()
-            .filter(|h| features.hidden_reason(&h.def().name).is_none())
+            .filter(|h| features.tool_visible(&h.def().name))
             .filter(|h| {
                 self.turn_tools
                     .as_ref()
@@ -1794,8 +1837,13 @@ impl Voice {
                 .await
                 .unwrap_or_else(|_| crate::hands::git::RepoSnapshot::default());
         let mut system = String::new();
-        // AGENTS.md hierarchy (root→cwd)
-        for agents in crate::conventions::discover_agents(&self.hand_ctx.cwd) {
+        // AGENTS.md hierarchy (root→cwd), with configured fallback
+        // filenames (AGENTS.override.md > AGENTS.md > CLAUDE.md >
+        // fallbacks, one file per directory)
+        for agents in crate::conventions::discover_agents_with(
+            &self.hand_ctx.cwd,
+            &self.project_doc_fallbacks,
+        ) {
             system.push_str(&format!(
                 "\n<project-instructions src=\"{}\">\n{}\n</project-instructions>\n",
                 agents.path.display(),
@@ -2730,6 +2778,18 @@ impl Voice {
             let output = ToolOutput::err(format!(
                 "{} is disabled by a session feature toggle (`{spec}`); it is unavailable until the user re-enables it",
                 call.tool
+            ));
+            self.surface_decided(call, &output, events).await;
+            return Err(output);
+        }
+        // positive allowlist ([features] allow): specs() already hid
+        // non-listed hands; this guard rejects strays fail-closed,
+        // like the disable guard above
+        if !self.features.read().tool_allowed(&call.tool) {
+            let allowed = self.features.read().allow_entries().join(", ");
+            let output = ToolOutput::err(format!(
+                "{} is not in this session's [features] allow list ({}); it is unavailable",
+                call.tool, allowed
             ));
             self.surface_decided(call, &output, events).await;
             return Err(output);
@@ -4470,6 +4530,105 @@ mod tests {
                 .iter()
                 .all(|e| !matches!(e, ka_protocol::Event::Note { .. })),
             "the warning fires once per session: {events2:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `[prompt]` identity precedence: identity_file > identity_inline
+    /// > the built-in sentence — and an unreadable file falls through
+    /// to the inline text (one note, naming the inline fallback).
+    #[tokio::test]
+    async fn identity_precedence_file_over_inline_over_default() {
+        let dir = std::env::temp_dir().join(format!("ka-voice-id2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let catalog = Catalog::parse(
+            "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000\n",
+        )
+        .unwrap();
+        let speaker = |seen: std::sync::Arc<parking_lot::Mutex<Vec<String>>>| {
+            Voice::new(catalog.clone(), dir.clone(), ka_protocol::Mode::Ask, 5).with_speaker(
+                Wire::OpenaiChat,
+                std::sync::Arc::new(SystemSpeaker { systems: seen }),
+            )
+        };
+
+        // both configured: the file wins, the inline text never shows
+        let id_path = dir.join("IDENTITY.md");
+        std::fs::write(&id_path, "You are Ka, the file identity.").unwrap();
+        let seen = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let mut voice = speaker(seen.clone());
+        voice.set_identity_file(Some(id_path.display().to_string()));
+        voice.set_identity_inline(Some("You are Ka, the inline identity.".to_string()));
+        let (events, _) = run_identity_turn(&mut voice).await;
+        assert!(events.iter().all(|e| !matches!(e, Event::Note { .. })));
+        let system = seen.lock()[0].clone();
+        assert!(system.contains("the file identity"), "{system}");
+        assert!(
+            !system.contains("the inline identity"),
+            "identity_file outranks identity_inline: {system}"
+        );
+        assert!(!system.contains("precise coding agent"));
+
+        // inline only: its text replaces the built-in sentence
+        let seen = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let mut voice = speaker(seen.clone());
+        voice.set_identity_inline(Some("You are Ka, the inline identity.".to_string()));
+        let (events, _) = run_identity_turn(&mut voice).await;
+        assert!(events.iter().all(|e| !matches!(e, Event::Note { .. })));
+        let system = seen.lock()[0].clone();
+        assert!(system.contains("the inline identity"), "{system}");
+        assert!(
+            !system.contains("precise coding agent"),
+            "inline replaces the built-in identity: {system}"
+        );
+
+        // neither: the built-in identity stands
+        let seen = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let mut voice = speaker(seen.clone());
+        let (_, _) = run_identity_turn(&mut voice).await;
+        assert!(
+            seen.lock()[0].contains("You are ka, a precise coding agent."),
+            "no identity config keeps the default: {}",
+            seen.lock()[0]
+        );
+
+        // unreadable file with inline set: exactly one note naming the
+        // inline fallback, and the inline text rides the prompt
+        let seen = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let mut voice = speaker(seen.clone());
+        voice.set_identity_file(Some(dir.join("missing.md").display().to_string()));
+        voice.set_identity_inline(Some("You are Ka, the inline identity.".to_string()));
+        let (events, _) = run_identity_turn(&mut voice).await;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, Event::Note { .. }))
+                .count(),
+            1,
+            "one note for the unreadable file: {events:?}"
+        );
+        assert!(events.iter().any(|e| matches!(
+            e,
+            Event::Note { message }
+                if message.contains("identity file") && message.contains("identity_inline")
+        )));
+        assert!(
+            seen.lock()[0].contains("the inline identity"),
+            "unreadable file falls through to inline: {}",
+            seen.lock()[0]
+        );
+
+        // the inline text is capped at 8 KiB like the file
+        let seen = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let mut voice = speaker(seen.clone());
+        voice.set_identity_inline(Some("x".repeat(20_000)));
+        let (_, _) = run_identity_turn(&mut voice).await;
+        let system = &seen.lock()[0];
+        assert!(
+            system.contains("[identity truncated at 8 KiB]"),
+            "inline identity capped: {} chars",
+            system.len()
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

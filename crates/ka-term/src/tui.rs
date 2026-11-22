@@ -2320,7 +2320,7 @@ fn usage_tail(u: &ka_protocol::Usage, dur: f64) -> String {
 
 /// Base64-encode a string's UTF-8 bytes (standard alphabet, `=` padding).
 /// Local helper — the workspace has no base64 dependency.
-fn b64encode(data: impl AsRef<[u8]>) -> String {
+pub fn b64encode(data: impl AsRef<[u8]>) -> String {
     const ALPHA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let bytes = data.as_ref();
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);

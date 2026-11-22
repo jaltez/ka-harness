@@ -488,7 +488,7 @@ struct Ctx {
 async fn run(
     mut commands: mpsc::Receiver<Command>,
     events: mpsc::Sender<Event>,
-    config: Config,
+    mut config: Config,
     catalog: ka_dialect::Catalog,
     strand_choice: StrandChoice,
     speaker: Option<(
@@ -502,6 +502,12 @@ async fn run(
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| std::path::PathBuf::from("."));
+    // [[model_pins]]: the FIRST pin whose glob matches the session cwd
+    // overwrites the configured model (roles and the strand baseline
+    // read config.model below); no match leaves it untouched
+    if let Some(pinned) = config.effective_model_for(&cwd) {
+        config.model = Some(pinned);
+    }
     // safe mode: config-file hooks are customizations too — built-ins,
     // config chain, rules, and auth stay
     let mcp_servers = if crate::conventions::bare_mode() {
@@ -528,22 +534,32 @@ async fn run(
     if let Some((wire, speaker)) = speaker {
         voice = voice.with_speaker(wire, speaker);
     }
-    // [features] disable: validated once, primed into the shared toggle
-    // slot every layer of this feature reads (specs filter, admit guard,
-    // prompt build, the dynamic hands)
+    // [features] disable + allow: validated once, primed into the
+    // shared toggle slot every layer of this feature reads (specs
+    // filter, admit guard, prompt build, the dynamic hands)
     let disabled_specs = crate::features::parse_specs(&config.features.disable)
         .map_err(|e| -> DynError { format!("[features] disable: {e}").into() })?;
-    let features = crate::features::FeatureToggles::slot(disabled_specs);
+    let features =
+        crate::features::FeatureToggles::slot_with(disabled_specs, config.features.allow.clone());
     voice.set_feature_slot(features.clone());
     voice.set_rules(rules);
     voice.set_verify(config.verify.clone());
-    // [prompt] identity_file: same trust class as convention discovery
-    // (a user-authored local file) — inert in safe mode
+    // [prompt] identity_file + identity_inline: same trust class as
+    // convention discovery (user-authored local text) — inert in safe
+    // mode
     voice.set_identity_file(if crate::conventions::bare_mode() {
         None
     } else {
         config.prompt.identity_file.clone()
     });
+    voice.set_identity_inline(if crate::conventions::bare_mode() {
+        None
+    } else {
+        config.prompt.identity_inline.clone()
+    });
+    // project_doc_fallback_filenames: discovery self-gates on safe
+    // mode; the names only widen the per-directory search
+    voice.set_project_doc_fallbacks(config.project_doc_fallback_filenames.clone());
     voice.set_allowed_tools(allowed_tools);
     voice.set_hooks(hooks);
     voice.set_bash_background_ms(config.effective_bash_background_after_ms());
@@ -584,7 +600,7 @@ async fn run(
     // decisions below honor it
     let strand = attach_strand(&events, &mut state, &mut voice, &cwd, &strand_choice).await?;
     // strand-restored sandbox override: recompute the live policy
-    if let Some(mode) = voice.features_snapshot().1 {
+    if let Some(mode) = voice.features_snapshot().2 {
         if let Err(e) = apply_sandbox_policy(&mut voice, &sandbox_cfg, &cwd, &mode) {
             events
                 .send(Event::Error {
@@ -1118,7 +1134,7 @@ async fn emit_inventory(ctx: &Ctx) {
             .cloned()
             .collect()
     };
-    let (disabled, _) = ctx.voice.features_snapshot();
+    let (disabled, _, _) = ctx.voice.features_snapshot();
     ctx.events
         .send(Event::Inventory {
             tools: ctx.voice.visible_hand_names(),
@@ -1133,15 +1149,18 @@ async fn emit_inventory(ctx: &Ctx) {
 }
 
 /// Persist the toggle snapshot to the strand (last record wins on
-/// resume), announce it, and refresh the inventory card.
+/// resume), announce it, and refresh the inventory card. The positive
+/// allowlist rides the same record as `allow:<entry>` strings
+/// ([crate::features::encode_snapshot]).
 async fn persist_features(ctx: &mut Ctx) {
-    let (disabled, sandbox) = ctx.voice.features_snapshot();
+    let (disabled, allow, sandbox) = ctx.voice.features_snapshot();
+    let snapshot = crate::features::encode_snapshot(&disabled, &allow);
     let _ = ctx.strand.append(ka_strand::Record::Change {
         id: ka_strand::new_record_id(),
         model: None,
         effort: None,
         mode: None,
-        features: Some(disabled.clone()),
+        features: Some(snapshot),
         sandbox: sandbox.clone(),
     });
     ctx.events
@@ -2525,17 +2544,20 @@ async fn attach_strand(
         .ok();
     // feature toggles: a recorded snapshot replaces the live set
     // wholesale (over the config baseline, like model/mode); a strand
-    // that never recorded one keeps the current set. Specs that no
-    // longer parse (grammar drift) are skipped with a note.
+    // that never recorded one keeps the current set. The list also
+    // carries the positive allowlist as `allow:<entry>` strings
+    // ([features::encode_snapshot]); specs that no longer parse
+    // (grammar drift) are skipped with a note.
     if let Some(list) = &settings.features {
+        let (spec_strs, allow) = crate::features::split_snapshot(list);
         let parsed: Vec<ka_protocol::FeatureSpec> =
-            list.iter().filter_map(|s| s.parse().ok()).collect();
-        let skipped: Vec<String> = list
+            spec_strs.iter().filter_map(|s| s.parse().ok()).collect();
+        let skipped: Vec<String> = spec_strs
             .iter()
             .filter(|s| s.parse::<ka_protocol::FeatureSpec>().is_err())
             .cloned()
             .collect();
-        voice.restore_feature_snapshot(parsed, settings.sandbox.clone());
+        voice.restore_feature_snapshot(parsed, allow, settings.sandbox.clone());
         if !skipped.is_empty() {
             events
                 .send(Event::Note {
@@ -2548,7 +2570,7 @@ async fn attach_strand(
                 .ok();
         }
     }
-    let (disabled, sandbox) = voice.features_snapshot();
+    let (disabled, _, sandbox) = voice.features_snapshot();
     if !disabled.is_empty() || sandbox.is_some() {
         events
             .send(Event::FeaturesChanged { disabled, sandbox })

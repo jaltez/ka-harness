@@ -27,6 +27,21 @@ pub fn set_bare_mode(on: bool) {
     BARE.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Disable the rule-file conventions for this process (CLI
+/// `--ignore-rules`): `discover_rules` yields nothing, so neither the
+/// project `.ka/rules/*.md` (and `.agents`/`.claude` siblings) nor the
+/// user rules dir contribute. Permission `[[rules]]` tables are
+/// cleared by the caller (`apply_run_opts`); hardstops are NOT
+/// affected — they are not rules.
+pub fn set_rules_disabled(on: bool) {
+    RULES_DISABLED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether rule-file conventions are disabled for this process.
+pub fn rules_disabled() -> bool {
+    RULES_DISABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn bare_mode() -> bool {
     // the env half is read once: bare_mode is consulted on every hook
     // run and discovery call, and KA_SAFEMODE never changes mid-process
@@ -80,6 +95,16 @@ pub fn discover_memory(cwd: &Path) -> Vec<MemoryFile> {
 }
 
 pub fn discover_agents(cwd: &Path) -> Vec<AgentsFile> {
+    discover_agents_with(cwd, &[])
+}
+
+/// [`discover_agents`] with configured fallback filenames
+/// (`project_doc_fallback_filenames`): per directory, the first file
+/// found in this order becomes that directory's layer —
+/// `AGENTS.override.md` (replaces the directory's instructions, pi
+/// semantics), `AGENTS.md`, `CLAUDE.md`, then the configured fallback
+/// names in order. Empty/whitespace files never count as found.
+pub fn discover_agents_with(cwd: &Path, fallbacks: &[String]) -> Vec<AgentsFile> {
     if bare_mode() {
         return Vec::new();
     }
@@ -98,7 +123,9 @@ pub fn discover_agents(cwd: &Path) -> Vec<AgentsFile> {
     }
     let mut found = Vec::new();
     for dir in chain.iter().rev() {
-        for name in ["AGENTS.md", "CLAUDE.md"] {
+        let mut names: Vec<&str> = vec!["AGENTS.override.md", "AGENTS.md", "CLAUDE.md"];
+        names.extend(fallbacks.iter().map(String::as_str));
+        for name in names {
             let candidate = dir.join(name);
             if let Ok(content) = std::fs::read_to_string(&candidate) {
                 if !content.trim().is_empty() {
@@ -106,7 +133,7 @@ pub fn discover_agents(cwd: &Path) -> Vec<AgentsFile> {
                         path: candidate,
                         content,
                     });
-                    break; // one file per directory, AGENTS.md preferred
+                    break; // one file per directory, override > AGENTS.md
                 }
             }
         }
@@ -135,7 +162,7 @@ pub struct RuleFile {
 /// `~/.config/ka/rules`. Name-sorted, capped at 12, project wins on
 /// name collisions.
 pub fn discover_rules(cwd: &Path) -> Vec<RuleFile> {
-    if bare_mode() {
+    if bare_mode() || rules_disabled() {
         return Vec::new();
     }
     let trusted = crate::trust::project_trusted(cwd);

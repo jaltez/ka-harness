@@ -38,7 +38,7 @@ Markdown answers render with shaded code panels, tables, and mermaid diagrams dr
 
 `vendor/model@effort` — e.g. `anthropic/claude-sonnet-5@high`, `ollama/qwen3.5:9b` (`@` because model ids may contain colons).
 
-Three wire protocols (Anthropic messages, OpenAI chat, OpenAI Responses) cover essentially every endpoint, including all OpenAI-compatible ones. Ollama and LM Studio servers are auto-discovered; vLLM and llama.cpp endpoints are built in as keyless providers (selector-only) alongside a catalog of 500+ models shipped in the binary. `/model` opens the picker listing only configured providers (key present or keyless); `/model <vendor>` narrows it to one vendor, and any unlisted `vendor/model` selector can still be typed through. `ka models` and `ka providers` list from the terminal.
+Three wire protocols (Anthropic messages, OpenAI chat, OpenAI Responses) cover essentially every endpoint, including all OpenAI-compatible ones. Ollama and LM Studio servers are auto-discovered; vLLM and llama.cpp endpoints are built in as keyless providers (selector-only) alongside a catalog of 500+ models shipped in the binary. `/model` opens the picker listing only configured providers (key present or keyless); `/model <vendor>` narrows it to one vendor, and any unlisted `vendor/model` selector can still be typed through. `ka models` and `ka providers` list from the terminal (`ka models <query>` filters by id substring).
 
 More: [selectors](https://ka-harness.dev/docs/models/selectors/) · [providers & keys](https://ka-harness.dev/docs/models/providers/) · [usage & pricing](https://ka-harness.dev/docs/models/usage/).
 
@@ -58,6 +58,15 @@ verdict = "allow"           # allow | ask | deny
 
 Every key with its default: [ka.toml reference](https://ka-harness.dev/docs/reference/config/).
 
+Handy extras, all strict-TOML like everything else:
+
+- `ka config set <key> <value>` / `ka config get <key>` / `ka config path` — read and write one scalar key (the set refreshes the `ka.schema.json` sidecar its `#:schema` header points at, so editors autocomplete).
+- `[history] persistence = "none"` — the session leaves no trace (also `--ephemeral` per run: temp data dir, removed at exit); `max_bytes` stops persisting past a ceiling.
+- `[[model_pins]]` — pin `model = "vendor/model@effort"` to a `path` glob: first matching pin wins over the configured model.
+- `project_doc_fallback_filenames = ["CLAUDE.md", ...]` — extra instruction-file names where a directory has no `AGENTS.md`; `AGENTS.override.md` replaces a directory's layer entirely.
+- `[prompt] identity_inline` — replace ka's built-in identity sentence inline (`identity_file` still wins); also `--system-prompt "…"` per run.
+- `[features] allow = [...]` — positive hand allowlist: unlisted hands are hidden from the model and rejected at admit time (disable still wins).
+
 ## Safety
 
 - **Clearances** (read / write / exec) and four permission modes, `ask` → `allow` (`guarded`/`free`/`plan` still parse as pre-v0.5 aliases).
@@ -66,6 +75,8 @@ Every key with its default: [ka.toml reference](https://ka-harness.dev/docs/refe
 - **Secret redaction**, one-way, in every tool result.
 - **Optional fs sandbox** for bash children (bwrap / firejail / landlock), fail-closed; the landlock backend exposes only an enumerated `/dev` surface (`null`, `zero`, `full`, `random`, `urandom`, `shm`) rather than the host `/dev`.
 - **`ka --safe-mode`** — the troubleshooting floor: every customization off, built-ins kept.
+- **`--tools read,edit`** — positive allowlist for the session; `--ignore-rules` runs without `[[rules]]` tables and rule files (hardstops always stay; they are not rules).
+- **Run caps** — `--max-budget-usd` asks to stop past a spend ceiling, `--max-cost`/`--max-time` exit with code 3 when crossed, `--warn-cost` warns on stderr.
 
 Details — doom-loop rules, protected paths, project trust, runtime feature toggles: [safety model](https://ka-harness.dev/docs/concepts/safety/).
 
@@ -74,11 +85,11 @@ Details — doom-loop rules, protected paths, project trust, runtime feature tog
 | Surface      | Use                                                           |
 | ------------ | ------------------------------------------------------------- |
 | `ka`         | terminal UI                                                   |
-| `ka run "…"` | headless one-turn, final text (`--print ndjson`/`stream-json` for events), exit 0/1/2 |
+| `ka run "…"` | headless one-turn, final text (`--print ndjson`/`stream-json` for events, `-o FILE` to a file), exit 0 ok · 1 error · 2 aborted · 3 cap |
 | `ka serve`   | HTTP: prompt via POST, SSE event streams, read-only observers |
 | `ka acp`     | Agent Client Protocol for editors                             |
 
-Also: `ka sessions` · `ka export` (markdown/HTML) · `ka rewind` · `ka attach` · `ka completions` · `ka init` · `ka update`.
+Also: `ka sessions` · `ka export` (markdown / self-contained HTML / roundtrippable JSONL) · `ka rewind` · `ka attach` · `ka completions` · `ka init` · `ka update`.
 
 ## Extend
 

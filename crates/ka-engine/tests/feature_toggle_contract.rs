@@ -316,6 +316,7 @@ async fn config_disable_baseline_hides_at_startup() {
         cwd: Some(dir.to_string_lossy().into_owned()),
         features: ka_engine::config::Features {
             disable: vec!["agents".to_string()],
+            allow: Vec::new(),
         },
         ..Default::default()
     };

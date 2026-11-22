@@ -249,6 +249,15 @@ pub fn set_data_dir_for_tests(dir: PathBuf) {
     DATA_DIR_OVERRIDE.with(|d| *d.borrow_mut() = Some(dir));
 }
 
+/// Set or clear a thread data-root override at runtime — the
+/// `--ephemeral` harness path: strands, spills and snapshots land in a
+/// temp dir the caller removes at exit, so nothing persists. Same
+/// thread-local as [`set_data_dir_for_tests`] (the current-thread
+/// runtime runs every task on the calling thread), plus a `None` clear.
+pub fn set_data_dir_override(dir: Option<PathBuf>) {
+    DATA_DIR_OVERRIDE.with(|d| *d.borrow_mut() = dir);
+}
+
 /// Data root: `KA_DATA_DIR` (tests) > platform data base (see
 /// [`data_base`]) + `ka`.
 pub fn data_dir() -> PathBuf {
@@ -1197,6 +1206,90 @@ pub fn render_html(title: &str, markdown: &str) -> String {
         .replace("__KA_MARKDOWN__", &esc(markdown))
 }
 
+/// Render the strand's live chain as canonical JSONL: one line per
+/// record, the exact serde shape the on-disk file carries, so
+/// re-parsing the render with [`read`] replays the same records,
+/// settings, listing counters, and tip. Every record from the header
+/// through the current tip rides along in file order — surviving lines
+/// are the file's own, never reordered or re-shaped — except the
+/// conversation siblings a rewind retracted: a [`Record::Rewind`] drops
+/// the messages recorded after its `kept_from` (an unknown anchor —
+/// e.g. one behind a digest, which clears anchor ids exactly like the
+/// engine's replay — drops every message so far, never keeping an
+/// abandoned tail logically live), and a [`Record::Boundary`]
+/// (rewind-to-zero) drops the messages before it. The markers and every
+/// non-conversation record (changes, usage, titles, names) stay in
+/// place: replay and [`list`] fold/sum them identically from the render
+/// as from the file, so a strand that is already a file renders
+/// semantically equivalent to its content up to the tip. Shared by the
+/// CLI/TUI JSONL export, like [`render_markdown`].
+pub fn render_jsonl(records: &[Record]) -> std::io::Result<String> {
+    // The live chain in file order, plus the chain slots of messages a
+    // rewind/boundary retracted (filled during the walk).
+    let mut chain: Vec<&Record> = Vec::with_capacity(records.len());
+    // Every chain message so far: (record id, slot in `chain`) — the
+    // anchors a Rewind can name (`kept_from` can name any message
+    // record, Tool/empty-content included). Cleared by Digest exactly
+    // like the engine's replay clears its id list, so anchors behind a
+    // digest miss and fall to the unknown-anchor rule.
+    let mut msg_anchors: Vec<(&RecordId, usize)> = Vec::new();
+    let mut retracted: Vec<usize> = Vec::new();
+    for record in records {
+        match record {
+            Record::Message { id, .. } => {
+                msg_anchors.push((id, chain.len()));
+                chain.push(record);
+            }
+            Record::Digest { .. } => {
+                // everything before rides in the summary; anchors behind
+                // it must miss (engine parity) — but the lines stay: the
+                // file keeps them and the fold clears them anyway.
+                msg_anchors.clear();
+                chain.push(record);
+            }
+            Record::Rewind { kept_from, .. } => {
+                match msg_anchors.iter().position(|(id, _)| *id == kept_from) {
+                    // the abandoned branch: the messages after the kept
+                    // anchor are the tip's siblings, not its ancestors
+                    Some(pos) => {
+                        retracted.extend(msg_anchors[pos + 1..].iter().map(|(_, slot)| *slot));
+                        msg_anchors.truncate(pos + 1);
+                    }
+                    // unknown anchor: drop everything replayable — never
+                    // keep the abandoned tail logically live
+                    None => {
+                        retracted.extend(msg_anchors.iter().map(|(_, slot)| *slot));
+                        msg_anchors.clear();
+                    }
+                }
+                chain.push(record);
+            }
+            Record::Boundary { .. } => {
+                // rewind-to-zero: no message survives it
+                retracted.extend(msg_anchors.iter().map(|(_, slot)| *slot));
+                msg_anchors.clear();
+                chain.push(record);
+            }
+            _ => chain.push(record),
+        }
+    }
+    let mut dead = vec![false; chain.len()];
+    for slot in retracted {
+        dead[slot] = true;
+    }
+    let mut out = String::new();
+    for (slot, record) in chain.iter().enumerate() {
+        if dead[slot] {
+            continue;
+        }
+        let mut line = serde_json::to_string(record)
+            .map_err(|e| std::io::Error::other(format!("record serialize: {e}")))?;
+        line.push('\n');
+        out.push_str(&line);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -1785,6 +1878,311 @@ mod tests {
         assert!(md.contains("### **ka**\n\n**bold**"));
         assert!(md.contains("### *digest*\n\n> compacted"));
         assert!(!md.contains("*tool*"), "blank tool content is skipped");
+    }
+
+    #[test]
+    fn render_jsonl_renders_file_lines_and_reparses_the_tip() {
+        let data = temp_data("jsonl-file");
+        let cwd = PathBuf::from("/tmp/proj");
+        let mut strand = StrandFile::create(&cwd, None).unwrap();
+        // fork marker on the header, like fork_strand leaves behind
+        strand.set_parent("s-origin");
+        for record in [
+            Record::Message {
+                images: Vec::new(),
+                id: new_record_id(),
+                role: Role::User,
+                content: "export me".into(),
+                calls: Vec::new(),
+                results: Vec::new(),
+                thinking: None,
+            },
+            Record::Message {
+                images: Vec::new(),
+                id: new_record_id(),
+                role: Role::Assistant,
+                content: "rendered back".into(),
+                calls: Vec::new(),
+                results: Vec::new(),
+                thinking: None,
+            },
+            Record::Change {
+                id: new_record_id(),
+                model: Some("ka-model-2".into()),
+                effort: None,
+                mode: None,
+                features: None,
+                sandbox: None,
+            },
+            Record::Title {
+                id: new_record_id(),
+                title: "export me (fork)".into(),
+            },
+        ] {
+            strand.append(record).unwrap();
+        }
+        let path = strand.path().unwrap().to_path_buf();
+
+        let rendered = render_jsonl(strand.records()).unwrap();
+
+        // an opened strand renders byte-equivalent to its content up to
+        // the tip: same record lines, same key order
+        assert_eq!(rendered, std::fs::read_to_string(&path).unwrap());
+        assert!(rendered.contains("\"parent\":\"s-origin\""), "{rendered}");
+
+        // roundtrip: re-parse reproduces the same records and same tip
+        let reparse = data.join("reparse.jsonl");
+        std::fs::write(&reparse, &rendered).unwrap();
+        let reparsed = read(&reparse).unwrap();
+        assert_eq!(reparsed, strand.records());
+        assert_eq!(reparsed.last(), strand.records().last());
+        // and opening it replays the same settings state
+        let reopened = StrandFile::open(&reparse).unwrap();
+        assert_eq!(reopened.settings().model.as_deref(), Some("ka-model-2"));
+        assert_eq!(reopened.records().last(), strand.records().last());
+    }
+
+    #[test]
+    fn render_jsonl_drops_rewound_siblings_and_keeps_tip() {
+        let m1 = new_record_id();
+        let m2 = new_record_id();
+        let m3 = new_record_id();
+        let records = vec![
+            Record::Header {
+                id: StrandId("s-rw".into()),
+                ts: "2026-11-22T00:00:00Z".into(),
+                cwd: "/tmp/proj".into(),
+                version: 1,
+                repo: None,
+                parent: None,
+            },
+            Record::Message {
+                images: Vec::new(),
+                id: m1.clone(),
+                role: Role::User,
+                content: "kept question".into(),
+                calls: Vec::new(),
+                results: Vec::new(),
+                thinking: None,
+            },
+            Record::Change {
+                id: new_record_id(),
+                model: Some("m-one".into()),
+                effort: None,
+                mode: None,
+                features: None,
+                sandbox: None,
+            },
+            Record::Message {
+                images: Vec::new(),
+                id: m2.clone(),
+                role: Role::Assistant,
+                content: "abandoned answer".into(),
+                calls: Vec::new(),
+                results: Vec::new(),
+                thinking: None,
+            },
+            // usage of the dead turn stays: listing sums it from the
+            // raw log the same way before and after the render
+            Record::Usage {
+                id: new_record_id(),
+                cost: 0.5,
+                input: 10,
+                output: 5,
+                cache_read: 0,
+                cache_write: 0,
+            },
+            Record::Rewind {
+                id: new_record_id(),
+                kept_from: m1.clone(),
+            },
+            Record::Change {
+                id: new_record_id(),
+                model: Some("m-two".into()),
+                effort: None,
+                mode: None,
+                features: None,
+                sandbox: None,
+            },
+            Record::Message {
+                images: Vec::new(),
+                id: m3.clone(),
+                role: Role::User,
+                content: "retry question".into(),
+                calls: Vec::new(),
+                results: Vec::new(),
+                thinking: None,
+            },
+        ];
+
+        let rendered = render_jsonl(&records).unwrap();
+        // the abandoned sibling branch is gone; the kept chain, both
+        // changes, the dead turn's usage, and the marker remain
+        assert!(!rendered.contains("abandoned answer"), "{rendered}");
+        assert!(rendered.contains("kept question"));
+        assert!(rendered.contains("retry question"));
+        assert_eq!(rendered.lines().count(), records.len() - 1);
+
+        // re-parse: same chain order and identity, same tip
+        let reparse = temp_data("jsonl-rewind").join("rendered.jsonl");
+        std::fs::write(&reparse, &rendered).unwrap();
+        let reparsed = read(&reparse).unwrap();
+        let outlines: Vec<String> = reparsed.iter().map(outline).collect();
+        assert_eq!(
+            outlines,
+            vec![
+                "header:s-rw".to_string(),
+                format!("message:{}:kept question", m1.0),
+                "change:".to_string() + &reparsed[2].id().unwrap().0 + ":m-one",
+                "usage:".to_string() + &reparsed[3].id().unwrap().0 + ":0.5",
+                format!("rewind:{}:{}", reparsed[4].id().unwrap().0, m1.0),
+                "change:".to_string() + &reparsed[5].id().unwrap().0 + ":m-two",
+                format!("message:{}:retry question", m3.0),
+            ]
+        );
+        assert_eq!(reparsed.last(), records.last());
+
+        // replay parity: the render folds to the same conversation
+        assert_eq!(
+            fold_contents(&records),
+            vec!["kept question".to_string(), "retry question".to_string()]
+        );
+        assert_eq!(fold_contents(&records), fold_contents(&reparsed));
+    }
+
+    #[test]
+    fn render_jsonl_boundary_truncates_messages_but_keeps_settings() {
+        let records = vec![
+            Record::Header {
+                id: StrandId("s-boundary".into()),
+                ts: "2026-11-22T00:00:00Z".into(),
+                cwd: "/tmp/proj".into(),
+                version: 1,
+                repo: None,
+                parent: None,
+            },
+            Record::Message {
+                images: Vec::new(),
+                id: new_record_id(),
+                role: Role::User,
+                content: "before clear".into(),
+                calls: Vec::new(),
+                results: Vec::new(),
+                thinking: None,
+            },
+            Record::Change {
+                id: new_record_id(),
+                model: Some("kept-model".into()),
+                effort: None,
+                mode: None,
+                features: None,
+                sandbox: None,
+            },
+            Record::Boundary {
+                id: new_record_id(),
+            },
+            Record::Message {
+                images: Vec::new(),
+                id: new_record_id(),
+                role: Role::User,
+                content: "after clear".into(),
+                calls: Vec::new(),
+                results: Vec::new(),
+                thinking: None,
+            },
+        ];
+
+        let rendered = render_jsonl(&records).unwrap();
+        // rewind-to-zero: no message before the boundary survives; the
+        // marker, the change recorded before it, and the new branch do
+        assert!(!rendered.contains("before clear"), "{rendered}");
+        assert!(rendered.contains("\"record\":\"boundary\""));
+        assert!(rendered.contains("kept-model"));
+        assert!(rendered.contains("after clear"));
+
+        let reparse = temp_data("jsonl-boundary").join("rendered.jsonl");
+        std::fs::write(&reparse, &rendered).unwrap();
+        let reparsed = read(&reparse).unwrap();
+        assert_eq!(reparsed.last(), records.last());
+        // truncation respected on replay: same cleared conversation
+        assert_eq!(fold_contents(&records), vec!["after clear".to_string()]);
+        assert_eq!(fold_contents(&records), fold_contents(&reparsed));
+        // settings survive the truncation, like the file's replay
+        let reopened = StrandFile::open(&reparse).unwrap();
+        assert_eq!(reopened.settings().model.as_deref(), Some("kept-model"));
+    }
+
+    #[test]
+    fn render_jsonl_unknown_rewind_anchor_drops_replayable_tail() {
+        let records = vec![
+            Record::Header {
+                id: StrandId("s-digest".into()),
+                ts: "2026-11-22T00:00:00Z".into(),
+                cwd: "/tmp/proj".into(),
+                version: 1,
+                repo: None,
+                parent: None,
+            },
+            Record::Message {
+                images: Vec::new(),
+                id: new_record_id(),
+                role: Role::User,
+                content: "pre-digest question".into(),
+                calls: Vec::new(),
+                results: Vec::new(),
+                thinking: None,
+            },
+            Record::Digest {
+                id: new_record_id(),
+                summary: "collapsed".into(),
+                kept_from: new_record_id(),
+            },
+            Record::Message {
+                images: Vec::new(),
+                id: new_record_id(),
+                role: Role::User,
+                content: "post-digest question".into(),
+                calls: Vec::new(),
+                results: Vec::new(),
+                thinking: None,
+            },
+            // anchor names a message behind the digest: the engine's
+            // replay misses it and clears everything replayable
+            Record::Rewind {
+                id: new_record_id(),
+                kept_from: new_record_id(),
+            },
+            Record::Message {
+                images: Vec::new(),
+                id: new_record_id(),
+                role: Role::User,
+                content: "fresh question".into(),
+                calls: Vec::new(),
+                results: Vec::new(),
+                thinking: None,
+            },
+        ];
+
+        let rendered = render_jsonl(&records).unwrap();
+        // digest-collapsed history keeps its lines (the log is never
+        // rewritten for a digest — list sums it, the fold clears it);
+        // the rewind's replay window (post-digest messages) is what an
+        // unknown anchor retracts
+        assert!(rendered.contains("pre-digest question"), "{rendered}");
+        assert!(!rendered.contains("post-digest question"), "{rendered}");
+        assert!(rendered.contains("\"record\":\"digest\""));
+        assert!(rendered.contains("\"record\":\"rewind\""));
+        assert!(rendered.contains("fresh question"));
+        assert_eq!(rendered.lines().count(), records.len() - 1);
+
+        let reparse = temp_data("jsonl-digest").join("rendered.jsonl");
+        std::fs::write(&reparse, &rendered).unwrap();
+        let reparsed = read(&reparse).unwrap();
+        // replay parity with the original file: both fold to the same
+        // digest-cleared, rewound conversation
+        assert_eq!(fold_contents(&records), vec!["fresh question".to_string()]);
+        assert_eq!(fold_contents(&records), fold_contents(&reparsed));
+        assert_eq!(reparsed.last(), records.last());
     }
 
     #[test]

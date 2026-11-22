@@ -368,8 +368,15 @@ pub struct Lsp {
 pub struct PromptSettings {
     /// A file whose text replaces ka's built-in identity sentence in
     /// the system prompt (free-form instructions; re-read every turn,
-    /// capped at 8 KiB). Ignored in safe mode.
+    /// capped at 8 KiB). Ignored in safe mode. Precedence over
+    /// `identity_inline`.
     pub identity_file: Option<String>,
+    /// Inline text replacing ka's built-in identity sentence, for
+    /// setups that keep instructions in the config (capped at 8 KiB,
+    /// same as `identity_file`). Used when no `identity_file` is
+    /// configured (or it is unreadable); otherwise the built-in
+    /// identity applies. Ignored in safe mode.
+    pub identity_inline: Option<String>,
 }
 
 /// DAP debugging probe ([debug]): off by default — spawning debug
@@ -455,6 +462,14 @@ pub struct Features {
     /// `skill:<name>`, `tool:<hand>`, `agent:<name>`. Unknown specs are
     /// a hard startup error.
     pub disable: Vec<String>,
+    /// Positive allowlist of hands: when set (non-empty), ONLY these
+    /// hands are offered — everything else is invisible to the model
+    /// and rejected by name at call time (fail-closed, like
+    /// `disable`). Entries are hand names (`read`, `bash`,
+    /// `github__create_issue`) or a whole server as `mcp:<server>`
+    /// (admits that server's tools and the lazy `mcp_call` front
+    /// hand). `disable` wins over `allow`.
+    pub allow: Vec<String>,
 }
 
 /// Engine configuration. All fields optional at the data level; resolution
@@ -535,6 +550,18 @@ pub struct Config {
     /// Prompt assembly ([prompt]).
     #[serde(default)]
     pub prompt: PromptSettings,
+    /// Strand persistence policy ([history]).
+    #[serde(default)]
+    pub history: History,
+    /// Model pins ([[model_pins]]): the first pin whose `path` glob
+    /// matches the session cwd overwrites `model`.
+    #[serde(default)]
+    pub model_pins: Vec<ModelPin>,
+    /// Additional instruction filenames conventions search per
+    /// directory when it carries no `AGENTS.md` (after the built-in
+    /// `CLAUDE.md` fallback), e.g. `["CONTEXT.md", ".cursorrules"]`.
+    #[serde(default)]
+    pub project_doc_fallback_filenames: Vec<String>,
 }
 
 impl Config {
@@ -671,6 +698,24 @@ impl Config {
         if other.prompt.identity_file.is_some() {
             self.prompt.identity_file = other.prompt.identity_file;
         }
+        if other.prompt.identity_inline.is_some() {
+            self.prompt.identity_inline = other.prompt.identity_inline;
+        }
+        if other.history.persistence.is_some() {
+            self.history.persistence = other.history.persistence;
+        }
+        if other.history.max_bytes.is_some() {
+            self.history.max_bytes = other.history.max_bytes;
+        }
+        if !other.model_pins.is_empty() {
+            self.model_pins = other.model_pins;
+        }
+        if !other.project_doc_fallback_filenames.is_empty() {
+            self.project_doc_fallback_filenames = other.project_doc_fallback_filenames;
+        }
+        if !other.features.allow.is_empty() {
+            self.features.allow = other.features.allow;
+        }
     }
     /// Effective step cap (default 20).
     pub fn effective_max_steps(&self) -> u32 {
@@ -747,11 +792,48 @@ impl Config {
         self.pokes.max.unwrap_or(3)
     }
 
+    /// Effective strand persistence (`[history] persistence`; default
+    /// all).
+    pub fn effective_history_persistence(&self) -> HistoryPersistence {
+        self.history.persistence.unwrap_or_default()
+    }
+
+    /// Effective strand byte ceiling (`[history] max_bytes`; None =
+    /// unlimited).
+    pub fn effective_history_max_bytes(&self) -> Option<u64> {
+        self.history.max_bytes
+    }
+
+    /// The pinned model for `cwd` ([[model_pins]]): the FIRST pin
+    /// whose `path` glob matches wins; `None` = no pin matches (the
+    /// configured `model` stands). Engine bootstrap applies this over
+    /// `model` before any consumer reads it.
+    pub fn effective_model_for(&self, cwd: &std::path::Path) -> Option<String> {
+        self.model_pins
+            .iter()
+            .find(|pin| pin_path_matches(&pin.path, cwd))
+            .map(|pin| pin.model.clone())
+    }
+
     /// JSON schema for editor integration (`ka config schema`).
     pub fn schema_json() -> Result<String, serde_json::Error> {
         let schema = schemars::schema_for!(Config);
         serde_json::to_string_pretty(&schema)
     }
+}
+
+/// Does a [[model_pins]] glob match the session cwd? Full-path match,
+/// or any `/`-boundary suffix of the path (`projects/ka/*` matches
+/// `/home/me/projects/ka/sub`). Globs reuse the engine's `*`/`?`
+/// matcher, where `*` spans path separators.
+fn pin_path_matches(glob: &str, cwd: &std::path::Path) -> bool {
+    let path = cwd.to_string_lossy().replace('\\', "/");
+    if crate::voice::glob_match(glob, &path) {
+        return true;
+    }
+    path.match_indices('/')
+        .skip(1)
+        .any(|(i, _)| crate::voice::glob_match(glob, &path[i + 1..]))
 }
 
 /// The project layer as a writer needs it: `Some(default)` when the
@@ -909,12 +991,28 @@ pub fn save_settings_to(
     if let Some(features) = features {
         layer.features.disable = features.to_vec();
     }
-    let mut text = String::from("# ka user config — written by /settings\n\n");
+    // editor support: the JSON schema lands next to the toml (sibling
+    // `<stem>.schema.json`) and a `#:schema` directive — already a TOML
+    // comment — is prepended as the first line so editors pick the
+    // sidecar up. Regenerated from scratch on every write, so the
+    // directive never duplicates across saves.
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("ka");
+    let schema_name = format!("{stem}.schema.json");
+    let schema = Config::schema_json().map_err(|e| format!("schema: {e}"))?;
+    let mut text = format!("#:schema {schema_name}\n");
+    text.push_str("# ka user config — written by /settings\n\n");
     text.push_str(&toml::to_string_pretty(&layer).map_err(|e| e.to_string())?);
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
     }
     std::fs::write(path, text).map_err(|e| format!("write {}: {e}", path.display()))?;
+    let schema_path = path.with_file_name(schema_name);
+    std::fs::write(&schema_path, schema)
+        .map_err(|e| format!("write {}: {e}", schema_path.display()))?;
     Ok(path.to_path_buf())
 }
 
@@ -1239,10 +1337,10 @@ mod tests {
         let mut cfg = Config::default();
         cfg.overlay(
             Config::parse_layer(
-                "[guards]\nspend_usd = 2.5\ncontext_pct = 80\n\n[[search]]\nprovider = \"tavily\"\napi_key_env = \"TAVILY_KEY\"\n\n[tools.web]\nallow_private_hosts = true\n\n[tools.mcp]\ndiscovery = \"lazy\"\n\n[tui]\nheader_glyph = \"*\"\nbell = false\nnotify = \"notify-send ka done\"\nherdr = true\n\n[verify]\ntest = \"cargo test\"\n\n[[verify.lints]]\npattern = \"*.rs\"\ncommand = \"rustfmt --check {file}\"\n\n[features]\ndisable = [\"agents\", \"mcp:github\"]\n\n[prompt]\nidentity_file = \"/tmp/IDENTITY.md\"\n\n[lsp]\nwrite_through = true\n\n[debug]\nenable = true\n\n[debug.adapters]\ncodelldb = \"/opt/codelldb/adapter\"\n",
+                "project_doc_fallback_filenames = [\"CONTEXT.md\"]\n\n[guards]\nspend_usd = 2.5\ncontext_pct = 80\n\n[[search]]\nprovider = \"tavily\"\napi_key_env = \"TAVILY_KEY\"\n\n[tools.web]\nallow_private_hosts = true\n\n[tools.mcp]\ndiscovery = \"lazy\"\n\n[tui]\nheader_glyph = \"*\"\nbell = false\nnotify = \"notify-send ka done\"\nherdr = true\n\n[verify]\ntest = \"cargo test\"\n\n[[verify.lints]]\npattern = \"*.rs\"\ncommand = \"rustfmt --check {file}\"\n\n[features]\ndisable = [\"agents\", \"mcp:github\"]\nallow = [\"read\", \"grep\"]\n\n[prompt]\nidentity_file = \"/tmp/IDENTITY.md\"\nidentity_inline = \"You are Ka, personal agent.\"\n\n[lsp]\nwrite_through = true\n\n[debug]\nenable = true\n\n[debug.adapters]\ncodelldb = \"/opt/codelldb/adapter\"\n\n[history]\npersistence = \"none\"\nmax_bytes = 65536\n\n[[model_pins]]\npath = \"projects/ka/*\"\nmodel = \"openai/gpt-5.1@high\"\n",
                 "project",
             )
-            .unwrap(),
+                .unwrap(),
         );
         assert_eq!(cfg.guards.spend_usd, Some(2.5), "spend guard is live");
         assert_eq!(cfg.guards.context_pct, Some(80));
@@ -1296,6 +1394,36 @@ mod tests {
                 .map(String::as_str),
             Some("/opt/codelldb/adapter"),
             "[debug] adapters survive the overlay"
+        );
+        assert_eq!(
+            cfg.prompt.identity_inline.as_deref(),
+            Some("You are Ka, personal agent."),
+            "[prompt] identity_inline survives the overlay"
+        );
+        assert_eq!(
+            cfg.effective_history_persistence(),
+            HistoryPersistence::None,
+            "[history] persistence survives the overlay"
+        );
+        assert_eq!(
+            cfg.effective_history_max_bytes(),
+            Some(65536),
+            "[history] max_bytes survives the overlay"
+        );
+        assert_eq!(
+            cfg.effective_model_for(std::path::Path::new("/home/me/projects/ka/sub")),
+            Some("openai/gpt-5.1@high".to_string()),
+            "[[model_pins]] survive the overlay and match"
+        );
+        assert_eq!(
+            cfg.features.allow,
+            vec!["read".to_string(), "grep".to_string()],
+            "[features] allow survives the overlay"
+        );
+        assert_eq!(
+            cfg.project_doc_fallback_filenames,
+            vec!["CONTEXT.md".to_string()],
+            "project_doc_fallback_filenames survive the overlay"
         );
     }
 
