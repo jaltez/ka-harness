@@ -191,19 +191,36 @@ impl InputBuffer {
         self.cursor = char_idx; // row past the end: clamp to text end
     }
 
-    /// Take the current text (clearing the buffer).
+    /// Take the current text (clearing the buffer). Recall is separate:
+    /// only [`InputBuffer::submit`] adds the text to the history.
     pub fn take(&mut self) -> String {
         let text = std::mem::take(&mut self.text);
         self.cursor = 0;
-        if !text.trim().is_empty() {
-            self.history.push_back(text.clone());
-            if self.history.len() > 100 {
-                self.history.pop_front();
-            }
-        }
         self.browsing = None;
         self.parked = None;
         text
+    }
+
+    /// Take the current text and recall it when it is a prompt.
+    pub fn submit(&mut self) -> String {
+        let text = self.take();
+        self.remember(&text);
+        text
+    }
+
+    /// Recall a sent prompt — commands are not prompts, so a `/`-led
+    /// slash line and a `!`-led shell line never enter the history.
+    /// Blank prompts are skipped; newest last; the 100-entry cap drops
+    /// the oldest.
+    fn remember(&mut self, prompt: &str) {
+        let line = prompt.trim_start();
+        if line.is_empty() || line.starts_with(['/', '!']) {
+            return;
+        }
+        self.history.push_back(prompt.to_string());
+        if self.history.len() > 100 {
+            self.history.pop_front();
+        }
     }
 
     /// Seed the draft history from a resumed session's prompts (oldest
@@ -8659,6 +8676,7 @@ async fn app(
                                 // its answer are in sight, wherever it was
                                 // scrolled to
                                 scroll = None;
+                                input.remember(&text);
                                 last_user = Some(text.clone());
                                 for img in &outgoing {
                                     let kb = img.data.len() * 3 / 4 / 1024;
@@ -19996,7 +20014,7 @@ mod tests {
         assert_eq!(input.cursor, input.text.chars().count());
         assert_eq!(slot, None);
         // the slot is spent: another recall is a no-op
-        input.take();
+        input.submit();
         assert_eq!(stash_draft(&mut slot, &mut input), None);
     }
 
@@ -20014,12 +20032,12 @@ mod tests {
         b.end();
         b.insert('!');
         assert_eq!(b.text, "hélo!");
-        let taken = b.take();
+        let taken = b.submit();
         assert_eq!(taken, "hélo!");
         assert!(b.text.is_empty());
 
         b.insert('x');
-        let _ = b.take();
+        let _ = b.submit();
         b.history_prev();
         assert_eq!(b.text, "x");
         b.history_prev();
@@ -20034,7 +20052,7 @@ mod tests {
         let mut b = InputBuffer::default();
         for t in ["first prompt", "second prompt"] {
             b.insert_str(t);
-            b.take();
+            b.submit();
         }
         b.insert_str("half typed draft");
         b.left();
@@ -20060,10 +20078,35 @@ mod tests {
         // nothing was parked: the draft is empty past the newest entry
         let mut c = InputBuffer::default();
         c.insert_str("only prompt");
-        c.take();
+        c.submit();
         c.history_prev();
         c.history_next();
         assert!(c.text.is_empty());
+    }
+
+    #[test]
+    fn prompt_history_holds_prompts_only() {
+        let mut b = InputBuffer::default();
+        for t in ["first prompt", "/help", "!echo hi", "/mode free", "  "] {
+            b.insert_str(t);
+            b.submit();
+        }
+        // Up walks the prompts alone: no slash line, no shell line
+        b.insert_str("draft");
+        b.history_prev();
+        assert_eq!(b.text, "first prompt");
+        b.history_next();
+        assert_eq!(b.text, "draft", "nothing else is recalled");
+        // take() never recalls; a plain prompt does
+        let mut c = InputBuffer::default();
+        c.insert_str("taken raw");
+        c.take();
+        c.history_prev();
+        assert!(c.text.is_empty(), "take() leaves the history alone");
+        c.insert_str("a prompt");
+        c.submit();
+        c.history_prev();
+        assert_eq!(c.text, "a prompt");
     }
     #[test]
     fn newline_and_backspace_roundtrip() {
@@ -20113,7 +20156,7 @@ mod tests {
         for c in "old".chars() {
             b.insert(c);
         }
-        b.take(); // history: ["old"]
+        b.submit(); // history: ["old"]
         for c in "one\ntwo".chars() {
             b.insert(c);
         }
@@ -22403,7 +22446,7 @@ mod tests {
         let mut b = InputBuffer::default();
         for t in ["alpha one", "beta", "alpha two"] {
             b.insert_str(t);
-            b.take();
+            b.submit();
         } // history oldest→newest: alpha one, beta, alpha two
         b.search_start();
         for c in "alpha".chars() {
@@ -22426,7 +22469,7 @@ mod tests {
         let mut c = InputBuffer::default();
         for t in ["alpha one", "alpha two"] {
             c.insert_str(t);
-            c.take();
+            c.submit();
         }
         c.search_start();
         c.search_push('a');
@@ -22440,7 +22483,7 @@ mod tests {
     fn reverse_search_cancel_restores_the_draft() {
         let mut b = InputBuffer::default();
         b.insert_str("keep");
-        b.take();
+        b.submit();
         b.insert_str("draft in progress");
         b.cursor = 5;
         b.search_start();
@@ -22456,7 +22499,7 @@ mod tests {
         let mut b = InputBuffer::default();
         for t in ["alpha prompt", "beta prompt"] {
             b.insert_str(t);
-            b.take();
+            b.submit();
         }
         b.insert_str("half typed");
         b.search_start();
@@ -22490,7 +22533,7 @@ mod tests {
     fn reverse_search_empty_query_is_a_no_op() {
         let mut b = InputBuffer::default();
         b.insert_str("older");
-        b.take();
+        b.submit();
         b.insert_str("live draft");
         b.search_start();
         assert_eq!(b.search_title().as_deref(), Some("rsearch: ``"));
@@ -22501,7 +22544,7 @@ mod tests {
         // backspacing the query away re-matches from the newest entry
         let mut c = InputBuffer::default();
         c.insert_str("hello world");
-        c.take();
+        c.submit();
         c.insert_str("draft");
         c.search_start();
         c.search_push('x');
