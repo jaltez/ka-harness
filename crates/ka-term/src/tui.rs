@@ -7492,6 +7492,13 @@ async fn app(
                         (KeyCode::Esc, _) if input.searching() => input.search_cancel(),
                         (KeyCode::Enter, _) if input.searching() => input.search_accept(),
                         (KeyCode::Backspace, _) if input.searching() => input.search_backspace(),
+                        // typed characters join the query, never the draft
+                        // they replace on screen
+                        (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT)
+                            if input.searching() =>
+                        {
+                            input.search_push(c)
+                        }
                         (KeyCode::Tab, _) if input.searching() => {}
                         (KeyCode::Up, _) if input.searching() => {}
                         (KeyCode::Down, _) if input.searching() => {}
@@ -22276,7 +22283,41 @@ mod tests {
         assert_eq!(b.cursor, 5);
         assert!(!b.searching());
     }
-
+    #[test]
+    fn reverse_search_takes_typed_characters_and_backspace() {
+        let mut b = InputBuffer::default();
+        for t in ["alpha prompt", "beta prompt"] {
+            b.insert_str(t);
+            b.take();
+        }
+        b.insert_str("half typed");
+        b.search_start();
+        // every typed character lands in the query; the buffer shows
+        // the match (or the pre-search draft while nothing matches)
+        for c in "alpz".chars() {
+            b.search_push(c);
+        }
+        assert_eq!(
+            b.search_title().as_deref(),
+            Some("rsearch: `alpz` (no match)")
+        );
+        assert_eq!(
+            b.text, "alpha prompt",
+            "a miss keeps the last match in view"
+        );
+        assert!(
+            !b.text.contains('z'),
+            "typed characters never reach the draft"
+        );
+        // Backspace edits the query until the newest match returns
+        b.search_backspace();
+        assert_eq!(b.search_title().as_deref(), Some("rsearch: `alp`"));
+        assert_eq!(b.text, "alpha prompt");
+        // Esc puts back exactly the draft that was being typed
+        b.search_cancel();
+        assert!(!b.searching());
+        assert_eq!(b.text, "half typed");
+    }
     #[test]
     fn reverse_search_empty_query_is_a_no_op() {
         let mut b = InputBuffer::default();
