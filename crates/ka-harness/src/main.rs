@@ -3061,6 +3061,14 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
                 .unwrap_or_else(|| update::DEFAULT_REPO.to_string());
             let channel =
                 std::env::var("KA_UPDATE_CHANNEL").unwrap_or_else(|_| "stable".to_string());
+            // the resume path must be read BEFORE the update runs: the
+            // swap renames the new binary over this one, unlinking the
+            // running inode — /proc/self/exe read afterwards reports
+            // "<path> (deleted)", and exec on that path fails with
+            // ENOENT (os error 2). The pre-swap path is stable: after
+            // a successful swap it names the new binary, after a
+            // staged (ETXTBSY) install it still names the old one.
+            let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
             match update::run(&channel, false, &repo).await {
                 Ok(msg) => println!("{msg}"),
                 Err(e) => eprintln!("ka: update failed: {e}"),
@@ -3068,8 +3076,7 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
             if session.is_empty() {
                 return Ok(ExitCode::SUCCESS);
             }
-            let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
-            let mut relaunch = std::process::Command::new(exe);
+            let mut relaunch = std::process::Command::new(&exe);
             relaunch.arg("--session").arg(&session);
             // startup flags are never written to the strand (only
             // in-session changes are), so the re-exec must carry them
