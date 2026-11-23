@@ -3562,18 +3562,38 @@ fn rewind_turn_for_prompt(
         .cloned()
 }
 
+/// The transcript row of a prompt's echo, by occurrence counted from the
+/// newest: two identical prompts are two turns, and rewinding the older
+/// one must cut at the older row, not at its newer twin.
+fn transcript_prompt_row(entries: &[Line], prompt: &str, rank_from_newest: usize) -> Option<usize> {
+    let rows: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| matches!(l, Line::User(t) if t == prompt))
+        .map(|(i, _)| i)
+        .collect();
+    let n = rows.len();
+    (rank_from_newest < n).then(|| rows[n - 1 - rank_from_newest])
+}
+
 /// Apply a rewind picked from either the double-esc menu or the
 /// click-a-prompt popup: the engine cuts the last `turns` user
 /// records, and the transcript is trimmed at the picked prompt's own
-/// row (falling back to the count when the text never echoed onto the
-/// transcript — steers render as Info rows). With `edit`, the prompt
-/// lands in the composer instead of being dropped.
+/// row. The click popup knows its row (`at`); the menu knows only the
+/// text, so it names the occurrence by `rank` (identical prompts ahead
+/// of the picked one in the newest-first list). When no echoed row
+/// matches, the count is used (steers and some followups never echo).
+/// With `edit`, the prompt lands in the composer instead of being
+/// dropped.
+#[allow(clippy::too_many_arguments)]
 async fn apply_rewind(
     commands: &tokio::sync::mpsc::Sender<Command>,
     transcript: &mut Transcript,
     input: &mut InputBuffer,
     turns: usize,
     prompt: &str,
+    at: Option<usize>,
+    rank: usize,
     edit: bool,
 ) {
     let _ = commands
@@ -3581,10 +3601,7 @@ async fn apply_rewind(
             turns: turns as u32,
         })
         .await;
-    let row = transcript
-        .entries()
-        .iter()
-        .rposition(|l| matches!(l, Line::User(t) if t == prompt));
+    let row = at.or_else(|| transcript_prompt_row(transcript.entries(), prompt, rank));
     match row {
         Some(i) => {
             transcript.rewind_at(i);
@@ -5089,6 +5106,9 @@ pub enum Modal {
     PromptActions {
         /// Turns-from-end of the clicked prompt (1 = most recent).
         turns: usize,
+        /// The transcript row the click landed on: the rewind cuts
+        /// exactly there, whichever of several identical prompts it was.
+        entry: usize,
         /// The prompt's own text (staged into the composer on fork /
         /// edit & resend).
         prompt: String,
@@ -6711,6 +6731,12 @@ async fn app(
                                     KeyCode::Enter | KeyCode::Char('r') | KeyCode::Char('e') => {
                                         let edit = key.code == KeyCode::Char('e');
                                         let (turns, prompt) = items[*selected].clone();
+                                        // identical prompts ahead of the picked
+                                        // one are its newer twins
+                                        let rank = items[..*selected]
+                                            .iter()
+                                            .filter(|(_, p)| *p == prompt)
+                                            .count();
                                         modal = None;
                                         apply_rewind(
                                             commands,
@@ -6718,6 +6744,8 @@ async fn app(
                                             &mut input,
                                             turns,
                                             &prompt,
+                                            None,
+                                            rank,
                                             edit,
                                         )
                                         .await;
@@ -6728,6 +6756,7 @@ async fn app(
                             Modal::PromptActions {
                                 turns,
                                 prompt,
+                                entry,
                                 selected,
                             } => {
                                 match key.code {
@@ -6758,7 +6787,7 @@ async fn app(
                                             ));
                                             continue;
                                         }
-                                        let (turns, prompt) = (*turns, prompt.clone());
+                                        let (turns, prompt, entry) = (*turns, prompt.clone(), *entry);
                                         modal = None;
                                         match action {
                                             PromptAction::Rewind | PromptAction::Edit => {
@@ -6768,6 +6797,8 @@ async fn app(
                                                     &mut input,
                                                     turns,
                                                     &prompt,
+                                                    Some(entry),
+                                                    0,
                                                     matches!(action, PromptAction::Edit),
                                                 )
                                                 .await;
@@ -7688,13 +7719,33 @@ async fn app(
                                 }
                             }
                             PathKey::Backspace => {
-                                path_popup = None;
+                                let mentions =
+                                    path_popup.as_ref().is_some_and(|pp| pp.mentions);
                                 input.backspace();
+                                // a mention list follows the typing: it
+                                // re-ranks instead of closing
+                                path_popup = if mentions {
+                                    mention_popup_for(
+                                        &input,
+                                        &mention_entries(&mut mention_cache),
+                                    )
+                                } else {
+                                    None
+                                };
                                 slash_popup = update_suggestions(&input.text);
                             }
                             PathKey::Char(c) => {
-                                path_popup = None;
+                                let mentions =
+                                    path_popup.as_ref().is_some_and(|pp| pp.mentions);
                                 input.insert(c);
+                                path_popup = if mentions {
+                                    mention_popup_for(
+                                        &input,
+                                        &mention_entries(&mut mention_cache),
+                                    )
+                                } else {
+                                    None
+                                };
                                 slash_popup = update_suggestions(&input.text);
                             }
                             PathKey::Close => path_popup = None,
@@ -9404,6 +9455,12 @@ async fn app(
                         _ if let Some(c) = typed_char(&key) => {
                             input.insert(c);
                             slash_popup = update_suggestions(&input.text);
+                            // the @ list opens the moment the sigil is typed
+                            path_popup = if slash_popup.is_none() {
+                                mention_popup_for(&input, &mention_entries(&mut mention_cache))
+                            } else {
+                                None
+                            };
                         }
                         _ => {}
                     }
@@ -9837,6 +9894,7 @@ async fn app(
                                                     modal = Some(Modal::PromptActions {
                                                         turns,
                                                         prompt,
+                                                        entry,
                                                         selected: 0,
                                                     });
                                                 }
@@ -9903,7 +9961,10 @@ async fn app(
                                             }
                                         }
                                         Click::Model => {
-                                            if modal.is_none() && pending.is_none() {
+                                            if modal.is_none()
+                                                && pending.is_none()
+                                                && picker.is_none()
+                                            {
                                                 modal = Some(Modal::Model(ModelPicker {
                                                     models: models.clone(),
                                                     vendor: None,
@@ -11956,7 +12017,11 @@ fn fuzzy_score(path: &str, needle: &str) -> Option<u32> {
     if want.is_empty() {
         return Some(0);
     }
-    let file_start = path.rfind('/').map_or(0, |p| p + 1);
+    // the file name starts after the last '/': counted in the same
+    // lowercased characters as `hay`, never in bytes of the raw path
+    let file_start = path.rsplit_once('/').map_or(0, |(dir, _)| {
+        dir.chars().flat_map(char::to_lowercase).count() + 1
+    });
     let boundary = |at: usize| at == 0 || matches!(hay[at - 1], '/' | '_' | '-' | '.' | ' ');
     let (mut score, mut hi, mut prev) = (0u32, 0usize, None);
     for &c in &want {
@@ -12155,15 +12220,42 @@ fn ghost_suggestion(
     if !mentionish {
         return None;
     }
-    let entries = match cache {
+    crate::ghost::mention_ghost(text, cursor, &mention_entries(cache))
+}
+
+/// The cached @-mention walk (shared by the ghost and the mention
+/// popup), refreshed once it is older than [`MENTION_TTL`]: the
+/// recursive scan is too heavy per keystroke, and a stale listing for a
+/// few seconds is invisible next to a completion list.
+fn mention_entries(cache: &mut Option<(Instant, Vec<(String, bool)>)>) -> Vec<(String, bool)> {
+    match cache {
         Some((at, entries)) if at.elapsed() < MENTION_TTL => entries.clone(),
         _ => {
             let entries = walk_files(&std::env::current_dir().unwrap_or_default(), WALK_CAP);
             *cache = Some((Instant::now(), entries.clone()));
             entries
         }
-    };
-    crate::ghost::mention_ghost(text, cursor, &entries)
+    }
+}
+
+/// The @-mention popup for the mention token at the caret: the typed
+/// query after the `@` (possibly empty, the moment the sigil is typed)
+/// fuzzily ranks the walk. `None` when the caret is not on a mention
+/// token or nothing matches.
+fn mention_popup_for(input: &InputBuffer, entries: &[(String, bool)]) -> Option<PathPopup> {
+    let (start, token) = path_token(&input.text, input.cursor)?;
+    let query = token.strip_prefix('@')?;
+    let matches = mention_matches(entries, query);
+    if matches.is_empty() {
+        return None;
+    }
+    Some(PathPopup {
+        entries: matches,
+        selected: 0,
+        token_start: start,
+        prefix: "@".to_string(),
+        mentions: true,
+    })
 }
 
 /// How long the @-mention walk for the ghost text stays cached.
@@ -15352,7 +15444,15 @@ fn render(
     let (tx_chunk, todos_area) = if todos_h > 0 {
         let [above, panel] =
             ratatui::layout::Layout::vertical([Min(0), Length(todos_h)]).areas(chunks[2]);
-        (above, panel)
+        // the transcript keeps a column of air at each side: so does the panel
+        (
+            above,
+            Rect {
+                x: panel.x + 1,
+                width: panel.width.saturating_sub(1),
+                ..panel
+            },
+        )
     } else {
         (chunks[2], Rect::default())
     };
@@ -15860,17 +15960,42 @@ fn render(
         // the model picker, the mode chip the mode picker
         if let Some(mut zones) = strip_zone.get() {
             let mut x = status.x;
+            // the mode chip is one button across all of its spans, icon
+            // cell included: find the pill's spans in the bar by content
+            let pill = mode_pill(meters);
+            let pill_at = (!pill.is_empty())
+                .then(|| {
+                    (0..=bar.len().saturating_sub(pill.len())).find(|&i| {
+                        bar[i..i + pill.len()]
+                            .iter()
+                            .zip(&pill)
+                            .all(|(a, b)| a.content == b.content)
+                    })
+                })
+                .flatten();
+            if let Some(slot) = zones.hints.iter_mut().find(|s| s.0.width == 0) {
+                if let Some(i) = pill_at {
+                    let start: u16 = bar[..i].iter().map(|s| s.content.width() as u16).sum();
+                    let w: u16 = bar[i..i + pill.len()]
+                        .iter()
+                        .map(|s| s.content.width() as u16)
+                        .sum();
+                    *slot = (
+                        Rect {
+                            x: status.x + start,
+                            y: status.y,
+                            width: w,
+                            height: 1,
+                        },
+                        StripButton::Mode,
+                    );
+                }
+            }
             for span in &bar {
                 let w = span.content.width() as u16;
                 let text = span.content.trim();
-                let button = if !meters.model.is_empty() && text == meters.model {
-                    Some(StripButton::Model)
-                } else if !meters.mode.is_empty() && text.contains(meters.mode.as_str()) {
-                    Some(StripButton::Mode)
-                } else {
-                    None
-                };
-                if let Some(button) = button
+                if !meters.model.is_empty()
+                    && text == meters.model
                     && let Some(slot) = zones.hints.iter_mut().find(|s| s.0.width == 0)
                 {
                     *slot = (
@@ -15880,7 +16005,7 @@ fn render(
                             width: w,
                             height: 1,
                         },
-                        button,
+                        StripButton::Model,
                     );
                 }
                 x += w;
@@ -16629,6 +16754,7 @@ fn render(
                 turns,
                 prompt,
                 selected,
+                ..
             } => {
                 // hint + prompt echo + 3 actions, plus the frame's 4 chrome rows
                 let height = 9.min(fh);
@@ -19188,6 +19314,60 @@ mod tests {
         assert_eq!(popup_cap(6), 4);
         assert_eq!(popup_cap(20), 14, "a 40-row screen shows fourteen");
         assert_eq!(popup_cap(60), 14, "capped at fourteen");
+    }
+
+    /// Rewinding one of several identical prompts cuts at that one: the
+    /// click popup's row is used as is, and an occurrence rank picks the
+    /// same row from the text alone.
+    #[tokio::test]
+    async fn rewind_cuts_the_clicked_twin_of_a_duplicated_prompt() {
+        let build = || {
+            let mut t = Transcript::default();
+            for text in ["same", "same", "other", "same"] {
+                t.push(Line::User(text.into()));
+                t.push(Line::Assistant("reply".into()));
+            }
+            t
+        };
+        let t = build();
+        let rows = t.entries().to_vec();
+        assert_eq!(
+            transcript_prompt_row(&rows, "same", 0),
+            Some(6),
+            "the newest twin"
+        );
+        assert_eq!(transcript_prompt_row(&rows, "same", 1), Some(2));
+        assert_eq!(transcript_prompt_row(&rows, "same", 2), Some(0));
+        assert_eq!(
+            transcript_prompt_row(&rows, "same", 3),
+            None,
+            "no fourth twin"
+        );
+        assert_eq!(transcript_prompt_row(&rows, "missing", 0), None);
+        // the engine is told the same turn either way, and the view cuts
+        // at the twin that was clicked
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Command>(4);
+        let mut input = InputBuffer::default();
+        let mut older = build();
+        apply_rewind(&tx, &mut older, &mut input, 3, "same", Some(2), 0, false).await;
+        assert!(matches!(rx.try_recv(), Ok(Command::Rewind { turns: 3 })));
+        let users = |t: &Transcript| -> Vec<String> {
+            t.entries()
+                .iter()
+                .filter_map(|l| match l {
+                    Line::User(t) => Some(t.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(
+            users(&older),
+            vec!["same"],
+            "only the twin before the cut remains"
+        );
+        let mut by_rank = build();
+        apply_rewind(&tx, &mut by_rank, &mut input, 3, "same", None, 1, false).await;
+        assert_eq!(users(&by_rank), vec!["same"], "the rank finds the same row");
     }
 
     /// In the click-a-prompt popup Enter runs the row the pointer is on,
@@ -23556,6 +23736,8 @@ mod tests {
             ("README.md".to_string(), false),
             ("src".to_string(), true),
             ("src/tui_snapshots.rs".to_string(), false),
+            ("日本語/x.md".to_string(), false),
+            ("lib/École/readme.md".to_string(), false),
         ];
         let names = |q: &str| -> Vec<String> {
             mention_matches(&entries, q)
@@ -23573,9 +23755,15 @@ mod tests {
             vec!["src", "src/main.rs", "src/tui_snapshots.rs"]
         );
         // case-insensitive, and in-order letters anywhere in the path
-        assert_eq!(names("READM"), vec!["README.md"]);
+        assert_eq!(names("READM"), vec!["README.md", "lib/École/readme.md"]);
         assert_eq!(names("tuisnap"), vec!["src/tui_snapshots.rs"]);
         assert!(names("zzz").is_empty());
+        // multibyte directories: the file-name offset is counted in chars,
+        // so these never panic and still rank a file-name prefix first
+        assert_eq!(names("x.md"), vec!["日本語/x.md"]);
+        assert_eq!(names("日本"), vec!["日本語/x.md"]);
+        // a tie on score keeps walk order
+        assert_eq!(names("readm"), vec!["README.md", "lib/École/readme.md"]);
         // an empty query right after the @ lists everything in walk order
         assert_eq!(
             names(""),
@@ -23584,9 +23772,43 @@ mod tests {
                 "lib/main.rs",
                 "README.md",
                 "src",
-                "src/tui_snapshots.rs"
+                "src/tui_snapshots.rs",
+                "日本語/x.md",
+                "lib/École/readme.md",
             ]
         );
+    }
+
+    /// The @ list opens the moment the sigil is typed (an empty query
+    /// lists the walk) and follows the typing; a word that merely
+    /// contains an @ is not a mention.
+    #[test]
+    fn mention_popup_opens_on_the_sigil_and_follows_the_typing() {
+        let entries = vec![
+            ("src/main.rs".to_string(), false),
+            ("README.md".to_string(), false),
+        ];
+        let popup = |text: &str| {
+            let input = InputBuffer {
+                text: text.to_string(),
+                cursor: text.chars().count(),
+                ..Default::default()
+            };
+            mention_popup_for(&input, &entries)
+        };
+        let names = |p: Option<PathPopup>| -> Vec<String> {
+            p.map(|pp| pp.entries.into_iter().map(|(n, _)| n).collect())
+                .unwrap_or_default()
+        };
+        assert_eq!(names(popup("@")), vec!["src/main.rs", "README.md"]);
+        assert_eq!(names(popup("see @read")), vec!["README.md"]);
+        assert_eq!(names(popup("see @ma")), vec!["src/main.rs"]);
+        assert_eq!(names(popup("@zzz")), Vec::<String>::new());
+        assert!(
+            popup("mail@example.com").is_none(),
+            "a word with an @ inside"
+        );
+        assert!(popup("no mention").is_none());
     }
 
     #[test]
@@ -25950,6 +26172,7 @@ mod tests {
             Modal::PromptActions {
                 turns: 2,
                 prompt: "fix the flaky test".into(),
+                entry: 0,
                 selected: 0,
             },
             Modal::Memory {
@@ -26933,7 +27156,7 @@ mod tests {
         let mut input = InputBuffer::default();
 
         // plain rewind at "one" (turns=2): rows from that prompt onward go
-        apply_rewind(&tx_cmd, &mut t, &mut input, 2, "one", false).await;
+        apply_rewind(&tx_cmd, &mut t, &mut input, 2, "one", None, 0, false).await;
         let entries = t.entries();
         assert!(
             entries
@@ -26947,7 +27170,7 @@ mod tests {
         let mut t = Transcript::default();
         t.push(Line::User("keep".into()));
         t.push(Line::User("drop".into()));
-        apply_rewind(&tx_cmd, &mut t, &mut input, 1, "keep", true).await;
+        apply_rewind(&tx_cmd, &mut t, &mut input, 1, "keep", None, 0, true).await;
         assert_eq!(input.text, "keep");
         assert_eq!(input.cursor, input.text.chars().count());
         assert!(
@@ -26962,7 +27185,17 @@ mod tests {
         // back to the nth-from-end cut
         let mut t = Transcript::default();
         t.push(Line::User("seen".into()));
-        apply_rewind(&tx_cmd, &mut t, &mut input, 1, "never echoed", false).await;
+        apply_rewind(
+            &tx_cmd,
+            &mut t,
+            &mut input,
+            1,
+            "never echoed",
+            None,
+            0,
+            false,
+        )
+        .await;
         assert!(
             t.entries().iter().all(|l| !matches!(l, Line::User(_))),
             "nth-from-end fallback cut the last user row: {:?}",

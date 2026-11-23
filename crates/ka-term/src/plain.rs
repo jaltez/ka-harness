@@ -267,6 +267,7 @@ pub fn modal_lines(
             turns,
             prompt,
             selected,
+            ..
         } => {
             let rows = vec![
                 format!("\"{prompt}\"  [-{turns}]"),

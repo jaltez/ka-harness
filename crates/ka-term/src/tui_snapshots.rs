@@ -2925,6 +2925,7 @@ fn modal_scenes() -> Vec<Scene> {
                 opens(Modal::PromptActions {
                     turns: 3,
                     prompt: PROMPTS[5].into(),
+                    entry: 5,
                     selected: 1,
                 })
             },
