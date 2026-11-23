@@ -5116,6 +5116,31 @@ fn mouse_mode_text(captured: bool) -> String {
     )
 }
 
+/// The key press an open modal acts on — and the permission ask and
+/// input-box picker, which capture keys the same way. A modal lists
+/// single keys only (`s` saves, `r` rewinds, `a` stages all, a field
+/// takes characters), so a chord must never act as its bare key:
+/// ctrl+r in the rewind menu is not `r`, ctrl+a in `/git` is not `a`,
+/// and no field takes a letter from ctrl+w or alt+x. A chord keeps its
+/// modifiers but reads as `KeyCode::Null`, which no listed key matches
+/// (ctrl+c is answered before any modal sees it). Shift is not a
+/// chord: it is already part of the character it produced (`A`, `?`),
+/// and terminals report it on Enter and the arrows too, so ⇧⏎ still
+/// submits and ⇧↓ still moves.
+fn modal_key(key: crossterm::event::KeyEvent) -> crossterm::event::KeyEvent {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let chord = KeyModifiers::CONTROL
+        | KeyModifiers::ALT
+        | KeyModifiers::SUPER
+        | KeyModifiers::HYPER
+        | KeyModifiers::META;
+    if key.modifiers.intersects(chord) {
+        crossterm::event::KeyEvent::new(KeyCode::Null, key.modifiers)
+    } else {
+        key
+    }
+}
+
 /// Key handling shared by the pager modals (TaskDetail, Debug): the
 /// page keys scroll the window, Home jumps to the top, End re-pins to
 /// the tail; any other key closes. Returns true when the modal should
@@ -5913,6 +5938,7 @@ async fn app(
                     quit_armed = None;
                     // Ask dialog captures input first
                     if let Some(ask) = pending.as_mut() {
+                        let key = modal_key(key);
                         match key.code {
                             KeyCode::Up | KeyCode::Left => {
                                 ask.selected = ask.selected.saturating_sub(1);
@@ -5960,6 +5986,7 @@ async fn app(
                     // tiers or /thinking levels, both borrowing the
                     // input box exactly like the permission ask does
                     if let Some(open) = picker.as_mut() {
+                        let key = modal_key(key);
                         match open {
                             InputPicker::Mode(pk) => match key.code {
                                 KeyCode::Esc => picker = None,
@@ -6032,6 +6059,7 @@ async fn app(
                     }
                     // Modal (session picker / settings) captures input next
                     if let Some(open) = modal.as_mut() {
+                        let key = modal_key(key);
                         match open {
                             Modal::Session(picker) => match key.code {
                                 KeyCode::Esc => modal = None,
@@ -26329,6 +26357,104 @@ mod tests {
             !top.contains('▸') && !top.contains('▾'),
             "no dead chevron on a non-expandable card: {top:?}"
         );
+    }
+
+    /// A modal lists single keys only: a chord never acts as its bare
+    /// key. ctrl+a in /git is the composer's line-home, not the panel's
+    /// `a`; ctrl+r in the rewind menu is not `r`; a commit message
+    /// takes `w` but never the w of ctrl+w. Shift is the character
+    /// itself, and terminals report it on Enter and the arrows too.
+    #[test]
+    fn a_chord_never_acts_as_its_bare_key_inside_a_modal() {
+        use crate::git::{GitAction, Pane};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let seen = |code: KeyCode, mods: KeyModifiers| modal_key(KeyEvent::new(code, mods)).code;
+        let list = Pane::List;
+        let commit = Pane::Commit;
+        assert_eq!(
+            crate::git::handle_key(
+                seen(KeyCode::Char('a'), KeyModifiers::NONE),
+                &list,
+                false,
+                3,
+                0
+            ),
+            GitAction::StageAll,
+            "the bare key acts"
+        );
+        assert_eq!(
+            crate::git::handle_key(
+                seen(KeyCode::Char('a'), KeyModifiers::CONTROL),
+                &list,
+                false,
+                3,
+                0
+            ),
+            GitAction::None,
+            "ctrl+a stages nothing"
+        );
+        assert_eq!(
+            crate::git::handle_key(
+                seen(KeyCode::Char('s'), KeyModifiers::ALT),
+                &list,
+                false,
+                3,
+                0
+            ),
+            GitAction::None,
+            "alt+s stages nothing"
+        );
+        assert_eq!(
+            crate::git::handle_key(
+                seen(KeyCode::Char('w'), KeyModifiers::NONE),
+                &commit,
+                false,
+                3,
+                0
+            ),
+            GitAction::Type('w'),
+            "a text field takes the bare letter"
+        );
+        for mods in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+            assert_eq!(
+                crate::git::handle_key(seen(KeyCode::Char('w'), mods), &commit, false, 3, 0),
+                GitAction::None,
+                "a text field takes no letter from a {mods:?} chord"
+            );
+        }
+        assert_eq!(
+            crate::git::handle_key(
+                seen(KeyCode::Char('W'), KeyModifiers::SHIFT),
+                &commit,
+                false,
+                3,
+                0
+            ),
+            GitAction::Type('W'),
+            "shift types its own character"
+        );
+        // no listed key matches a chord: not Enter, not space, not the arrows
+        for (code, mods) in [
+            (KeyCode::Enter, KeyModifiers::ALT),
+            (KeyCode::Char(' '), KeyModifiers::CONTROL),
+            (KeyCode::Char('r'), KeyModifiers::CONTROL),
+            (KeyCode::Down, KeyModifiers::CONTROL),
+        ] {
+            let seen = modal_key(KeyEvent::new(code, mods));
+            assert_eq!(seen.code, KeyCode::Null, "{code:?} + {mods:?}");
+            assert_eq!(seen.modifiers, mods, "the chord itself stays readable");
+        }
+        // shift rides the character it produced and reaches the modal
+        assert_eq!(
+            seen(KeyCode::Char('R'), KeyModifiers::SHIFT),
+            KeyCode::Char('R')
+        );
+        assert_eq!(
+            seen(KeyCode::Char('?'), KeyModifiers::SHIFT),
+            KeyCode::Char('?')
+        );
+        assert_eq!(seen(KeyCode::Enter, KeyModifiers::SHIFT), KeyCode::Enter);
+        assert_eq!(seen(KeyCode::Down, KeyModifiers::SHIFT), KeyCode::Down);
     }
 
     /// The ✕ chip renders on the top border, inside the chip hit zone;
