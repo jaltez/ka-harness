@@ -2365,22 +2365,106 @@ fn queue_refusal(draft: &str) -> Option<String> {
     if item.starts_with("/skill:") || item == "/skill" {
         return Some("skills run immediately — press enter".to_string());
     }
+    if let Some(head) = unknown_slash(item) {
+        return Some(format!("{head}: unknown command — nothing queued"));
+    }
+    let cmd = slash_command(item)?;
     let head = item.split(' ').next().unwrap_or_default();
-    match slash_command(item) {
-        None => Some(format!("{head}: unknown command — nothing queued")),
-        Some(cmd) => {
-            if cmd.quit {
-                Some(format!("{head} runs immediately — press enter"))
-            } else if cmd.modal.is_some() {
-                Some(format!("{head} opens a picker — run it after the turn"))
-            } else if cmd.followup.is_some() {
-                Some(format!("{head} sends a follow-up prompt — run it directly"))
-            } else if cmd.event.is_none() {
-                Some(format!("{head} only prints a note — nothing to run"))
+    if cmd.quit {
+        Some(format!("{head} runs immediately — press enter"))
+    } else if cmd.modal.is_some() {
+        Some(format!("{head} opens a picker — run it after the turn"))
+    } else if cmd.followup.is_some() {
+        Some(format!("{head} sends a follow-up prompt — run it directly"))
+    } else if cmd.event.is_none() {
+        Some(format!("{head} only prints a note — nothing to run"))
+    } else {
+        None
+    }
+}
+
+/// The one rule behind every refusal of a `/`-led line: it names no
+/// built-in or custom command. For a slash line, returns its typed head
+/// (`/hlep`) when nothing answers to it. Skill lines answer to the live
+/// inventory, not the command table.
+fn unknown_slash(item: &str) -> Option<&str> {
+    let skill_line = item.starts_with("/skill:") || item == "/skill" || item.starts_with("/skill ");
+    (item.starts_with('/') && !skill_line && slash_command(item).is_none())
+        .then(|| item.split(' ').next().unwrap_or_default())
+}
+
+/// The note Enter leaves for an unknown slash line, naming the nearest
+/// command when there is one: `unknown command /hlep. did you mean /help?`.
+fn unknown_command_note(head: &str) -> String {
+    let mut note = format!("unknown command {head}.");
+    if let Some(near) = nearest_command(head) {
+        note.push_str(&format!(" did you mean {near}?"));
+    }
+    note
+}
+
+/// The command closest to a misspelled head: a name it is a prefix of,
+/// else a name within edit distance 2; ties go to the shortest name. A
+/// bare `/` is no misspelling — every command continues it.
+fn nearest_command(head: &str) -> Option<String> {
+    if head.len() < 2 {
+        return None;
+    }
+    available_slash_commands()
+        .into_iter()
+        .map(|(name, _)| name)
+        .filter(|name| name != head)
+        .filter_map(|name| {
+            let distance = if name.starts_with(head) {
+                0
             } else {
-                None
+                edit_distance(head, &name)
+            };
+            (distance <= 2).then_some((distance, name.chars().count(), name))
+        })
+        .min()
+        .map(|(_, _, name)| name)
+}
+
+/// Damerau-Levenshtein distance over chars: a substitution, an
+/// insertion, a deletion, or two adjacent characters swapped each cost 1,
+/// so `/hlep` sits one step from `/help`.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    // three rolling rows of the distance table: i-2, i-1, and i
+    let mut older: Vec<usize> = (0..=b.len()).collect();
+    let mut prev = vec![0; b.len() + 1];
+    let mut row = prev.clone();
+    for (i, &ca) in a.iter().enumerate() {
+        row[0] = i + 1;
+        for (j, &cb) in b.iter().enumerate() {
+            row[j + 1] = (prev[j] + usize::from(ca != cb))
+                .min(row[j] + 1)
+                .min(prev[j + 1] + 1);
+            if i > 0 && j > 0 && ca == b[j - 1] && a[i - 1] == cb {
+                row[j + 1] = row[j + 1].min(older[j - 1] + 1);
             }
         }
+        (older, prev, row) = (prev, row, older);
+    }
+    prev[b.len()]
+}
+
+/// What Enter submits for a `/`-led draft. The draft itself goes when
+/// it names a command; otherwise a highlighted popup row stands in for
+/// it, completed the way Tab completes it; with no popup the line is
+/// refused with a note and never reaches the model.
+fn slash_enter(popup: Option<&SlashPopup>, draft: &str) -> Result<String, String> {
+    let Some(head) = unknown_slash(draft) else {
+        return Ok(draft.to_string());
+    };
+    let Some(name) = popup.map(|p| complete_slash(&p.items[p.selected].0)) else {
+        return Err(unknown_command_note(head));
+    };
+    match unknown_slash(&name) {
+        Some(head) => Err(unknown_command_note(head)),
+        None => Ok(name),
     }
 }
 
@@ -7439,7 +7523,22 @@ async fn app(
                         // composer.send (⏎ by default): mid-turn the same
                         // key steers — see the busy branch (composer.steer)
                         _ if bindings.matches(&key, "composer.send") => {
-                            let text = input.take();
+                            // a `/`-led draft runs the highlighted popup row
+                            // when it is not a command itself, and a line
+                            // naming no command is refused with a note —
+                            // the draft stays put, the model never sees it
+                            let text = match slash_enter(slash_popup.as_ref(), &input.text) {
+                                Ok(text) if text == input.text => input.take(),
+                                Ok(text) => {
+                                    input.text.clear();
+                                    input.cursor = 0;
+                                    text
+                                }
+                                Err(note) => {
+                                    transcript.push_separated(Line::Warn(note));
+                                    continue;
+                                }
+                            };
                             // a submitted line invalidates any completion popup
                             slash_popup = None;
                             path_popup = None;
@@ -13244,7 +13343,12 @@ const ASK_HINTS: &[(&str, &str)] = &[
     ("esc", "deny"),
 ];
 /// Hints on the slash popup's bottom border.
-const POPUP_HINTS: &[(&str, &str)] = &[("↑↓", "select"), ("tab", "complete"), ("esc", "close")];
+const POPUP_HINTS: &[(&str, &str)] = &[
+    ("↑↓", "select"),
+    ("tab", "complete"),
+    ("enter", "run"),
+    ("esc", "close"),
+];
 /// Hints on the path popup's bottom border.
 const PATH_HINTS: &[(&str, &str)] = &[("↑↓", "choose"), ("tab", "accept"), ("esc", "close")];
 
@@ -18781,6 +18885,76 @@ mod tests {
         assert!(resume_hint("s19a4f2e1b0-3f9c2a81d4b7", 0, false, false).is_none());
         // no session id (engine died at bootstrap): nothing to print
         assert!(resume_hint("", 3, false, true).is_none());
+    }
+
+    #[test]
+    fn enter_refuses_an_unknown_slash_command_and_names_the_nearest() {
+        // a typo is refused, never sent, and the note names the command
+        let miss = slash_enter(None, "/hlep").unwrap_err();
+        assert_eq!(miss, "unknown command /hlep. did you mean /help?");
+        // prefix: the shortest continuation wins
+        assert_eq!(
+            slash_enter(None, "/mo").unwrap_err(),
+            "unknown command /mo. did you mean /mode?"
+        );
+        // a bare slash names nothing; a far miss names nothing
+        assert_eq!(slash_enter(None, "/").unwrap_err(), "unknown command /.");
+        assert_eq!(
+            slash_enter(None, "/zzzzzz").unwrap_err(),
+            "unknown command /zzzzzz."
+        );
+        // known lines, skill lines, and prompts pass through untouched
+        for known in [
+            "/help",
+            "/mode free",
+            "/skill:review",
+            "/skill",
+            "see /mode",
+            "hello",
+        ] {
+            assert_eq!(
+                slash_enter(None, known).unwrap_or_default(),
+                known,
+                "{known}"
+            );
+        }
+        // the queue path shares the rule
+        assert!(queue_refusal("/hlep").is_some_and(|r| r.contains("unknown")));
+        assert!(
+            queue_refusal("/skill:review")
+                .unwrap_or_default()
+                .contains("immediately")
+        );
+    }
+
+    #[test]
+    fn enter_runs_the_highlighted_popup_row() {
+        let hel = update_suggestions("/hel");
+        assert_eq!(
+            slash_enter(hel.as_ref(), "/hel").unwrap_or_default(),
+            "/help "
+        );
+        // Down moved the highlight off the first row: that row runs
+        let mut many = update_suggestions("/c")
+            .filter(|p| p.items.len() > 1)
+            .unwrap();
+        many.selected = many.items.len() - 1;
+        let last = many.items[many.selected].0.clone();
+        assert_eq!(
+            slash_enter(Some(&many), "/c").unwrap_or_default(),
+            complete_slash(&last)
+        );
+        // an exact command ignores the popup; a skill starter completes
+        // to its colon so the inventory popup opens
+        assert_eq!(
+            slash_enter(hel.as_ref(), "/help").unwrap_or_default(),
+            "/help"
+        );
+        let sk = update_suggestions("/sk");
+        assert_eq!(
+            slash_enter(sk.as_ref(), "/sk").unwrap_or_default(),
+            "/skill:"
+        );
     }
 
     #[test]
