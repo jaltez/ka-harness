@@ -30,7 +30,7 @@ ka --session 3f9c2a81               # resume by id prefix or name
 ka run "summarize the build error"  # one headless turn; final text on stdout (--print ndjson for events)
 ```
 
-Essential keys: `Enter` send or steer mid-turn · `⇧Enter` newline (`Ctrl+J` fallback) · `Esc` unpin scroll, then abort · `Ctrl-C` abort · `/help` for the rest.
+Essential keys: `Enter` send or steer mid-turn · `⇧Enter` newline (`Ctrl+J` fallback) · `Esc` close the open popup, clear the draft, unpin scroll, then abort · `Ctrl-C` abort · `/help` for the rest.
 
 Markdown answers render with shaded code panels, tables, and mermaid diagrams drawn as box-drawing flowcharts, sequence and state diagrams, quadrant planes; anything the renderer does not cover keeps its source panel.
 

@@ -3099,14 +3099,18 @@ fn detect_branch() -> Option<String> {
 }
 
 /// What a pressed Esc does, in the key loop's precedence order: popups
-/// and the search own Esc first (their own arms above); then a pinned
-/// scroll unpins — even mid-turn, so the scroll pill's promised 'esc'
-/// never costs a running turn the abort; then a busy turn aborts; a
-/// double-press on an empty idle input opens the rewind menu.
+/// and the search own Esc first (their own arms above); then a
+/// non-empty draft clears — in every state, mid-turn included, and
+/// without arming the rewind chain; then a pinned scroll unpins — even
+/// mid-turn, so the scroll pill's promised 'esc' never costs a running
+/// turn the abort; then a busy turn aborts; a double-press on an empty
+/// idle input opens the rewind menu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EscAction {
-    /// Leave the /focus collapsed view (first in line: the /focus note
-    /// promises 'esc', in every other state).
+    /// Clear the draft (undoable like the Ctrl+C clear).
+    ClearDraft,
+    /// Leave the /focus collapsed view (the /focus note promises 'esc',
+    /// in every other state).
     Unfocus,
     /// Release the pinned viewport back to the tail.
     UnpinScroll,
@@ -3129,14 +3133,16 @@ fn esc_action(
     last_esc: Option<Instant>,
     now: Instant,
 ) -> EscAction {
-    if focus_on {
+    if ask_open {
+        EscAction::None
+    } else if !input_empty {
+        EscAction::ClearDraft
+    } else if focus_on {
         EscAction::Unfocus
     } else if scrolled {
         EscAction::UnpinScroll
     } else if busy {
         EscAction::Abort
-    } else if ask_open || !input_empty {
-        EscAction::None
     } else {
         let doubled = last_esc.is_some_and(|t| now.duration_since(t) < Duration::from_millis(600));
         if doubled {
@@ -3286,16 +3292,17 @@ async fn apply_rewind(
 }
 
 /// The Esc arm of the key loop, extracted so its precedence is testable
-/// against the command channel: unfocus first, unpin, abort only
-/// unscrolled, rewind on the double-press. `rewind` is computed
-/// lazily — only the rewind arm reads the strand.
+/// against the command channel: clear a draft first (disarming the
+/// rewind double), then unfocus, unpin, abort only unscrolled, rewind
+/// on the double-press. `rewind` is computed lazily — only the rewind
+/// arm reads the strand.
 #[allow(clippy::too_many_arguments)]
 async fn handle_esc(
     commands: &mut mpsc::Sender<Command>,
     scroll: &mut Option<usize>,
     focus: &mut bool,
     busy: bool,
-    input_empty: bool,
+    input: &mut InputBuffer,
     ask_open: bool,
     last_esc: &mut Option<Instant>,
     modal: &mut Option<Modal>,
@@ -3306,11 +3313,16 @@ async fn handle_esc(
         *focus,
         scroll.is_some(),
         busy,
-        input_empty,
+        input.text.is_empty(),
         ask_open,
         *last_esc,
         now,
     ) {
+        EscAction::ClearDraft => {
+            input.clear_draft();
+            // a clear is not the first half of `esc esc`
+            *last_esc = None;
+        }
         EscAction::Unfocus => *focus = false,
         EscAction::UnpinScroll => *scroll = None,
         EscAction::Abort => {
@@ -7494,17 +7506,18 @@ async fn app(
                             continue;
                         }
                         // every other Esc runs one precedence chain: a
-                        // pinned scroll unpins FIRST (the pill promises
-                        // 'esc', even mid-turn — the abort must not steal
-                        // it), then the abort, then the double-Esc rewind
+                        // non-empty draft clears first, then a pinned
+                        // scroll unpins (the pill promises 'esc', even
+                        // mid-turn — the abort must not steal it), then
+                        // the abort, then the double-Esc rewind
                         (KeyCode::Esc, _) => {
                             handle_esc(
                                 commands,
                                 &mut scroll,
                                 &mut transcript.focus,
                                 busy,
-                                input.text.is_empty(),
-                                pending.is_some(),
+                                &mut input,
+                                pending.as_ref().is_some(),
                                 &mut last_esc,
                                 &mut modal,
                                 || rewind_items(
@@ -13359,8 +13372,12 @@ fn composer_hints(
     picker: bool,
     rsearch: bool,
     busy: bool,
+    draft: bool,
     mouse_captured: bool,
 ) -> &'static [(&'static str, &'static str)] {
+    // a present draft names its Esc: the first press clears it, and
+    // only the next one reaches the chain below it
+    const CLEAR: (&str, &str) = ("esc", "clear");
     if picker {
         &[
             ("↑↓", "select"),
@@ -13371,12 +13388,40 @@ fn composer_hints(
     } else if rsearch {
         &[("^r", "next"), ("⏎", "accept"), ("esc", "cancel")]
     } else if busy {
-        &[("⏎", "steer"), ("+ · alt+q", "queue"), ("esc", "abort")]
+        if draft {
+            &[
+                ("⏎", "steer"),
+                CLEAR,
+                ("+ · alt+q", "queue"),
+                ("esc", "abort"),
+            ]
+        } else {
+            &[("⏎", "steer"), ("+ · alt+q", "queue"), ("esc", "abort")]
+        }
     } else if mouse_captured {
+        if draft {
+            &[
+                ("⏎", "send"),
+                CLEAR,
+                ("drag", "select+copy"),
+                ("↑↓ ^p/^n", "history"),
+                ("/", "commands"),
+            ]
+        } else {
+            &[
+                ("⏎", "send"),
+                ("drag", "select+copy"),
+                ("↑↓ ^p/^n", "history"),
+                ("/", "commands"),
+            ]
+        }
+    } else if draft {
         &[
             ("⏎", "send"),
-            ("drag", "select+copy"),
-            ("↑↓ ^p/^n", "history"),
+            CLEAR,
+            ("drag", "select"),
+            ("↑↓", "scroll"),
+            ("^p/^n", "history"),
             ("/", "commands"),
         ]
     } else {
@@ -15081,7 +15126,13 @@ fn render(
                     strip_end,
                     limit,
                     y,
-                    composer_hints(picker.is_some(), rsearch.is_some(), busy, mouse_captured),
+                    composer_hints(
+                        picker.is_some(),
+                        rsearch.is_some(),
+                        busy,
+                        !input.is_empty(),
+                        mouse_captured,
+                    ),
                 );
             }
         }
@@ -16790,7 +16841,7 @@ pub(crate) fn help_modal_rows(width: usize) -> Vec<ratatui::text::Line<'static>>
         ("!cmd".into(), "run a shell command directly".into()),
         (
             "esc".into(),
-            "close popups & modals · unpin scroll first".into(),
+            "close popups & modals · clear the draft · unpin scroll, then abort".into(),
         ),
         ("↑ ↓".into(), "prompt history · navigate pickers".into()),
         ("ctrl+p / ctrl+n".into(), "prompt history".into()),
@@ -19140,14 +19191,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn esc_unpins_scroll_before_abort_and_rewind() {
-        // the pure decision: focus first, then scrolled wins over busy,
-        // busy over rewind
+    async fn esc_clears_a_draft_before_unpinning_aborting_and_rewinding() {
+        // the pure decision: a draft clears before anything else, in
+        // every state; with no draft, focus first, then scrolled wins
+        // over busy, busy over rewind; an open ask owns its own Esc
         let now = Instant::now();
+        for (focus_on, scrolled, busy) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            assert_eq!(
+                esc_action(focus_on, scrolled, busy, false, false, None, now),
+                EscAction::ClearDraft,
+                "focus={focus_on} scrolled={scrolled} busy={busy}: the draft clears first"
+            );
+        }
+        assert_eq!(
+            esc_action(false, false, true, false, true, None, now),
+            EscAction::None,
+            "an open ask owns Esc while a draft waits"
+        );
         assert_eq!(
             esc_action(true, false, false, true, false, None, now),
             EscAction::Unfocus,
-            "focus view owns Esc in every state"
+            "focus view owns Esc in every draftless state"
         );
         assert_eq!(
             esc_action(false, true, true, true, false, None, now),
@@ -19162,20 +19231,42 @@ mod tests {
             esc_action(false, false, false, true, false, None, now),
             EscAction::ArmRewind
         );
-        // through the command-sender seam: busy + scrolled sends NO
-        // Abort — Esc unpins only
+        // through the command-sender seam: a draft mid-turn, scroll
+        // pinned, rewind armed — Esc clears the draft, sends NO Abort,
+        // and leaves the rewind disarmed
         let (tx, mut rx) = mpsc::channel(4);
         let mut commands = tx.clone();
         let mut scroll = Some(3usize);
         let mut modal = None;
-        let mut last_esc = None;
+        let mut last_esc = Some(now);
         let mut focus = false;
+        let mut input = InputBuffer::default();
+        input.insert_str("half typed");
         handle_esc(
             &mut commands,
             &mut scroll,
             &mut focus,
             true,
+            &mut input,
+            false,
+            &mut last_esc,
+            &mut modal,
+            || unreachable!("no strand read while a draft is present"),
+            now,
+        )
+        .await;
+        assert!(input.text.is_empty(), "the draft cleared");
+        assert_eq!(scroll, Some(3), "the pin outlives the clear");
+        assert_eq!(last_esc, None, "clearing is not the first half of esc esc");
+        assert!(rx.try_recv().is_err(), "no Abort was sent");
+        // draftless now: busy + scrolled still sends NO Abort — Esc
+        // unpins only
+        handle_esc(
+            &mut commands,
+            &mut scroll,
+            &mut focus,
             true,
+            &mut input,
             false,
             &mut last_esc,
             &mut modal,
@@ -19194,7 +19285,7 @@ mod tests {
             &mut scroll,
             &mut focus,
             true,
-            true,
+            &mut input,
             false,
             &mut last_esc,
             &mut modal,
@@ -19212,7 +19303,7 @@ mod tests {
             &mut scroll,
             &mut focus,
             true,
-            true,
+            &mut input,
             false,
             &mut last_esc,
             &mut modal,
@@ -19227,7 +19318,7 @@ mod tests {
             &mut scroll,
             &mut focus,
             false,
-            true,
+            &mut input,
             false,
             &mut last_esc,
             &mut modal,
@@ -19237,6 +19328,26 @@ mod tests {
         .await;
         assert_eq!(last_esc, Some(now));
         assert!(rx.try_recv().is_err(), "idle Esc sends nothing");
+    }
+
+    #[test]
+    fn composer_hints_name_the_clear_whenever_a_draft_is_present() {
+        for (busy, mouse_captured) in [(false, false), (false, true), (true, false)] {
+            let with = composer_hints(false, false, busy, true, mouse_captured);
+            let without = composer_hints(false, false, busy, false, mouse_captured);
+            // the clear sits right after the first pair, ahead of what
+            // the row drops first on a narrow terminal
+            assert_eq!(with[0], without[0]);
+            assert_eq!(with[1], ("esc", "clear"));
+            assert_eq!(&with[2..], &without[1..]);
+        }
+        // a picker and the reverse search keep their own Esc
+        for own in [
+            composer_hints(true, false, false, true, false),
+            composer_hints(false, true, false, true, false),
+        ] {
+            assert!(own.iter().all(|(_, v)| *v != "clear"));
+        }
     }
 
     #[test]
