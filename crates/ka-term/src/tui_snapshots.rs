@@ -18,6 +18,10 @@
 //! `must_contain` is a characterization: every string is on the frame
 //! today at every asserted size, and the test fails when one leaves.
 //!
+//! An overlay scene (`ask`, `modal`) also fails on a bare selection
+//! band ([`bare_selection_bands`]): a row whose selection ground shows
+//! no glyph.
+//!
 //! A scene fixes what would otherwise move between runs:
 //!
 //! * the clock: `render`'s `now` is [`now`], frozen for the process,
@@ -225,6 +229,24 @@ fn row_cells(buf: &Buffer, y: u16) -> Vec<&Cell> {
 fn row_text(buf: &Buffer, y: u16) -> String {
     let row: String = row_cells(buf, y).iter().map(|cell| cell.symbol()).collect();
     row.trim_end_matches(' ').to_owned()
+}
+
+/// The rows of an overlay that wear the selection ground but show no
+/// glyph: the remainder of a row laid out wider than its box, blank in
+/// a text dump and a stray dark cell on screen. A selected row always
+/// carries its pointer or its label, so a band of bare cells is never
+/// meant.
+fn bare_selection_bands(buf: &Buffer) -> Vec<String> {
+    (0..buf.area.height)
+        .filter(|&y| {
+            let mut band = (0..buf.area.width)
+                .map(|x| &buf[(x, y)])
+                .filter(|cell| cell.bg == crate::palette::SEL_BG);
+            band.next()
+                .is_some_and(|_| band.all(|cell| cell.symbol() == " "))
+        })
+        .map(|y| format!("a selection band with no glyph on row {y}"))
+        .collect()
 }
 
 /// The whole frame as text, one row per line.
@@ -2084,6 +2106,8 @@ fn ask_scenes() -> Vec<Scene> {
                 "permission",
                 "allow edit to modify files?",
                 "1 allow",
+                "2 always",
+                "3 deny",
                 "esc deny",
             ],
             |_| {
@@ -2101,6 +2125,9 @@ fn ask_scenes() -> Vec<Scene> {
             [
                 "permission",
                 "run `cargo test -p ka-term --lib`?",
+                "1 allow",
+                "2 always",
+                "3 deny",
                 "esc deny",
             ],
             |_| {
@@ -2116,7 +2143,7 @@ fn ask_scenes() -> Vec<Scene> {
             "ask-hardstop",
             "Permission ask: a hardstop",
             "ask",
-            ["HARDSTOP", "Proceed anyway?", "deny"],
+            ["HARDSTOP", "Proceed anyway?", "1 allow", "2 always", "deny"],
             |_| {
                 asking(ask(
                     "HARDSTOP — force push to a shared branch: `git push --force origin main`. \
@@ -2130,14 +2157,20 @@ fn ask_scenes() -> Vec<Scene> {
             "ask-selected-deny",
             "Permission ask: the deny option selected",
             "ask",
-            ["▌ 3 deny"],
+            ["▌ 3 deny", "1 allow", "2 always"],
             |_| asking(ask("run `rm -rf target`?", None, 2)),
         ),
         Scene::new(
             "ask-edit-long-lines",
             "Permission ask: an edit whose diff lines wrap",
             "ask",
-            ["permission", "1 allow"],
+            [
+                "permission",
+                "allow edit to modify files?",
+                "1 allow",
+                "2 always",
+                "3 deny",
+            ],
             |_| {
                 asking(ask(
                     "allow edit to modify files?",
@@ -2150,7 +2183,7 @@ fn ask_scenes() -> Vec<Scene> {
             "ask-sandbox-grant",
             "Permission ask: a sandbox grant folded into a wrapped question",
             "ask",
-            ["sandbox grant", "allow"],
+            ["sandbox grant", "allow", "2 always", "3 deny"],
             |_| {
                 asking(ask(
                     "run `curl -sSf https://sh.rustup.rs | sh -s -- -y`?\nsandbox grant: network \
@@ -2584,7 +2617,14 @@ fn modal_scenes() -> Vec<Scene> {
             "modal-settings",
             "Settings panel (/settings)",
             "modal",
-            ["model", "accept_edits", "providers:", "(keyless)"],
+            [
+                "model",
+                "accept_edits",
+                "providers:",
+                "(keyless)",
+                // a url that outgrows its row ends in an ellipsis
+                "… │",
+            ],
             move |_| {
                 opens(Modal::Settings(SettingsPanel {
                     model: "zai/glm-5.3".into(),
@@ -2666,7 +2706,11 @@ fn modal_scenes() -> Vec<Scene> {
             "modal-model-nomatch",
             "Model picker: the filter matches nothing",
             "modal",
-            ["model", "kernel/forge-9▌"],
+            [
+                "model",
+                "kernel/forge-9▌",
+                "enter sets 'kernel/forge-9' as a custom selector",
+            ],
             move |_| {
                 opens(Modal::Model(ModelPicker {
                     models: catalog(),
@@ -2680,7 +2724,7 @@ fn modal_scenes() -> Vec<Scene> {
             "modal-model-noproviders",
             "Model picker: no configured provider",
             "modal",
-            ["model"],
+            ["model", "no configured providers — /provider to connect"],
             move |_| {
                 let unconfigured: Vec<ModelInfo> = catalog()
                     .iter()
@@ -2714,7 +2758,7 @@ fn modal_scenes() -> Vec<Scene> {
             "modal-provider-nomatch",
             "Provider picker: the filter matches nothing",
             "modal",
-            ["providers"],
+            ["providers", "(no providers match)"],
             move |_| {
                 let mut picker = ProviderPicker::new(providers(), &catalog());
                 picker.filter = "nope".into();
@@ -3149,7 +3193,7 @@ fn modal_scenes() -> Vec<Scene> {
             "modal-search",
             "Transcript search (/search)",
             "modal",
-            ["search", "refine"],
+            ["search", "refine", "jumps to the hit"],
             move |_| {
                 opens(Modal::Search {
                     query: "the".into(),
@@ -3212,7 +3256,7 @@ fn modal_scenes() -> Vec<Scene> {
             "modal-queue",
             "Follow-up queue (/queue)",
             "modal",
-            ["queue", "#1", "#9"],
+            ["queue", "#1", "#9", "#10", "dequeues the picked prompt"],
             move |_| {
                 opens(Modal::Queue {
                     items: ids(&PROMPTS[..10]),
@@ -3939,17 +3983,21 @@ fn plain_modals(modals: &[Scene]) -> Vec<Scene> {
 // ── the tests ────────────────────────────────────────────────────
 
 /// One frame of `scene` at `size`: the buffer `render` painted, and
-/// the `must_contain` strings missing from its text.
-fn shoot(scene: &Scene, size: (u16, u16)) -> (Buffer, Vec<&str>) {
+/// what makes it unusable — each `must_contain` string missing from
+/// its text, and, for an overlay, each bare selection band.
+fn shoot(scene: &Scene, size: (u16, u16)) -> (Buffer, Vec<String>) {
     let buf = draw(&mut (scene.build)(size), size);
     let text = frame_text(&buf);
-    let missing = scene
+    let mut unusable: Vec<String> = scene
         .must_contain
         .iter()
         .filter(|needle| !text.contains(needle.as_str()))
-        .map(String::as_str)
+        .map(|needle| format!("missing {needle:?}"))
         .collect();
-    (buf, missing)
+    if matches!(scene.category, "ask" | "modal") {
+        unusable.extend(bare_selection_bands(&buf));
+    }
+    (buf, unusable)
 }
 
 /// Renders every scene at every size and writes the snapshot files.
@@ -3963,23 +4011,25 @@ fn snapshots_dump() {
     let mut index = String::from("id\tname\tcategory\tsize\tfound\tmissing\n");
     for scene in scenes() {
         for size in SIZES.into_iter().chain([STRESS]) {
-            let (buf, missing) = shoot(&scene, size);
+            let (buf, unusable) = shoot(&scene, size);
             let stem = format!("{}@{}x{}", scene.id, size.0, size.1);
-            write(&dir.join(format!("{stem}.txt")), &(frame_text(&buf) + "\n"));
+            let text = frame_text(&buf);
+            write(&dir.join(format!("{stem}.txt")), &format!("{text}\n"));
             write(&dir.join(format!("{stem}.ansi")), &frame_ansi(&buf));
             let found: Vec<&str> = scene
                 .must_contain
                 .iter()
                 .map(String::as_str)
-                .filter(|needle| !missing.contains(needle))
+                .filter(|needle| text.contains(*needle))
                 .collect();
+            let missing = unusable.join(" | ");
             let fields = [
                 scene.id.as_str(),
                 &scene.name,
                 scene.category,
                 &format!("{}x{}", size.0, size.1),
                 &found.join(" | "),
-                &missing.join(" | "),
+                &missing,
             ];
             index.push_str(
                 &fields
@@ -3994,18 +4044,22 @@ fn snapshots_dump() {
     write(&dir.join("index.tsv"), &index);
 }
 
-/// Every scene keeps, at every asserted size, the strings that make it usable.
+/// Every scene keeps, at every asserted size, what makes it usable.
 #[test]
 fn snapshots_stay_usable() {
     git_fixture();
     let mut unusable = Vec::new();
     for scene in scenes() {
         for size in SIZES {
-            let (_, missing) = shoot(&scene, size);
-            if !missing.is_empty() {
+            let (_, problems) = shoot(&scene, size);
+            if !problems.is_empty() {
                 unusable.push(format!(
-                    "{} ({}) at {}x{}: missing {:?}",
-                    scene.id, scene.name, size.0, size.1, missing
+                    "{} ({}) at {}x{}: {}",
+                    scene.id,
+                    scene.name,
+                    size.0,
+                    size.1,
+                    problems.join("; ")
                 ));
             }
         }

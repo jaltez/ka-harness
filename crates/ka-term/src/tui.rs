@@ -14445,6 +14445,35 @@ fn list_row(
     }
 }
 
+/// Spans laid out left to right inside `width` cols, each keeping its
+/// style: the first span that does not fit is cut there, an ellipsis
+/// marking the cut, and nothing after it is drawn — so the row never
+/// wraps.
+fn fit_spans(
+    spans: Vec<ratatui::text::Span<'static>>,
+    width: usize,
+) -> ratatui::text::Line<'static> {
+    use ratatui::text::{Line as TuiLine, Span};
+    use unicode_width::UnicodeWidthStr;
+    let mut out: Vec<Span<'static>> = Vec::with_capacity(spans.len());
+    let mut room = width;
+    for span in spans {
+        let used = span.content.width();
+        if used > room {
+            if room > 0 {
+                out.push(Span::styled(
+                    trunc_cols(span.content.as_ref(), room),
+                    span.style,
+                ));
+            }
+            break;
+        }
+        room -= used;
+        out.push(span);
+    }
+    TuiLine::from(out)
+}
+
 /// The filter row atop a filterable picker: `❯ {filter}▌` in ACCENT;
 /// an empty filter shows a FAINT italic `type to filter` instead.
 fn filter_row(filter: &str) -> ratatui::text::Line<'static> {
@@ -15528,7 +15557,10 @@ fn render(
     // ── modals: each arm sizes its box and builds its body; the frame,
     // shadow, and bottom-border hints are shared ──
     if let Some(open) = modal {
-        let (fw, fh) = (full.width, full.height);
+        // every box below is sized for the area it is drawn in: rows are
+        // laid out for the width `centered` really gives them, and no box
+        // asks for more height than the transcript pane has
+        let (fw, fh) = (modal_area.width, modal_area.height);
         let meta = Style::new().fg(crate::palette::META);
         // borders + horizontal padding
         let inner = |w: u16| w.saturating_sub(4) as usize;
@@ -15542,7 +15574,7 @@ fn render(
             Modal::Session(picker) => {
                 let rows = picker.rows();
                 // borders(2) + vertical padding(2) + filter row(1)
-                let height = (rows.len() as u16 + 5).min(22);
+                let height = (rows.len() as u16 + 5).min(22).min(fh);
                 let width = 68.min(fw);
                 let cap = (height as usize).saturating_sub(5);
                 let offset = window_of(picker.selected, rows.len(), cap);
@@ -15558,7 +15590,7 @@ fn render(
                 (width, height, modal_title("sessions"), text)
             }
             Modal::Key(prompt) => {
-                let height = 10u16.min(fh.saturating_sub(2));
+                let height = 10u16.min(fh);
                 let width = 68.min(fw);
                 let mut text = vec![TuiLine::styled("api key", crate::palette::ACCENT_BOLD)];
                 text.push(TuiLine::from(vec![
@@ -15591,7 +15623,7 @@ fn render(
                 (width, height, modal_title("api key"), text)
             }
             Modal::Help { scroll } => {
-                let height = 34u16.min(fh.saturating_sub(2));
+                let height = 34u16.min(fh);
                 let width = 80.min(fw);
                 // the table exceeds one pane: window the rows by the
                 // top offset (the key handler clamps against the length
@@ -15611,7 +15643,9 @@ fn render(
             Modal::Model(picker) => {
                 let rows = picker.rows();
                 // borders(2) + vertical padding(2) + filter row(1)
-                let height = (rows.len() as u16 + 5).min(30).min(fh.saturating_sub(2));
+                // a list that matches nothing spends one more row on its note
+                let note = usize::from(rows.is_empty());
+                let height = ((rows.len() + 5 + note) as u16).min(30).min(fh);
                 // the row budget the frame can give the row text
                 // (borders + padding take 4, the selection pointer 2)
                 let cols = ModelCols::fit(&rows, fw.saturating_sub(6) as usize);
@@ -15646,7 +15680,8 @@ fn render(
             Modal::Provider(picker) => {
                 let rows = picker.rows();
                 // borders(2) + vertical padding(2) + filter row(1)
-                let height = (rows.len() as u16 + 5).min(20);
+                let note = usize::from(rows.is_empty());
+                let height = ((rows.len() + 5 + note) as u16).min(20).min(fh);
                 let width = 68.min(fw);
                 let cap = (height as usize).saturating_sub(5);
                 let mut text = vec![filter_row(&picker.filter)];
@@ -15680,8 +15715,7 @@ fn render(
             }
             Modal::Settings(panel) => {
                 // borders(2) + vertical padding(2) + the rows below
-                let height = ((SettingsPanel::ROWS + panel.providers.len() + 7) as u16)
-                    .min(fh.saturating_sub(2));
+                let height = ((SettingsPanel::ROWS + panel.providers.len() + 7) as u16).min(fh);
                 let width = 80.min(fw);
                 let inner_w = inner(width);
                 // mode and effort render as their icon+word/battery forms
@@ -15727,14 +15761,25 @@ fn render(
                         inner_w,
                         meta,
                     ),
-                    TuiLine::styled(format!("  config: {}", panel.config_path), meta),
+                    TuiLine::styled(
+                        trunc_cols(&format!("  config: {}", panel.config_path), inner_w),
+                        meta,
+                    ),
                     TuiLine::raw("  providers:"),
                 ];
-                let url_room = (width.saturating_sub(42)) as usize;
                 // keyed providers first; cap the list so the panel stays
                 // readable with a large catalog behind it
                 let mut providers: Vec<&ProviderInfo> = panel.providers.iter().collect();
                 providers.sort_by_key(|p| !p.key_set && !p.env_var.is_empty());
+                // every provider row fits its box: the name column is as
+                // wide as the longest name, and the url gives way with an
+                // ellipsis before a row would wrap
+                let name_w = providers
+                    .iter()
+                    .map(|p| p.name.width())
+                    .max()
+                    .unwrap_or(0)
+                    .max(12);
                 const CAP: usize = 18;
                 let (shown, rest) = providers.split_at(CAP.min(providers.len()));
                 for p in shown {
@@ -15745,19 +15790,19 @@ fn render(
                     } else {
                         format!("{} ✗", p.env_var)
                     };
-                    let url: String = p.base_url.chars().take(url_room).collect();
-                    text.push(TuiLine::from(vec![
-                        Span::styled(format!("    {:<12}", p.name), meta),
-                        Span::styled(
-                            key,
-                            if p.key_set || p.env_var.is_empty() {
-                                crate::palette::OK
-                            } else {
-                                crate::palette::ERR
-                            },
-                        ),
-                        Span::styled(format!("  {url}"), crate::palette::FAINT),
-                    ]));
+                    let key_style = if p.key_set || p.env_var.is_empty() {
+                        crate::palette::OK
+                    } else {
+                        crate::palette::ERR
+                    };
+                    text.push(fit_spans(
+                        vec![
+                            Span::styled(format!("    {:<width$}", p.name, width = name_w), meta),
+                            Span::styled(key, key_style),
+                            Span::styled(format!("  {}", p.base_url), crate::palette::FAINT),
+                        ],
+                        inner_w,
+                    ));
                 }
                 if !rest.is_empty() {
                     text.push(TuiLine::styled(format!("    … +{} more", rest.len()), meta));
@@ -15766,7 +15811,7 @@ fn render(
             }
             Modal::Spills { items, selected } => {
                 // borders(2) + vertical padding(2) + list rows
-                let height = (items.len() as u16 + 5).clamp(7, 21);
+                let height = (items.len() as u16 + 5).clamp(7, 21).min(fh);
                 let width = 68.min(fw);
                 let mut text = Vec::new();
                 if items.is_empty() {
@@ -15788,7 +15833,7 @@ fn render(
                 (width, height, modal_title("spills"), text)
             }
             Modal::Prompts { items, selected } => {
-                let height = (items.len() as u16 + 5).clamp(7, 21);
+                let height = (items.len() as u16 + 5).clamp(7, 21).min(fh);
                 let width = 68.min(fw);
                 let mut text = Vec::new();
                 if items.is_empty() {
@@ -15831,7 +15876,7 @@ fn render(
                         note
                     });
                 let extra = usize::from(cost_note.is_some());
-                let height = ((rows.len() + extra) as u16 + 5).clamp(7, 21);
+                let height = ((rows.len() + extra) as u16 + 5).clamp(7, 21).min(fh);
                 let width = 90.min(fw);
                 let mut text = Vec::new();
                 if entries.is_empty() {
@@ -15884,7 +15929,7 @@ fn render(
                     ("esc", "close the panel"),
                 ];
                 let width = 110.min(fw);
-                let height = fh.saturating_sub(2);
+                let height = fh;
                 let inner_w = inner(width);
                 let mut text: Vec<TuiLine<'static>> = Vec::new();
                 let title;
@@ -15897,9 +15942,12 @@ fn render(
                                 .unwrap_or_else(|| "(no branch)".into());
                         let staged = files.iter().filter(|f| f.staged()).count();
                         text.push(TuiLine::styled(
-                            format!(
-                                "{branch} · {staged} staged · {} changed (working tree)",
-                                files.len()
+                            trunc_cols(
+                                &format!(
+                                    "{branch} · {staged} staged · {} changed (working tree)",
+                                    files.len()
+                                ),
+                                inner_w,
                             ),
                             meta,
                         ));
@@ -15933,9 +15981,14 @@ fn render(
                         }
                     }
                     crate::git::Pane::Diff { path, text: diff } => {
-                        title = format!("git diff — {path}");
+                        // the title yields to the close chip: a long path
+                        // cuts with an ellipsis instead of running over the ✕
+                        title = format!(
+                            "git diff — {}",
+                            trunc_cols(path, usize::from(width.saturating_sub(17)))
+                        );
                         let total = diff.lines().count();
-                        let visible = (height as usize).saturating_sub(5).max(1);
+                        let visible = (height as usize).saturating_sub(4);
                         let (first, _) = window_range(total, visible, *scroll);
                         if total == 0 {
                             text.push(TuiLine::styled("(no differences)", meta));
@@ -15981,13 +16034,16 @@ fn render(
                     }
                 }
                 if let Some(n) = note {
-                    text.push(TuiLine::styled(format!("· {n}"), meta));
+                    text.push(TuiLine::styled(
+                        trunc_cols(&format!("· {n}"), inner_w),
+                        meta,
+                    ));
                 }
                 (width, height, title, text)
             }
             // TUI-18: read-only panels — same pager shape as Debug
             Modal::Hooks { rows, scroll } => {
-                let height = (rows.len() as u16 + 5).clamp(7, 30).min(modal_area.height);
+                let height = (rows.len() as u16 + 5).clamp(7, 30).min(fh);
                 let width = 90.min(fw);
                 let visible = (height as usize).saturating_sub(5);
                 let (first, _) = window_range(rows.len(), visible, *scroll);
@@ -15999,7 +16055,7 @@ fn render(
                 (width, height, title, body)
             }
             Modal::Permissions { rows, scroll } => {
-                let height = (rows.len() as u16 + 5).clamp(7, 30).min(modal_area.height);
+                let height = (rows.len() as u16 + 5).clamp(7, 30).min(fh);
                 let width = 90.min(fw);
                 let visible = (height as usize).saturating_sub(5);
                 let (first, _) = window_range(rows.len(), visible, *scroll);
@@ -16011,7 +16067,7 @@ fn render(
                 (width, height, title, body)
             }
             Modal::Doctor { rows, scroll } => {
-                let height = (rows.len() as u16 + 5).clamp(7, 30).min(modal_area.height);
+                let height = (rows.len() as u16 + 5).clamp(7, 30).min(fh);
                 let width = 90.min(fw);
                 let visible = (height as usize).saturating_sub(5);
                 let (first, _) = window_range(rows.len(), visible, *scroll);
@@ -16026,7 +16082,7 @@ fn render(
                 let lines: Vec<&str> = text.lines().collect();
                 // clamp to the transcript pane: a taller box would bleed
                 // over the composer / status line
-                let height = (lines.len() as u16 + 5).clamp(7, 30).min(modal_area.height);
+                let height = (lines.len() as u16 + 5).clamp(7, 30).min(fh);
                 let width = 90.min(fw);
                 let visible = (height as usize).saturating_sub(5);
                 let (first, _) = window_range(lines.len(), visible, *scroll);
@@ -16040,7 +16096,7 @@ fn render(
             Modal::Debug { rows, scroll } => {
                 // clamp to the transcript pane: a taller box would bleed
                 // over the composer / status line
-                let height = (rows.len() as u16 + 5).clamp(7, 30).min(modal_area.height);
+                let height = (rows.len() as u16 + 5).clamp(7, 30).min(fh);
                 let width = 90.min(fw);
                 let visible = (height as usize).saturating_sub(5);
                 let (first, _) = window_range(rows.len(), visible, *scroll);
@@ -16052,7 +16108,7 @@ fn render(
                 (width, height, title, body)
             }
             Modal::Rewind { items, selected } => {
-                let height = (items.len() as u16 + 5).clamp(6, 22);
+                let height = (items.len() as u16 + 5).clamp(6, 22).min(fh);
                 let width = 76.min(fw);
                 let mut text = vec![TuiLine::styled(
                     "pick a message — ⏎/r rewind here · e edit & resend · s summarize & rewind · esc close",
@@ -16075,7 +16131,7 @@ fn render(
                 selected,
             } => {
                 // hint + prompt echo + 3 actions, plus the frame's 4 chrome rows
-                let height = 9.min(modal_area.height.max(6));
+                let height = 9.min(fh);
                 let width = 76.min(fw);
                 let mut text = vec![TuiLine::styled(
                     "⏎/r rewind · e edit & resend · f fork · esc close",
@@ -16110,7 +16166,7 @@ fn render(
                 selected,
             } => {
                 let extra = if inbox.is_empty() { 0 } else { inbox.len() + 2 };
-                let height = (rows.len() as u16 + extra as u16 + 4).clamp(6, 24);
+                let height = (rows.len() as u16 + extra as u16 + 4).clamp(6, 24).min(fh);
                 let width = 80.min(fw);
                 let mut text = Vec::new();
                 let mut budget = (height as usize).saturating_sub(4);
@@ -16145,7 +16201,7 @@ fn render(
             Modal::Features {
                 entries, selected, ..
             } => {
-                let height = (entries.len() as u16 + 4).clamp(6, 24);
+                let height = (entries.len() as u16 + 4).clamp(6, 24).min(fh);
                 let width = 76.min(fw);
                 let cap = (height as usize).saturating_sub(4);
                 // keep the selection inside the window
@@ -16179,7 +16235,7 @@ fn render(
                     Modal::Skills { .. } => "skills · agents · mcp",
                     _ => "info",
                 };
-                let height = (rows.len() as u16 + 4).clamp(6, 24);
+                let height = (rows.len() as u16 + 4).clamp(6, 24).min(fh);
                 let width = 80.min(fw);
                 let cap = (height as usize).saturating_sub(4);
                 let mut text = Vec::new();
@@ -16210,7 +16266,7 @@ fn render(
                 } else {
                     "context"
                 };
-                let height = (rows.len() as u16 + 4).clamp(6, 24);
+                let height = (rows.len() as u16 + 4).clamp(6, 24).min(fh);
                 let width = 80.min(fw);
                 let cap = (height as usize).saturating_sub(4);
                 let text = rows
@@ -16228,7 +16284,7 @@ fn render(
             }
             Modal::Theme { names, selected } => {
                 // "default" + one row per theme; borders(2)+padding(2)
-                let height = ((names.len() + 1) as u16 + 4).clamp(6, 20);
+                let height = ((names.len() + 1) as u16 + 4).clamp(6, 20).min(fh);
                 let width = 60.min(fw);
                 let cap = (height as usize).saturating_sub(4);
                 let offset = window_of(*selected, names.len() + 1, cap);
@@ -16255,7 +16311,7 @@ fn render(
             Modal::Style { names, selected } => {
                 // "built-in" + one row per style; same shape as the
                 // theme picker
-                let height = ((names.len() + 1) as u16 + 4).clamp(6, 20);
+                let height = ((names.len() + 1) as u16 + 4).clamp(6, 20).min(fh);
                 let width = 60.min(fw);
                 let cap = (height as usize).saturating_sub(4);
                 let offset = window_of(*selected, names.len() + 1, cap);
@@ -16286,7 +16342,7 @@ fn render(
             } => {
                 if let Some(path) = save {
                     // inline save prompt: a two-row mini-form
-                    let height = 8u16.min(fh.saturating_sub(2));
+                    let height = 8u16.min(fh);
                     let width = 68.min(fw);
                     let mut text = vec![
                         TuiLine::styled("save block to file", crate::palette::ACCENT_BOLD),
@@ -16304,7 +16360,7 @@ fn render(
                     ));
                     (width, height, modal_title("copy · save"), text)
                 } else {
-                    let height = (blocks.len() as u16 + 4).clamp(6, 26);
+                    let height = (blocks.len() as u16 + 4).clamp(6, 26).min(fh);
                     let width = 90.min(fw);
                     let cap = (height as usize).saturating_sub(4);
                     let offset = window_of(*selected, blocks.len(), cap);
@@ -16325,7 +16381,7 @@ fn render(
                 hits,
                 selected,
             } => {
-                let height = (hits.len() as u16 + 6).clamp(7, 26);
+                let height = (hits.len() as u16 + 6).clamp(7, 26).min(fh);
                 let width = 90.min(fw);
                 let cap = (height as usize).saturating_sub(6);
                 let mut text = vec![filter_row(query)];
@@ -16350,7 +16406,7 @@ fn render(
                 (width, height, modal_title("search"), text)
             }
             Modal::Changelog { rows, scroll } => {
-                let height = 34u16.min(fh.saturating_sub(2));
+                let height = 34u16.min(fh);
                 let width = 88.min(fw);
                 let cap = (height as usize).saturating_sub(4);
                 let total = rows.len();
@@ -16376,7 +16432,7 @@ fn render(
                 (width, height, modal_title("changelog"), text)
             }
             Modal::Queue { items, selected } => {
-                let height = (items.len() as u16 + 5).clamp(6, 22);
+                let height = (items.len() as u16 + 5).clamp(6, 22).min(fh);
                 let width = 84.min(fw);
                 let cap = (height as usize).saturating_sub(5);
                 let offset = window_of(*selected, items.len(), cap);
@@ -16400,9 +16456,7 @@ fn render(
                 actions,
                 selected,
             } => {
-                let height = (items.len() as u16 + 5)
-                    .clamp(9, 34)
-                    .min(fh.saturating_sub(2).max(9));
+                let height = (items.len() as u16 + 5).clamp(9, 34).min(fh);
                 let width = 110.min(fw);
                 let mut text = Vec::new();
                 if items.is_empty() {
@@ -16468,9 +16522,9 @@ fn render(
     // selection pointer. No ✕ chip and no published zone — a click can
     // never answer it.
     if let Some(ask) = ask {
-        let width = 80.min(full.width);
+        let width = 80.min(modal_area.width);
         let body = ask_modal_body(ask, width.saturating_sub(4) as usize);
-        let height = (body.len() as u16 + 4).clamp(5, modal_area.height.max(5));
+        let height = (body.len() as u16 + 4).min(modal_area.height);
         let rect = centered(width, height, modal_area);
         frame.render_widget(ratatui::widgets::Clear, rect);
         let title = TuiLine::styled(
