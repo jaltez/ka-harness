@@ -2863,8 +2863,8 @@ pub struct Inventory {
     pub mcp: Vec<ka_protocol::McpSummary>,
     /// Discovered subagent names.
     pub agents: Vec<String>,
-    /// Discovered skill names.
-    pub skills: Vec<String>,
+    /// Discovered skills (name + dimmed origin tag).
+    pub skills: Vec<ka_protocol::SkillEntry>,
     /// Advertised MCP prompts (`server/name (args)`).
     pub prompts: Vec<String>,
     /// Specs currently disabled by feature toggles (shared grammar).
@@ -3301,11 +3301,21 @@ fn inventory_rows(sidebar: &SidebarState, width: usize) -> Vec<ratatui::text::Li
             .chain(items.iter().map(|s| plain(trunc_cols(s, width))))
             .collect::<Vec<_>>()
     };
-    let mut out = names(
-        &crate::icons::strip_skills(),
-        "skills",
-        &sidebar.inventory.skills,
-    );
+    let mut out = vec![header(&crate::icons::strip_skills(), "skills")];
+    out.extend(sidebar.inventory.skills.iter().map(|s| {
+        if s.source.is_empty() {
+            plain(trunc_cols(&s.name, width))
+        } else {
+            // ecosystem root (`.claude`, `.agents`) rides dimmed, so an
+            // imported skill set identifies itself
+            let tag = format!(" {}", s.source);
+            let room = width.saturating_sub(unicode_width::UnicodeWidthStr::width(&tag[..]));
+            TuiLine::from(vec![
+                Span::raw(trunc_cols(&s.name, room)),
+                Span::styled(tag, crate::palette::META),
+            ])
+        }
+    }));
     out.extend(names(
         &crate::icons::agents(),
         "agents",
@@ -3426,7 +3436,7 @@ fn feature_rows(sidebar: &SidebarState) -> Vec<FeatureRow> {
     }
     header(&mut out, "skills");
     for s in &sidebar.inventory.skills {
-        on(&mut out, &format!("skill:{s}"), s.clone());
+        on(&mut out, &format!("skill:{}", s.name), s.name.clone());
     }
     header(&mut out, "agents");
     for a in &sidebar.inventory.agents {
@@ -4273,55 +4283,189 @@ pub struct ModelPicker {
     pub filter: String,
 }
 
-/// One picker row for a model. Must stay on a single line under the
-/// picker's row budget (62 display cols: 68 wide minus borders,
-/// padding, and the 2-col selection pointer) or Paragraph wraps and the
-/// tail models clip off the picker — the exact bug that hid installed
-/// ollama models behind two-line rows.
-fn model_row(m: &ModelInfo, ctx: &str, key: &str) -> String {
-    use unicode_width::UnicodeWidthStr;
-    // reasoning levels ride last as the effort battery (`✻◔◑◕`); a
-    // level with no battery glyph falls back to its name, so nothing is
-    // hidden — the id column absorbs any extra width
-    let think = if m.efforts.is_empty() {
-        String::new()
-    } else {
-        let mut s = format!(" {}", crate::icons::thought());
-        for e in &m.efforts {
-            match crate::icons::effort_glyph(e) {
-                Some(g) => s.push_str(g),
-                None => {
-                    s.push(' ');
-                    s.push_str(e);
-                }
+/// Context window for a picker row: `1M`/`1.5M` at a million tokens,
+/// `262k`/`8k` below; `?` when the catalog has no number.
+fn fmt_ctx(context: u32) -> String {
+    if context == 0 {
+        return "?".to_string();
+    }
+    if context >= 1_000_000 {
+        let v = format!("{:.1}", context as f64 / 1_000_000.0);
+        return format!("{}M", v.strip_suffix(".0").unwrap_or(&v));
+    }
+    format!("{}k", context / 1000)
+}
+
+/// The reasoning-effort battery that rides last on a model row
+/// (`✻◔◑◕`, one glyph per level); a level without a glyph falls back
+/// to its name, so nothing is hidden.
+fn think_battery(m: &ModelInfo) -> String {
+    if m.efforts.is_empty() {
+        return String::new();
+    }
+    let mut s = format!(" {}", crate::icons::thought());
+    for e in &m.efforts {
+        match crate::icons::effort_glyph(e) {
+            Some(g) => s.push_str(g),
+            None => {
+                s.push(' ');
+                s.push_str(e);
             }
         }
-        s
-    };
-    let wire = m
-        .wire
+    }
+    s
+}
+
+/// Wire label for display: `anthropic_messages` → `anthropic`.
+fn wire_label(m: &ModelInfo) -> &str {
+    m.wire
         .trim_end_matches("_messages")
-        .trim_end_matches("_chat");
-    let price = if m.plan {
-        "plan".to_string()
-    } else if m.priced {
-        let trim = |v: f64| {
-            if (v - v.round()).abs() < f64::EPSILON {
-                format!("{}", v.round() as u64)
-            } else {
-                format!("{v}")
-            }
-        };
-        format!("${}/${}", trim(m.price_in), trim(m.price_out))
-    } else {
-        "-".to_string()
+        .trim_end_matches("_chat")
+}
+
+/// A priced row's `$/mtok` cell split at the `/`; `None` for plan rows
+/// (flat `plan`) and unknown pricing (flat `-`).
+fn price_parts(m: &ModelInfo) -> Option<(String, String)> {
+    if !m.priced || m.plan {
+        return None;
+    }
+    let trim = |v: f64| {
+        if (v - v.round()).abs() < f64::EPSILON {
+            format!("{}", v.round() as u64)
+        } else {
+            format!("{v}")
+        }
     };
-    // 26 + 1 + 5 + 1 + 10 + 1 + 9 + key (≤2) + battery (≤6) = 61
-    let id_w = 26usize
-        .saturating_sub(think.width().saturating_sub(6))
-        .max(8);
-    let id: String = m.id.chars().take(id_w).collect();
-    format!("{id:<id_w$} {ctx:>5} {price:<10} {wire:<9}{key:<2}{think}")
+    Some((
+        format!("${}", trim(m.price_in)),
+        format!("${}", trim(m.price_out)),
+    ))
+}
+
+/// Column widths one picker's model rows share, computed per popup
+/// from the visible rows and the frame budget: ids keep their full
+/// length until the frame really runs out, and the price cell aligns
+/// on its `/` (input right-aligned, output left) so the wire column
+/// holds still.
+#[derive(Debug, Clone, Copy)]
+pub struct ModelCols {
+    id: usize,
+    ctx: usize,
+    price_in: usize,
+    price_out: usize,
+    wire: usize,
+    /// Key column width (0 when no row carries an env key).
+    key: usize,
+    /// The widest battery the rows carry; the id column reserves it.
+    think: usize,
+}
+
+impl ModelCols {
+    /// Fit the columns to `rows` within `budget` display columns —
+    /// the row-text room after the picker's frame and pointer.
+    fn fit(rows: &[&ModelInfo], budget: usize) -> Self {
+        use unicode_width::UnicodeWidthStr;
+        let ctx = rows
+            .iter()
+            .map(|m| fmt_ctx(m.context).width())
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let think = rows
+            .iter()
+            .map(|m| think_battery(m).width())
+            .max()
+            .unwrap_or(0);
+        let key = rows.iter().any(|m| !m.key_env.is_empty()) as usize * 2;
+        let wire = rows
+            .iter()
+            .map(|m| wire_label(m).width())
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        // floors keep the flat `plan`/`-` cells readable on
+        // all-unpriced lists
+        let (mut pin, mut pout) = (4usize, 4usize);
+        for m in rows {
+            if let Some((i, o)) = price_parts(m) {
+                pin = pin.max(i.width());
+                pout = pout.max(o.width());
+            }
+        }
+        let fixed = 1 + ctx + 1 + (pin + 1 + pout) + 1 + wire + key + think;
+        let id_cap = budget.saturating_sub(fixed).max(8);
+        let id = rows
+            .iter()
+            .map(|m| m.id.chars().count())
+            .max()
+            .unwrap_or(8)
+            .min(id_cap)
+            .max(8);
+        Self {
+            id,
+            ctx,
+            price_in: pin,
+            price_out: pout,
+            wire,
+            key,
+            think,
+        }
+    }
+
+    /// The full row-text width under these columns.
+    fn row_w(&self) -> usize {
+        self.id + 1 + self.ctx + 1 + self.price_w() + 1 + self.wire + self.key + self.think
+    }
+
+    /// The price cell width (`$in/$out` with the slash fixed).
+    fn price_w(&self) -> usize {
+        self.price_in + 1 + self.price_out
+    }
+}
+
+/// One picker row for a model: single line by construction — `cols`
+/// budgets the id against the picker's frame width, so Paragraph never
+/// wraps and the tail models clip off the picker (the exact bug that
+/// hid installed ollama models behind two-line rows).
+fn model_row(m: &ModelInfo, cols: &ModelCols) -> String {
+    use unicode_width::UnicodeWidthStr;
+    let think = think_battery(m);
+    // the id column absorbs battery overflow beyond its reserve, so a
+    // wide fallback battery cannot push the tail columns off-row
+    let room = cols
+        .id
+        .saturating_sub(think.width().saturating_sub(cols.think));
+    let id: String = m.id.chars().take(room).collect();
+    let ctx = fmt_ctx(m.context);
+    let key = if m.key_env.is_empty() {
+        ""
+    } else if m.key_set {
+        " ✓"
+    } else {
+        " ✗"
+    };
+    let wire = wire_label(m);
+    let price = match price_parts(m) {
+        Some((pin, pout)) => {
+            format!(
+                "{pin:>pi$}/{pout:<po$}",
+                pi = cols.price_in,
+                po = cols.price_out
+            )
+        }
+        None => format!(
+            "{:<pw$}",
+            if m.plan { "plan" } else { "-" },
+            pw = cols.price_w()
+        ),
+    };
+    format!(
+        "{id:<idw$} {ctx:>ctxw$} {price:<pww$} {wire:<wirew$}{key}{think}",
+        idw = cols.id,
+        ctxw = cols.ctx,
+        pww = cols.price_w(),
+        wirew = cols.wire,
+    )
 }
 
 impl ModelPicker {
@@ -10165,7 +10309,7 @@ fn apply_event(
             }
             // the /skill: autocomplete follows the live inventory
             if let Ok(mut live) = SKILLS.write() {
-                *live = skills.clone();
+                *live = skills.iter().map(|s| s.name.clone()).collect();
             }
             sidebar.inventory = Inventory {
                 tools: tools.clone(),
@@ -11736,7 +11880,12 @@ pub fn skill_invocation(text: &str, inventory: &Inventory) -> Option<Result<Comm
             }
             return Some(Err(format!(
                 "invoke one by name: /skill:<name> [args] — {}",
-                inventory.skills.join(", ")
+                inventory
+                    .skills
+                    .iter()
+                    .map(|s| s.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             )));
         }
         None => return None,
@@ -11750,7 +11899,7 @@ pub fn skill_invocation(text: &str, inventory: &Inventory) -> Option<Result<Comm
     }
     // inventory skills = discovered AND enabled (emit_inventory filters
     // both); disabled names arrive in the shared spec grammar
-    if !inventory.skills.iter().any(|s| s == name) {
+    if !inventory.skills.iter().any(|s| s.name == name) {
         if inventory.disabled.iter().any(|d| d == "skills") {
             return Some(Err("skills are disabled — /features on skills".to_string()));
         }
@@ -15083,27 +15232,20 @@ fn render(
             Modal::Model(picker) => {
                 let rows = picker.rows();
                 // borders(2) + vertical padding(2) + filter row(1)
-                let height = (rows.len() as u16 + 5).min(20);
-                // 70 wide: the 66-col body fits a model row plus its lead
-                let width = 70.min(fw);
+                let height = (rows.len() as u16 + 5).min(30).min(fh.saturating_sub(2));
+                // the row budget the frame can give the row text
+                // (borders + padding take 4, the selection pointer 2)
+                let cols = ModelCols::fit(&rows, fw.saturating_sub(6) as usize);
+                // 70 wide and up: the body fits a model row plus its
+                // lead — long ids grow the picker instead of clipping
+                let width = 70u16.max(6 + cols.row_w() as u16).min(fw);
                 let cap = (height as usize).saturating_sub(5);
+                let offset = window_of(picker.selected, rows.len(), cap);
                 let mut text = vec![filter_row(&picker.filter)];
-                for (i, m) in rows.iter().enumerate().take(cap) {
-                    let ctx = if m.context > 0 {
-                        format!("{}k", m.context / 1000)
-                    } else {
-                        "?".to_string()
-                    };
-                    let key = if m.key_env.is_empty() {
-                        String::new()
-                    } else if m.key_set {
-                        " ✓".to_string()
-                    } else {
-                        " ✗".to_string()
-                    };
+                for (i, m) in rows.iter().skip(offset).take(cap).enumerate() {
                     text.push(list_row(
-                        model_row(m, &ctx, &key),
-                        i == picker.selected,
+                        model_row(m, &cols),
+                        i + offset == picker.selected,
                         inner(width),
                         Style::new(),
                     ));
@@ -17392,12 +17534,68 @@ mod tests {
             "ollama/some-extremely-long-model-name:with-tag-and-more",
             1_000_000,
         );
-        let row = model_row(&long, "1000k", " ✗");
+        let cols = ModelCols::fit(&[&long], MODEL_ROW_BUDGET);
+        let row = model_row(&long, &cols);
         assert!(row_w(&row) <= MODEL_ROW_BUDGET, "row too wide: {row}");
+        // room to spare: the id keeps its full length instead of
+        // clipping — the picker grows for it
+        let cols = ModelCols::fit(&[&long], 90);
+        assert_eq!(cols.id, long.id.chars().count());
         let short = model("ollama/qwen3.5:9b", 262_144);
-        let row = model_row(&short, "262k", "");
-        assert!(row.contains("qwen3.5:9b"));
+        let cols = ModelCols::fit(&[&short], 64);
+        let row = model_row(&short, &cols);
+        assert!(row.contains("qwen3.5:9b"), "id clipped: {row}");
         assert!(row.contains("openai"), "wire abbreviated: {row}");
+    }
+
+    #[test]
+    fn ctx_formats_millions_and_thousands() {
+        assert_eq!(fmt_ctx(0), "?");
+        assert_eq!(fmt_ctx(1_000_000), "1M");
+        assert_eq!(fmt_ctx(1_500_000), "1.5M");
+        assert_eq!(fmt_ctx(2_048_000), "2M");
+        assert_eq!(fmt_ctx(262_144), "262k");
+        assert_eq!(fmt_ctx(8_000), "8k");
+    }
+
+    #[test]
+    fn price_cells_align_on_the_slash() {
+        let mut cheap = model("a/cheap", 100_000);
+        cheap.priced = true;
+        cheap.price_in = 0.3;
+        cheap.price_out = 1.2;
+        let mut pricey = model("a/pricey", 100_000);
+        pricey.priced = true;
+        pricey.price_in = 0.15;
+        pricey.price_out = 1.98;
+        let mut plan = model("a/plan", 100_000);
+        plan.plan = true;
+        let rows = [cheap, pricey, plan];
+        let refs: Vec<&ModelInfo> = rows.iter().collect();
+        let cols = ModelCols::fit(&refs, 80);
+        let built: Vec<String> = rows.iter().map(|m| model_row(m, &cols)).collect();
+        // the price cell sits at a fixed offset in every row
+        let cells: Vec<&str> = built
+            .iter()
+            .map(|r| {
+                let start = cols.id + 1 + cols.ctx + 1;
+                &r[start..start + cols.price_w()]
+            })
+            .collect();
+        // priced cells split at the same column (the plan cell is flat)
+        let slashes: Vec<usize> = cells[..2]
+            .iter()
+            .map(|c| c.find('/').expect("priced cell has a slash"))
+            .collect();
+        assert!(slashes.windows(2).all(|w| w[0] == w[1]), "{cells:?}");
+        let wires: Vec<usize> = built
+            .iter()
+            .map(|r| r.find("openai").expect("wire label present"))
+            .collect();
+        assert!(wires.windows(2).all(|w| w[0] == w[1]), "{built:?}");
+        assert_eq!(cells[0], " $0.3/$1.2 ");
+        assert_eq!(cells[1], "$0.15/$1.98");
+        assert_eq!(cells[2], "plan       ");
     }
 
     #[test]
@@ -17409,10 +17607,12 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let row = model_row(&m, "200k", "");
-        assert!(row.ends_with(" ✻◔◑◕"), "{row}");
         let plain = model("ollama/qwen3.5:9b", 262_144);
-        let plain_row = model_row(&plain, "262k", "");
+        let both: Vec<&ModelInfo> = [&m, &plain].into_iter().collect();
+        let cols = ModelCols::fit(&both, MODEL_ROW_BUDGET);
+        let row = model_row(&m, &cols);
+        assert!(row.ends_with(" ✻◔◑◕"), "{row}");
+        let plain_row = model_row(&plain, &cols);
         assert!(!plain_row.contains('✻'), "{plain_row}");
         assert_eq!(
             row.find("200k").map(|i| row[..i].chars().count()),
@@ -17431,7 +17631,8 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let row = model_row(&big, "200k", " ✗");
+        let cols = ModelCols::fit(&[&big], MODEL_ROW_BUDGET);
+        let row = model_row(&big, &cols);
         assert!(
             row_w(&row) <= MODEL_ROW_BUDGET,
             "four-level row too wide: {row}"
@@ -17440,7 +17641,8 @@ mod tests {
         // a level without a battery glyph keeps its name
         let mut odd = model("x/y", 8_000);
         odd.efforts = vec!["low".into(), "xhigh".into()];
-        let row = model_row(&odd, "8k", "");
+        let cols = ModelCols::fit(&[&odd], MODEL_ROW_BUDGET);
+        let row = model_row(&odd, &cols);
         assert!(row.ends_with(" ✻◔ xhigh"), "{row}");
         assert!(row_w(&row) <= MODEL_ROW_BUDGET, "{row}");
     }
@@ -22183,7 +22385,10 @@ mod tests {
                     .collect(),
                 mcp: Vec::new(),
                 agents: Vec::new(),
-                skills: vec!["rust-docs".into()],
+                skills: vec![ka_protocol::SkillEntry {
+                    name: "rust-docs".into(),
+                    source: String::new(),
+                }],
                 prompts: Vec::new(),
                 disabled: Vec::new(),
             },
@@ -22204,7 +22409,10 @@ mod tests {
                     ok: true,
                     tools: 4,
                 }],
-                skills: vec!["pdf".into()],
+                skills: vec![ka_protocol::SkillEntry {
+                    name: "pdf".into(),
+                    source: String::new(),
+                }],
                 agents: vec!["reviewer".into()],
                 disabled: vec!["agents".into(), "mcp:github".into()],
                 ..Default::default()
@@ -22286,7 +22494,10 @@ mod tests {
                 tools: vec!["read".into()],
                 mcp: Vec::new(),
                 agents,
-                skills: vec!["rust-docs".into()],
+                skills: vec![ka_protocol::SkillEntry {
+                    name: "rust-docs".into(),
+                    source: String::new(),
+                }],
                 prompts: Vec::new(),
                 disabled: Vec::new(),
             },
@@ -23471,7 +23682,10 @@ mod tests {
                         tools: 0,
                     },
                 ],
-                skills: vec!["rust-docs".into()],
+                skills: vec![ka_protocol::SkillEntry {
+                    name: "rust-docs".into(),
+                    source: String::new(),
+                }],
                 agents: vec!["scout".into()],
                 prompts: Vec::new(),
                 ..Default::default()
@@ -23570,7 +23784,10 @@ mod tests {
                     tools: 2,
                 }],
                 agents: vec!["coder".into()],
-                skills: vec!["rust-docs".into()],
+                skills: vec![ka_protocol::SkillEntry {
+                    name: "rust-docs".into(),
+                    source: String::new(),
+                }],
                 prompts: Vec::new(),
                 disabled: Vec::new(),
             },
@@ -23591,7 +23808,13 @@ mod tests {
             &mut sidebar,
         );
         assert_eq!(sidebar.inventory.tools, vec!["read".to_string()]);
-        assert_eq!(sidebar.inventory.skills, vec!["rust-docs".to_string()]);
+        assert_eq!(
+            sidebar.inventory.skills,
+            vec![ka_protocol::SkillEntry {
+                name: "rust-docs".into(),
+                source: String::new(),
+            }]
+        );
 
         let _ = apply_event(
             &Event::Todos {

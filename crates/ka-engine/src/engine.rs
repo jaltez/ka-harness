@@ -1855,10 +1855,13 @@ async fn emit_inventory(ctx: &Ctx) {
             .map(|a| a.name.clone())
             .collect()
     };
-    let skills: Vec<String> = crate::conventions::discover_skills(&ctx.cwd)
+    let skills: Vec<ka_protocol::SkillEntry> = crate::conventions::discover_skills(&ctx.cwd)
         .into_iter()
         .filter(|s| ctx.voice.feature_slot().read().skill_enabled(&s.name))
-        .map(|s| s.name)
+        .map(|s| ka_protocol::SkillEntry {
+            name: s.name,
+            source: s.source,
+        })
         .collect();
     let mcp: Vec<McpSummary> = ctx
         .mcp_servers_cfg
@@ -7352,8 +7355,14 @@ mod tests {
         assert_eq!(agents, &["reviewer".to_string()]);
         // discovery also sees the user HOME layer, so only the injected
         // names are asserted exactly
-        assert!(skills.contains(&"demo".to_string()), "skills: {skills:?}");
-        assert!(skills.contains(&"second".to_string()), "skills: {skills:?}");
+        assert!(
+            skills.iter().any(|s| s.name == "demo"),
+            "skills: {skills:?}"
+        );
+        assert!(
+            skills.iter().any(|s| s.name == "second"),
+            "skills: {skills:?}"
+        );
         assert_eq!(
             mcp,
             &[ka_protocol::McpSummary {

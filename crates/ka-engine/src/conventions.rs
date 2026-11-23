@@ -252,6 +252,9 @@ pub struct Skill {
     pub name: String,
     /// Absolute SKILL.md path (the model reads this on demand).
     pub path: PathBuf,
+    /// Origin tag for ecosystem roots (`.claude`, `.agents`); empty
+    /// for ka-native roots (`.ka/skills`, `~/.config/ka/skills`).
+    pub source: String,
     /// One-line description from frontmatter.
     pub description: String,
     /// EXT-07 `disable-model-invocation: true`: the skill never enters
@@ -397,6 +400,24 @@ pub fn discover_in(project: Vec<PathBuf>, user: Vec<PathBuf>) -> Vec<Skill> {
     discover_skills_in(project.into_iter().chain(user).collect())
 }
 
+/// The dimmed origin tag an inventory row shows for a skill root:
+/// ka-native roots (`.ka/skills`, `~/.config/ka/skills`) stay
+/// untagged; ecosystem roots show their directory name (`.claude`,
+/// `.agents`), so imported skill sets identify themselves without a
+/// registry.
+fn skill_source(root: &Path) -> String {
+    let p = root.to_string_lossy();
+    if p.ends_with(".ka/skills") || p.ends_with(".config/ka/skills") {
+        return String::new();
+    }
+    // ecosystem roots are `<id>/skills` directories — the id above
+    // `skills` is the identity (`.claude`, `.agents`)
+    let dir = root.parent().unwrap_or(root);
+    dir.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
 /// Skill discovery against explicit roots (tests).
 pub fn discover_skills_in(roots: Vec<PathBuf>) -> Vec<Skill> {
     let mut skills: Vec<Skill> = Vec::new();
@@ -405,6 +426,7 @@ pub fn discover_skills_in(roots: Vec<PathBuf>) -> Vec<Skill> {
         let Ok(entries) = std::fs::read_dir(&root) else {
             continue;
         };
+        let source = skill_source(&root);
         for entry in entries.flatten() {
             let dir = entry.path();
             let skill_md = dir.join("SKILL.md");
@@ -425,6 +447,7 @@ pub fn discover_skills_in(roots: Vec<PathBuf>) -> Vec<Skill> {
             skills.push(Skill {
                 name,
                 path: skill_md,
+                source: source.clone(),
                 description,
                 disable_model_invocation: fm.disable_model_invocation,
                 paths: fm.paths,
@@ -664,6 +687,29 @@ mod tests {
         assert_eq!(skills.len(), 1, "project root wins over user: {skills:?}");
         assert_eq!(skills[0].description, "How we ship");
         assert!(skills[0].path.starts_with(&root));
+        // ka-native roots stay untagged even when they shadow an
+        // ecosystem root of the same name
+        assert_eq!(skills[0].source, "");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn skill_source_tags_ecosystem_roots_only() {
+        let root = temp_tree("skillsource");
+        let native = root.join(".ka/skills/native");
+        std::fs::create_dir_all(&native).unwrap();
+        std::fs::write(native.join("SKILL.md"), "---\ndescription: n\n---\n").unwrap();
+        let imported = root.join(".claude/skills/poteto");
+        std::fs::create_dir_all(&imported).unwrap();
+        std::fs::write(imported.join("SKILL.md"), "---\ndescription: p\n---\n").unwrap();
+
+        let skills = discover_skills_in(vec![root.join(".ka/skills"), root.join(".claude/skills")]);
+        assert_eq!(skills.len(), 2, "both roots contribute: {skills:?}");
+        assert_eq!(skills[0].source, "", "ka-native root untagged: {skills:?}");
+        assert_eq!(
+            skills[1].source, ".claude",
+            "ecosystem root tagged: {skills:?}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

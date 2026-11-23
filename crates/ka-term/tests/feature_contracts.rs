@@ -697,7 +697,16 @@ fn custom_command_frontmatter_scopes_the_turn() {
 #[test]
 fn skill_invocation_scopes_the_turn() {
     let mut inv = Inventory {
-        skills: vec!["pdf".to_string(), "commit-style".to_string()],
+        skills: vec![
+            ka_protocol::SkillEntry {
+                name: "pdf".into(),
+                source: String::new(),
+            },
+            ka_protocol::SkillEntry {
+                name: "commit-style".into(),
+                source: String::new(),
+            },
+        ],
         ..Default::default()
     };
 
@@ -744,7 +753,10 @@ fn skill_invocation_scopes_the_turn() {
     // disabled skill names the toggle (shared spec grammar). The
     // engine's inventory already dropped it from `skills` (emit_inventory
     // filters); `disabled` explains why.
-    inv.skills = vec!["commit-style".to_string()];
+    inv.skills = vec![ka_protocol::SkillEntry {
+        name: "commit-style".into(),
+        source: String::new(),
+    }];
     inv.disabled = vec!["skill:pdf".to_string()];
     let err = skill_invocation("/skill:pdf x", &inv).unwrap().unwrap_err();
     assert!(err.contains("skill:pdf"), "names the toggle: {err}");
@@ -761,7 +773,10 @@ fn skill_invocation_scopes_the_turn() {
 
     // bare `/skill` teaches the form and lists the offer (like bare
     // /agents); the space form is taught too, never silently invoked
-    inv.skills = vec!["pdf".to_string()];
+    inv.skills = vec![ka_protocol::SkillEntry {
+        name: "pdf".into(),
+        source: String::new(),
+    }];
     inv.disabled = Vec::new();
     let err = skill_invocation("/skill", &inv).unwrap().unwrap_err();
     assert!(

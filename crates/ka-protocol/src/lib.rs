@@ -685,6 +685,43 @@ pub struct McpSummary {
     pub tools: usize,
 }
 
+/// One discovered skill in the inventory: its name plus a dimmed
+/// origin tag for ecosystem roots (`.claude`, `.agents`); empty for
+/// ka-native roots (`.ka/skills`, `~/.config/ka/skills`). `source`
+/// is additive: absent deserializes empty.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+pub struct SkillEntry {
+    /// Skill name (directory name).
+    pub name: String,
+    /// Origin root's directory name (empty = ka-native).
+    pub source: String,
+}
+
+impl<'de> Deserialize<'de> for SkillEntry {
+    // Wire tolerance: older peers send bare name strings; current
+    // peers send `{name, source}`. Both decode — a bare string reads
+    // as an untagged ka-native entry.
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Wire {
+            Tagged {
+                name: String,
+                #[serde(default)]
+                source: String,
+            },
+            Name(String),
+        }
+        Ok(match Wire::deserialize(d)? {
+            Wire::Tagged { name, source } => Self { name, source },
+            Wire::Name(name) => Self {
+                name,
+                source: String::new(),
+            },
+        })
+    }
+}
+
 /// One entry of the model-maintained todo list ([`Event::Todos`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TodoItem {
@@ -854,8 +891,9 @@ pub enum Event {
         mcp: Vec<McpSummary>,
         /// Discovered subagent names.
         agents: Vec<String>,
-        /// Discovered skill names.
-        skills: Vec<String>,
+        /// Discovered skills: name plus a dimmed origin tag for ecosystem
+        /// roots (`.claude`, `.agents`); empty for ka-native roots.
+        skills: Vec<SkillEntry>,
         /// Advertised MCP prompts as `server/name (args)` (additive).
         #[serde(default)]
         prompts: Vec<String>,
@@ -1299,7 +1337,10 @@ mod tests {
                 },
             ],
             agents: vec!["coder".into()],
-            skills: vec!["rust-docs".into()],
+            skills: vec![SkillEntry {
+                name: "rust-docs".into(),
+                source: ".claude".into(),
+            }],
             prompts: Vec::new(),
             disabled: vec!["mcp:jira".into()],
         });
@@ -1451,7 +1492,14 @@ mod tests {
                     }]
                 );
                 assert!(agents.is_empty());
-                assert_eq!(skills, vec!["demo".to_string()]);
+                // bare legacy strings decode as untagged ka-native entries
+                assert_eq!(
+                    skills,
+                    vec![SkillEntry {
+                        name: "demo".into(),
+                        source: String::new(),
+                    }]
+                );
                 assert!(
                     disabled.is_empty(),
                     "pre-toggle inventory lines must decode with no disabled specs"
