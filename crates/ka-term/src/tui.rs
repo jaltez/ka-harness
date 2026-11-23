@@ -3639,6 +3639,26 @@ fn feature_rows(sidebar: &SidebarState) -> Vec<FeatureRow> {
     out
 }
 
+/// The row the /features panel opens on: the first one a toggle can
+/// act on. The panel starts with a section header, and ⏎ on a header
+/// does nothing.
+fn feature_start(entries: &[FeatureRow]) -> usize {
+    entries.iter().position(|r| !r.header).unwrap_or(0)
+}
+
+/// The toggle row one step from `selected` (down, or up). Headers are
+/// skipped and a walk past the last toggle row holds there: the panel
+/// ends with a header whenever its last section is empty.
+fn feature_step(entries: &[FeatureRow], selected: usize, down: bool) -> usize {
+    let mut toggles = (0..entries.len()).filter(|&i| !entries[i].header);
+    if down {
+        toggles.find(|&i| i > selected)
+    } else {
+        toggles.rfind(|&i| i < selected)
+    }
+    .unwrap_or(selected)
+}
+
 /// Popup rows for the info strip button: cwd ⎇ branch, session, model,
 /// effort, cost, context — the old sidebar's session + info sections.
 fn info_rows(
@@ -6548,22 +6568,8 @@ async fn app(
                             }
                             Modal::Features { entries, selected } => match key.code {
                                 KeyCode::Esc => modal = None,
-                                KeyCode::Up => {
-                                    while *selected > 0 {
-                                        *selected -= 1;
-                                        if !entries[*selected].header {
-                                            break;
-                                        }
-                                    }
-                                }
-                                KeyCode::Down => {
-                                    while *selected + 1 < entries.len() {
-                                        *selected += 1;
-                                        if !entries[*selected].header {
-                                            break;
-                                        }
-                                    }
-                                }
+                                KeyCode::Up => *selected = feature_step(entries, *selected, false),
+                                KeyCode::Down => *selected = feature_step(entries, *selected, true),
                                 // ⏎ (or space) flips the selected row; the
                                 // optimistic flip lands instantly and the
                                 // engine's FeaturesChanged keeps the state
@@ -7779,9 +7785,10 @@ async fn app(
                                 // here, one SetFeature per spec.
                                 let args = text.trim().strip_prefix("/features").map(str::trim).unwrap_or("");
                                 if args.is_empty() {
+                                    let entries = feature_rows(&sidebar);
                                     modal = Some(Modal::Features {
-                                        entries: feature_rows(&sidebar),
-                                        selected: 0,
+                                        selected: feature_start(&entries),
+                                        entries,
                                     });
                                 } else {
                                     let mut parts = args.split_whitespace();
@@ -23011,6 +23018,78 @@ mod tests {
         // tools and skills live in the sidebar now: nothing in the chat
         assert!(lines.entries().is_empty(), "{:?}", lines.entries());
         assert_eq!(lines.total_rows(), 0);
+    }
+
+    /// The /features selection lives on toggle rows only: the panel
+    /// opens on the first one (not the `features` header, where ⏎ does
+    /// nothing), ↑/↓ skip headers, and ↓ past the last toggle row
+    /// holds there instead of parking on the trailing header.
+    #[test]
+    fn features_selection_stays_on_toggle_rows() {
+        let sidebar = SidebarState {
+            known_tools: vec!["read".into(), "bash".into()],
+            inventory: Inventory {
+                skills: vec!["pdf".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let rows = feature_rows(&sidebar);
+        assert!(
+            rows.first().is_some_and(|r| r.header) && rows.last().is_some_and(|r| r.header),
+            "the panel starts with a header and ends with one when no agent is installed"
+        );
+        let top = feature_start(&rows);
+        assert_eq!(rows[top].spec, "agents", "opens on the first toggle row");
+        assert_eq!(
+            feature_step(&rows, top, false),
+            top,
+            "↑ at the first toggle row holds"
+        );
+        let mut selected = top;
+        let mut down = vec![rows[selected].spec.clone()];
+        loop {
+            let next = feature_step(&rows, selected, true);
+            if next == selected {
+                break;
+            }
+            selected = next;
+            down.push(rows[selected].spec.clone());
+        }
+        assert_eq!(
+            down,
+            [
+                "agents",
+                "skills",
+                "mcp",
+                "hooks",
+                "web",
+                "lsp",
+                "debug",
+                "sandbox",
+                "tool:read",
+                "tool:bash",
+                "skill:pdf",
+            ],
+            "↓ visits every toggle row once and holds on the last one"
+        );
+        let mut up = Vec::new();
+        loop {
+            let prev = feature_step(&rows, selected, false);
+            if prev == selected {
+                break;
+            }
+            selected = prev;
+            up.push(rows[selected].spec.clone());
+        }
+        assert_eq!(
+            up,
+            down[..down.len() - 1]
+                .iter()
+                .rev()
+                .cloned()
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
