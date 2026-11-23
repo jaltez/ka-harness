@@ -14827,7 +14827,14 @@ fn render_plain(
             "(esc closes · {})",
             hint.join(" · ")
         )));
-        frame.render_widget(Paragraph::new(text), tx_area);
+        // the modal owns the pane: clear it first, or the transcript
+        // underneath bleeds through the end of every modal row and a
+        // reader hears fragments of both
+        frame.render_widget(ratatui::widgets::Clear, tx_area);
+        frame.render_widget(
+            Paragraph::new(text).wrap(ratatui::widgets::Wrap { trim: false }),
+            tx_area,
+        );
         return;
     }
 

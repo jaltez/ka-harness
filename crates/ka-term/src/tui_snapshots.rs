@@ -1775,7 +1775,7 @@ fn chrome_scenes() -> Vec<Scene> {
             "chrome-plain",
             "Plain view (/plain): the session as screen-reader text",
             "chrome",
-            ["user: ", "done: "],
+            ["user: ", "done"],
             |_| RenderInput {
                 plain_mode: true,
                 ..titled()
@@ -3844,14 +3844,14 @@ fn plain_scenes() -> Vec<Scene> {
             "plain-notes",
             "Plain view: notes, a warning, an error, shell output, a report, a verdict",
             "plain",
-            ["note: ", "warning: ", "error: ", "shell: ", "done: "],
+            ["note: ", "warning: ", "error: ", "shell: ", "done"],
             |_| plain_showing(all_kinds(), is_note),
         ),
         Scene::new(
             "plain-verdicts",
             "Plain view: turn verdicts",
             "plain",
-            ["done: ", "done (with warnings)", "failed: "],
+            ["done", "aborted", "failed"],
             |_| plain_showing(all_kinds(), is_verdict),
         ),
         Scene::new(
@@ -3962,8 +3962,10 @@ fn plain_modals(modals: &[Scene]) -> Vec<Scene> {
                 .modal
                 .clone()
                 .unwrap_or_else(|| panic!("{} opens no modal", scene.id));
+            // the text file trims trailing spaces, so the header's
+            // trailing padding is not part of what a reader can find
             let first = format!(
-                "── {} ",
+                "── {}",
                 crate::plain::modal_lines(&modal, 64, &state.sidebar).0
             );
             Scene::new(

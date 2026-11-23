@@ -61,7 +61,18 @@ pub fn transcript_rows(transcript: &Transcript) -> Vec<String> {
                     crate::tui::SummaryTone::Warn => "done (with warnings)",
                     crate::tui::SummaryTone::Err => "failed",
                 };
-                out.push(format!("{verdict}: {text}"));
+                // the verdict text already opens with its verdict: say it once
+                let head = text.split_whitespace().next().unwrap_or("");
+                let same = match tone {
+                    crate::tui::SummaryTone::Ok => head == "done",
+                    crate::tui::SummaryTone::Warn => head == "done" || head == "aborted",
+                    crate::tui::SummaryTone::Err => head == "failed",
+                };
+                if same {
+                    out.push(text.clone());
+                } else {
+                    out.push(format!("{verdict}: {text}"));
+                }
                 if let Some(d) = detail {
                     for line in d.lines() {
                         out.push(line.to_string());
