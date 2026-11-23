@@ -2307,42 +2307,37 @@ fn input_inner_w(term_w: u16) -> usize {
     term_w.saturating_sub(6 + COMPOSER_LEAD) as usize
 }
 
-/// Max rows of diff detail shown in an ask form. The input box grows
-/// at most five rows past its base (six content rows total), and the
-/// options row must stay visible: the detail budget is whatever is
-/// left after the question lines and the options row, never above 8.
-const ASK_DETAIL_MAX: usize = 8;
-
-/// Rows of detail the ask form can afford for `question_lines` lines.
-/// `ask_detail_rows` may add a trailer, so one row of headroom is kept.
-fn ask_detail_budget(question_lines: usize) -> usize {
-    ASK_DETAIL_MAX
-        .min(6usize.saturating_sub(question_lines + 1))
-        .saturating_sub(1)
-}
-
 /// Body rows of the permission-ask modal, `width` cols wide: the
 /// question wrapped in bold GOLD_HI, the budgeted diff detail, then one
 /// option per row as a FAINT `N ` key cap plus its label. The selected
 /// row leads with the `▌ ` pointer and wears the selection style;
 /// unselected rows lead two blank cols so the caps align.
-fn ask_modal_body(ask: &PendingAsk, width: usize) -> Vec<ratatui::text::Line<'static>> {
+fn ask_modal_body(
+    ask: &PendingAsk,
+    width: usize,
+    max_rows: usize,
+) -> Vec<ratatui::text::Line<'static>> {
     use ratatui::style::{Modifier, Style};
     use ratatui::text::{Line as TuiLine, Span};
     use unicode_width::UnicodeWidthStr;
     let strong = Style::new()
         .fg(crate::palette::STRONG)
         .add_modifier(Modifier::BOLD);
-    let mut rows: Vec<TuiLine<'static>> = wrap_rows(&ask.question, width)
+    // the options are the decision: they always fit. The question keeps
+    // at least one row; the detail takes what is left.
+    let question = wrap_rows(&ask.question, width);
+    let opts = ask.options.len();
+    let q_room = question.len().min(max_rows.saturating_sub(opts).max(1));
+    let mut rows: Vec<TuiLine<'static>> = question
         .into_iter()
+        .take(q_room)
         .map(|r| TuiLine::from(Span::styled(r.text, strong)))
         .collect();
-    let q_lines = ask.question.split('\n').count();
-    let budget = ask_detail_budget(q_lines);
+    let budget = max_rows.saturating_sub(rows.len() + opts);
     if budget > 0
         && let Some(detail) = &ask.detail
     {
-        rows.extend(ask_detail_rows(detail, budget));
+        rows.extend(ask_detail_rows(detail, budget, width));
     }
     let sel_bg = Style::new().bg(crate::palette::SEL_BG);
     for (i, opt) in ask.options.iter().enumerate() {
@@ -2368,35 +2363,75 @@ fn ask_modal_body(ask: &PendingAsk, width: usize) -> Vec<ratatui::text::Line<'st
     rows
 }
 
-/// Colorized rows for an ask's diff detail: additions in OK, removals
-/// in ERR, hunk headers in META, file headers in FAINT, context plain.
-/// Clamped to `max` rows with a `… +N more` trailer.
-fn ask_detail_rows(detail: &str, max: usize) -> Vec<ratatui::text::Line<'static>> {
+/// Colorized rows for an ask's diff detail. The changed lines are the
+/// decision, so they come first and take the rows; file headers never
+/// spend one. A dim `path +N -M` summary leads only when the budget can
+/// still show a change after it, and the `… +N more` trailer is itself
+/// one of the budgeted rows, so the ask never grows past its detail
+/// allowance.
+fn ask_detail_rows(detail: &str, max: usize, width: usize) -> Vec<ratatui::text::Line<'static>> {
     use ratatui::style::Style;
     use ratatui::text::Span;
-    let mut rows: Vec<ratatui::text::Line<'static>> = detail
-        .lines()
-        .map(|l| {
-            let style = if l.starts_with("+++") || l.starts_with("---") {
-                Style::new().fg(crate::palette::FAINT)
-            } else if l.starts_with("@@") {
-                Style::new().fg(crate::palette::META)
-            } else if l.starts_with('+') {
-                Style::new().fg(crate::palette::OK)
-            } else if l.starts_with('-') {
-                Style::new().fg(crate::palette::ERR)
-            } else {
-                Style::new()
-            };
-            ratatui::text::Line::from(vec![ratatui::text::Span::styled(l.to_string(), style)])
-        })
-        .collect();
-    if rows.len() > max {
-        let more = rows.len() - max;
-        rows.truncate(max);
+    if max == 0 {
+        return Vec::new();
+    }
+    let faint = Style::new().fg(crate::palette::FAINT);
+    let style_of = |l: &str| -> Style {
+        if l.starts_with("@@") {
+            Style::new().fg(crate::palette::META)
+        } else if l.starts_with('+') {
+            Style::new().fg(crate::palette::OK)
+        } else if l.starts_with('-') {
+            Style::new().fg(crate::palette::ERR)
+        } else {
+            Style::new()
+        }
+    };
+    let is_change = |l: &str| {
+        (l.starts_with('+') && !l.starts_with("+++"))
+            || (l.starts_with('-') && !l.starts_with("---"))
+    };
+    let mut picked: Vec<&str> = detail.lines().filter(|l| is_change(l)).collect();
+    if picked.is_empty() {
+        // a create, a delete, or opaque content: show the detail without
+        // the file headers that would otherwise eat the whole budget
+        picked = detail
+            .lines()
+            .filter(|l| !l.starts_with("--- ") && !l.starts_with("+++ "))
+            .collect();
+    }
+    let adds = picked.iter().filter(|l| l.starts_with('+')).count();
+    let dels = picked.iter().filter(|l| l.starts_with('-')).count();
+    // rows are pre-truncated to the dialog width, so one source line is
+    // one rendered row and the budget is exact
+    let mut rows: Vec<ratatui::text::Line<'static>> = Vec::new();
+    let mut budget = max;
+    if budget >= 3 && !picked.is_empty() {
+        // a summary leads only when a change can still follow it
+        let path = detail
+            .lines()
+            .find_map(|l| {
+                l.strip_prefix("+++ b/")
+                    .or_else(|| l.strip_prefix("--- a/"))
+            })
+            .unwrap_or("");
+        rows.push(ratatui::text::Line::from(vec![Span::styled(
+            trunc_cols(&format!("{path}  +{adds} -{dels}"), width),
+            faint,
+        )]));
+        budget -= 1;
+    }
+    let room = budget.saturating_sub(usize::from(picked.len() > budget));
+    let more = picked.len().saturating_sub(room);
+    rows.extend(
+        picked.into_iter().take(room).map(|l| {
+            ratatui::text::Line::from(vec![Span::styled(trunc_cols(l, width), style_of(l))])
+        }),
+    );
+    if more > 0 {
         rows.push(ratatui::text::Line::from(vec![Span::styled(
             format!("… +{more} more"),
-            Style::new().fg(crate::palette::FAINT),
+            faint,
         )]));
     }
     rows
@@ -16616,7 +16651,11 @@ fn render(
     // never answer it.
     if let Some(ask) = ask {
         let width = 80.min(modal_area.width);
-        let body = ask_modal_body(ask, width.saturating_sub(4) as usize);
+        let body = ask_modal_body(
+            ask,
+            width.saturating_sub(4) as usize,
+            modal_area.height.saturating_sub(4) as usize,
+        );
         let height = (body.len() as u16 + 4).min(modal_area.height);
         let rect = centered(width, height, modal_area);
         frame.render_widget(ratatui::widgets::Clear, rect);
@@ -24470,57 +24509,109 @@ mod tests {
             detail: Some("+a\n".into()),
             selected: 0,
         };
-        let rows = ask_modal_body(&ask, 40);
+        let rows = ask_modal_body(&ask, 40, 20);
         let text = |l: &ratatui::text::Line<'static>| {
             l.spans
                 .iter()
                 .map(|s| s.content.to_string())
                 .collect::<String>()
         };
-        // bold gold question, then the budgeted detail, then options
+        // bold gold question, then the path/count summary, the changed
+        // line, then the options
         assert_eq!(text(&rows[0]), "allow write to modify files?");
         assert_eq!(rows[0].spans[0].style.fg, Some(crate::palette::STRONG));
-        assert_eq!(text(&rows[1]), "+a");
+        assert!(text(&rows[1]).contains("+1 -0"), "{:?}", text(&rows[1]));
+        assert_eq!(text(&rows[2]), "+a");
         // the selected option leads with the ▌ pointer, its FAINT key
         // cap, then the label in the selection style padded to the width
-        assert_eq!(text(&rows[2]), pad_to_width("▌ 1 allow".to_string(), 40));
-        assert_eq!(rows[2].spans[1].style.fg, Some(crate::palette::FAINT));
-        assert_eq!(rows[2].spans[2].style, selection_style());
+        assert_eq!(text(&rows[3]), pad_to_width("▌ 1 allow".to_string(), 40));
+        assert_eq!(rows[3].spans[1].style.fg, Some(crate::palette::FAINT));
+        assert_eq!(rows[3].spans[2].style, selection_style());
         // unselected rows lead two blank cols so the caps align
-        assert_eq!(text(&rows[3]), "  2 deny");
-        assert_ne!(rows[3].spans[2].style, selection_style());
+        assert_eq!(text(&rows[4]), "  2 deny");
+        assert_ne!(rows[4].spans[2].style, selection_style());
         // the pointer follows the selection
         let ask = PendingAsk { selected: 1, ..ask };
-        let rows = ask_modal_body(&ask, 40);
-        assert_eq!(rows[3].spans[2].style, selection_style());
-        assert_ne!(rows[2].spans[2].style, selection_style());
+        let rows = ask_modal_body(&ask, 40, 20);
+        assert_eq!(rows[4].spans[2].style, selection_style());
+        assert_ne!(rows[3].spans[2].style, selection_style());
     }
 
     #[test]
-    fn ask_detail_rows_colorize_and_clamp() {
+    fn ask_detail_rows_lead_with_the_change_and_stay_in_budget() {
         let rows = ask_detail_rows(
             "--- a/f.rs\n+++ b/f.rs\n@@ -1,3 +1,3 @@\n context\n-removed\n+added\n",
             8,
+            40,
         );
         let fg = |l: &ratatui::text::Line<'static>| l.spans[0].style.fg;
-        assert_eq!(rows[0].spans[0].content.as_ref(), "--- a/f.rs");
-        assert_eq!(fg(&rows[0]), Some(crate::palette::FAINT));
-        assert_eq!(fg(&rows[1]), Some(crate::palette::FAINT));
-        assert_eq!(fg(&rows[2]), Some(crate::palette::META));
-        assert_eq!(fg(&rows[3]), None, "context stays default");
-        assert_eq!(fg(&rows[4]), Some(crate::palette::ERR));
-        assert_eq!(fg(&rows[5]), Some(crate::palette::OK));
-        // clamp keeps the budget and notes the remainder
-        let clamped = ask_detail_rows("ctx\n+added\n-removed\n", 2);
-        assert_eq!(clamped.len(), 3);
+        // a summary leads, then the changed lines; no file header and no
+        // context spends a row
         assert!(
-            clamped[2].spans[0].content.contains("1 more"),
+            rows[0].spans[0].content.contains("f.rs  +1 -1"),
             "{:?}",
-            clamped[2].spans[0].content
+            rows[0]
         );
-        // the budget keeps trailer headroom: 2 allowed rows means the
-        // third detail row becomes the `… +N more` trailer
-        assert_eq!(clamped.len(), 3, "trailer rides in the budget");
+        assert_eq!(fg(&rows[0]), Some(crate::palette::FAINT));
+        assert_eq!(rows[1].spans[0].content.as_ref(), "-removed");
+        assert_eq!(fg(&rows[1]), Some(crate::palette::ERR));
+        assert_eq!(rows[2].spans[0].content.as_ref(), "+added");
+        assert_eq!(fg(&rows[2]), Some(crate::palette::OK));
+        assert!(
+            rows.iter().all(|r| !r.spans[0].content.starts_with("---")),
+            "headers never spend a row"
+        );
+        // the trailer rides inside the budget: never more than `max` rows
+        let many = "+a\n+b\n+c\n+d\n+e\n-f\n";
+        let clamped = ask_detail_rows(many, 3, 40);
+        assert_eq!(clamped.len(), 3, "{clamped:?}");
+        assert!(
+            clamped[2].spans[0].content.contains("more"),
+            "{:?}",
+            clamped[2]
+        );
+        // a change line is truncated, never wrapped, so the budget is exact
+        let long = format!("+{}", "x".repeat(200));
+        let row = ask_detail_rows(&long, 1, 20);
+        assert_eq!(row.len(), 1);
+        assert!(
+            row[0].spans[0].content.chars().count() <= 20,
+            "truncated to the dialog width"
+        );
+    }
+
+    /// The options are the decision: a tall question and a long diff give
+    /// way to them, and the body never exceeds the box.
+    #[test]
+    fn ask_body_always_fits_its_options() {
+        use ka_protocol::AskId;
+        let ask = PendingAsk {
+            id: AskId("1".into()),
+            question: "allow edit to modify files?\n".to_string() + &"word ".repeat(120),
+            options: vec!["allow".into(), "always".into(), "deny".into()],
+            selected: 0,
+            detail: Some(
+                (0..40)
+                    .map(|i| format!("+change line {i} with a lot of words to wrap around"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+        };
+        for max_rows in [6usize, 10, 20] {
+            let rows = ask_modal_body(&ask, 76, max_rows);
+            assert!(rows.len() <= max_rows, "{max_rows}: {}", rows.len());
+            let text: String = rows
+                .iter()
+                .map(|r| {
+                    r.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(text.contains("deny"), "{max_rows}: options lost: {text}");
+        }
     }
 
     #[test]
