@@ -36,6 +36,9 @@ pub struct InputBuffer {
     history: VecDeque<String>,
     /// Index while browsing history; None = live edit.
     browsing: Option<usize>,
+    /// The draft and caret parked when history_prev left a live edit;
+    /// stepping back past the newest entry restores them.
+    parked: Option<(String, usize)>,
     /// Undo snapshots (text + cursor), most recent last; capped at 100.
     undo: Vec<(String, usize)>,
     /// Readline-style kill ring (single entry: kills REPLACE, not append).
@@ -199,6 +202,7 @@ impl InputBuffer {
             }
         }
         self.browsing = None;
+        self.parked = None;
         text
     }
 
@@ -217,10 +221,14 @@ impl InputBuffer {
         }
     }
 
-    /// Browse history upward (older).
+    /// Browse history upward (older). The draft being typed is parked
+    /// first: stepping back down past the newest entry brings it back.
     pub fn history_prev(&mut self) {
         if self.history.is_empty() {
             return;
+        }
+        if self.browsing.is_none() && !self.text.is_empty() {
+            self.parked = Some((self.text.clone(), self.cursor));
         }
         let idx = match self.browsing {
             None => self.history.len() - 1,
@@ -231,15 +239,18 @@ impl InputBuffer {
         self.load_history(idx);
     }
 
-    /// Browse history downward (newer).
+    /// Browse history downward (newer). Past the newest entry the
+    /// parked draft returns (readline behaviour); with none parked the
+    /// draft is empty.
     pub fn history_next(&mut self) {
         let Some(idx) = self.browsing else {
             return;
         };
         if idx + 1 >= self.history.len() {
             self.browsing = None;
-            self.text.clear();
-            self.cursor = 0;
+            let (text, cursor) = self.parked.take().unwrap_or_default();
+            self.text = text;
+            self.cursor = cursor;
         } else {
             self.browsing = Some(idx + 1);
             self.load_history(idx + 1);
@@ -19957,6 +19968,43 @@ mod tests {
         b.history_next();
         b.history_next();
         assert!(b.text.is_empty());
+    }
+
+    #[test]
+    fn history_keeps_the_half_typed_draft() {
+        let mut b = InputBuffer::default();
+        for t in ["first prompt", "second prompt"] {
+            b.insert_str(t);
+            b.take();
+        }
+        b.insert_str("half typed draft");
+        b.left();
+        b.left();
+        let caret = b.cursor;
+        // stepping up into history shows the older prompts
+        b.history_prev();
+        assert_eq!(b.text, "second prompt");
+        b.history_prev();
+        assert_eq!(b.text, "first prompt");
+        // stepping back down past the newest entry restores the draft,
+        // caret included
+        b.history_next();
+        b.history_next();
+        assert_eq!(b.text, "half typed draft");
+        assert_eq!(b.cursor, caret);
+        // editing the recalled entry re-parks the edited text next time
+        b.end();
+        b.insert('!');
+        b.history_prev();
+        b.history_next();
+        assert_eq!(b.text, "half typed draft!");
+        // nothing was parked: the draft is empty past the newest entry
+        let mut c = InputBuffer::default();
+        c.insert_str("only prompt");
+        c.take();
+        c.history_prev();
+        c.history_next();
+        assert!(c.text.is_empty());
     }
     #[test]
     fn newline_and_backspace_roundtrip() {
