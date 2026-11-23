@@ -742,7 +742,7 @@ pub struct Sandbox {
 #[serde(rename_all = "lowercase")]
 pub enum MouseMode {
     /// SGR button reporting (the default): wheel scrolls, bottom-strip
-    /// buttons are clickable, ⇧drag still selects. Ctrl+M toggles at
+    /// buttons are clickable, ⇧drag still selects. Alt+M toggles at
     /// runtime.
     #[default]
     Capture,
@@ -790,7 +790,7 @@ pub struct Tui {
     /// the wheel scrolls, the bottom-strip buttons are clickable and
     /// ⇧drag still selects; or `"native"` — no capture at all, plain
     /// drag selects and pastes with the terminal's own bindings and
-    /// the wheel scrolls via alternate-scroll. Ctrl+M toggles at
+    /// the wheel scrolls via alternate-scroll. Alt+M toggles at
     /// runtime either way. kitty has no alternate-scroll — keep
     /// `"capture"` there for the wheel.
     pub mouse: Option<MouseMode>,

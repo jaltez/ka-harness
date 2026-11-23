@@ -5049,7 +5049,7 @@ fn mouse_setting(captured: bool) -> Option<String> {
     })
 }
 
-/// The Ctrl+M toggle toast: mode names match the persisted
+/// The Alt+M toggle toast: mode names match the persisted
 /// `[tui] mouse` values.
 fn mouse_mode_text(captured: bool) -> String {
     format!(
@@ -5058,7 +5058,7 @@ fn mouse_mode_text(captured: bool) -> String {
         if captured {
             "everything clickable; hover previews what a click touches; drag over the transcript selects & copies; ⇧drag = native selection; ↑/↓ = prompt history"
         } else {
-            "plain drag selects natively; the wheel scrolls the chat (kitty: no alternate-scroll — Ctrl+M back to capture for the wheel); ↑/↓ scroll, Ctrl+P/N = prompt history"
+            "plain drag selects natively; the wheel scrolls the chat (kitty: no alternate-scroll — Alt+M back to capture for the wheel); ↑/↓ scroll, Ctrl+P/N = prompt history"
         }
     )
 }
@@ -5341,9 +5341,8 @@ pub async fn run(
     // drag selects/pastes natively, wheel scrolls via DECSET 1007).
     // Hybrid: while a popup or modal is open a native session transiently
     // enables capture so overlay clicks (✕ chip, click-outside) work, and
-    // releases it on close. Ctrl+M toggles the base at runtime
-    // (kitty-protocol terminals only — plain terminals read Ctrl+M as
-    // Enter) and persists it.
+    // releases it on close. Alt+M toggles the base at runtime and
+    // persists it.
     //
     // Focus reporting (DECSET 1004) rides along for
     // `[tui] notify_unfocused`: terminals that answer keep FOCUSED
@@ -5357,7 +5356,7 @@ pub async fn run(
     );
     // capture is the default; `[tui] mouse = "native"` starts native —
     // plain drag selection, full-width chat, wheel via alternate-scroll.
-    // Ctrl+M toggles and persists either way.
+    // Alt+M toggles and persists either way.
     if mouse_capture {
         let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
     } else {
@@ -5628,7 +5627,7 @@ async fn app(
         // (plain drag selects, wheel via alternate-scroll); while any
         // overlay is open the app transiently owns the mouse so its
         // clicks work (✕ chip, click-outside, items). Base capture
-        // (Ctrl+M / [tui] mouse = "capture") overrides — always on.
+        // (Alt+M / [tui] mouse = "capture") overrides — always on.
         let overlay_open =
             modal.is_some() || slash_popup.is_some() || path_popup.is_some() || picker.is_some();
         if overlay_open && !was_overlay_open {
@@ -7509,14 +7508,13 @@ async fn app(
                             && path_popup.is_none()
                             && bindings.matches(&key, "mouse.toggle") =>
                         {
-                            // Ctrl+M: the runtime mouse toggle — capture
+                            // Alt+M: the runtime mouse toggle — capture
                             // (dashboard: sidebar + click zones + ⇧drag)
                             // ⇄ native (text mode: full-width chat, plain
                             // drag selects, wheel via alternate-scroll).
-                            // kitty-protocol terminals deliver Ctrl+M as a
-                            // distinct key; plain terminals read it as
-                            // Enter, so there `[tui] mouse = "capture"`
-                            // is the way back. The choice persists.
+                            // Alt+M is its own key on every protocol; ctrl+m was not (Enter
+                            // on legacy terminals, Enter+Control under the kitty protocol), so
+                            // the toggle never fired. `[tui] mouse = "capture"` sets it too. The choice persists.
                             mouse_captured = !mouse_captured;
                             rail_drag = None;
                             // the loop-top reconcile applies the new
@@ -19537,7 +19535,7 @@ mod tests {
             "ctrl+q",
             "ctrl+s",
             "ctrl+o",
-            "ctrl+m",
+            "alt+m",
             "ctrl+t",
             "alt+o",
             "alt+i",

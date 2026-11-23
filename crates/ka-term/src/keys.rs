@@ -105,7 +105,7 @@ pub const ACTIONS: &[Binding] = &[
     Binding {
         id: "mouse.toggle",
         ctx: CTX_IDLE,
-        default: &["ctrl+m"],
+        default: &["alt+m"],
     },
     Binding {
         id: "theme.picker",

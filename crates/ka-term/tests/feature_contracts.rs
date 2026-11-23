@@ -82,7 +82,7 @@ fn every_documented_slash_command_parses() {
     // session's trigger value lives in the app loop), and
     // /goal [/goal status] (a local read of the goal mirror the
     // engine's goal notes keep; CTX-05 has no Status action).
-    // Mouse capture toggles with Ctrl+M, not a slash command. They are
+    // Mouse capture toggles with Alt+M, not a slash command. They are
     // covered by the input-layer unit tests in src; if you move one
     // into slash_command, add it above.
 }
@@ -1020,7 +1020,13 @@ fn keybinding_actions_keep_their_documented_ids_and_defaults() {
     assert_eq!(b.display("popups.todos"), "alt+o");
     assert_eq!(b.display("popups.info"), "alt+i");
     assert_eq!(b.display("composer.external_editor"), "alt+e");
-    assert_eq!(b.display("mouse.toggle"), "ctrl+m");
+    // ctrl+m is Enter on legacy terminals (Enter+Control under the kitty
+    // protocol), so it could never toggle: the chord is alt+m
+    assert_eq!(b.display("mouse.toggle"), "alt+m");
+    let enter_ctrl = KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL);
+    assert!(!b.matches(&enter_ctrl, "mouse.toggle"));
+    let alt_m = KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT);
+    assert!(b.matches(&alt_m, "mouse.toggle"));
     assert_eq!(b.display("theme.picker"), "ctrl+g");
     assert_eq!(b.display("changelog"), "alt+c");
     assert_eq!(b.display("queue.open"), "alt+u");
