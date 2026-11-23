@@ -2594,6 +2594,7 @@ fn modal_scenes() -> Vec<Scene> {
                     edit: None,
                     providers: providers(),
                     config_path: CONFIG_PATH.into(),
+                    status: None,
                 }))
             },
         ),
@@ -2611,6 +2612,7 @@ fn modal_scenes() -> Vec<Scene> {
                     edit: Some("anthropic/clau".into()),
                     providers: providers(),
                     config_path: CONFIG_PATH.into(),
+                    status: None,
                 }))
             },
         ),
@@ -2623,6 +2625,7 @@ fn modal_scenes() -> Vec<Scene> {
                 opens(Modal::Features {
                     entries: feature_rows(&live_sidebar()),
                     selected: 5,
+                    status: None,
                 })
             },
         ),

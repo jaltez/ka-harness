@@ -4296,6 +4296,9 @@ pub struct SettingsPanel {
     pub providers: Vec<ProviderInfo>,
     /// User config path (informational).
     pub config_path: String,
+    /// Status line shown in place of the hints until the next key:
+    /// what the last `s` saved, or what an applied selector is.
+    pub status: Option<String>,
 }
 
 impl SettingsPanel {
@@ -4833,6 +4836,9 @@ pub enum Modal {
         entries: Vec<FeatureRow>,
         /// Selected row index (always a toggleable row).
         selected: usize,
+        /// Status line shown in place of the hints until the next key:
+        /// what the last `s` saved.
+        status: Option<String>,
     },
     /// Model picker.
     Model(ModelPicker),
@@ -6321,6 +6327,8 @@ async fn app(
                             },
             Modal::Settings(panel) => {
                                 let editing = panel.edit.is_some();
+                                // the status line yields to the hints on the next key
+                                panel.status = None;
                                 match key.code {
                                     KeyCode::Esc => {
                                         if editing {
@@ -6384,6 +6392,7 @@ async fn app(
                                         // "(canned)" is the no-model placeholder,
                                         // not a selector — persisting it would
                                         // poison every later launch
+                                        panel.status = Some(SAVING.to_string());
                                         let model = (panel.model != "(canned)")
                                             .then(|| panel.model.clone());
                                         let _ = commands
@@ -6566,7 +6575,10 @@ async fn app(
                             Modal::Context { .. } => {
                                 modal = None;
                             }
-                            Modal::Features { entries, selected } => match key.code {
+                            Modal::Features { entries, selected, status } => {
+                                // the status line yields to the hints on the next key
+                                *status = None;
+                                match key.code {
                                 KeyCode::Esc => modal = None,
                                 KeyCode::Up => *selected = feature_step(entries, *selected, false),
                                 KeyCode::Down => *selected = feature_step(entries, *selected, true),
@@ -6613,12 +6625,11 @@ async fn app(
                                             features: Some(disabled),
                                         })
                                         .await;
-                                    transcript.push_separated(Line::Info(
-                                        "saved feature toggles as the default (user ka.toml)".into(),
-                                    ));
+                                    *status = Some(SAVING.to_string());
                                 }
                                 _ => {}
-                            },
+                                }
+                            }
                             Modal::Tree {
                                 items,
                                 actions,
@@ -7789,6 +7800,7 @@ async fn app(
                                     modal = Some(Modal::Features {
                                         selected: feature_start(&entries),
                                         entries,
+                                        status: None,
                                     });
                                 } else {
                                     let mut parts = args.split_whitespace();
@@ -8482,6 +8494,7 @@ async fn app(
                                             edit: None,
                                             providers: providers.clone(),
                                             config_path: ka_config_path(),
+                                            status: None,
                                         }),
                                         ModalKind::Spills { focus } => Modal::Spills {
                                             items: spills.clone(),
@@ -9794,6 +9807,10 @@ async fn app(
                                 }
                             }
                         }
+                        // a save's reply reaches the panel that asked
+                        // while it is still open — its status line, not
+                        // only the transcript behind it
+                        show_save_reply(&evt, &mut modal);
                         if matches!(evt, Event::TurnFinished { .. }) {
                             turn_ended = true;
                             // one queued item per settle — and the queue
@@ -13703,6 +13720,35 @@ fn modal_hints(open: &Modal) -> &'static [(&'static str, &'static str)] {
     }
 }
 
+/// What `s` says on the panel until the engine answers.
+const SAVING: &str = "saving…";
+
+/// The status line a panel shows in place of its hints. `/settings` and
+/// `/features` answer `s` here, where the eye is, instead of only in
+/// the transcript behind the panel.
+fn modal_status(open: &Modal) -> Option<&str> {
+    match open {
+        Modal::Settings(panel) => panel.status.as_deref(),
+        Modal::Features { status, .. } => status.as_deref(),
+        _ => None,
+    }
+}
+
+/// Land the engine's reply to a settings save on the panel that asked
+/// for it, if that panel is still open: its success note, or the error.
+fn show_save_reply(evt: &Event, modal: &mut Option<Modal>) {
+    let message = match evt {
+        Event::Note { message } if message.starts_with("saved settings to ") => message,
+        Event::Error { message, .. } if message.starts_with("saving settings failed") => message,
+        _ => return,
+    };
+    match modal.as_mut() {
+        Some(Modal::Settings(panel)) => panel.status = Some(message.clone()),
+        Some(Modal::Features { status, .. }) => *status = Some(message.clone()),
+        _ => {}
+    }
+}
+
 /// `Buffer::set_line` guarded against an origin outside the buffer
 /// (tiny terminals squeeze rects to nothing); the width clips at the
 /// buffer edge.
@@ -13710,6 +13756,19 @@ fn put_line(buf: &mut ratatui::buffer::Buffer, x: u16, y: u16, line: &ratatui::t
     if buf.area.contains(ratatui::layout::Position { x, y }) {
         buf.set_line(x, y, line, line.width() as u16);
     }
+}
+
+/// Paint a panel's status on the border row its hints usually take:
+/// left-aligned in the hints' ink and clipped to the row, so a reply
+/// is never dropped for being long.
+fn paint_status(buf: &mut ratatui::buffer::Buffer, left: u16, right: u16, y: u16, status: &str) {
+    use ratatui::text::Line as TuiLine;
+    let room = right.saturating_sub(left) as usize;
+    let line = TuiLine::styled(
+        format!(" {} ", trunc_cols(status, room.saturating_sub(2))),
+        crate::palette::FAINT,
+    );
+    put_line(buf, left, y, &line);
 }
 
 /// Paint contextual hints right-aligned on a border row: they end at
@@ -16083,7 +16142,9 @@ fn render(
                 }
                 (width, height, modal_title("memory"), text)
             }
-            Modal::Features { entries, selected } => {
+            Modal::Features {
+                entries, selected, ..
+            } => {
                 let height = (entries.len() as u16 + 4).clamp(6, 24);
                 let width = 76.min(fw);
                 let cap = (height as usize).saturating_sub(4);
@@ -16389,13 +16450,15 @@ fn render(
         let buf = frame.buffer_mut();
         drop_shadow(buf, rect);
         if rect.height >= 2 {
-            paint_hints(
-                buf,
+            let (left, right, y) = (
                 rect.x + 2,
                 rect.right().saturating_sub(2),
                 rect.bottom() - 1,
-                modal_hints(open),
             );
+            match modal_status(open) {
+                Some(status) => paint_status(buf, left, right, y, status),
+                None => paint_hints(buf, left, right, y, modal_hints(open)),
+            }
         }
     }
 
@@ -19610,6 +19673,7 @@ mod tests {
             edit: None,
             providers: vec![],
             config_path: String::new(),
+            status: None,
         };
         let seq = [
             Some(Effort::Low),
@@ -26578,6 +26642,7 @@ mod tests {
             edit: Some("half-typed model".into()),
             providers: vec![],
             config_path: "/tmp/ka-config".into(),
+            status: None,
         };
         let (_terminal, modal_zone, _popup) =
             draw_overlay(None, None, Some(&Modal::Settings(panel.clone())), None);
@@ -26594,6 +26659,112 @@ mod tests {
         // modal leaves it exactly as passed — no save, no apply
         assert_eq!(panel.edit.as_deref(), Some("half-typed model"));
         assert_eq!(panel.model, "mock-5");
+    }
+
+    /// The bottom border row of the modal drawn at `rect`, trimmed.
+    fn hint_row(
+        terminal: &ratatui::Terminal<ratatui::backend::TestBackend>,
+        rect: ratatui::layout::Rect,
+    ) -> String {
+        let y = rect.bottom() - 1;
+        (rect.x + 1..rect.right() - 1)
+            .map(|x| terminal.backend().buffer()[(x, y)].symbol().to_string())
+            .collect::<String>()
+            .trim()
+            .to_string()
+    }
+
+    /// `s` answers on the panel itself: the engine's reply takes the
+    /// hints' place on the bottom border until the next key. Unrelated
+    /// notes change nothing, and a reply no panel is waiting for stays
+    /// in the transcript.
+    #[test]
+    fn a_save_reply_replaces_the_hints_of_the_panel_that_asked() {
+        use ka_protocol::{ErrorClass, Mode};
+        let settings = |status: Option<&str>| {
+            Modal::Settings(SettingsPanel {
+                model: "zai/glm-5.3".into(),
+                mode: Mode::Ask,
+                effort: None,
+                selected: 0,
+                edit: None,
+                providers: Vec::new(),
+                config_path: String::new(),
+                status: status.map(str::to_string),
+            })
+        };
+        let features = |status: Option<&str>| {
+            let entries = feature_rows(&SidebarState::default());
+            Modal::Features {
+                selected: feature_start(&entries),
+                entries,
+                status: status.map(str::to_string),
+            }
+        };
+        let note = |message: &str| Event::Note {
+            message: message.into(),
+        };
+        let saved = "saved settings to /home/u/.config/ka/ka.toml";
+        let failed = "saving settings failed: disk full";
+        for (idle, asking, hints) in [
+            (settings(None), settings(Some(SAVING)), "s save"),
+            (features(None), features(Some(SAVING)), "save as default"),
+        ] {
+            let (_, modal_zone, _) = draw_overlay(None, None, Some(&idle), None);
+            let rect = modal_zone.get().expect("modal rect published");
+            // the bottom border of this panel, in any state
+            let border = |modal: &Modal| {
+                let (terminal, _, _) = draw_overlay(None, None, Some(modal), None);
+                hint_row(&terminal, rect)
+            };
+            let row = border(&idle);
+            assert!(row.contains(hints) && row.contains("esc close"), "{row}");
+            let row = border(&asking);
+            assert!(row.contains(SAVING) && !row.contains("esc close"), "{row}");
+
+            let mut modal = Some(asking);
+            fn shown(modal: &Option<Modal>) -> Option<&str> {
+                modal_status(modal.as_ref().expect("a panel"))
+            }
+            show_save_reply(&note("goal set: ship it"), &mut modal);
+            assert_eq!(
+                shown(&modal),
+                Some(SAVING),
+                "an unrelated note changes nothing"
+            );
+            show_save_reply(&note(saved), &mut modal);
+            assert_eq!(shown(&modal), Some(saved));
+            let row = border(modal.as_ref().expect("a panel"));
+            assert!(row.contains(saved) && !row.contains("esc close"), "{row}");
+            show_save_reply(
+                &Event::Error {
+                    class: ErrorClass::Protocol,
+                    retryable: false,
+                    message: failed.into(),
+                },
+                &mut modal,
+            );
+            assert_eq!(shown(&modal), Some(failed), "a failed save says so too");
+        }
+        // a reply no panel is waiting for
+        let mut closed: Option<Modal> = None;
+        show_save_reply(&note(saved), &mut closed);
+        assert!(closed.is_none());
+        let mut other = Some(Modal::Todos { rows: Vec::new() });
+        show_save_reply(&note(saved), &mut other);
+        assert_eq!(modal_status(other.as_ref().expect("a modal")), None);
+        // a long reply is clipped to the row, never dropped
+        let long = format!(
+            "saving settings failed: {}",
+            "no space left on device; ".repeat(6)
+        );
+        let (terminal, modal_zone, _) =
+            draw_overlay(None, None, Some(&settings(Some(&long))), None);
+        let row = hint_row(&terminal, modal_zone.get().expect("modal rect published"));
+        assert!(
+            row.contains("saving settings failed: no space left") && row.contains('…'),
+            "clipped, not dropped: {row}"
+        );
     }
 
     /// The permission ask is unreachable for the mouse: no close zone

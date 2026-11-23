@@ -147,9 +147,8 @@ pub fn modal_lines(
             }
             ("sessions".into(), rows)
         }
-        Modal::Settings(p) => (
-            "settings".into(),
-            vec![
+        Modal::Settings(p) => {
+            let mut rows = vec![
                 format!(
                     "{} model: {}",
                     marker(0, p.selected),
@@ -169,9 +168,17 @@ pub fn modal_lines(
                 ),
                 String::new(),
                 format!("config: {}", p.config_path),
-            ],
-        ),
-        Modal::Features { entries, selected } => {
+            ];
+            if let Some(status) = &p.status {
+                rows.push(status.clone());
+            }
+            ("settings".into(), rows)
+        }
+        Modal::Features {
+            entries,
+            selected,
+            status,
+        } => {
             let mut rows = Vec::new();
             for (i, row) in entries.iter().enumerate() {
                 if row.header {
@@ -184,6 +191,9 @@ pub fn modal_lines(
                         row.label
                     ));
                 }
+            }
+            if let Some(status) = status {
+                rows.push(status.clone());
             }
             ("features".into(), rows)
         }
@@ -540,5 +550,52 @@ mod tests {
         assert_eq!(title, "queue");
         assert_eq!(rows[0], "  first");
         assert_eq!(rows[1], "> second");
+    }
+
+    /// A panel's status (`s` answered) rides the plain rows too, last.
+    #[test]
+    fn modal_lines_carry_a_panel_status() {
+        use crate::tui::{FeatureRow, SettingsPanel};
+        let sidebar = crate::tui::SidebarState::default();
+        let rows = |modal: &Modal| modal_lines(modal, 80, &sidebar).1;
+        let settings = |status: Option<&str>| {
+            Modal::Settings(SettingsPanel {
+                model: "zai/glm-5.3".into(),
+                mode: ka_protocol::Mode::Ask,
+                effort: None,
+                selected: 0,
+                edit: None,
+                providers: Vec::new(),
+                config_path: "/tmp/ka-config".into(),
+                status: status.map(str::to_string),
+            })
+        };
+        let features = |status: Option<&str>| Modal::Features {
+            entries: vec![FeatureRow {
+                spec: "agents".into(),
+                label: "subagents".into(),
+                header: false,
+                on: true,
+            }],
+            selected: 0,
+            status: status.map(str::to_string),
+        };
+        let saved = "saved settings to /home/u/.config/ka/ka.toml";
+        assert_eq!(
+            rows(&settings(None)).last(),
+            Some(&"config: /tmp/ka-config".to_string())
+        );
+        assert_eq!(
+            rows(&settings(Some(saved))).last(),
+            Some(&saved.to_string())
+        );
+        assert_eq!(
+            rows(&features(None)).last(),
+            Some(&"> on  subagents".to_string())
+        );
+        assert_eq!(
+            rows(&features(Some(saved))).last(),
+            Some(&saved.to_string())
+        );
     }
 }
