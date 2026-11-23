@@ -1,6 +1,6 @@
 [package]
 name = "ka-sandbox"
-description = "Filesystem sandbox policy for ka child processes (Linux)"
+description = "Filesystem + domain-scoped network sandbox policy for ka child processes"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

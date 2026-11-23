@@ -129,6 +129,26 @@ impl BashHand {
             // [shell] env policy: all (default) inherits everything;
             // core/none start from the documented floor plus keep/set
             ctx.shell_env.apply_to(&mut cmd);
+            // [sandbox] PERM-03: a domain-restricted policy keeps the
+            // loopback proxy live and injects its URL (applied LAST so
+            // the policy wins over inherited or [shell] env_set proxy
+            // vars). Env-inheriting backends (seatbelt's sandbox-exec,
+            // firejail) pass these through to the child; env-clearing
+            // backends get the same pairs carried through wrap_command
+            // (--setenv / trampoline policy) instead. Honest enforcement:
+            // filtering happens inside the proxy — children that honor
+            // proxy env (curl/wget/git) are domain-filtered; Err fails
+            // the call closed rather than running the command without
+            // its configured filter.
+            match ka_sandbox::proxy_env(&ctx.sandbox) {
+                Ok(Some(env)) => {
+                    for (name, value) in env.vars() {
+                        cmd.env(name, value);
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => return ToolOutput::err(format!("bash: sandbox proxy: {e}\n{command}")),
+            };
             let mut child = match child_spawn(&mut cmd) {
                 Ok(c) => c,
                 Err(e) => return ToolOutput::err(format!("bash spawn: {e}")),
@@ -459,6 +479,7 @@ mod tests {
     use parking_lot::Mutex;
 
     use super::*;
+
     use crate::hands::jobs::JobTable;
     use crate::hands::{Ledger, Spill};
 
@@ -552,6 +573,62 @@ mod tests {
             .set
             .insert("KA_PERM_PROBE".into(), "via-set".into());
         assert_eq!(probe(&ctx, "\"$KA_PERM_PROBE\"").await, "via-set");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PERM-03: a domain-restricted sandbox policy injects the loopback
+    /// proxy URL into bash children (the sandbox policy wins over
+    /// inherited/[shell]-set proxy vars), and an unrestricted policy
+    /// injects nothing.
+    #[tokio::test]
+    async fn domain_policy_injects_proxy_env_into_children() {
+        // wrap_command needs an enforcement backend; on hosts without
+        // one the fs command fails closed before any env is injected,
+        // so the injection itself is only observable where a backend
+        // exists (CI linux always has landlock)
+        if ka_sandbox::detect_tool().is_none() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("ka-bash-proxy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ctx = ctx_for(&dir);
+        // /tmp and the spill root ride the allowlist: the hand redirects
+        // bash output (and the exit marker) into the spill file
+        ctx.sandbox = ka_sandbox::Policy::Fs {
+            allow_write: vec![
+                std::path::PathBuf::from("/tmp"),
+                crate::hands::spills_root(),
+            ],
+            allow_net: false,
+            pass_env: Vec::new(),
+            net: ka_sandbox::NetDomains {
+                allow: vec!["example.com".into()],
+                deny: Vec::new(),
+            },
+        };
+        // the proxy env must reach the child even when [shell] env_set
+        // tried to set its own proxy: the policy wins (applied last)
+        ctx.shell_env
+            .set
+            .insert("HTTPS_PROXY".into(), "http://10.9.9.9:1".into());
+        let proxy = child_env(&ctx, "HTTPS_PROXY").await;
+        let proxy = proxy.expect("domain-restricted policy injects HTTPS_PROXY");
+        assert!(
+            proxy.starts_with("http://127.0.0.1:"),
+            "policy proxy wins over [shell] env_set: {proxy}"
+        );
+        let no_proxy = child_env(&ctx, "NO_PROXY").await;
+        assert_eq!(
+            no_proxy.as_deref(),
+            Some(ka_sandbox::proxy::NO_PROXY_LOOPBACK)
+        );
+        let http = child_env(&ctx, "http_proxy").await;
+        assert_eq!(http, Some(proxy.clone()), "lowercase variant injected too");
+        // unrestricted policies inject nothing (proxy inert)
+        ctx.sandbox = ka_sandbox::Policy::Off;
+        ctx.shell_env.set.remove("HTTPS_PROXY");
+        assert_eq!(child_env(&ctx, "HTTPS_PROXY").await, None);
+        assert_eq!(child_env(&ctx, "NO_PROXY").await, None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

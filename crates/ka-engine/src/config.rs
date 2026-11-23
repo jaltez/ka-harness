@@ -662,6 +662,17 @@ pub struct Sandbox {
     /// sandbox-expansion ask appends the granted write paths here
     /// (project layer).
     pub allow_write: Vec<String>,
+    /// PERM-03: domains bash children may reach through the loopback
+    /// network proxy. `*.example.com` / `example.com` both match the
+    /// domain and its subdomains; IP literals must be listed verbatim.
+    /// Non-empty ⇒ children get `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`
+    /// injected (filtering = the child uses the proxy; curl/wget/git
+    /// respect it) and the landlock backend scopes raw TCP to the proxy
+    /// port. Enforcement is honest: tools ignoring proxy env bypass the
+    /// filter wherever the backend allows raw sockets.
+    pub net_allow_domains: Vec<String>,
+    /// PERM-03: denied domains — they win over `net_allow_domains`.
+    pub net_deny_domains: Vec<String>,
 }
 
 /// `[tui] mouse`: terminal mouse handling.
@@ -736,6 +747,8 @@ impl Sandbox {
         ka_sandbox::SandboxConfig {
             mode: self.mode.clone(),
             allow_write: self.allow_write.clone(),
+            net_allow_domains: self.net_allow_domains.clone(),
+            net_deny_domains: self.net_deny_domains.clone(),
         }
     }
 }
@@ -1365,6 +1378,18 @@ impl Config {
         }
         if !other.sandbox.allow_write.is_empty() {
             Self::merge_dedupe(&mut self.sandbox.allow_write, &other.sandbox.allow_write);
+        }
+        if !other.sandbox.net_allow_domains.is_empty() {
+            Self::merge_dedupe(
+                &mut self.sandbox.net_allow_domains,
+                &other.sandbox.net_allow_domains,
+            );
+        }
+        if !other.sandbox.net_deny_domains.is_empty() {
+            Self::merge_dedupe(
+                &mut self.sandbox.net_deny_domains,
+                &other.sandbox.net_deny_domains,
+            );
         }
         if other.guards.auto_review.is_some() {
             self.guards.auto_review = other.guards.auto_review;
@@ -2516,6 +2541,60 @@ mod tests {
             Some("fs"),
             "project [sandbox] must survive the overlay merge"
         );
+    }
+
+    #[test]
+    fn sandbox_net_domains_overlay_and_reach_policy() {
+        // PERM-03: the domain lists parse, merge (deduped) across layers,
+        // and land in the resolved fs policy's NetDomains
+        let mut base = Config::default();
+        base.overlay(
+            Config::parse_layer(
+                "[sandbox]\nmode = \"fs\"\nnet_allow_domains = [\"api.github.com\", \"*.corp.example\"]\nnet_deny_domains = [\"evil.example\"]\n",
+                "user",
+            )
+            .unwrap(),
+        );
+        base.overlay(
+            Config::parse_layer(
+                "[sandbox]\nnet_allow_domains = [\"api.github.com\", \"raw.githubusercontent.com\"]\n",
+                "project",
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            base.sandbox.net_allow_domains,
+            vec![
+                "api.github.com".to_string(),
+                "*.corp.example".to_string(),
+                "raw.githubusercontent.com".to_string(),
+            ],
+            "user + project lists merge deduped"
+        );
+        assert_eq!(
+            base.sandbox.net_deny_domains,
+            vec!["evil.example".to_string()],
+            "deny list survives the overlay"
+        );
+        let policy_cfg = base.sandbox.to_policy_config();
+        assert_eq!(policy_cfg.net_allow_domains.len(), 3);
+        assert_eq!(policy_cfg.net_deny_domains.len(), 1);
+        // the resolved policy carries both lists through to the proxy
+        let dir = std::env::temp_dir().join(format!("ka-cfg-domains-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let policy = ka_sandbox::policy_from_config(&policy_cfg, &dir).unwrap();
+        let net = policy.net_domains().expect("fs policy carries domains");
+        assert_eq!(net.allow.len(), 3);
+        assert_eq!(net.deny, vec!["evil.example"]);
+        assert!(net.is_restricted());
+        // an fs policy WITHOUT lists stays unrestricted (proxy inert)
+        let plain = ka_sandbox::SandboxConfig {
+            mode: Some("fs".into()),
+            ..Default::default()
+        };
+        let policy = ka_sandbox::policy_from_config(&plain, &dir).unwrap();
+        assert!(!policy.net_domains().unwrap().is_restricted());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -39,6 +39,37 @@ pub fn exec_trampoline(
                 .collect()
         })
         .unwrap_or_default();
+    // PERM-03: TCP ports the child may still CONNECT to (the loopback
+    // proxy's port under a domain-scoped policy) even though network is
+    // otherwise denied. Landlock's network rules are port-granular —
+    // any address on such a port is reachable; the proxy's own domain
+    // filter is what scopes the destination.
+    let net_ports: Vec<u16> = parsed
+        .get("net_ports")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_u64().map(|p| p as u16))
+                .collect()
+        })
+        .unwrap_or_default();
+    // PERM-03: explicit proxy env pairs — the dynamic loopback proxy URL
+    // is not in the parent environment, so it rides the policy itself
+    let env_pairs: Vec<(String, String)> = parsed
+        .get("env_pairs")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| {
+                    let pair = x.as_array()?;
+                    Some((
+                        pair.first()?.as_str()?.to_string(),
+                        pair.get(1)?.as_str()?.to_string(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let (program, args) = argv
         .split_first()
         .ok_or_else(|| "sandbox-exec: no command after --".to_string())?;
@@ -49,7 +80,7 @@ pub fn exec_trampoline(
         .iter()
         .map(|w| crate::resolve_writable(w.as_path()))
         .collect::<Result<_, _>>()?;
-    apply_landlock(&writable, allow_net)?;
+    apply_landlock(&writable, allow_net, &net_ports)?;
     // parity with bwrap --clearenv: the sandboxed command must not see
     // the parent's environment (provider API keys live there). PATH is
     // re-set to the bare minimum so plain commands still resolve; env
@@ -66,6 +97,11 @@ pub fn exec_trampoline(
     for (name, value) in passed {
         cmd.env(name, value);
     }
+    // PERM-03: the domain-scoped policy's proxy env rides the policy
+    // (the URL is dynamic — it is not in the parent environment)
+    for (name, value) in env_pairs {
+        cmd.env(name, value);
+    }
     let err = cmd.exec();
     // exec() only returns on failure
     Err(format!("sandbox-exec: {program}: {err}"))
@@ -74,13 +110,20 @@ pub fn exec_trampoline(
 /// Landlock policy: read everything beneath `/`; write only beneath the
 /// allowlist; network (bind/connect) denied when the kernel ABI ≥ 4 and
 /// the policy does not grant it (older kernels degrade silently —
-/// filesystem enforcement stays). Mirrors what bwrap's `--unshare-all`
+/// filesystem enforcement stays). `net_ports` are CONNECT exceptions for
+/// a domain-scoped policy (PERM-03): landlock rules are port-granular,
+/// so the loopback proxy's port stays reachable — the proxy itself does
+/// the per-domain filtering. Mirrors what bwrap's `--unshare-all`
 /// gives the fs tier.
 #[cfg(target_os = "linux")]
-fn apply_landlock(writable: &[std::path::PathBuf], allow_net: bool) -> Result<(), String> {
+fn apply_landlock(
+    writable: &[std::path::PathBuf],
+    allow_net: bool,
+    net_ports: &[u16],
+) -> Result<(), String> {
     use landlock::{
-        ABI, Access, AccessFs, AccessNet, Compatible, LandlockStatus, Ruleset, RulesetAttr,
-        RulesetCreatedAttr, path_beneath_rules,
+        ABI, Access, AccessFs, AccessNet, Compatible, LandlockStatus, NetPort, Ruleset,
+        RulesetAttr, RulesetCreatedAttr, path_beneath_rules,
     };
 
     // newest ABI the crate knows: IoctlDev (V5) and later rights get
@@ -109,6 +152,15 @@ fn apply_landlock(writable: &[std::path::PathBuf], allow_net: bool) -> Result<()
         .map_err(|e| format!("sandbox: read rules: {e}"))?
         .add_rules(path_beneath_rules(writable.iter(), AccessFs::from_all(abi)))
         .map_err(|e| format!("sandbox: write rules: {e}"))?;
+    // the proxy-port exceptions ride the created ruleset: ConnectTcp on
+    // exactly those ports, everything else handled-and-ungranted stays
+    // denied (best-effort on kernels without net support)
+    let mut created = created;
+    for port in net_ports {
+        created = created
+            .add_rule(NetPort::new(*port, AccessNet::ConnectTcp))
+            .map_err(|e| format!("sandbox: net port {port}: {e}"))?;
+    }
     let status = created
         .set_compatibility(landlock::CompatLevel::BestEffort)
         .restrict_self()

@@ -322,6 +322,7 @@ fn sandbox_check(cfg: &Config) -> Check {
         Some(ka_sandbox::Tool::Bubblewrap) => "bubblewrap (bwrap)",
         Some(ka_sandbox::Tool::Firejail) => "firejail",
         Some(ka_sandbox::Tool::Landlock) => "kernel landlock (re-exec trampoline)",
+        Some(ka_sandbox::Tool::Seatbelt) => "macOS seatbelt (sandbox-exec)",
         None => "none",
     };
     let fs_configured = cfg.sandbox.mode.as_deref() == Some("fs");

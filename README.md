@@ -87,16 +87,17 @@ Handy extras, all strict-TOML like everything else:
 - **Unbypassable hardstops** — root rm, fork bombs, fetch-and-execute: they ask even in allow mode; headless denies.
 - **Read ledger** — edits refuse files the model has not read, or that changed since.
 - **Secret redaction**, one-way, in every tool result.
-- **Optional fs sandbox** for bash children (bwrap / firejail / landlock), fail-closed; the landlock backend exposes only an enumerated `/dev` surface (`null`, `zero`, `full`, `random`, `urandom`, `shm`) rather than the host `/dev`.
+- **Optional fs sandbox** for bash children (bwrap / firejail / landlock / macOS seatbelt), fail-closed; the landlock backend exposes only an enumerated `/dev` surface (`null`, `zero`, `full`, `random`, `urandom`, `shm`) rather than the host `/dev`; Windows has no backend — `mode "fs"` fails closed with a platform-named error.
+- **Network domain allowlist** — `[sandbox] net_allow_domains` / `net_deny_domains` inject a loopback HTTP/CONNECT proxy into sandboxed bash children: domains resolve through the filter (wildcards, deny-first), every host is resolved once and pinned, and private/loopback targets are refused unless explicitly allowlisted (anti-DNS-rebinding). Enforcement covers proxy-honoring clients (curl/wget/git/pip…); landlock confines raw TCP to the proxy port.
 - **`ka --safe-mode`** — the troubleshooting floor: every customization off, built-ins kept.
 - **`--tools read,edit`** — positive allowlist for the session; `--ignore-rules` runs without `[[rules]]` tables and rule files (hardstops always stay; they are not rules).
 - **Permission profiles** — `[permissions.profiles.<name>]` named rule bundles with one-level `extends`, activated by `[permissions] profile`; profile rules evaluate before `[[rules]]` (more specific first). `ka rules check <command>` dry-runs your rules against a command.
 - **dontAsk mode** — `--mode dontask` denies everything that would ask (hardstops still confirm); for CI and unattended runs.
 - **Prompt policy** — `[permissions] prompt_policy = "deny"` auto-denies reviewable asks for serve/CI sessions.
 - **Auto-review tier** — `[guards] auto_review_tier = "exec+write"` extends the fast-role reviewer to write-tier asks (auto-allow only, every decision noted).
-- **MCP de primera clase** — OAuth para servers HTTP (DCR/CIMD dinámico, callback local, token cache con refresh, `bearer_token_env` / `headers_helper` por server); elicitation (pregunta al usuario), sampling (usa tu modelo), `roots` y notificaciones server-initiated aplicadas en vivo; política por server/tool (lote 10).
-- **`ka mcp-serve`** — expone las hands de lectura de ka (read/glob/grep/sessions_search/session_info) como un servidor MCP stdio para cualquier host MCP; read-only por diseño (sin bash en el servidor).
-- **Roles y routers** — `[roles.<nombre>]` para cualquier nombre (referenciable como `@nombre` en `--model`/`SetModel`) y `[virtual_models.<nombre>]` con estrategia `round_robin`/`failover` sobre una lista de selectores.
+- **First-class MCP** — OAuth for HTTP servers (dynamic DCR/CIMD, local callback, token cache with refresh, `bearer_token_env` / `headers_helper` per server); elicitation (asks the user), sampling (uses your model), `roots` and server-initiated notifications applied live; per-server/tool policy.
+- **`ka mcp-serve`** — exposes ka's read hands (read/glob/grep/sessions_search/session_info) as a stdio MCP server for any MCP host; read-only by design (no bash in the server).
+- **Roles and routers** — `[roles.<name>]` for any name (reference as `@name` in `--model`/`SetModel`) and `[virtual_models.<name>]` with `round_robin`/`failover` strategies over a list of selectors.
 - **Injection screening** — web results are scanned for known prompt-injection markers and flagged on the transcript; `[guards] injection_check = true` adds a fast-role classifier.
 - **Shell env policy** — `[shell] env = "core"|"none"|"all"`, `env_keep`, `env_set` control exactly what environment bash children see.
 - **Run caps** — `--max-budget-usd` asks to stop past a spend ceiling, `--max-cost`/`--max-time` exit with code 3 when crossed, `--warn-cost` warns on stderr.
