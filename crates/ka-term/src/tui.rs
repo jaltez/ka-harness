@@ -14217,6 +14217,25 @@ pub fn status_ids_valid(order: &[String]) -> Result<(), String> {
 /// segment that has nothing to say is skipped, never a bare label),
 /// goal/loop badges still close the row (state badges, not segments).
 /// The default order lives in [`status_left`]/[`status_right`].
+/// Fit a status bar to its width without ever cutting a segment: whole
+/// spans of the left cluster are dropped from its end (the least
+/// important ones live last) until the right cluster fits untouched.
+fn fit_status_left(
+    mut left: Vec<ratatui::text::Span<'static>>,
+    rw: usize,
+    width: usize,
+) -> Vec<ratatui::text::Span<'static>> {
+    let lw = |v: &[ratatui::text::Span<'static>]| -> usize {
+        use unicode_width::UnicodeWidthStr;
+        v.iter().map(|s| s.content.as_ref().width()).sum()
+    };
+    let room = width.saturating_sub(2);
+    while !left.is_empty() && lw(&left) + rw > room {
+        left.pop();
+    }
+    left
+}
+
 pub fn status_segments(meters: &Meters, order: &[String]) -> Vec<ratatui::text::Span<'static>> {
     use ratatui::text::Span;
     let mut segs: Vec<Span<'static>> = Vec::new();
@@ -15528,6 +15547,8 @@ fn render(
             Some(order) => (status_segments(meters, order), Vec::new()),
             None => (status_left(meters), status_right(meters)),
         };
+        let rw0: usize = right.iter().map(|s| s.content.width()).sum();
+        let left = fit_status_left(left, rw0, status.width as usize);
         let lw: usize = left.iter().map(|s| s.content.width()).sum();
         let rw: usize = right.iter().map(|s| s.content.width()).sum();
         // one col of air at each end
@@ -18723,6 +18744,27 @@ mod tests {
         assert_eq!(window_range(100, 20, Some(95)), (80, true));
         // zero visible
         assert_eq!(window_range(100, 0, Some(10)), (0, true));
+    }
+
+    /// The status bar never cuts a segment: whole spans drop from the end
+    /// of the left cluster, and the right cluster (cost, mode chip) keeps
+    /// every cell.
+    #[test]
+    fn status_bar_drops_whole_segments_and_keeps_the_right_cluster() {
+        use ratatui::text::Span;
+        let long = vec![
+            Span::raw("zai/glm-5.3"),
+            Span::raw(" high"),
+            Span::raw(" 2 tasks · 1 job · 1 dap"),
+        ];
+        let left = fit_status_left(long.clone(), 12, 80);
+        assert_eq!(left.len(), 3, "roomy bars keep everything");
+        let left = fit_status_left(long, 12, 26);
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].content.as_ref(), "zai/glm-5.3");
+        let wide = vec![Span::raw("a".repeat(40))];
+        let empty = fit_status_left(wide, 10, 20);
+        assert!(empty.is_empty(), "{empty:?}");
     }
 
     /// The rules that guard typed work and empty filters, pinned where a

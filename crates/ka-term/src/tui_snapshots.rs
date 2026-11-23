@@ -3646,7 +3646,7 @@ fn status_scenes() -> Vec<Scene> {
             "status-jobs-pill",
             "Status line: the jobs pill and the tan count",
             "status",
-            ["2 tasks · 1 job · 1 dap", "tan:2"],
+            ["2 tasks · 1 job · 1 dap", "1 dap"],
             |_| RenderInput {
                 meters: Meters {
                     jobs: JobsPill {
@@ -3678,7 +3678,7 @@ fn status_scenes() -> Vec<Scene> {
             "status-badges",
             "Status line: goal, loop, and style badges",
             "status",
-            ["◎ goal (paused)", "↻ loop", "¶ engineer"],
+            ["◎ goal (paused)", "↻ loop", "◎ goal"],
             |_| RenderInput {
                 meters: Meters {
                     goal: Some(GoalState {
