@@ -242,6 +242,28 @@ pub fn modal_lines(
                 .collect();
             ("rewind".into(), rows)
         }
+        Modal::PromptActions {
+            turns,
+            prompt,
+            selected,
+        } => {
+            let rows = vec![
+                format!("\"{prompt}\"  [-{turns}]"),
+                format!(
+                    "{} rewind here — cut -{turns} turn(s) (enter/r)",
+                    marker(0, *selected)
+                ),
+                format!(
+                    "{} rewind & edit — cut, then resend this prompt (e)",
+                    marker(1, *selected)
+                ),
+                format!(
+                    "{} fork here — branch a copy, original stays intact (f)",
+                    marker(2, *selected)
+                ),
+            ];
+            ("rewind".into(), rows)
+        }
         Modal::Memory {
             rows,
             inbox,

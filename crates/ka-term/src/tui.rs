@@ -674,6 +674,8 @@ pub enum RowRef {
     ToolCall(usize, usize),
     /// A verdict summary carrying hidden detail (folds on click).
     Summary(usize),
+    /// A user prompt row (click opens the rewind/fork popup).
+    User(usize),
 }
 
 /// One finished tool call inside a [`Line::ToolBlock`] row.
@@ -867,16 +869,28 @@ impl Transcript {
         }
     }
 
-    /// What a rendered row belongs to (click mapping): a plain entry
-    /// (thought-toggle target) or one specific call inside a tool
-    /// block (expand target, `(entry, call)`). Every row of a call —
-    /// header and threaded body alike — maps to that call; calls stack
-    /// with no rows between them. `/focus` digest rows map to nothing.
+    /// What a rendered row belongs to (click mapping): a user prompt
+    /// (the rewind/fork popup target), a plain entry (thought-toggle
+    /// target), or one specific call inside a tool block (expand
+    /// target, `(entry, call)`). Every row of a call — header and
+    /// threaded body alike — maps to that call; calls stack with no
+    /// rows between them. `/focus` head rows are one digest per
+    /// earlier prompt and answer as that prompt.
     pub fn row_ref_at(&self, row: usize) -> Option<RowRef> {
-        if let Some(full) = self.focus_to_full_row(row) {
-            return self.row_ref_at_full(full);
+        match (self.focus).then(|| self.focus_cut()).flatten() {
+            // `/focus` head: the digest row IS the prompt's row; the
+            // collapsed body entries behind it own no row
+            Some(cut) if row < self.focus_head_rows(cut) => {
+                self.focus_digest_entry(row, cut).map(RowRef::User)
+            }
+            Some(_) => self
+                .focus_to_full_row(row)
+                .and_then(|full| self.row_ref_at_full(full)),
+            // full view: rows are full rows. The focus mapping assumes
+            // the collapsed head and must not shift them — ungated, it
+            // mis-mapped every row once a session had two prompts.
+            None => self.row_ref_at_full(row),
         }
-        None
     }
 
     /// Click mapping over full-view rows ([`row_ref_at`]'s engine).
@@ -889,6 +903,7 @@ impl Transcript {
                     Line::Summary {
                         detail: Some(_), ..
                     } => RowRef::Summary(i),
+                    Line::User(_) => RowRef::User(i),
                     Line::ToolBlock(calls) => {
                         let mut off = row - acc;
                         for (j, call) in calls.iter().enumerate() {
@@ -3116,6 +3131,76 @@ fn rewind_items_from(
         .unwrap_or_default()
 }
 
+/// The rewind target for a clicked transcript prompt: the prompt's own
+/// occurrence among the strand's rewindable items ([`rewind_items`],
+/// newest first). Duplicated prompts resolve per occurrence — clicking
+/// the older of two identical prompts targets the older turn. `None`
+/// when the prompt has no rewind target from here (a `/`-command, or
+/// older than the 20-item rewind window): `/tree` still reaches it.
+fn rewind_turn_for_prompt(
+    entries: &[Line],
+    clicked: usize,
+    items: &[(usize, String)],
+) -> Option<(usize, String)> {
+    let text = match entries.get(clicked) {
+        Some(Line::User(t)) => t.clone(),
+        _ => return None,
+    };
+    // identical echoes of this prompt rank from the newest: 0 = newest
+    let rank_from_newest = entries
+        .iter()
+        .skip(clicked + 1)
+        .filter(|l| matches!(l, Line::User(t) if *t == text))
+        .count();
+    items
+        .iter()
+        .filter(|(_, t)| *t == text)
+        .nth(rank_from_newest)
+        .cloned()
+}
+
+/// Apply a rewind picked from either the double-esc menu or the
+/// click-a-prompt popup: the engine cuts the last `turns` user
+/// records, and the transcript is trimmed at the picked prompt's own
+/// row (falling back to the count when the text never echoed onto the
+/// transcript — steers render as Info rows). With `edit`, the prompt
+/// lands in the composer instead of being dropped.
+async fn apply_rewind(
+    commands: &tokio::sync::mpsc::Sender<Command>,
+    transcript: &mut Transcript,
+    input: &mut InputBuffer,
+    turns: usize,
+    prompt: &str,
+    edit: bool,
+) {
+    let _ = commands
+        .send(Command::Rewind {
+            turns: turns as u32,
+        })
+        .await;
+    let row = transcript
+        .entries()
+        .iter()
+        .rposition(|l| matches!(l, Line::User(t) if t == prompt));
+    match row {
+        Some(i) => {
+            transcript.rewind_at(i);
+        }
+        None => {
+            transcript.rewind_user(turns);
+        }
+    }
+    if edit {
+        input.text = prompt.to_string();
+        input.cursor = input.text.chars().count();
+        transcript.push_separated(Line::Info("✎ edit & resend — ⏎ sends when ready".into()));
+    } else {
+        transcript.push_separated(Line::Info(format!(
+            "⏪ rewound {turns} turn(s) — files unchanged (/undo restores edits)"
+        )));
+    }
+}
+
 /// The Esc arm of the key loop, extracted so its precedence is testable
 /// against the command channel: unfocus first, unpin, abort only
 /// unscrolled, rewind on the double-press. `rewind` is computed
@@ -4416,6 +4501,18 @@ pub enum Modal {
     Rewind {
         /// (turns-from-end, prompt text); 1 = most recent.
         items: Vec<(usize, String)>,
+        /// Selected row.
+        selected: usize,
+    },
+    /// Click-a-prompt popup: rewind / edit / fork at ONE past user
+    /// message — the mouse shortcut for the double-esc rewind menu
+    /// and `/tree`'s fork points.
+    PromptActions {
+        /// Turns-from-end of the clicked prompt (1 = most recent).
+        turns: usize,
+        /// The prompt's own text (staged into the composer on fork /
+        /// edit & resend).
+        prompt: String,
         /// Selected row.
         selected: usize,
     },
@@ -5935,41 +6032,85 @@ async fn app(
                                         let edit = key.code == KeyCode::Char('e');
                                         let (turns, prompt) = items[*selected].clone();
                                         modal = None;
-                                        let _ = commands
-                                            .send(Command::Rewind { turns: turns as u32 })
-                                            .await;
-                                        // the menu numbers strand user records;
-                                        // transcript rows diverge from them
-                                        // (steers render as Info rows) — cut at
-                                        // the picked prompt's own row, falling
-                                        // back to the count when the text never
-                                        // echoed onto the transcript
-                                        let row = transcript
-                                            .entries()
-                                            .iter()
-                                            .rposition(
-                                                |l| matches!(l, Line::User(t) if *t == prompt),
-                                            );
-                                        match row {
-                                            Some(i) => {
-                                                transcript.rewind_at(i);
-                                            }
-                                            None => {
-                                                transcript.rewind_user(turns);
-                                            }
+                                        apply_rewind(
+                                            commands,
+                                            &mut transcript,
+                                            &mut input,
+                                            turns,
+                                            &prompt,
+                                            edit,
+                                        )
+                                        .await;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            Modal::PromptActions {
+                                turns,
+                                prompt,
+                                selected,
+                            } => {
+                                match key.code {
+                                    KeyCode::Esc => modal = None,
+                                    KeyCode::Up => {
+                                        *selected = selected.saturating_sub(1);
+                                    }
+                                    KeyCode::Down => {
+                                        if *selected + 1 < 3 {
+                                            *selected += 1;
                                         }
-                                        if edit {
-                                            input.text = prompt;
-                                            input.cursor = input.text.chars().count();
-                                            transcript.push_separated(Line::Info(
-                                                "✎ edit & resend — ⏎ sends when ready"
-                                                    .into(),
+                                    }
+                                    KeyCode::Enter | KeyCode::Char('r') | KeyCode::Char('e') => {
+                                        // mid-turn the command drain swallows
+                                        // Rewind/ForkStrand — act only from
+                                        // idle, like the /tree fork
+                                        if busy {
+                                            transcript.push_separated(Line::Warn(
+                                                "⏳ turn running — esc to abort first".into(),
                                             ));
-                                        } else {
-                                            transcript.push_separated(Line::Info(format!(
-                                                "⏪ rewound {turns} turn(s) — files unchanged (/undo restores edits)"
-                                            )));
+                                            continue;
                                         }
+                                        let edit = key.code == KeyCode::Char('e');
+                                        let (turns, prompt) = (*turns, prompt.clone());
+                                        modal = None;
+                                        apply_rewind(
+                                            commands,
+                                            &mut transcript,
+                                            &mut input,
+                                            turns,
+                                            &prompt,
+                                            edit,
+                                        )
+                                        .await;
+                                    }
+                                    KeyCode::Char('f') => {
+                                        if busy {
+                                            transcript.push_separated(Line::Warn(
+                                                "⏳ turn running — esc to abort first".into(),
+                                            ));
+                                            continue;
+                                        }
+                                        // branch point: the current strand
+                                        // stays intact, the fork child
+                                        // continues from before the picked
+                                        // input (same as /tree)
+                                        let (turns, prompt) = (*turns, prompt.clone());
+                                        let _ = commands
+                                            .send(Command::ForkStrand { turns: turns as u32 })
+                                            .await;
+                                        busy = true;
+                                        modal = None;
+                                        // going back lands the picked prompt
+                                        // in the composer; an existing draft
+                                        // is parked in the kill ring (Ctrl+Y)
+                                        if !input.text.is_empty() {
+                                            input.clear_draft();
+                                        }
+                                        input.text = prompt.clone();
+                                        input.cursor = input.text.chars().count();
+                                        transcript.push_separated(Line::Info(format!(
+                                            "⑂ forked {turns} turn(s) back — prompt in the box; original intact in /tree"
+                                        )));
                                     }
                                     _ => {}
                                 }
@@ -8590,6 +8731,7 @@ async fn app(
                             Modal::Prompts { .. } => {}
                             Modal::Memory { .. } => {}
                             Modal::Rewind { .. } => {}
+                            Modal::PromptActions { .. } => {}
                             Modal::Tree { .. } => {}
                             Modal::Features { .. } => {}
                             Modal::Session(picker) => {
@@ -8934,6 +9076,36 @@ async fn app(
                                                 view_rows,
                                                 false,
                                             );
+                                        }
+                                        Click::User { entry } => {
+                                            // resolve the clicked prompt
+                                            // against the strand's
+                                            // rewindable items — the menu
+                                            // numbers engine history, and
+                                            // transcript rows drift from it
+                                            let items = rewind_items(
+                                                Some(meters.session.as_str())
+                                                    .filter(|s| !s.is_empty()),
+                                            );
+                                            match rewind_turn_for_prompt(
+                                                transcript.entries(),
+                                                entry,
+                                                &items,
+                                            ) {
+                                                Some((turns, prompt)) => {
+                                                    modal = Some(Modal::PromptActions {
+                                                        turns,
+                                                        prompt,
+                                                        selected: 0,
+                                                    });
+                                                }
+                                                None => {
+                                                    transcript.push_separated(Line::Info(
+                                                        "no rewind target for this prompt (a /-command, or older than the 20-turn window) — /tree reaches it"
+                                                            .into(),
+                                                    ));
+                                                }
+                                            }
                                         }
                                         Click::Todos => {
                                             modal = Some(Modal::Todos {
@@ -12995,6 +13167,13 @@ fn modal_hints(open: &Modal) -> &'static [(&'static str, &'static str)] {
             ("s", "summarize"),
             ("esc", "close"),
         ],
+        Modal::PromptActions { .. } => &[
+            ("↑↓", "choose"),
+            ("⏎/r", "rewind"),
+            ("e", "edit & resend"),
+            ("f", "fork"),
+            ("esc", "close"),
+        ],
         Modal::Memory { inbox, .. } if inbox.is_empty() => &[("esc", "close")],
         Modal::Memory { .. } => &[
             ("↑↓", "choose"),
@@ -15374,6 +15553,41 @@ fn render(
                 }
                 (width, height, modal_title("rewind"), text)
             }
+            Modal::PromptActions {
+                turns,
+                prompt,
+                selected,
+            } => {
+                // hint + prompt echo + 3 actions, plus the frame's 4 chrome rows
+                let height = 9.min(modal_area.height.max(6));
+                let width = 76.min(fw);
+                let mut text = vec![TuiLine::styled(
+                    "⏎/r rewind · e edit & resend · f fork · esc close",
+                    meta,
+                )];
+                // echo the picked prompt (dimmed): the backdrop dims the
+                // transcript row the click landed on
+                text.push(list_row(format!("“{prompt}”"), false, inner(width), meta));
+                text.push(list_row(
+                    format!("⏪ rewind here — cut −{turns} turn(s) (⏎/r)"),
+                    *selected == 0,
+                    inner(width),
+                    meta,
+                ));
+                text.push(list_row(
+                    "✎ rewind & edit — cut, then resend this prompt (e)".to_string(),
+                    *selected == 1,
+                    inner(width),
+                    meta,
+                ));
+                text.push(list_row(
+                    "⑂ fork here — branch a copy, original stays intact (f)".to_string(),
+                    *selected == 2,
+                    inner(width),
+                    meta,
+                ));
+                (width, height, modal_title("rewind"), text)
+            }
             Modal::Memory {
                 rows,
                 inbox,
@@ -16560,9 +16774,21 @@ fn modal_close_hit(rect: ratatui::layout::Rect, x: u16, y: u16) -> bool {
 /// order matches the old press-time handler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Click {
-    Tool { entry: usize, call: usize },
-    Thought { entry: usize },
-    Summary { entry: usize },
+    Tool {
+        entry: usize,
+        call: usize,
+    },
+    Thought {
+        entry: usize,
+    },
+    Summary {
+        entry: usize,
+    },
+    /// A user prompt row: opens the rewind/fork popup (the mouse
+    /// shortcut for double-esc rewind and `/tree`).
+    User {
+        entry: usize,
+    },
     JumpUp,
     JumpDown,
     Todos,
@@ -16599,6 +16825,7 @@ fn click_target(
         let row = start + (row - area.y) as usize;
         return match transcript.row_ref_at(row) {
             Some(RowRef::ToolCall(entry, call)) => Click::Tool { entry, call },
+            Some(RowRef::User(entry)) => Click::User { entry },
             Some(RowRef::Entry(entry)) => Click::Thought { entry },
             Some(RowRef::Summary(entry)) => Click::Summary { entry },
             None => Click::None,
@@ -16609,11 +16836,13 @@ fn click_target(
 
 /// What the pointer currently hovers — the visual affordance mirror of
 /// [`Click`]. Only elements with an action highlight: cards, foldable
-/// thinking bands, the strip buttons, the ▲▼ jump arrows, the rail
-/// thumb, and a modal's ✕ chip. Plain prose rows are inert.
+/// thinking bands, user prompts (the rewind/fork popup), the strip
+/// buttons, the ▲▼ jump arrows, the rail thumb, and a modal's ✕ chip.
+/// Plain prose rows are inert.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Hover {
-    /// One transcript entry (a tool card or a foldable thinking band).
+    /// One transcript entry (a tool card, a foldable thinking band, or
+    /// a user prompt — the rewind/fork popup target).
     Entry(usize),
     /// The ✕ chip of the open modal / chip-bearing popup.
     Chip,
@@ -16675,6 +16904,7 @@ fn hover_target(
     }
     match click_target(strip, arrows, tx, transcript, col, row) {
         Click::Tool { entry, .. } => Some(Hover::Entry(entry)),
+        Click::User { entry } => Some(Hover::Entry(entry)),
         Click::Thought { entry } => transcript.is_foldable(entry).then_some(Hover::Entry(entry)),
         Click::Summary { entry } => transcript
             .summary_foldable(entry)
@@ -23815,6 +24045,11 @@ mod tests {
                 items: vec![(1, "hello".into())],
                 selected: 0,
             },
+            Modal::PromptActions {
+                turns: 2,
+                prompt: "fix the flaky test".into(),
+                selected: 0,
+            },
             Modal::Memory {
                 rows: vec![],
                 inbox: vec![],
@@ -23857,6 +24092,7 @@ mod tests {
             modal_title("api key"),
             modal_title("spills"),
             modal_title("prompts"),
+            modal_title("rewind"),
             modal_title("rewind"),
             modal_title("memory"),
             modal_title("usage"),
@@ -24629,14 +24865,205 @@ mod tests {
             click_target(&strip, &arrows, &tx, &t, 116, 0),
             Click::JumpDown
         );
-        // a transcript row resolves to its entry (a user row: a
-        // thought-toggle that no-ops, matching the old handler)
+        // a transcript row resolves to its entry (a user row: the
+        // rewind/fork popup; the thought row after it: the thought toggle)
         assert_eq!(
             click_target(&strip, &arrows, &tx, &t, 5, 2),
-            Click::Thought { entry: 0 }
+            Click::User { entry: 0 }
+        );
+        let thought_row = 2 + t.rendered_rows_of(0) as u16;
+        assert_eq!(
+            click_target(&strip, &arrows, &tx, &t, 5, thought_row),
+            Click::Thought { entry: 1 }
         );
         // outside every zone: inert
         assert_eq!(click_target(&strip, &arrows, &tx, &t, 60, 20), Click::None);
+    }
+
+    /// A user prompt row hovers (the popup affordance) where plain
+    /// prose stays inert, and the popup's rewind target resolves per
+    /// occurrence: duplicated prompts pick the clicked one, `/`-rows
+    /// and prompts outside the rewind window resolve to nothing.
+    #[test]
+    fn user_prompt_click_and_rewind_turn_resolution() {
+        let modal_zone = std::cell::Cell::new(None::<ratatui::layout::Rect>);
+        let popup_zone = std::cell::Cell::new(None::<ratatui::layout::Rect>);
+        let rail =
+            std::cell::Cell::new(None::<(ratatui::layout::Rect, usize, usize, usize, usize)>);
+        let strip = std::cell::Cell::new(None::<StripZones>);
+        let arrows = std::cell::Cell::new(None::<TitleArrows>);
+        let tx = std::cell::Cell::new(Some((
+            ratatui::layout::Rect {
+                x: 1,
+                y: 2,
+                width: 100,
+                height: 30,
+            },
+            0usize,
+        )));
+        let mut t = Transcript::default();
+        t.set_width(60);
+        t.push(Line::User("do it".into())); // entry 0
+        t.push(Line::Assistant("ok".into())); // entry 1: inert prose
+        t.push(Line::User("/slash".into())); // entry 2: never rewindable
+        t.push(Line::User("do it".into())); // entry 3: duplicate, newest
+        t.push(Line::Assistant("again".into())); // entry 4
+
+        // hover: the user rows light, assistant prose does not (screen
+        // row = transcript top + the rows the earlier entries occupy)
+        let row_of = |entry: usize| -> u16 {
+            2 + (0..entry).map(|i| t.rendered_rows_of(i)).sum::<usize>() as u16
+        };
+        let user_row = row_of(0);
+        let prose_row = row_of(1);
+        assert_eq!(
+            hover_target(
+                &modal_zone,
+                &popup_zone,
+                false,
+                &strip,
+                &arrows,
+                &rail,
+                &tx,
+                &t,
+                5,
+                user_row
+            ),
+            Some(Hover::Entry(0))
+        );
+        assert_eq!(
+            hover_target(
+                &modal_zone,
+                &popup_zone,
+                false,
+                &strip,
+                &arrows,
+                &rail,
+                &tx,
+                &t,
+                5,
+                prose_row
+            ),
+            None
+        );
+
+        // resolution: the newest "do it" is turns=1, the older one
+        // turns=3 ("/slash" persists as a strand record but the menu
+        // filters `/`-prompts, so the older echo sits three turns back)
+        let items = vec![
+            (1usize, "do it".to_string()),
+            (2, "middle".to_string()),
+            (3, "do it".to_string()),
+        ];
+        assert_eq!(
+            rewind_turn_for_prompt(t.entries(), 3, &items),
+            Some((1, "do it".to_string()))
+        );
+        assert_eq!(
+            rewind_turn_for_prompt(t.entries(), 0, &items),
+            Some((3, "do it".to_string()))
+        );
+        // a `/`-command echo and a prompt outside the window: no target
+        assert_eq!(rewind_turn_for_prompt(t.entries(), 2, &items), None);
+        assert_eq!(
+            rewind_turn_for_prompt(t.entries(), 0, &items[..1]),
+            None,
+            "the older echo is not in the (capped) item list"
+        );
+        // non-user rows resolve to nothing
+        assert_eq!(rewind_turn_for_prompt(t.entries(), 1, &items), None);
+    }
+
+    /// Regression: with several prompts, the full view maps every row
+    /// to its own entry. The `/focus` row mapping assumes the collapsed
+    /// head; applied ungated it shifted or deadened every row once a
+    /// session had two prompts (tool cards in earlier turns answered
+    /// the wrong click). `/focus` head rows answer as their prompt.
+    #[test]
+    fn row_refs_stay_true_with_several_prompts() {
+        let mut t = Transcript::default();
+        t.set_width(60);
+        t.push(Line::User("one".into()));
+        t.push(Line::Assistant("a1".into()));
+        t.push(Line::User("two".into()));
+        t.push(Line::Assistant("a2".into()));
+        let row_of =
+            |t: &Transcript, entry: usize| (0..entry).map(|i| t.rendered_rows_of(i)).sum::<usize>();
+        // full view: each entry's first row maps back to it
+        for entry in 0..4 {
+            let want = if matches!(t.entries()[entry], Line::User(_)) {
+                RowRef::User(entry)
+            } else {
+                RowRef::Entry(entry)
+            };
+            assert_eq!(t.row_ref_at(row_of(&t, entry)), Some(want), "entry {entry}");
+        }
+        assert_eq!(t.row_ref_at(t.total_rows()), None, "past the end");
+
+        // focus view: one digest row for "one", then the last turn in full
+        t.set_focus(true);
+        assert_eq!(
+            t.row_ref_at(0),
+            Some(RowRef::User(0)),
+            "digest row is its prompt"
+        );
+        assert_eq!(t.row_ref_at(1), Some(RowRef::User(2)));
+        assert_eq!(
+            t.row_ref_at(1 + t.rendered_rows_of(2)),
+            Some(RowRef::Entry(3))
+        );
+        assert_eq!(t.row_ref_at(t.total_rows()), None, "past the end (focus)");
+    }
+
+    /// The shared rewind applier: cuts the transcript at the picked
+    /// prompt's own row (not the nth-from-end count), and `edit`
+    /// stages the prompt into the composer instead of dropping it.
+    #[tokio::test]
+    async fn apply_rewind_cuts_at_the_prompt_and_stages_edits() {
+        let (tx_cmd, _rx) = tokio::sync::mpsc::channel::<Command>(4);
+        let mut t = Transcript::default();
+        t.push(Line::User("one".into()));
+        t.push(Line::Assistant("a1".into()));
+        t.push(Line::User("two".into()));
+        t.push(Line::Assistant("a2".into()));
+        let mut input = InputBuffer::default();
+
+        // plain rewind at "one" (turns=2): rows from that prompt onward go
+        apply_rewind(&tx_cmd, &mut t, &mut input, 2, "one", false).await;
+        let entries = t.entries();
+        assert!(
+            entries
+                .iter()
+                .all(|l| !matches!(l, Line::User(u) if u == "one" || u == "two")),
+            "both prompts cut: {entries:?}"
+        );
+        assert_eq!(input.text, "", "plain rewind leaves the composer alone");
+
+        // edit rewind: the picked prompt lands in the composer
+        let mut t = Transcript::default();
+        t.push(Line::User("keep".into()));
+        t.push(Line::User("drop".into()));
+        apply_rewind(&tx_cmd, &mut t, &mut input, 1, "keep", true).await;
+        assert_eq!(input.text, "keep");
+        assert_eq!(input.cursor, input.text.chars().count());
+        assert!(
+            t.entries()
+                .iter()
+                .all(|l| !matches!(l, Line::User(u) if u == "keep" || u == "drop")),
+            "cut prompts leave the transcript: {:?}",
+            t.entries()
+        );
+
+        // a prompt that never echoed (steers, /-style followups) falls
+        // back to the nth-from-end cut
+        let mut t = Transcript::default();
+        t.push(Line::User("seen".into()));
+        apply_rewind(&tx_cmd, &mut t, &mut input, 1, "never echoed", false).await;
+        assert!(
+            t.entries().iter().all(|l| !matches!(l, Line::User(_))),
+            "nth-from-end fallback cut the last user row: {:?}",
+            t.entries()
+        );
     }
 
     #[test]
@@ -26003,7 +26430,7 @@ mod tests {
         // row -> ref mapping: the first row of each entry maps back
         // to it (user blocks render with padding, so use real heights)
         let e = t.row_ref_at(0).unwrap();
-        assert_eq!(e, RowRef::Entry(0), "row 0 is the user block");
+        assert_eq!(e, RowRef::User(0), "row 0 is the user block");
         let first_of_1 = t.rendered_rows_of(0);
         let e1 = t.row_ref_at(first_of_1).unwrap();
         assert_eq!(

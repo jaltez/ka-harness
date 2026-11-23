@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### TUI
+- Click a past user prompt (capture mouse mode) → rewind popup: `⏎/r` rewind there · `e` rewind & edit · `f` fork from there (same actions as the double-esc menu and `/tree`; `/focus` digest rows answer the same way).
+- Fixed: transcript click/hover mapping with several prompts — the `/focus` row mapping was applied with `/focus` off, shifting or deadening rows (tool cards in earlier turns answered the wrong click).
+- Fixed: `/update` in-session resume re-exec failed with ENOENT after the binary swap.
+
 ## 0.8.0 — 2026-11-23
 
 ### Batch 5 — customizable TUI

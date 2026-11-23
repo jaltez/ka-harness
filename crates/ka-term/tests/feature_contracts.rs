@@ -841,8 +841,14 @@ fn focus_collapses_finished_turns_and_restores() {
     assert!(text.contains("first prompt"), "digest: {text:?}");
     assert!(t.row(focused).is_none(), "no rows past the focused view");
 
-    // digest rows carry no click target; live-turn rows still map
-    assert_eq!(t.row_ref_at(0), None, "a digest is not a toggle target");
+    // a digest is never a fold/toggle target — it answers as the
+    // prompt it stands for (the click-a-prompt rewind/fork popup);
+    // live-turn rows keep their own mapping
+    assert_eq!(
+        t.row_ref_at(0),
+        Some(ka_term::tui::RowRef::User(0)),
+        "a digest answers as its prompt, not as a toggle"
+    );
     assert!(t.row_ref_at(1).is_some(), "live rows keep their mapping");
 
     // the ▲▼ jump anchors: turn one on its digest, turn two on its rows
