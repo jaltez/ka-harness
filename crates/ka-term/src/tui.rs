@@ -3169,6 +3169,20 @@ fn ctrl_c_action(busy: bool, searching: bool, draft: bool, armed: bool) -> CtrlC
     }
 }
 
+/// The character a keypress types into the composer: a plain char, or
+/// a shifted one (the shifted glyph). A chord with Ctrl or Alt held
+/// types nothing — an unmapped chord must not leak its letter into the
+/// draft or the steer box when the arm that owns it is guarded off.
+fn typed_char(key: &crossterm::event::KeyEvent) -> Option<char> {
+    match (key.code, key.modifiers) {
+        (
+            crossterm::event::KeyCode::Char(c),
+            crossterm::event::KeyModifiers::NONE | crossterm::event::KeyModifiers::SHIFT,
+        ) => Some(c),
+        _ => None,
+    }
+}
+
 fn esc_action(
     focus_on: bool,
     scrolled: bool,
@@ -9016,7 +9030,7 @@ async fn app(
                             input.delete_forward();
                             slash_popup = update_suggestions(&input.text);
                         }
-                        (KeyCode::Char(c), _) => {
+                        _ if let Some(c) = typed_char(&key) => {
                             input.insert(c);
                             slash_popup = update_suggestions(&input.text);
                         }
@@ -19429,6 +19443,33 @@ mod tests {
             ctrl_c_action(false, true, false, true),
             CtrlCAction::CancelSearch
         );
+    }
+
+    #[test]
+    fn chords_never_type_letters() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let types = |code, modifiers| typed_char(&crossterm::event::KeyEvent::new(code, modifiers));
+        // plain and shifted characters type
+        assert_eq!(types(KeyCode::Char('a'), KeyModifiers::NONE), Some('a'));
+        assert_eq!(types(KeyCode::Char('A'), KeyModifiers::SHIFT), Some('A'));
+        assert_eq!(types(KeyCode::Char(' '), KeyModifiers::NONE), Some(' '));
+        // ctrl+p with the slash popup open, ctrl+r and alt+e mid-turn:
+        // the guarded chords type nothing
+        for (code, modifiers) in [
+            (KeyCode::Char('p'), KeyModifiers::CONTROL),
+            (KeyCode::Char('n'), KeyModifiers::CONTROL),
+            (KeyCode::Char('r'), KeyModifiers::CONTROL),
+            (KeyCode::Char('e'), KeyModifiers::ALT),
+            (KeyCode::Char('m'), KeyModifiers::ALT),
+            (
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+        ] {
+            assert_eq!(types(code, modifiers), None, "{code:?} {modifiers:?}");
+        }
+        assert_eq!(types(KeyCode::Enter, KeyModifiers::NONE), None);
+        assert_eq!(types(KeyCode::Backspace, KeyModifiers::NONE), None);
     }
 
     #[test]
