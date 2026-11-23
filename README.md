@@ -30,7 +30,7 @@ ka --session 3f9c2a81               # resume by id prefix or name
 ka run "summarize the build error"  # one headless turn; final text on stdout (--print ndjson for events)
 ```
 
-Essential keys: `Enter` send or steer mid-turn · `⇧Enter` newline (`Ctrl+J` fallback) · `Esc` close the open popup, clear the draft, unpin scroll, then abort · `Ctrl-C` abort · `/help` for the rest.
+Essential keys: `Enter` send or steer mid-turn · `⇧Enter` newline (`Ctrl+J` fallback) · `Esc` close the open popup, clear the draft, unpin scroll, then abort · `Ctrl-C` abort (backs out of a modal first; a second press quits) · `/help` for the rest.
 
 Markdown answers render with shaded code panels, tables, and mermaid diagrams drawn as box-drawing flowcharts, sequence and state diagrams, quadrant planes; anything the renderer does not cover keeps its source panel.
 
@@ -81,6 +81,8 @@ Handy extras, all strict-TOML like everything else:
 
 - **A TUI that bends** — themes as data (`[tui] theme = "solarized"` + live `/theme`, TOML in `.ka/themes/` or `~/.config/ka/themes/`), remappable keybindings by action id (`[keybindings]` in config, unknown = hard error), segmented status line (`[tui] status_line = [...]`), terminal title (`[tui] title`), notifications by event and condition (`notify_on`, `notify_unfocused` with focus reporting), `/copy` block picker, `/search` transcript search, `/changelog`, `/queue` visible follow-ups and `:emoji:` shortcodes on completion. (Spellcheck stays out — dictionary footprint.)
 - **Interactive TUI** — `/vim` (INSERT/NORMAL/VISUAL over the draft with motions and counts), `/screen` (fullscreen alt-screen with a clean transcript dump to the scrollback on exit), ghost text in the composer (Tab accepts), `/recap` (last recap or local summary), `/plain` (decoration-free render for screen readers), read-only `/hooks` //`/permissions` //`/doctor` panels, jobs/DAP pill on the status line, `/tan <question>` (tangential background question on a read-only child session — the answer arrives as a note, never a turn; `/tan` lists, `/tan cancel [id]` cancels; off in safe-mode).
+- **Mouse, in capture mode** (`[tui] mouse`, the default) — click a past prompt to rewind, edit or fork from it; click the composer hints (send, clear, history, commands) and the status line's mode chip and model label; scroll the command and `@` popups with the wheel; `@` opens the file list the moment it is typed and narrows it as you type. The todo list stays pinned above the composer while a turn runs.
+
 ## Safety
 
 - **Clearances** (read / write / exec) and four permission modes, `ask` → `allow` (`guarded`/`free`/`plan` still parse as pre-v0.5 aliases).

@@ -6,7 +6,7 @@ Goal: every surface of the TUI properly sized, legible, and doing what a user ex
 
 Three lenses, so a claim could be checked against two independent observations.
 
-1. **A frame harness, committed.** `crates/ka-term/src/tui_snapshots.rs` renders 214 scenes through the real `render` at 80x24, 120x40 and 200x50 (plus a 64x18 stress size), with exact colors. Each scene asserts the strings that make it usable. Regenerate with
+1. **A frame harness, committed.** `crates/ka-term/src/tui_snapshots.rs` renders 215 scenes through the real `render` at 80x24, 120x40 and 200x50 (plus a 64x18 stress size), with exact colors. Each scene asserts the strings that make it usable. Regenerate with
    `KA_SNAP_DIR=/tmp/snaps cargo test -p ka-term --all-features --lib tui::snapshots -- --ignored`; assert with the same command without `--ignored`.
 2. **The real binary on a pty.** `/tmp/ka-ux-rig/shoot.py` drives ka in a private tmux server, types, presses, clicks, and captures text and styled frames. Every capture run gets a throwaway HOME, `XDG_CONFIG_HOME`, `XDG_STATE_HOME` and data dir, because in-app saves write the user's config regardless of `--ephemeral` (see the open findings).
 3. **The real terminal.** Windows Terminal windows attached to the same sessions and captured with `wincap.ps1`, so the look is judged in the user's own font and color scheme.
@@ -38,15 +38,27 @@ Each landed as its own commit with its test or its harness scene.
 - The status line never cuts a segment; whole spans drop from the end of the left cluster, so the cost and the mode chip always survive.
 - Plain mode clears its pane before painting a modal (a screen reader used to hear fragments of both), wraps rows, and says a verdict once.
 - Commands echo as one dim line instead of a full prompt band.
-- The snapshot harness itself is the durable part: 214 scenes, asserted on every run.
+- The snapshot harness itself is the durable part: 215 scenes, asserted on every run.
 
 ## Added during the run, at the user's request
 
 - The click-a-prompt popup: Enter runs the highlighted row (`r`, `e`, `f` still jump straight to their action).
 - Composer popups list up to 14 rows in a 96-column box (from 7 in 64), the mouse wheel moves the highlight while one is open, and the ghost completes the highlighted command.
-- `@` mentions match fuzzily over the whole path, ranked: a filename prefix first, then segment starts, then scattered letters.
+- `@` opens the file list the moment the sigil is typed and re-ranks it on every character (Backspace too) with a fuzzy search over the whole path, ranked: a filename prefix first, then segment starts, then scattered letters. A query that matches nothing closes the list.
 - The composer hints that name an action are buttons for it (send, clear, history, commands); the status line's mode chip and model label open their pickers. A click is replayed as the equivalent key press through the real handler, so nothing is implemented twice.
 - The todo list is pinned above the composer while a turn runs, so it stays in view beside the streaming text.
+
+## Pre-release review
+
+An independent reviewer, given the range and the user's requests and none of this account, ran the gate in its own build directory, drove the real binary, and read the diff. Verdict: release with fixes. What it found, and what happened to each:
+
+- **Major, fixed.** The fuzzy `@` matcher mixed a byte offset into a char vector, so typing `@x` in a directory with a multibyte name crashed the composer. The offset is counted in characters now, and the test carries those paths.
+- **Fixed.** The `@` list opened only on Tab and closed on the next typed character. It now opens on the sigil and follows the typing.
+- **Fixed.** Rewinding the older of two identical prompts trimmed the view at the newer twin. The click popup carries its row, and the menu names the occurrence by rank.
+- **Fixed.** Three small ones: the model label took a click while the mode picker was open, the mode chip's icon cell was not clickable, and the pinned todo panel sat one column left of the transcript.
+- **Noted.** `Event::Inventory.skills` changed shape (`SkillEntry` instead of a name). The changelog carries it under Protocol.
+- **Left as is.** With a draft present, the `commands` hint types `/` into the draft, because that is what the key does.
+- **Left as is.** The dim ghost after `@` is prefix-only; the list is where fuzzy matches show.
 
 ## Open findings
 
