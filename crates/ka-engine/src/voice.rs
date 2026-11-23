@@ -237,6 +237,13 @@ fn message_tokens(msg: &TurnMessage, ratio: f64) -> u64 {
 /// result receiver).
 type SpecSlot = std::sync::Arc<tokio::sync::Mutex<Option<(usize, oneshot::Receiver<String>)>>>;
 
+/// A staged pre-finish step ([`Voice::pre_finish`]): runs just before
+/// the terminal TurnFinished, with read access to the voice so it can
+/// pick up the turn's messages. The returned future must not borrow —
+/// everything it needs is cloned out before the await.
+pub(crate) type PreFinish =
+    Box<dyn FnOnce(&Voice) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> + Send>;
+
 /// Shared LSP diagnostics manager (engine-owned, opt-in): edit/write
 /// results get informational diagnostics appended. A cheap cloneable
 /// handle — internal state lives behind its own locks, so polls never
@@ -288,13 +295,12 @@ pub struct Voice {
     hooks_cfg: Vec<crate::config::Hook>,
     /// Staged by the engine to run just before the terminal
     /// TurnFinished — auto-commit notes must precede the event ACP
-    /// clients break on. Taken and cleared at every turn exit.
-    /// Staged by the engine to run just before the terminal
-    /// TurnFinished — auto-commit notes must precede the event ACP
-    /// clients break on. Taken and cleared at every turn exit. (Mutex
-    /// keeps `Voice: Sync` — spawned turn futures hold `&Voice`.)
-    pub(crate) pre_finish:
-        Option<parking_lot::Mutex<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>>>,
+    /// clients break on. Taken and cleared at every turn exit. The
+    /// engine stages one per turn; it receives the voice so staged work
+    /// can read the just-finished turn's history (GIT-03 feeds the
+    /// turn's user/assistant pair to the commit-subject role). Mutex
+    /// keeps `Voice: Sync` — spawned turn futures hold `&Voice`.
+    pub(crate) pre_finish: Option<parking_lot::Mutex<PreFinish>>,
     /// Persistent allowlist from `[permissions] allow` (tools that skip
     /// the ask entirely).
     allowed_tools: Vec<String>,
@@ -1152,6 +1158,23 @@ impl Voice {
         WebGuard {
             classifier: Some(classifier),
         }
+    }
+
+    /// GIT-03: a cloneable aux-completion handle for the engine's
+    /// staged pre-finish step (the auto-commit subject role), which
+    /// cannot borrow the voice mid-turn. Same plumbing as
+    /// [`Voice::role_complete`] — unknown model degrades to None and
+    /// the caller falls back.
+    pub(crate) fn aux_handle(&mut self, model_id: &str) -> Option<AuxRole> {
+        let dialect = self.catalog.get(model_id)?.clone();
+        let speaker = self.speaker(dialect.wire);
+        AuxRole::resolve(
+            model_id.to_string(),
+            dialect,
+            self.session_id.clone(),
+            speaker,
+            Self::ROLE_MAX_OUTPUT,
+        )
     }
 
     /// Set the per-turn tool allowlist (engine clears it after the
@@ -3423,7 +3446,7 @@ impl Voice {
         let pre = self.pre_finish.take().map(parking_lot::Mutex::into_inner);
         if final_stop == Stop::Done {
             if let Some(fut) = pre {
-                fut.await;
+                fut(self).await;
             }
         }
         events
@@ -5119,11 +5142,12 @@ enum AskOutcome {
 
 /// One resolved auxiliary fast-role completion handle: dialect +
 /// speaker + auth, cloned out of the voice so spawned tool tasks (the
-/// `[guards] injection_check` classifier) can run short completions
-/// without borrowing the voice itself. Same plumbing as
+/// `[guards] injection_check` classifier) and the engine's staged
+/// pre-finish work (GIT-03 auto-commit subject) can run short
+/// completions without borrowing the voice itself. Same plumbing as
 /// [`Voice::role_complete`], which delegates here.
 #[derive(Clone)]
-struct AuxRole {
+pub(crate) struct AuxRole {
     model_id: String,
     dialect: ka_dialect::Dialect,
     token: Option<String>,
@@ -5157,7 +5181,7 @@ impl AuxRole {
     /// Clamp the output cap (chars) and resolve auth. Callers pass the
     /// cap: [`Voice::ROLE_MAX_OUTPUT`] for few-word roles, a
     /// sampling-derived cap for MCP sampling (EXT-05b).
-    fn resolve(
+    pub(crate) fn resolve(
         model_id: String,
         mut dialect: ka_dialect::Dialect,
         session_id: Option<String>,
@@ -5178,7 +5202,7 @@ impl AuxRole {
     }
 
     /// One short capped completion; best-effort (None degrades).
-    async fn complete(
+    pub(crate) async fn complete(
         &self,
         system: &str,
         prompt: &str,

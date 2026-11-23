@@ -4458,6 +4458,27 @@ pub enum Modal {
         /// never fetches what the user did not ask to see).
         previews: Vec<(u64, String)>,
     },
+    /// /git staging & commit panel (GIT-04): porcelain status, per-file
+    /// diffs, stage/unstage/commit. Never pushes, forces, rebases,
+    /// hard-resets, or stashes — the panel's git vocabulary stops at
+    /// add / reset HEAD -- path / commit -m.
+    Git {
+        /// Working-tree rows, refreshed after every mutation.
+        files: Vec<crate::git::GitFile>,
+        /// Selected row (landing view).
+        selected: usize,
+        /// Sub-view (list / one file's diff / commit message).
+        pane: crate::git::Pane,
+        /// Diff scroll anchor (None = pinned to the tail).
+        scroll: Option<usize>,
+        /// Commit-message draft (Commit pane).
+        draft: String,
+        /// Key-help overlay on the landing view (`?`).
+        keys_shown: bool,
+        /// Inline note: errors and confirmations render at the bottom
+        /// of the panel instead of leaving the modal.
+        note: Option<String>,
+    },
     /// Full result of one background task (the pager over
     /// `Command::TaskDetail`).
     TaskDetail {
@@ -6268,6 +6289,173 @@ async fn app(
                                     modal = None;
                                 }
                             }
+                            // GIT-04: the staging & commit panel. The
+                            // keymap itself is pure (crate::git::handle_key);
+                            // this arm applies the action to the modal
+                            // state and runs the git commands against the
+                            // session cwd — stage/unstage refresh the rows
+                            // in place, commit reports inline.
+                            Modal::Git {
+                                files,
+                                selected,
+                                pane,
+                                scroll,
+                                draft,
+                                keys_shown,
+                                note,
+                            } => {
+                                use crate::git::{GitAction, Pane as GitPane};
+                                let action = crate::git::handle_key(
+                                    key.code,
+                                    pane,
+                                    *keys_shown,
+                                    files.len(),
+                                    *selected,
+                                );
+                                match action {
+                                    GitAction::None => {}
+                                    GitAction::Close => modal = None,
+                                    GitAction::Back => {
+                                        *pane = GitPane::List;
+                                        *scroll = None;
+                                    }
+                                    GitAction::Select(row) => *selected = row,
+                                    GitAction::ToggleKeys => *keys_shown = !*keys_shown,
+                                    GitAction::Type(c) => draft.push(c),
+                                    GitAction::Erase => {
+                                        draft.pop();
+                                    }
+                                    GitAction::OpenDiff => {
+                                        if let Some(file) = files.get(*selected).cloned() {
+                                            match crate::git::diff_for(&session_cwd, &file) {
+                                                Ok(text) => {
+                                                    *pane = GitPane::Diff {
+                                                        path: file.path.clone(),
+                                                        text,
+                                                    };
+                                                    *scroll = Some(0);
+                                                    *note = None;
+                                                }
+                                                Err(e) => *note = Some(e),
+                                            }
+                                        }
+                                    }
+                                    GitAction::Scroll(lines) => {
+                                        let total = match &*pane {
+                                            GitPane::Diff { text, .. } => text.lines().count(),
+                                            _ => 0,
+                                        };
+                                        let visible = pager_visible(view_rows);
+                                        if lines <= -10 {
+                                            page_up(scroll, total, visible);
+                                        } else if lines >= 10 {
+                                            page_down(scroll, total, visible);
+                                        } else if lines < 0 {
+                                            *scroll = Some(scroll.unwrap_or(0).saturating_sub(1));
+                                        } else {
+                                            *scroll = Some(scroll.unwrap_or(0) + 1);
+                                        }
+                                    }
+                                    GitAction::Top => *scroll = Some(0),
+                                    GitAction::Tail => *scroll = None,
+                                    GitAction::Stage => {
+                                        if let Some(file) = files.get(*selected) {
+                                            let path = file.path.clone();
+                                            let was_staged = file.staged();
+                                            let git_args = if was_staged {
+                                                crate::git::unstage_args(&path)
+                                            } else {
+                                                crate::git::stage_args(&path)
+                                            };
+                                            let refreshed = crate::git::run_git(
+                                                &session_cwd,
+                                                &git_args,
+                                            )
+                                            .and_then(|_| {
+                                                crate::git::run_git(
+                                                    &session_cwd,
+                                                    &crate::git::status_args(),
+                                                )
+                                            });
+                                            match refreshed {
+                                                Ok(status) => {
+                                                    *files = crate::git::parse_porcelain(&status);
+                                                    *note = Some(if was_staged {
+                                                        format!("unstaged {path}")
+                                                    } else {
+                                                        format!("staged {path}")
+                                                    });
+                                                }
+                                                Err(e) => *note = Some(e),
+                                            }
+                                        }
+                                    }
+                                    GitAction::StageAll => {
+                                        let refreshed = crate::git::run_git(
+                                            &session_cwd,
+                                            &crate::git::stage_all_args(),
+                                        )
+                                        .and_then(|_| {
+                                            crate::git::run_git(
+                                                &session_cwd,
+                                                &crate::git::status_args(),
+                                            )
+                                        });
+                                        match refreshed {
+                                            Ok(status) => {
+                                                *files = crate::git::parse_porcelain(&status);
+                                                *note = Some("staged everything".to_string());
+                                            }
+                                            Err(e) => *note = Some(e),
+                                        }
+                                    }
+                                    GitAction::CommitOpen => {
+                                        if files.iter().any(crate::git::GitFile::staged) {
+                                            *pane = GitPane::Commit;
+                                            draft.clear();
+                                            *note = None;
+                                        } else {
+                                            *note = Some(
+                                                "nothing staged — s stages the selected file, a stages all"
+                                                    .to_string(),
+                                            );
+                                        }
+                                    }
+                                    GitAction::CommitSubmit => {
+                                        let message = draft.trim().to_string();
+                                        if message.is_empty() {
+                                            *note =
+                                                Some("empty message — write one first".to_string());
+                                        } else {
+                                            match crate::git::run_git(
+                                                &session_cwd,
+                                                &crate::git::commit_args(&message),
+                                            ) {
+                                                Ok(out) => {
+                                                    let hash = crate::git::commit_summary(&out);
+                                                    if let Ok(status) = crate::git::run_git(
+                                                        &session_cwd,
+                                                        &crate::git::status_args(),
+                                                    ) {
+                                                        *files =
+                                                            crate::git::parse_porcelain(&status);
+                                                    }
+                                                    *pane = GitPane::List;
+                                                    *scroll = None;
+                                                    draft.clear();
+                                                    *note = Some(match hash {
+                                                        Some(hash) => {
+                                                            format!("✓ committed {hash}")
+                                                        }
+                                                        None => "✓ committed".to_string(),
+                                                    });
+                                                }
+                                                Err(e) => *note = Some(e),
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             // TUI-18: the read-only panels page like Debug
                             Modal::Hooks { rows, scroll }
                             | Modal::Permissions { rows, scroll }
@@ -6756,6 +6944,27 @@ async fn app(
                             modal = Some(Modal::Info {
                                 rows: info_rows(&sidebar, &meters, 64),
                             });
+                            continue;
+                        }
+                        // GIT-04: the staging & commit panel — same
+                        // opener as /git; a failed status warns
+                        _ if bindings.matches(&key, "git.panel") => {
+                            match crate::git::run_git(&session_cwd, &crate::git::status_args()) {
+                                Ok(status) => {
+                                    modal = Some(Modal::Git {
+                                        files: crate::git::parse_porcelain(&status),
+                                        selected: 0,
+                                        pane: crate::git::Pane::List,
+                                        scroll: None,
+                                        draft: String::new(),
+                                        keys_shown: false,
+                                        note: None,
+                                    });
+                                }
+                                Err(e) => {
+                                    pop_toast(&mut toast, format!("git: {e}"));
+                                }
+                            }
                             continue;
                         }
                         // the four surface pickers: theme (/theme),
@@ -7586,6 +7795,36 @@ async fn app(
                     None => transcript.push_separated(Line::Warn("no api key variable is known for this model".into())),
                 }
                                                 }
+                                                // GIT-04: /git reads the working
+                                                // tree locally; a failed status
+                                                // (not a repo, bare git gone)
+                                                // warns instead of opening an
+                                                // empty panel
+                                                ModalKind::Git => {
+                                                    match crate::git::run_git(
+                                                        &session_cwd,
+                                                        &crate::git::status_args(),
+                                                    ) {
+                                                        Ok(status) => {
+                                                            modal = Some(Modal::Git {
+                                                                files: crate::git::parse_porcelain(
+                                                                    &status,
+                                                                ),
+                                                                selected: 0,
+                                                                pane: crate::git::Pane::List,
+                                                                scroll: None,
+                                                                draft: String::new(),
+                                                                keys_shown: false,
+                                                                note: None,
+                                                            });
+                                                        }
+                                                        Err(e) => {
+                                                            transcript.push_separated(
+                                                                Line::Warn(format!("git: {e}")),
+                                                            );
+                                                        }
+                                                    }
+                                                }
                                                 // TUI-18: the read-only panels read
                                                 // the layered config the surface
                                                 // sees; a broken file warns instead
@@ -7816,12 +8055,13 @@ async fn app(
                                         | ModalKind::Help => {
                                             Modal::Help { scroll: None }
                                         }
-                                        // Hooks/Permissions/Doctor are
+                                        // Hooks/Permissions/Doctor/Git are
                                         // handled in their own outer arm —
                                         // unreachable here
                                         ModalKind::Hooks
                                         | ModalKind::Permissions
-                                        | ModalKind::Doctor => Modal::Help { scroll: None },
+                                        | ModalKind::Doctor
+                                        | ModalKind::Git => Modal::Help { scroll: None },
                                         // unreachable in practice: /tasks and
                                         // /debug send events, and the modal is
                                         // built from the event payload — these
@@ -8325,6 +8565,19 @@ async fn app(
                             Modal::Key(prompt) => {
                                 prompt.input.extend(text.chars().filter(|c| !c.is_whitespace()));
                             }
+                            // the git panel pastes into the commit message
+                            // only; list/diff panes have nothing to paste
+                            Modal::Git {
+                                pane: crate::git::Pane::Commit,
+                                draft,
+                                ..
+                            } => {
+                                for c in text.chars() {
+                                    if !c.is_whitespace() {
+                                        draft.push(c);
+                                    }
+                                }
+                            }
                             Modal::Prompts { .. } => {}
                             Modal::Memory { .. } => {}
                             Modal::Rewind { .. } => {}
@@ -8364,7 +8617,9 @@ async fn app(
                             | Modal::Queue { .. }
                             | Modal::Hooks { .. }
                             | Modal::Permissions { .. }
-                            | Modal::Doctor { .. } => {}
+                            | Modal::Doctor { .. }
+                            // non-commit git panes have nothing to paste
+                            | Modal::Git { .. } => {}
                         }
                     } else if path_popup.is_some() {
                         path_popup = None;
@@ -10386,6 +10641,14 @@ fn builtin_slash_commands() -> Vec<(String, String)> {
             "read-only review of current changes ([base])".to_string(),
         ),
         (
+            "/pr".to_string(),
+            "PR review via gh: /pr <n|url|branch> [fix]".to_string(),
+        ),
+        (
+            "/git".to_string(),
+            "staging & commit panel: s stage, a all, c commit, ⏎ diff".to_string(),
+        ),
+        (
             "/approve".to_string(),
             "review the plan file, then build it".to_string(),
         ),
@@ -10940,6 +11203,9 @@ pub enum ModalKind {
     Permissions,
     /// TUI-18: doctor panel (live surface state).
     Doctor,
+    /// /git staging & commit panel (the status rows are read locally,
+    /// in the app loop, against the session cwd).
+    Git,
 }
 
 /// Load a custom command body from `.ka/commands/<name>.md` (project) or
@@ -11369,6 +11635,8 @@ pub fn slash_command(text: &str) -> Option<Slash> {
             | "/hooks"
             | "/permissions"
             | "/doctor"
+            | "/pr"
+            | "/git"
     ) {
         if let Some((fm, body)) = custom_command(head, rest) {
             // EXT-08: `shell:` output rides ahead of the prompt body
@@ -11530,6 +11798,49 @@ blocker > major > minor > nit, each as `file:line — issue — concrete fix`, \
             quit: false,
             modal: None,
             followup: Some(build_followup()),
+        }),
+        // GIT-01: PR review preset — the prompt runs `gh` in the
+        // model's bash hand (ka-term owns no git/gh); readonly reviews
+        // lock Readonly mode like /review, fix runs stay in Ask so
+        // edits and pushes still confirm. The transcript note confirms
+        // which preset went out.
+        "/pr" => {
+            let parsed = crate::git::parse_pr_invocation(rest);
+            match parsed {
+                Some((reference, fix)) => Some(Slash {
+                    note: Some(format!(
+                        "pr · reviewing {} ({})",
+                        crate::git::pr_label(&reference),
+                        if fix { "fix mode" } else { "readonly" }
+                    )),
+                    event: Some(Command::SetMode {
+                        mode: if fix {
+                            ka_protocol::Mode::Ask
+                        } else {
+                            ka_protocol::Mode::Readonly
+                        },
+                    }),
+                    quit: false,
+                    modal: None,
+                    followup: Some(crate::git::pr_review_prompt(&reference, fix)),
+                }),
+                None => Some(Slash {
+                    note: Some("usage: /pr <n|url|branch> [fix]".to_string()),
+                    event: None,
+                    quit: false,
+                    followup: None,
+                    modal: None,
+                }),
+            }
+        }
+        // GIT-04: the staging & commit panel; status is read locally
+        // in the app loop (it needs the session cwd)
+        "/git" => Some(Slash {
+            note: None,
+            event: None,
+            quit: false,
+            followup: None,
+            modal: Some(ModalKind::Git),
         }),
         "/rewind" => {
             // bare /rewind drops the last exchange; an unparsable count
@@ -12571,6 +12882,29 @@ fn modal_hints(open: &Modal) -> &'static [(&'static str, &'static str)] {
         ],
         Modal::Context { .. } => &[("esc", "close")],
         Modal::Tasks { .. } => &[("↑↓", "choose"), ("⏎", "page result"), ("esc", "close")],
+        // GIT-04: hints follow the pane
+        Modal::Git {
+            pane, keys_shown, ..
+        } => match (pane, *keys_shown) {
+            (crate::git::Pane::List, true) => &[("?", "close help"), ("esc", "close")],
+            (crate::git::Pane::List, false) => &[
+                ("↑↓", "choose"),
+                ("⏎", "diff"),
+                ("s", "stage"),
+                ("a", "all"),
+                ("c", "commit"),
+                ("?", "keys"),
+                ("esc", "close"),
+            ],
+            (crate::git::Pane::Diff { .. }, _) => &[
+                ("↑↓/pgup/pgdn", "scroll"),
+                ("home/end", "top/tail"),
+                ("esc", "back"),
+            ],
+            (crate::git::Pane::Commit, _) => {
+                &[("type", "message"), ("⏎", "commit"), ("esc", "back")]
+            }
+        },
         Modal::TaskDetail { .. } | Modal::Debug { .. } => &[
             ("pgup/pgdn", "scroll"),
             ("home/end", "top/tail"),
@@ -14687,6 +15021,129 @@ fn render(
                 let title = format!("{} tasks", crate::icons::tool_icon("tasks"));
                 (width, height, title, text)
             }
+            // GIT-04: the staging & commit panel — near-fullscreen
+            // (status + diff + commit panes; `?` overlays the keymap,
+            // notes render as the last row)
+            Modal::Git {
+                files,
+                selected,
+                pane,
+                scroll,
+                draft,
+                keys_shown,
+                note,
+            } => {
+                const KEY_HELP: &[(&str, &str)] = &[
+                    ("↑↓", "choose a file"),
+                    ("⏎", "diff the selected file"),
+                    ("s", "stage / unstage the selection"),
+                    ("a", "stage everything"),
+                    ("c", "commit the staged set"),
+                    ("?", "close this help"),
+                    ("esc", "close the panel"),
+                ];
+                let width = 110.min(fw);
+                let height = fh.saturating_sub(2);
+                let inner_w = inner(width);
+                let mut text: Vec<TuiLine<'static>> = Vec::new();
+                let title;
+                match pane {
+                    crate::git::Pane::List => {
+                        // header: branch + staged/changed counts, then
+                        // the porcelain rows (or the keymap overlay)
+                        let branch =
+                            crate::git::branch(&PLAN_CWD.get().cloned().unwrap_or_default())
+                                .unwrap_or_else(|| "(no branch)".into());
+                        let staged = files.iter().filter(|f| f.staged()).count();
+                        text.push(TuiLine::styled(
+                            format!(
+                                "{branch} · {staged} staged · {} changed (working tree)",
+                                files.len()
+                            ),
+                            meta,
+                        ));
+                        title = "git staging".to_string();
+                        if *keys_shown {
+                            for (k, d) in KEY_HELP {
+                                text.push(TuiLine::from(vec![
+                                    Span::styled(
+                                        format!("{k:<4}"),
+                                        Style::new().fg(crate::palette::ACCENT),
+                                    ),
+                                    Span::styled(*d, meta),
+                                ]));
+                            }
+                        } else if files.is_empty() {
+                            text.push(TuiLine::styled(
+                                "(working tree clean — nothing to stage)",
+                                meta,
+                            ));
+                        } else {
+                            let cap = (height as usize).saturating_sub(6).max(1);
+                            let offset = window_of(*selected, files.len(), cap);
+                            for (i, file) in files.iter().enumerate().skip(offset).take(cap) {
+                                text.push(list_row(
+                                    file.row(),
+                                    i == *selected,
+                                    inner_w,
+                                    Style::new(),
+                                ));
+                            }
+                        }
+                    }
+                    crate::git::Pane::Diff { path, text: diff } => {
+                        title = format!("git diff — {path}");
+                        let total = diff.lines().count();
+                        let visible = (height as usize).saturating_sub(5).max(1);
+                        let (first, _) = window_range(total, visible, *scroll);
+                        if total == 0 {
+                            text.push(TuiLine::styled("(no differences)", meta));
+                        }
+                        for line in diff.lines().skip(first).take(visible) {
+                            // the ask-diff palette: + OK, - ERR, hunk
+                            // headers META, file headers FAINT
+                            let style = if line.starts_with("+++") || line.starts_with("---") {
+                                Style::new().fg(crate::palette::FAINT)
+                            } else if line.starts_with("@@") {
+                                Style::new().fg(crate::palette::META)
+                            } else if line.starts_with('+') {
+                                Style::new().fg(crate::palette::OK)
+                            } else if line.starts_with('-') {
+                                Style::new().fg(crate::palette::ERR)
+                            } else {
+                                Style::new()
+                            };
+                            text.push(TuiLine::styled(
+                                trunc_cols(line, inner_w).to_string(),
+                                style,
+                            ));
+                        }
+                    }
+                    crate::git::Pane::Commit => {
+                        title = "git commit".to_string();
+                        text.push(TuiLine::styled("staged for this commit:", meta));
+                        let cap = (height as usize).saturating_sub(7).max(1);
+                        for file in files.iter().filter(|f| f.staged()).take(cap) {
+                            text.push(list_row(file.row(), false, inner_w, Style::new()));
+                        }
+                        text.push(TuiLine::from(vec![
+                            Span::styled("message: ", Style::new().fg(crate::palette::ACCENT)),
+                            Span::raw(draft.clone()),
+                            Span::styled("▏", Style::new().fg(crate::palette::ACCENT)),
+                        ]));
+                        if draft.is_empty() {
+                            text.push(TuiLine::styled(
+                                "(⏎ commits the staged set · esc back)",
+                                meta,
+                            ));
+                        }
+                    }
+                }
+                if let Some(n) = note {
+                    text.push(TuiLine::styled(format!("· {n}"), meta));
+                }
+                (width, height, title, text)
+            }
             // TUI-18: read-only panels — same pager shape as Debug
             Modal::Hooks { rows, scroll } => {
                 let height = (rows.len() as u16 + 5).clamp(7, 30).min(modal_area.height);
@@ -15721,6 +16178,7 @@ pub(crate) fn help_modal_rows(width: usize) -> Vec<ratatui::text::Line<'static>>
         ("popups.skills", "skills · agents · mcp popup"),
         ("popups.todos", "todos popup"),
         ("popups.info", "session info popup"),
+        ("git.panel", "git staging & commit panel (/git)"),
         ("composer.external_editor", "edit the draft in $EDITOR"),
     ]
     .into_iter()
@@ -15803,6 +16261,7 @@ pub(crate) fn help_modal_rows(width: usize) -> Vec<ratatui::text::Line<'static>>
         &mut text,
         &[
             ("/tasks", "background tasks — ⏎ pages a result, cost footer"),
+            ("/git", "stage/commit panel over git status (s a c keys)"),
             ("/debug", "live debug sessions"),
             ("/mcp", "refresh MCP tool lists (/mcp refresh)"),
             ("/prompt", "run an MCP prompt"),
@@ -15884,6 +16343,7 @@ pub(crate) fn help_modal_rows(width: usize) -> Vec<ratatui::text::Line<'static>>
             ("/plan", "research the task, draft the plan"),
             ("/build", "implement the plan file"),
             ("/review", "read-only review of changes [base]"),
+            ("/pr", "review a PR via gh: /pr <n|url|branch> [fix]"),
             ("/approve", "review the plan file, then build"),
             (
                 "/goal",

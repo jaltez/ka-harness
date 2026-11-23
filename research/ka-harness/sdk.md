@@ -113,7 +113,8 @@ to stderr only). Client connects, then per session:
 Embed in a Rust program → the crates (`spawn_full`, send `Command`, receive
 `Event`). Script/CI one-shot → `ka run --print ndjson` (or `stream-json`);
 the exit code carries the stop reason. Long-lived service → `ka serve` SSE.
-Editor integration → `ka acp`. Batch reporting/auditing → `ka sessions --json`
+Editor integration → `ka acp`. MCP host → `ka mcp-serve` (read-only hands as
+MCP tools over stdio). Batch reporting/auditing → `ka sessions --json`
 + `ka export`.
 
 ## Versioning
@@ -122,42 +123,33 @@ All workspace crates carry one version (`0.2.10`), pinned through `workspace.dep
 publish together in lockstep — a surface and its protocol change in the same release. Pre-1.0:
 shapes may change between minor versions.
 
-## 6. ka-passport (future crate) — the design stub, ratified 2026-09-29
+## 6. ka-passport — shipped (batch 11, 2026-11-22; design ratified 2026-09-29)
 
-Subscription OAuth (Claude Pro/Max, ChatGPT plans, …) is the #1 onboarding
-moat every competitor ships and ka deliberately does not — **keys-only core
-is a locked decision** (roadmap Phase 1, re-ratified in Phase 8 and the
-2026-09-29 review). The seam a future `ka-passport` crate plugs into is
-fixed NOW so the core never grows provider-specific auth:
+Subscription OAuth (Claude Pro/Max first) landed as the `ka-passport` crate behind
+the ka-harness cargo feature `passport` (default off, per ratification). The seam
+is exactly the one this stub fixed:
 
 ```rust
-/// The one auth abstraction core ka-dialect would accept (design shape;
-/// NOT implemented yet). A passport crate implements this and hooks the
-/// auth ladder between the keyring and `!command` tiers.
+/// The TokenSource abstraction core ka-dialect accepts (shipped shape).
 pub trait TokenSource: Send + Sync {
     /// Bearer token for the vendor's API, refreshing when stale.
     fn token(&self, vendor: &str) -> Result<String, AuthError>;
-    /// Which vendors this source can serve (e.g. ["anthropic-plan"]).
+    /// Which vendors this source can serve (e.g. ["claude-plan"]).
     fn vendors(&self) -> &[String];
 }
 ```
 
-Data shapes (catalog-side, so passports stay data-over-code):
+Current state:
 
-```toml
-# dialects.toml overlay — a plan vendor is just a vendor
-[dialects."claude-plan/claude-sonnet-5"]
-wire = "anthropic_messages"
-base_url = "https://api.anthropic.com"
-priced = false          # subscription: no per-token cost display
-auth = "passport"       # NEW optional key: token comes from a
-                        # registered TokenSource, never an env var
-```
-
-Rules fixed at ratification: core never links the passport crate (ka-harness
-opt-in via cargo feature), `auth = "passport"` rows without a registered
-source fail with an instructive error at engine bootstrap, tokens live in
-the OS keyring under service `ka-passport` (same class as keys today), and
-`--safe-mode` keeps passport auth available (it is auth, not a
-customization). Implementation order when it lands: one provider
-end-to-end (Claude Pro/Max), then the long tail.
+- `ClaudePlanSource` implements the full Claude Pro/Max OAuth flow (PKCE S256,
+  loopback callback, token exchange + proactive refresh against
+  `console.anthropic.com/v1/oauth/token`); tokens live in the OS keyring under
+  service `ka-passport` (injectable `TokenStore` for tests).
+- Registration: `ka_passport::claude::install()` registers the source into the
+  ka-dialect auth registry (consulted after env/dotenv, before keyring, for
+  served vendors). The `claude-plan` vendor rides the `anthropic_messages` wire
+  with `Authorization: Bearer` + `anthropic-beta: oauth-2025-04-20` (no
+  `x-api-key`).
+- CLI: `ka passport login|logout|status`. Safe-mode keeps passport auth
+  available (auth is not a customization). Long-tail providers (ChatGPT plans,
+  Copilot, …) follow the same `TokenSource` shape.

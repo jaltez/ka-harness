@@ -1,0 +1,103 @@
+# Vendored by `ka action init` — ka automation for pull requests (AUTO-01).
+# Triggers: a manual dispatch (with a prompt input) or a PR labeled `ka`.
+# The job checks out the PR at its pinned HEAD SHA, installs the released
+# ka binary (sha256-verified against the release assets), runs ka in
+# read-only mode with the issue/PR body (or dispatch input) as the prompt,
+# and posts the final answer as a PR comment.
+#
+# Secret surface: the job receives ONLY KA_MODEL and the KA_*_API_KEY
+# provider keys — no write tokens beyond the built-in github.token, which
+# is scoped to `pull-requests: write` for the comment alone.
+
+name: ka
+
+on:
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: "Prompt for ka (used as-is; a PR label run uses the PR body instead)"
+        required: false
+        default: ""
+  pull_request_target:
+    types: [labeled]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: ka-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  ka:
+    # PR runs fire only when the added label is `ka`; manual dispatch
+    # always runs (the label guard does not apply to it)
+    if: >-
+      ${{
+        github.event_name == 'workflow_dispatch' || github.event.label.name == 'ka'
+      }}
+    runs-on: ubuntu-latest
+    env:
+      # The ONLY secrets this workflow exposes: the model selector and
+      # provider API keys. Nothing else crosses into the run.
+      KA_MODEL: ${{ secrets.KA_MODEL }}
+      KA_ANTHROPIC_API_KEY: ${{ secrets.KA_ANTHROPIC_API_KEY }}
+      KA_OPENAI_API_KEY: ${{ secrets.KA_OPENAI_API_KEY }}
+      KA_GEMINI_API_KEY: ${{ secrets.KA_GEMINI_API_KEY }}
+      KA_DEEPSEEK_API_KEY: ${{ secrets.KA_DEEPSEEK_API_KEY }}
+      KA_OPENROUTER_API_KEY: ${{ secrets.KA_OPENROUTER_API_KEY }}
+      KA_XAI_API_KEY: ${{ secrets.KA_XAI_API_KEY }}
+      # Env-var route (never inline expansion into `run:`): the PR body is
+      # attacker-controlled and must not reach the shell as script text.
+      KA_PROMPT: >-
+        ${{
+          github.event_name == 'pull_request_target'
+          && github.event.pull_request.body
+          || inputs.prompt
+        }}
+    steps:
+      - name: Check out the PR at its pinned HEAD SHA
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          # the pull_request_target event checks out the BASE by default;
+          # pin the PR head so the reviewed tree is the proposed one
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Install ka from the latest release (checksum verified)
+        run: |
+          set -euo pipefail
+          asset="ka-x86_64-unknown-linux-musl.tar.gz"
+          api="https://api.github.com/repos/jaltez/ka-harness/releases/latest"
+          url="$(curl -fsSL --header 'User-Agent: ka-action' "$api" \
+            | jq -r --arg asset "$asset" \
+                '.assets[] | select(.name == $asset) | .browser_download_url')"
+          test -n "$url" || { echo "release asset $asset not found" >&2; exit 1; }
+          curl -fsSL --header 'User-Agent: ka-action' -o "$asset" "$url"
+          curl -fsSL --header 'User-Agent: ka-action' -o "$asset.sha256" "$url.sha256"
+          # refuse a tampered or partial download before it ever runs
+          sha256sum --check "$asset.sha256"
+          tar -xzf "$asset"
+          ./ka --version
+
+      - name: Run ka (read-only) on the issue/PR body
+        run: |
+          set -euo pipefail
+          if [ -z "${KA_PROMPT:-}" ]; then
+            echo "no prompt: label a PR with 'ka' (body is the prompt) or pass the workflow_dispatch 'prompt' input" >&2
+            exit 1
+          fi
+          ./ka run --mode readonly --print text "$KA_PROMPT" > ka-answer.md
+
+      - name: Post the answer as a PR comment
+        if: ${{ github.event_name == 'pull_request_target' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr comment "${{ github.event.pull_request.number }}" \
+            --body-file ka-answer.md
+
+      - name: Print the answer (dispatch runs have no PR to comment on)
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        run: cat ka-answer.md

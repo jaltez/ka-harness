@@ -347,6 +347,48 @@ pub fn modal_lines(
         Modal::Hooks { rows, .. } => ("hooks".into(), rows.clone()),
         Modal::Permissions { rows, .. } => ("permissions".into(), rows.clone()),
         Modal::Doctor { rows, .. } => ("doctor".into(), rows.clone()),
+        // GIT-04: the panel as text — header counts, marked file rows
+        // (or the keymap), the diff body, or the commit draft
+        Modal::Git {
+            files,
+            selected,
+            pane,
+            scroll: _,
+            draft,
+            keys_shown,
+            note,
+        } => {
+            let mut rows = Vec::new();
+            let staged = files.iter().filter(|f| f.staged()).count();
+            rows.push(format!("{} staged of {} changed", staged, files.len()));
+            match pane {
+                crate::git::Pane::List if *keys_shown => {
+                    rows.push("keys: ↑↓ choose · ⏎ diff · s stage/unstage · a all · c commit · ? close help · esc close".into());
+                }
+                crate::git::Pane::List => {
+                    if files.is_empty() {
+                        rows.push("(working tree clean)".into());
+                    }
+                    for (i, file) in files.iter().enumerate() {
+                        rows.push(format!("{} {}", marker(i, *selected), file.row()));
+                    }
+                }
+                crate::git::Pane::Diff { path, text } => {
+                    rows.push(format!("diff: {path}"));
+                    rows.extend(text.lines().map(str::to_string));
+                }
+                crate::git::Pane::Commit => {
+                    for file in files.iter().filter(|f| f.staged()) {
+                        rows.push(format!("  {}", file.row()));
+                    }
+                    rows.push(format!("message: {draft}"));
+                }
+            }
+            if let Some(n) = note {
+                rows.push(n.clone());
+            }
+            ("git".into(), rows)
+        }
     }
 }
 

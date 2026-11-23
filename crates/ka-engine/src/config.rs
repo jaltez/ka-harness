@@ -388,9 +388,7 @@ impl ShellEnvPolicy {
 }
 
 /// Git automation settings.
-#[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
-)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct Git {
     /// After each completed engine turn (stop = done), stage the whole
@@ -398,6 +396,17 @@ pub struct Git {
     /// included (`git add -A`) — and commit it as `ka: <first prompt
     /// line>`. Off by default.
     pub auto_commit: Option<bool>,
+    /// GIT-03: with `auto_commit` on, generate the commit subject with
+    /// this role instead of echoing the first prompt line. Either a
+    /// `[roles]` name (`default`, `fast`, or any `[roles.extra]`
+    /// entry — bare or `@`-prefixed) or a literal model selector. A
+    /// role that fails or does not resolve falls back silently to the
+    /// first prompt line.
+    pub commit_role: Option<String>,
+    /// GIT-03: lines appended under the auto-commit subject (e.g. the
+    /// provenance trailer `"Assisted-by: ka"`). Empty lines are
+    /// dropped; the subject stays untouched.
+    pub trailers: Vec<String>,
 }
 
 /// Role → model-selector mappings.
@@ -1330,6 +1339,12 @@ impl Config {
         if other.git.auto_commit.is_some() {
             self.git.auto_commit = other.git.auto_commit;
         }
+        if other.git.commit_role.is_some() {
+            self.git.commit_role = other.git.commit_role.clone();
+        }
+        if !other.git.trailers.is_empty() {
+            self.git.trailers = other.git.trailers.clone();
+        }
         if other.lsp.enable.is_some() {
             self.lsp.enable = other.lsp.enable;
         }
@@ -2003,6 +2018,41 @@ mod tests {
         let schema = Config::schema_json().unwrap();
         assert!(schema.contains("service_tier"), "got: {schema}");
         assert!(schema.contains("cache_warming"), "got: {schema}");
+    }
+
+    /// GIT-03: `[git] commit_role` + `trailers` parse strictly, overlay
+    /// layer-by-layer, and default to the pre-GIT-03 shape.
+    #[test]
+    fn git_commit_role_and_trailers_parse_and_overlay() {
+        let cfg = Config::parse_layer(
+            "[git]\nauto_commit = true\ncommit_role = \"fast\"\ntrailers = [\"Assisted-by: ka\"]\n",
+            "user",
+        )
+        .unwrap();
+        assert_eq!(cfg.git.auto_commit, Some(true));
+        assert_eq!(cfg.git.commit_role.as_deref(), Some("fast"));
+        assert_eq!(cfg.git.trailers, vec!["Assisted-by: ka".to_string()]);
+
+        // defaults: unset keys keep today's behavior (prompt-line
+        // subject, no body)
+        let defaults = Config::default();
+        assert_eq!(defaults.git.commit_role, None);
+        assert!(defaults.git.trailers.is_empty());
+
+        // a later layer overrides only what it sets: an empty trailer
+        // list keeps the lower layer's trailers
+        let mut merged = cfg;
+        merged
+            .overlay(Config::parse_layer("[git]\ncommit_role = \"@review\"\n", "project").unwrap());
+        assert_eq!(merged.git.commit_role.as_deref(), Some("@review"));
+        assert_eq!(merged.git.auto_commit, Some(true));
+        assert_eq!(merged.git.trailers, vec!["Assisted-by: ka".to_string()]);
+
+        // strict parse: unknown [git] keys stay a hard error
+        let err = Config::parse_layer("[git]\ncommit_rol = \"fast\"\n", "u")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown field"), "got: {err}");
     }
 
     #[test]

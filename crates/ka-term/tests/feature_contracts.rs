@@ -58,6 +58,8 @@ fn every_documented_slash_command_parses() {
         "/prompt",
         "/tree",
         "/memory",
+        "/pr",
+        "/git",
     ];
     let mut missing = Vec::new();
     for cmd in documented {
@@ -1016,6 +1018,82 @@ fn management_panels_and_session_toggles_parse() {
             cmd.event.is_none() && cmd.modal.is_none()
         }
     );
+}
+
+/// GIT-01: /pr builds the gh review preset — readonly locks Readonly
+/// mode like /review, `fix` stays in Ask and appends the
+/// implement-commit-push instructions; the transcript note confirms
+/// which preset went out, and unparsable forms are usage errors.
+#[test]
+fn pr_preset_builds_gh_review_prompts() {
+    let readonly = slash_command("/pr 123").expect("parses");
+    assert_eq!(
+        readonly.note.as_deref(),
+        Some("pr · reviewing #123 (readonly)")
+    );
+    assert!(
+        matches!(
+            readonly.event,
+            Some(Command::SetMode {
+                mode: ka_protocol::Mode::Readonly
+            })
+        ),
+        "readonly review locks Readonly mode"
+    );
+    let prompt = readonly.followup.expect("the preset prompt");
+    assert!(prompt.contains("gh pr view 123"), "{prompt}");
+    assert!(prompt.contains("gh api repos/<owner>/<repo>/pulls/<number>/comments"));
+    assert!(prompt.contains("file:line — issue — concrete fix"));
+    assert!(!prompt.contains("FIX run"), "{prompt}");
+
+    let fix = slash_command("/pr https://github.com/o/r/pull/42 fix").expect("parses");
+    assert_eq!(
+        fix.note.as_deref(),
+        Some("pr · reviewing https://github.com/o/r/pull/42 (fix mode)")
+    );
+    assert!(
+        matches!(
+            fix.event,
+            Some(Command::SetMode {
+                mode: ka_protocol::Mode::Ask
+            })
+        ),
+        "fix runs confirm edits and pushes (Ask)"
+    );
+    let prompt = fix.followup.expect("the fix preset");
+    assert!(prompt.contains("FIX run"), "{prompt}");
+    assert!(prompt.contains("Never force-push"), "{prompt}");
+
+    for bad in ["/pr", "/pr 123 FIX", "/pr 123 fix extra"] {
+        let cmd = slash_command(bad).expect("still parses as a usage row");
+        assert!(cmd.event.is_none(), "{bad} sends nothing");
+        assert!(cmd.followup.is_none(), "{bad} prompts nothing");
+        assert!(
+            cmd.note
+                .as_deref()
+                .is_some_and(|n| n.starts_with("usage: /pr")),
+            "{bad} explains its syntax: {:?}",
+            cmd.note
+        );
+    }
+}
+
+/// GIT-04: /git opens the staging & commit panel (modal, no engine
+/// event) and the binding to it is registered.
+#[test]
+fn git_panel_opens_and_binds() {
+    let cmd = slash_command("/git").expect("/git");
+    assert_eq!(cmd.modal, Some(ModalKind::Git));
+    assert!(cmd.event.is_none(), "status is read locally");
+    assert!(
+        slash_command("/git now").is_none() || {
+            let c = slash_command("/git now").expect("parses");
+            c.modal == Some(ModalKind::Git)
+        }
+    );
+    // the alt+g chord resolves through the action registry
+    let b = ka_term::keys::Bindings::default();
+    assert_eq!(b.display("git.panel"), "alt+g");
 }
 
 /// TUI-15 + TUI-14: the /tasks roster rows the engine pre-renders feed

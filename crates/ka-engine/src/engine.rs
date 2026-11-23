@@ -53,6 +53,10 @@ struct EngineRoles {
     /// Cheap/fast selector (`[roles] fast`); `None` degrades every
     /// fast-role consumer (auto-titles today) to its fallback.
     fast: Option<String>,
+    /// GIT-03: `[git] commit_role` resolved against the catalog at
+    /// startup (`None` = unset, or set but unresolvable — auto-commit
+    /// keeps the deterministic first-prompt-line subject).
+    commit: Option<String>,
 }
 
 /// Resolve one role selector through the same catalog path as the main
@@ -75,6 +79,19 @@ fn expand_role_selector(roles: &crate::config::Roles, selector: &str) -> String 
         .unwrap_or_else(|| selector.to_string())
 }
 
+/// GIT-03: `[git] commit_role` — a `[roles]` name resolves through the
+/// table (bare `fast`/`default`/extra-name, or `@`-prefixed); anything
+/// else is a literal selector (`vendor/model@effort`). Unknown names
+/// stay literal and fail catalog resolution downstream — the silent
+/// first-prompt-line fallback.
+fn commit_role_selector(roles: &crate::config::Roles, raw: &str) -> String {
+    roles
+        .resolve(&format!("@{raw}"))
+        .or_else(|| roles.resolve(raw))
+        .map(str::to_string)
+        .unwrap_or_else(|| raw.to_string())
+}
+
 /// Resolve the `[roles]` table against the catalog. `default` falls
 /// back to the configured model; a missing/invalid `fast` simply stays
 /// `None` (fast-role-gated features degrade gracefully).
@@ -90,6 +107,10 @@ fn resolve_roles(
             .or(fallback_default)
             .and_then(|s| resolve_role(catalog, s)),
         fast: roles.fast.as_deref().and_then(|s| resolve_role(catalog, s)),
+        // GIT-03: `[git] commit_role` resolves separately in `run`
+        // (it is git config, not a [roles] row) and is assigned onto
+        // the state after this constructor returns.
+        commit: None,
     }
 }
 
@@ -446,6 +467,9 @@ struct EngineState {
     /// `[git] auto_commit`: stage the whole worktree (`git add -A`) and
     /// commit after each completed turn.
     auto_commit: bool,
+    /// GIT-03: `[git] trailers` appended under every auto-commit
+    /// subject (the role-generated one included).
+    commit_trailers: Vec<String>,
     /// `[verify] test` command; runs after edit-carrying turns.
     verify_test: Option<String>,
     /// One automatic verify-fix round per user prompt (loop guard).
@@ -551,6 +575,7 @@ impl From<Config> for EngineState {
             roles: EngineRoles::default(),
             needs_title: false,
             auto_commit: c.git.auto_commit.unwrap_or(false),
+            commit_trailers: c.git.trailers,
             poke_max: c.pokes.max.unwrap_or(3),
             history: c.history,
             verify_test: c.verify.test.clone(),
@@ -682,6 +707,17 @@ async fn run(
     // roles resolve once at engine start, through the same catalog the
     // main model uses (discovery overlays already applied by the caller)
     let roles = resolve_roles(&catalog, &config.roles, config.model.as_deref());
+    // GIT-03: `[git] commit_role` — a `[roles]` name or a literal
+    // selector, resolved through the catalog like every other role;
+    // unresolvable → None and auto-commit keeps its fallback subject
+    let commit_selector = config
+        .git
+        .commit_role
+        .as_deref()
+        .map(|raw| commit_role_selector(&config.roles, raw));
+    let commit_role = commit_selector
+        .as_deref()
+        .and_then(|s| resolve_role(&catalog, s));
     // passport tier bootstrap (MODEL-01, ratified rule): every selector
     // this session can speak with an `auth = "passport"` dialect must
     // find a registered TokenSource NOW — an unregistered row is an
@@ -691,6 +727,7 @@ async fn run(
         config.roles.default.as_deref(),
         config.roles.fast.as_deref(),
         config.model.as_deref(),
+        commit_selector.as_deref(),
     ]
     .into_iter()
     .flatten()
@@ -812,6 +849,7 @@ async fn run(
     let sandbox_cfg = config.sandbox.clone();
     let mut state = EngineState::from(config);
     state.roles = roles;
+    state.roles.commit = commit_role;
     // checkpoints live in ONE session log shared by the surface
     // command, the `checkpoint` hand, and `/restore`: hand-taken
     // snapshots are restorable exactly like surface-taken ones
@@ -4841,14 +4879,30 @@ async fn dispatch_turn(
     let usage = if let Some(model) = turn_model {
         // stage auto-commit to run inside the voice just before its
         // terminal TurnFinished: ACP clients break on that event, so
-        // the commit (and its notes) must land first
+        // the commit (and its notes) must land first. GIT-03: the
+        // `[git] commit_role` generator is cloned out of the voice at
+        // staging time (the step cannot borrow the voice mid-turn) and
+        // the step reads the turn's user/assistant pair off the
+        // history at run time.
         voice.pre_finish = state.auto_commit.then(|| {
-            let events = events.clone();
-            let cwd = cwd.to_path_buf();
-            let head = prompt_head.clone();
-            let fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
-                Box::pin(async move { auto_commit(&events, &cwd, &head).await });
-            parking_lot::Mutex::new(fut)
+            let stage = std::sync::Arc::new(AutoCommitStage {
+                events: events.clone(),
+                cwd: cwd.to_path_buf(),
+                head: prompt_head.clone(),
+                generator: state
+                    .roles
+                    .commit
+                    .as_deref()
+                    .and_then(|id| voice.aux_handle(id)),
+                trailers: state.commit_trailers.clone(),
+            });
+            parking_lot::Mutex::new(Box::new(move |voice: &Voice| {
+                let stage = std::sync::Arc::clone(&stage);
+                let turn = turn_pair(voice);
+                let fut: std::pin::Pin<Box<dyn Future<Output = ()> + Send>> =
+                    Box::pin(async move { auto_commit(&stage, turn.as_ref()).await });
+                fut
+            }) as crate::voice::PreFinish)
         });
         voice
             .turn(
@@ -5463,7 +5517,17 @@ async fn turn_canned(
         .div_ceil(4);
     history.push(ka_dialect::speaker::TurnMessage::assistant(chunks.concat()));
     if state.auto_commit {
-        auto_commit(events, cwd, &text).await;
+        // no voice on the canned path (no model configured): the
+        // commit-role generator never resolves here, so the subject is
+        // the deterministic prompt line — trailers still apply
+        let stage = AutoCommitStage {
+            events: events.clone(),
+            cwd: cwd.to_path_buf(),
+            head: text.lines().next().unwrap_or("").to_string(),
+            generator: None,
+            trailers: state.commit_trailers.clone(),
+        };
+        auto_commit(&stage, None).await;
     }
     let usage = Usage {
         input: est_in,
@@ -5480,18 +5544,106 @@ async fn turn_canned(
     (usage, Stop::Done)
 }
 
+/// Everything one auto-commit needs, staged by the engine at dispatch
+/// (and rebuilt per canned turn): the commit cannot borrow the turn
+/// state, so the decision-relevant bits are cloned out up front.
+struct AutoCommitStage {
+    events: mpsc::Sender<Event>,
+    cwd: std::path::PathBuf,
+    /// First prompt line — the deterministic fallback subject.
+    head: String,
+    /// GIT-03 `[git] commit_role`: the resolved generator handle.
+    /// `None` (unset, or failed startup resolution) keeps today's
+    /// first-prompt-line subject, silently.
+    generator: Option<crate::voice::AuxRole>,
+    /// GIT-03 `[git] trailers`: appended under the subject.
+    trailers: Vec<String>,
+}
+
+/// This turn's last user prompt + assistant reply, straight off the
+/// voice history at pre-finish time (GIT-03 feeds the pair to the
+/// commit-subject role). Aborted turns never reach the staged step.
+fn turn_pair(voice: &Voice) -> Option<(String, String)> {
+    let mut user = None;
+    let mut assistant = None;
+    for msg in voice.history.iter().rev() {
+        match msg.role {
+            ka_dialect::speaker::TurnRole::User if user.is_none() => {
+                user = Some(msg.content.clone())
+            }
+            ka_dialect::speaker::TurnRole::Assistant if assistant.is_none() => {
+                assistant = Some(msg.content.clone())
+            }
+            _ => {}
+        }
+        if user.is_some() && assistant.is_some() {
+            break;
+        }
+    }
+    Some((user?, assistant?))
+}
+
+/// GIT-03: the commit-subject role's instructions — one line, no
+/// quotes, no prefix (the deterministic `ka: ` prefix is added here,
+/// so the subject reads like every other auto-commit).
+const COMMIT_SYSTEM: &str = "You write git commit subjects for a coding agent's staged work: \
+one line, at most 72 characters, imperative mood, no quotes, no markdown, no prefix. Reply \
+with only the subject line.";
+/// Conversation chars fed to the subject role (user + assistant side).
+const COMMIT_TALK_CAP: usize = 4_000;
+/// Chars of the staged `diff --stat` fed to the subject role.
+const COMMIT_STAT_CAP: usize = 2_000;
+
+/// One best-effort subject from the commit role: staged diff-stat plus
+/// the turn's user/assistant pair (or the prompt line when the pair is
+/// unavailable). Any failure → None → the caller falls back silently.
+async fn generated_subject(
+    generator: &crate::voice::AuxRole,
+    diff_stat: &str,
+    turn: Option<&(String, String)>,
+    head: &str,
+) -> Option<String> {
+    let convo = match turn {
+        Some((user, assistant)) => {
+            format!(
+                "User request:\n{}\nAssistant result:\n{}",
+                user.trim(),
+                assistant.trim()
+            )
+        }
+        None => format!("User request:\n{}", head.trim()),
+    };
+    let convo: String = convo.chars().take(COMMIT_TALK_CAP).collect();
+    let stat: String = diff_stat.chars().take(COMMIT_STAT_CAP).collect();
+    let prompt = format!(
+        "Write the git commit subject for these staged changes.\n\nStaged diff stat:\n{stat}\n\n{convo}"
+    );
+    let reply = generator
+        .complete(COMMIT_SYSTEM, &prompt, TITLE_TIMEOUT)
+        .await?;
+    reply
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(str::to_string)
+}
+
 /// `[git] auto_commit`: stage the whole worktree (`git add -A` —
-/// untracked files and anything already staged included) and commit
-/// with a deterministic one-line message (`ka: <first prompt line>`, 72
-/// chars max — no model roundtrip). Outside a repo: silent no-op. Any
-/// git failure is an advisory note, never a turn failure.
-async fn auto_commit(events: &mpsc::Sender<Event>, cwd: &std::path::Path, prompt: &str) {
+/// untracked files and anything already staged included) and commit.
+/// Subject: the `[git] commit_role`'s one-liner over the staged diff
+/// stat + the turn's messages (GIT-03), falling back silently to the
+/// deterministic `ka: <first prompt line>` (72 chars max, no model
+/// roundtrip) when the role is unset, unresolved, or fails. `[git]
+/// trailers` append under the subject. Outside a repo: silent no-op.
+/// Any git failure is an advisory note, never a turn failure.
+async fn auto_commit(stage: &AutoCommitStage, turn: Option<&(String, String)>) {
     let git = |args: &[&str]| {
         tokio::process::Command::new("git")
             .args(args)
-            .current_dir(cwd)
+            .current_dir(&stage.cwd)
             .output()
     };
+    let events = &stage.events;
     match git(&["rev-parse", "--is-inside-work-tree"]).await {
         Ok(out) if String::from_utf8_lossy(&out.stdout).trim() == "true" => {}
         _ => return,
@@ -5525,15 +5677,38 @@ async fn auto_commit(events: &mpsc::Sender<Event>, cwd: &std::path::Path, prompt
             return;
         }
     }
-    let first_line: String = prompt
+    let first_line: String = stage
+        .head
         .lines()
         .next()
         .unwrap_or("")
         .chars()
         .take(72)
         .collect();
-    let msg: String = format!("ka: {first_line}").chars().take(72).collect();
-    match git(&[
+    let fallback: String = format!("ka: {first_line}").chars().take(72).collect();
+    let msg: String = match &stage.generator {
+        Some(generator) => {
+            let diff_stat = git(&["diff", "--cached", "--stat"])
+                .await
+                .map(|out| String::from_utf8_lossy(&out.stdout).to_string())
+                .unwrap_or_default();
+            generated_subject(generator, &diff_stat, turn, &stage.head)
+                .await
+                .map(|subject| format!("ka: {subject}").chars().take(72).collect())
+                .unwrap_or(fallback)
+        }
+        None => fallback,
+    };
+    // trailers ride a second `-m` paragraph so the subject line stays
+    // clean (`git log --format=%s` unchanged for trailer-less commits)
+    let body = stage
+        .trailers
+        .iter()
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut commit_args: Vec<&str> = vec![
         "-c",
         "user.name=ka",
         "-c",
@@ -5541,9 +5716,11 @@ async fn auto_commit(events: &mpsc::Sender<Event>, cwd: &std::path::Path, prompt
         "commit",
         "-m",
         &msg,
-    ])
-    .await
-    {
+    ];
+    if !body.is_empty() {
+        commit_args.extend(["-m", body.as_str()]);
+    }
+    match git(&commit_args).await {
         Ok(out) if out.status.success() => {
             let id = git(&["rev-parse", "--short", "HEAD"])
                 .await
@@ -5584,12 +5761,15 @@ async fn auto_commit(events: &mpsc::Sender<Event>, cwd: &std::path::Path, prompt
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use ka_protocol::{Command, ErrorClass, Event, Stop};
+    use ka_dialect::speaker::{SpeakFuture, SpeakRequest, Speaker, StreamEvent};
+    use ka_protocol::{Command, ErrorClass, Event, Stop, Usage};
     use std::time::Duration;
     use tokio::sync::mpsc;
 
     use crate::config::Config;
-    use crate::engine::{EngineHandle, spawn};
+    use crate::engine::{
+        EngineHandle, StrandChoice, commit_role_selector, spawn, spawn_with_speaker,
+    };
 
     async fn drain_until_finished(events: &mut mpsc::Receiver<Event>) -> Vec<Event> {
         let mut seen = Vec::new();
@@ -5700,6 +5880,7 @@ mod tests {
             cwd: Some(dir.display().to_string()),
             git: crate::config::Git {
                 auto_commit: Some(true),
+                ..Default::default()
             },
             ..Default::default()
         });
@@ -5771,6 +5952,7 @@ mod tests {
             cwd: Some(dir.display().to_string()),
             git: crate::config::Git {
                 auto_commit: Some(true),
+                ..Default::default()
             },
             ..Default::default()
         });
@@ -5795,6 +5977,243 @@ mod tests {
             })
         ));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ------------------------------------------------------------ GIT-03
+
+    /// GIT-03 fixture: one speaker for the whole session — the main
+    /// turn, the commit-subject role, and the auto-title role —
+    /// discriminated by system prompt, recording every request.
+    struct CommitSpeaker {
+        requests: std::sync::Arc<parking_lot::Mutex<Vec<SpeakRequest>>>,
+    }
+    impl Speaker for CommitSpeaker {
+        fn speak<'a>(
+            &'a self,
+            req: SpeakRequest,
+            out: mpsc::Sender<StreamEvent>,
+        ) -> SpeakFuture<'a> {
+            let system = req.system.clone();
+            self.requests.lock().push(req);
+            Box::pin(async move {
+                let reply = if system.contains("commit subjects") {
+                    "fix the parser bug"
+                } else if system.contains("conversation titles") {
+                    "Session title"
+                } else {
+                    "I rewrote the parser loop"
+                };
+                out.send(StreamEvent::Text(reply.into())).await.ok();
+                out.send(StreamEvent::Finished {
+                    stop: Stop::Done,
+                    usage: Usage::default(),
+                })
+                .await
+                .ok();
+            })
+        }
+    }
+
+    fn commit_speaker() -> (
+        std::sync::Arc<CommitSpeaker>,
+        std::sync::Arc<parking_lot::Mutex<Vec<SpeakRequest>>>,
+    ) {
+        let requests = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        (
+            std::sync::Arc::new(CommitSpeaker {
+                requests: requests.clone(),
+            }),
+            requests,
+        )
+    }
+
+    fn test_catalog() -> ka_dialect::Catalog {
+        ka_dialect::Catalog::parse(
+            "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000000\n",
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn auto_commit_commit_role_generates_the_subject_and_appends_trailers() {
+        let dir = dirty_repo("role");
+        let cfg = Config {
+            cwd: Some(dir.display().to_string()),
+            model: Some("test/m".into()),
+            roles: crate::config::Roles {
+                default: None,
+                fast: Some("test/m".into()),
+                extra: Default::default(),
+            },
+            git: crate::config::Git {
+                auto_commit: Some(true),
+                // a [roles] NAME resolves through the table
+                commit_role: Some("fast".into()),
+                trailers: vec!["Assisted-by: ka".into()],
+            },
+            ..Default::default()
+        };
+        let (speaker, requests) = commit_speaker();
+        let mut handle = spawn_with_speaker(
+            cfg,
+            test_catalog(),
+            StrandChoice::New,
+            ka_dialect::Wire::OpenaiChat,
+            speaker,
+        );
+        handle
+            .commands
+            .send(Command::Prompt {
+                allowed_tools: None,
+                model: None,
+                text: "fix the parser".into(),
+                schema: None,
+                images: Vec::new(),
+                skills: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let seen = drain_until_finished(&mut handle.events).await;
+        assert!(matches!(
+            seen.last(),
+            Some(Event::TurnFinished {
+                stop: Stop::Done,
+                ..
+            })
+        ));
+        assert_eq!(head_count(&dir), 2, "exactly one new commit");
+        let subject = String::from_utf8_lossy(&git_in(&dir, &["log", "-1", "--format=%s"]).stdout)
+            .trim()
+            .to_string();
+        assert_eq!(subject, "ka: fix the parser bug");
+        let body = String::from_utf8_lossy(&git_in(&dir, &["log", "-1", "--format=%b"]).stdout)
+            .trim()
+            .to_string();
+        assert_eq!(body, "Assisted-by: ka", "trailers must be appended");
+        // the generator saw the staged diff stat + the turn's two sides
+        let commit_req = requests
+            .lock()
+            .iter()
+            .find(|r| r.system.contains("commit subjects"))
+            .expect("commit role request")
+            .clone();
+        let prompt = commit_req
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            prompt.contains("tracked.txt"),
+            "diff stat must ride the prompt: {prompt:?}"
+        );
+        assert!(
+            prompt.contains("fix the parser"),
+            "user side must ride the prompt: {prompt:?}"
+        );
+        assert!(
+            prompt.contains("I rewrote the parser loop"),
+            "assistant side must ride the prompt: {prompt:?}"
+        );
+        // the fallback stays silent: no role-failure note
+        assert!(
+            !seen.iter().any(|e| matches!(e, Event::Note { message }
+                if message.contains("commit role") || message.contains("fallback"))),
+            "generation must not chatter: {seen:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn auto_commit_unresolved_role_falls_back_silently_with_trailers() {
+        let dir = dirty_repo("fallback");
+        let cfg = Config {
+            cwd: Some(dir.display().to_string()),
+            model: Some("test/m".into()),
+            git: crate::config::Git {
+                auto_commit: Some(true),
+                // not in the catalog → no generator, no note
+                commit_role: Some("test/missing".into()),
+                trailers: vec!["Assisted-by: ka".into(), "   ".into()],
+            },
+            ..Default::default()
+        };
+        let (speaker, requests) = commit_speaker();
+        let mut handle = spawn_with_speaker(
+            cfg,
+            test_catalog(),
+            StrandChoice::New,
+            ka_dialect::Wire::OpenaiChat,
+            speaker,
+        );
+        handle
+            .commands
+            .send(Command::Prompt {
+                allowed_tools: None,
+                model: None,
+                text: "hello".into(),
+                schema: None,
+                images: Vec::new(),
+                skills: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let seen = drain_until_finished(&mut handle.events).await;
+        assert!(matches!(
+            seen.last(),
+            Some(Event::TurnFinished {
+                stop: Stop::Done,
+                ..
+            })
+        ));
+        assert_eq!(head_count(&dir), 2, "exactly one new commit");
+        let subject = String::from_utf8_lossy(&git_in(&dir, &["log", "-1", "--format=%s"]).stdout)
+            .trim()
+            .to_string();
+        assert_eq!(subject, "ka: hello", "fallback keeps the prompt line");
+        let body = String::from_utf8_lossy(&git_in(&dir, &["log", "-1", "--format=%b"]).stdout)
+            .trim()
+            .to_string();
+        // the blank trailer line is dropped, the real one stays
+        assert_eq!(body, "Assisted-by: ka");
+        // silence: no request ever reached a commit-subject role and no
+        // note blamed the missing role
+        assert!(
+            !requests
+                .lock()
+                .iter()
+                .any(|r| r.system.contains("commit subjects")),
+            "unresolved role must not fire"
+        );
+        assert!(
+            !seen.iter().any(|e| matches!(e, Event::Note { message }
+                if message.contains("commit role") || message.contains("fallback"))),
+            "fallback must be silent: {seen:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn commit_role_selector_maps_names_and_keeps_literals() {
+        let roles = crate::config::Roles {
+            default: Some("vendor/main".into()),
+            fast: Some("vendor/fast@low".into()),
+            extra: [("review".to_string(), "vendor/r".to_string())]
+                .into_iter()
+                .collect(),
+        };
+        assert_eq!(commit_role_selector(&roles, "fast"), "vendor/fast@low");
+        assert_eq!(commit_role_selector(&roles, "@fast"), "vendor/fast@low");
+        assert_eq!(commit_role_selector(&roles, "review"), "vendor/r");
+        assert_eq!(commit_role_selector(&roles, "@review"), "vendor/r");
+        assert_eq!(commit_role_selector(&roles, "default"), "vendor/main");
+        // anything else stays a literal selector (unknown names fail
+        // catalog resolution downstream → silent first-line fallback)
+        assert_eq!(
+            commit_role_selector(&roles, "vendor/other@high"),
+            "vendor/other@high"
+        );
+        assert_eq!(commit_role_selector(&roles, "@nowhere"), "@nowhere");
     }
 
     #[tokio::test]

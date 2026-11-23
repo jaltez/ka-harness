@@ -78,6 +78,7 @@ pub fn syntax_ghost(input: &str) -> Option<Ghost> {
     let template = match name {
         "/goal" => "<condición>",
         "/loop" => "[--every <secs>] <task>",
+        "/pr" => "<n|url|branch> [fix]",
         _ => return None,
     };
     match args {
@@ -245,6 +246,8 @@ mod tests {
         assert_eq!(g.suffix("/goal"), " <condición>");
         let g = syntax_ghost("/loop").expect("prefix matches");
         assert_eq!(g.suffix("/loop"), " [--every <secs>] <task>");
+        let g = syntax_ghost("/pr").expect("prefix matches");
+        assert_eq!(g.suffix("/pr"), " <n|url|branch> [fix]");
         // trailing space: the template continues right at the caret
         let g = syntax_ghost("/goal ").expect("prefix matches");
         assert_eq!(g.suffix("/goal "), "<condición>");

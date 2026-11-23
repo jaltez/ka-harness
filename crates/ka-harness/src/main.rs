@@ -468,8 +468,45 @@ enum CliCommand {
     Agents,
     /// List known providers with API-key env status
     Providers,
-    /// Generate a starter AGENTS.md from a quick repo scan
-    Init,
+    /// Generate a starter AGENTS.md from a quick repo scan (foreign
+    /// agent rule files are imported as marked sections unless
+    /// --no-import)
+    Init {
+        /// Skip importing .cursorrules / .cursor/rules/*.mdc /
+        /// .github/copilot-instructions.md into the generated AGENTS.md
+        #[arg(long)]
+        no_import: bool,
+    },
+    /// GitHub Actions integration: vendor the PR-automation workflow
+    /// (.github/workflows/ka.yml)
+    Action {
+        #[command(subcommand)]
+        cmd: action::ActionCmd,
+    },
+    /// Manage crontab entries that invoke `ka run`
+    /// (# ka-schedule <name> marked lines)
+    Schedule {
+        #[command(subcommand)]
+        cmd: schedule::ScheduleCmd,
+    },
+    /// Run one recipe: .ka/recipes/<name>.toml, its steps as sequential
+    /// prompts in a single session
+    Recipe {
+        /// Recipe name (bare stem; the file is .ka/recipes/<name>.toml)
+        name: String,
+        /// Placeholder override k=v (repeatable; beats the recipe's
+        /// [vars] defaults)
+        #[arg(long = "var", value_name = "K=V")]
+        vars: Vec<String>,
+        /// Print the rendered prompts and exit — no session, no model
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Manage git worktrees under <repo>/.worktrees/
+    Worktree {
+        #[command(subcommand)]
+        cmd: worktree::WorktreeCmd,
+    },
     /// Inspect configuration
     Config {
         #[command(subcommand)]
@@ -648,15 +685,19 @@ pub enum InstallCmd {
 }
 
 mod acp;
+mod action;
 mod attach;
 mod doctor;
 mod herdr;
 mod import;
 mod mcp_serve;
+mod recipes;
+mod schedule;
 mod serve;
 mod session_import;
 mod skills;
 mod update;
+mod worktree;
 
 /// One startup flag that shapes a session but is never written to the
 /// strand (only in-session changes are). The `/update` re-exec and the
@@ -1722,7 +1763,18 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
         }
         Some(CliCommand::Agents) => run_agents(),
         Some(CliCommand::Providers) => run_providers(),
-        Some(CliCommand::Init) => run_init(),
+        Some(CliCommand::Init { no_import }) => run_init(no_import),
+        Some(CliCommand::Action { cmd }) => action::run(cmd),
+        Some(CliCommand::Schedule { cmd }) => schedule::run(cmd),
+        Some(CliCommand::Recipe {
+            name,
+            vars,
+            dry_run,
+        }) => {
+            let overrides = parse_var_overrides(&vars)?;
+            recipes::run(&name, &overrides, dry_run).await
+        }
+        Some(CliCommand::Worktree { cmd }) => worktree::run(cmd),
         Some(CliCommand::Sessions { json, archived }) => run_sessions_archived(json, archived),
         Some(CliCommand::Gc {
             dry_run,
@@ -3577,9 +3629,31 @@ fn warn_untrusted_conventions(cwd: &std::path::Path) {
 /// Deterministic starter AGENTS.md from repo shape (no model call).
 /// Generated at the root project — the nearest `.git` ancestor of the
 /// launch dir, else the launch dir — where ka and other agents read it.
-fn run_init() -> Result<ExitCode, String> {
+///
+/// GIT-06: when foreign agent rule files exist (.cursorrules,
+/// .cursor/rules/*.mdc, .github/copilot-instructions.md), their content
+/// is imported into the generated AGENTS.md under clearly marked
+/// `## Imported rules (…)` sections — the originals are never touched.
+/// `--no-import` skips the merge entirely.
+fn run_init(no_import: bool) -> Result<ExitCode, String> {
     let cwd = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
     let root = ka_engine::project_root(&cwd);
+    let (target, imported) = init_agents_md(&root, !no_import)?;
+    println!("wrote {}", target.display());
+    println!("edit it to describe real conventions; ka reads it automatically");
+    for src in imported {
+        println!(
+            "imported rules from {} (original left untouched)",
+            src.display()
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Generate AGENTS.md at `root` (refusing to overwrite) and, when
+/// `import_rules`, append the foreign rule sections. Returns the written
+/// path and the source files whose content was imported.
+fn init_agents_md(root: &Path, import_rules: bool) -> Result<(PathBuf, Vec<PathBuf>), String> {
     let target = root.join("AGENTS.md");
     if target.exists() {
         return Err(format!(
@@ -3621,10 +3695,105 @@ fn run_init() -> Result<ExitCode, String> {
     body.push_str(
         "## Conventions\n\n- Describe code style, naming, and layout rules here.\n- List commands that must pass before finishing a task.\n\n## Notes\n\n- Anything an agent should know (quirks, forbidden areas, deployment).\n",
     );
+
+    let mut imported = Vec::new();
+    if import_rules {
+        append_imported_rules(&mut body, root, &mut imported)?;
+    }
     std::fs::write(&target, body).map_err(|e| format!("write: {e}"))?;
-    println!("wrote {}", target.display());
-    println!("edit it to describe real conventions; ka reads it automatically");
-    Ok(ExitCode::SUCCESS)
+    Ok((target, imported))
+}
+
+/// Append the foreign rule sections onto `body`: cursor sources first
+/// (.cursorrules, then .cursor/rules/*.mdc sorted by name), then
+/// copilot (.github/copilot-instructions.md). Every source is marked
+/// with its origin; the source files themselves are read-only inputs.
+fn append_imported_rules(
+    body: &mut String,
+    root: &Path,
+    imported: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    let mut cursor_sources: Vec<PathBuf> = Vec::new();
+    let cursorrules = root.join(".cursorrules");
+    if cursorrules.is_file() {
+        cursor_sources.push(cursorrules);
+    }
+    let rules_dir = root.join(".cursor").join("rules");
+    if rules_dir.is_dir() {
+        let mut mdc: Vec<PathBuf> = std::fs::read_dir(&rules_dir)
+            .map_err(|e| format!("read {}: {e}", rules_dir.display()))?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "mdc"))
+            .collect();
+        mdc.sort();
+        cursor_sources.extend(mdc);
+    }
+    append_rule_family(body, root, "cursor", &cursor_sources, imported)?;
+    let copilot = root.join(".github").join("copilot-instructions.md");
+    let copilot_sources = if copilot.is_file() {
+        vec![copilot]
+    } else {
+        Vec::new()
+    };
+    append_rule_family(body, root, "copilot", &copilot_sources, imported)?;
+    Ok(())
+}
+
+/// One `## Imported rules (<family>)` section listing every source and
+/// embedding each file's content behind an origin marker. Sources whose
+/// content is empty/whitespace are skipped entirely (no empty section).
+fn append_rule_family(
+    body: &mut String,
+    root: &Path,
+    family: &str,
+    sources: &[PathBuf],
+    imported: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    let mut blocks: Vec<(String, String)> = Vec::new();
+    for src in sources {
+        let rel = src
+            .strip_prefix(root)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| src.to_string_lossy().into_owned());
+        let content = std::fs::read_to_string(src).map_err(|e| format!("read {rel}: {e}"))?;
+        let trimmed = content.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        blocks.push((rel, trimmed.to_string()));
+    }
+    if blocks.is_empty() {
+        return Ok(());
+    }
+    body.push_str(&format!("\n## Imported rules ({family})\n\n"));
+    body.push_str(&format!(
+        "Imported by `ka init` from the {family} rule file(s) below — \
+         ka reads AGENTS.md, not the sources. The original files are \
+         untouched: edit one side or the other, not both.\n"
+    ));
+    for (rel, content) in blocks {
+        body.push_str(&format!(
+            "\n<!-- from {rel} — imported by `ka init`; the original file is untouched -->\n\n{content}\n"
+        ));
+        imported.push(root.join(&rel));
+    }
+    Ok(())
+}
+
+/// `--var k=v` overrides for `ka recipe`: split on the first `=`, the
+/// key must be non-empty. Values may contain `=`.
+fn parse_var_overrides(args: &[String]) -> Result<Vec<(String, String)>, String> {
+    args.iter()
+        .map(|arg| {
+            let (k, v) = arg
+                .split_once('=')
+                .ok_or_else(|| format!("--var expects k=v, got {arg:?}"))?;
+            if k.is_empty() {
+                return Err(format!("--var key must be non-empty, got {arg:?}"));
+            }
+            Ok((k.to_string(), v.to_string()))
+        })
+        .collect()
 }
 
 /// Headless rewind: attach to the latest strand and drop N turns.
@@ -4421,5 +4590,129 @@ mod config_surface_tests {
         };
         assert_eq!(session, "abc");
         assert_eq!(message, "ping");
+    }
+}
+
+/// GIT-06 · `ka init` foreign-rule import: cursor/copilot rule files
+/// land as clearly marked sections in the generated AGENTS.md, the
+/// originals untouched; `--no-import` skips the merge.
+#[cfg(test)]
+mod init_import_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+
+    fn temp_root(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("ka-init-{}-{n}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn generated(path: &std::path::Path) -> String {
+        std::fs::read_to_string(path).unwrap()
+    }
+
+    #[test]
+    fn cursorrules_land_as_a_marked_imported_section() {
+        let root = temp_root("cursor");
+        std::fs::write(
+            root.join(".cursorrules"),
+            "Always use spaces.\nNo emoji in code.\n",
+        )
+        .unwrap();
+        let (target, imported) = init_agents_md(&root, true).unwrap();
+        assert_eq!(imported, vec![root.join(".cursorrules")]);
+        let md = generated(&target);
+        assert!(md.contains("## Imported rules (cursor)"), "{md}");
+        assert!(md.contains("Always use spaces."), "{md}");
+        assert!(md.contains("<!-- from .cursorrules"), "{md}");
+        // the starter body is still there, imports come after it
+        assert!(md.find("# AGENTS.md").unwrap() < md.find("## Imported rules").unwrap());
+        // the original is byte-identical
+        assert_eq!(
+            std::fs::read_to_string(root.join(".cursorrules")).unwrap(),
+            "Always use spaces.\nNo emoji in code.\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cursor_rules_dir_and_copilot_get_their_own_sections() {
+        let root = temp_root("families");
+        std::fs::create_dir_all(root.join(".cursor/rules")).unwrap();
+        std::fs::write(root.join(".cursor/rules/a.mdc"), "Rule A.\n").unwrap();
+        std::fs::write(root.join(".cursor/rules/b.mdc"), "Rule B.\n").unwrap();
+        std::fs::create_dir_all(root.join(".github")).unwrap();
+        std::fs::write(
+            root.join(".github/copilot-instructions.md"),
+            "Keep PRs small.\n",
+        )
+        .unwrap();
+        let (target, imported) = init_agents_md(&root, true).unwrap();
+        let md = generated(&target);
+        assert!(md.contains("## Imported rules (cursor)"), "{md}");
+        assert!(md.contains("## Imported rules (copilot)"), "{md}");
+        // .mdc files sorted by name, each origin-marked
+        let a = md.find("<!-- from .cursor/rules/a.mdc").unwrap();
+        let b = md.find("<!-- from .cursor/rules/b.mdc").unwrap();
+        assert!(a < b, "mdc sources in sorted order");
+        assert!(md.contains("Rule B."));
+        assert!(md.contains("Keep PRs small."));
+        assert_eq!(imported.len(), 3);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn no_import_flag_and_missing_files_mean_no_section() {
+        let root = temp_root("noimport");
+        std::fs::write(root.join(".cursorrules"), "Always use spaces.\n").unwrap();
+        let (target, imported) = init_agents_md(&root, false).unwrap();
+        assert!(imported.is_empty());
+        assert!(!generated(&target).contains("## Imported rules"));
+
+        let plain = temp_root("plain");
+        let (target, imported) = init_agents_md(&plain, true).unwrap();
+        assert!(imported.is_empty());
+        assert!(!generated(&target).contains("## Imported rules"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&plain);
+    }
+
+    #[test]
+    fn empty_foreign_files_produce_no_section() {
+        let root = temp_root("empty");
+        std::fs::write(root.join(".cursorrules"), "   \n").unwrap();
+        let (target, imported) = init_agents_md(&root, true).unwrap();
+        assert!(imported.is_empty());
+        assert!(!generated(&target).contains("## Imported rules"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn existing_agents_md_still_refuses() {
+        let root = temp_root("exists");
+        std::fs::write(root.join("AGENTS.md"), "# mine\n").unwrap();
+        let err = init_agents_md(&root, true).unwrap_err();
+        assert!(err.contains("refusing to overwrite"), "{err}");
+        assert_eq!(generated(&root.join("AGENTS.md")), "# mine\n");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn var_overrides_split_on_the_first_equals() {
+        let parsed = parse_var_overrides(&[
+            "k=v".to_string(),
+            "eq=a=b".to_string(),
+            "empty=".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(parsed[0], ("k".to_string(), "v".to_string()));
+        assert_eq!(parsed[1], ("eq".to_string(), "a=b".to_string()));
+        assert_eq!(parsed[2], ("empty".to_string(), String::new()));
+        assert!(parse_var_overrides(&["nonsense".to_string()]).is_err());
+        assert!(parse_var_overrides(&["=v".to_string()]).is_err());
     }
 }

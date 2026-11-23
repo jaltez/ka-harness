@@ -617,6 +617,9 @@ fn config_schema_carries_every_documented_key() {
         "discovery",
         "git",
         "auto_commit",
+        // GIT-03: role-generated commit subject + provenance trailers
+        "commit_role",
+        "trailers",
         "verify",
         "test",
         "lints",

@@ -132,6 +132,11 @@ pub const ACTIONS: &[Binding] = &[
         ctx: CTX_IDLE,
         default: &["alt+s"],
     },
+    Binding {
+        id: "git.panel",
+        ctx: CTX_IDLE,
+        default: &["alt+g"],
+    },
 ];
 
 /// One parsed key step: a key plus its held modifiers. `SHIFT` alone on
@@ -548,11 +553,11 @@ mod tests {
     #[test]
     fn config_reroutes_and_replaces_multi_chord_defaults() {
         let mut cfg = BTreeMap::new();
-        cfg.insert("popups.todos".to_string(), "alt+g".to_string());
+        cfg.insert("popups.todos".to_string(), "alt+x".to_string());
         let b = Bindings::resolve(Some(&cfg)).expect("resolves");
-        assert!(b.matches(&key(KeyCode::Char('g'), KeyModifiers::ALT), "popups.todos"));
+        assert!(b.matches(&key(KeyCode::Char('x'), KeyModifiers::ALT), "popups.todos"));
         assert!(!b.matches(&key(KeyCode::Char('o'), KeyModifiers::ALT), "popups.todos"));
-        assert!(b.matches_custom(&key(KeyCode::Char('g'), KeyModifiers::ALT), "popups.todos"));
+        assert!(b.matches_custom(&key(KeyCode::Char('x'), KeyModifiers::ALT), "popups.todos"));
         assert!(!b.matches_custom(
             &key(KeyCode::Char('t'), KeyModifiers::CONTROL),
             "popups.skills"
