@@ -5226,6 +5226,34 @@ fn mouse_mode_text(captured: bool) -> String {
 /// chord: it is already part of the character it produced (`A`, `?`),
 /// and terminals report it on Enter and the arrows too, so ⇧⏎ still
 /// submits and ⇧↓ still moves.
+/// Whether a modal holds typed work a stray click outside would cost:
+/// an api-key value, a settings edit, or a save path. Filters are cheap
+/// to retype and do not count.
+fn modal_has_typed_edit(open: &Modal) -> bool {
+    match open {
+        Modal::Key(prompt) => !prompt.input.is_empty(),
+        Modal::Settings(panel) => panel.edit.as_deref().is_some_and(|e| !e.is_empty()),
+        Modal::CopyPick {
+            save: Some(path), ..
+        } => !path.is_empty(),
+        _ => false,
+    }
+}
+
+/// Whether Enter may act in the session picker: a filter that matches
+/// nothing must not silently start a fresh session.
+fn session_picker_can_enter(picker: &SessionPicker) -> bool {
+    picker.filter.is_empty() || picker.rows().len() > 1
+}
+
+/// Whether a typed model selector is in the catalog (exact id, or a
+/// vendor prefix the catalog lists).
+fn selector_in_catalog(selector: &str, models: &[ModelInfo]) -> bool {
+    models
+        .iter()
+        .any(|m| m.id == selector || m.id.split('/').next() == Some(selector))
+}
+
 fn modal_key(key: crossterm::event::KeyEvent) -> crossterm::event::KeyEvent {
     use crossterm::event::{KeyCode, KeyModifiers};
     let chord = KeyModifiers::CONTROL
@@ -6140,6 +6168,13 @@ async fn app(
                                     picker.filter_typed("");
                                 }
                                 KeyCode::Enter => {
+                                    if !session_picker_can_enter(picker) {
+                                        pop_toast(
+                                            &mut toast,
+                                            "no matches — esc clears the filter".to_string(),
+                                        );
+                                        continue;
+                                    }
                                     let id = picker.pick();
                                     let target = id.unwrap_or_else(|| "new".to_string());
                                     fresh = target == "new";
@@ -6401,6 +6436,17 @@ async fn app(
                                                     panel.edit.clone().unwrap_or_default();
                                                 if !value.trim().is_empty() {
                                                     panel.model = value.trim().to_string();
+                                                    panel.status = Some(if selector_in_catalog(
+                                                        &panel.model,
+                                                        &models,
+                                                    ) {
+                                                        format!("{} applied", panel.model)
+                                                    } else {
+                                                        format!(
+                                                            "{} not in the catalog — sent as a custom selector",
+                                                            panel.model
+                                                        )
+                                                    });
                                                     let _ = commands
                                                         .send(Command::SetModel {
                                                             selector: panel.model.clone(),
@@ -8268,7 +8314,7 @@ async fn app(
                                     ));
                                     continue;
                                 }
-                                transcript.push_separated(Line::User(text));
+                                transcript.push_separated(Line::Info(text));
                                 if busy || pending.is_some() || !queue.is_empty() {
                                     transcript.push_separated(Line::Warn(
                                         "update waits for idle — finish or stop the turn first"
@@ -8287,7 +8333,7 @@ async fn app(
                             // notes last said; CTX-05 keeps GoalAction
                             // free of a Status variant on purpose.
                             if matches!(text.trim(), "/goal" | "/goal status") {
-                                transcript.push_separated(Line::User(text.clone()));
+                                transcript.push_separated(Line::Info(text.clone()));
                                 transcript.push_separated(Line::Info(goal_status_note(
                                     meters.goal.as_ref(),
                                 )));
@@ -8299,7 +8345,7 @@ async fn app(
                             if let Some(outcome) = skill_invocation(&text, &sidebar.inventory) {
                                 match outcome {
                                     Ok(cmd) => {
-                                        transcript.push_separated(Line::User(text.clone()));
+                                        transcript.push_separated(Line::Info(text.clone()));
                                         busy = true;
                                         let _ = commands.send(cmd).await;
                                     }
@@ -8308,7 +8354,7 @@ async fn app(
                                 continue;
                             }
                             if let Some(cmd) = slash_command(&text) {
-                                transcript.push_separated(Line::User(text));
+                                transcript.push_separated(Line::Info(text));
                                 if matches!(
                                     cmd.event,
                                     Some(Command::SetMode {
@@ -9343,7 +9389,10 @@ async fn app(
                         }
                         hover = next;
                     } else if left_down && capture_now && pending.is_none() && modal.is_some() {
-                        if let Some(rect) = modal_zone.get()
+                        // a click outside closes a panel, but never throws
+                        // away an api key, a settings edit or a save path
+                        if modal.as_ref().is_some_and(modal_has_typed_edit) {
+                        } else if let Some(rect) = modal_zone.get()
                             && modal_close_hit(rect, mouse_evt.column, mouse_evt.row)
                         {
                             modal = None;
@@ -9870,7 +9919,7 @@ async fn app(
                                 }
                                 while let Some(next) = pop_queue_head(&mut queue) {
                                     if let Some(cmd) = slash_command(&next) {
-                                        transcript.push_separated(Line::User(next));
+                                        transcript.push_separated(Line::Info(next));
                                         if let Some(note) = cmd.note {
                                             transcript.push_separated(
                                                 if note.starts_with("usage:") {
@@ -18628,6 +18677,82 @@ mod tests {
         assert_eq!(window_range(100, 20, Some(95)), (80, true));
         // zero visible
         assert_eq!(window_range(100, 0, Some(10)), (0, true));
+    }
+
+    /// The rules that guard typed work and empty filters, pinned where a
+    /// user can feel them: a stray click, a no-match Enter, a bad selector.
+    #[test]
+    fn typed_work_and_empty_filters_are_guarded() {
+        use ka_protocol::Mode;
+        let key = |input: &str| {
+            Modal::Key(KeyPrompt {
+                provider: "mockco".into(),
+                env_var: "MOCK_KEY".into(),
+                doc_url: String::new(),
+                drill: None,
+                input: input.to_string(),
+                pending_model: None,
+            })
+        };
+        assert!(modal_has_typed_edit(&key("sk-live")), "a typed key is work");
+        assert!(!modal_has_typed_edit(&key("")), "an empty field is not");
+        let settings = |edit: Option<&str>| {
+            Modal::Settings(SettingsPanel {
+                model: "(canned)".into(),
+                mode: Mode::Ask,
+                effort: None,
+                selected: 0,
+                edit: edit.map(str::to_string),
+                providers: Vec::new(),
+                config_path: String::new(),
+                status: None,
+            })
+        };
+        assert!(modal_has_typed_edit(&settings(Some("zai/glm-5.3"))));
+        assert!(!modal_has_typed_edit(&settings(Some(""))));
+        assert!(!modal_has_typed_edit(&settings(None)));
+        assert!(
+            modal_has_typed_edit(&Modal::CopyPick {
+                blocks: Vec::new(),
+                selected: 0,
+                save: Some("out.md".into()),
+            }),
+            "a save path is work"
+        );
+        assert!(!modal_has_typed_edit(&Modal::Session(SessionPicker {
+            sessions: Vec::new(),
+            selected: 0,
+            filter: "abc".into(),
+            current: None,
+        })));
+
+        // a filter that matches nothing must not start a fresh session
+        let picker = |filter: &str| SessionPicker {
+            sessions: Vec::new(),
+            selected: 0,
+            filter: filter.to_string(),
+            current: None,
+        };
+        assert!(session_picker_can_enter(&picker("")));
+        assert!(!session_picker_can_enter(&picker("zzz")));
+
+        // a selector is catalog-known by exact id or by vendor prefix
+        let models = vec![ModelInfo {
+            id: "zai/glm-5.3".into(),
+            wire: "openai_chat".into(),
+            context: 200_000,
+            key_env: String::new(),
+            key_set: false,
+            doc_url: String::new(),
+            price_in: 0.0,
+            price_out: 0.0,
+            priced: false,
+            plan: false,
+            efforts: Vec::new(),
+        }];
+        assert!(selector_in_catalog("zai/glm-5.3", &models));
+        assert!(selector_in_catalog("zai", &models));
+        assert!(!selector_in_catalog("glm-55", &models));
     }
 
     /// A doc pager opens at the TOP (unlike the transcript's tail pin),

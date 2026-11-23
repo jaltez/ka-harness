@@ -1,0 +1,2 @@
+ts	phase	decision	why	evidence	result
+2026-11-23T22:00:41Z	improve	landed the doc-pager rework myself after the panel owner's quota died: one rendered-row window, top-open, Esc-only close, markers inside the box	the salvaged pager primitives had two meanings for None, which caused the changelog and permissions findings; I unified them per surface and proved it in the harness	commit on ux/tui; scenes modal-task-detail, modal-changelog, modal-permissions, modal-doctor	tests green
