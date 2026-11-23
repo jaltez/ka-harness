@@ -2967,6 +2967,13 @@ fn line_down(scroll: &mut Option<usize>, total: usize, visible: usize) {
 /// Transcript rows per mouse-wheel notch.
 const WHEEL_STEP: usize = 3;
 
+/// Rows a composer popup may list: the room above the composer, less its
+/// frame — never more than 14 (about twice the old fixed seven, when the
+/// screen allows) and never fewer than 3.
+fn popup_cap(room: u16) -> usize {
+    (room.saturating_sub(2) as usize).clamp(3, 14)
+}
+
 /// A pending self-update, from the CLI's startup check to the TUI
 /// (`ka update` remains the only install path — this only announces).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6017,8 +6024,19 @@ async fn app(
                     input.vim.label(),
                     // TUI-09: the dim continuation at the caret (slash
                     // command / @-mention); None = nothing to suggest
-                    ghost_suggestion(&input_snapshot, cursor, &mut mention_cache)
-                        .map(|g| g.suffix(&input_snapshot)),
+                    // with the slash popup open the ghost completes the
+                    // HIGHLIGHTED command (Enter runs it), not the first match
+                    slash_popup
+                        .as_ref()
+                        .and_then(|p| p.items.get(p.selected))
+                        .and_then(|(name, _)| {
+                            name.strip_prefix(input_snapshot.as_str())
+                                .map(str::to_string)
+                        })
+                        .or_else(|| {
+                            ghost_suggestion(&input_snapshot, cursor, &mut mention_cache)
+                                .map(|g| g.suffix(&input_snapshot))
+                        }),
                 );
             })?;
 
@@ -9489,6 +9507,41 @@ async fn app(
                             slash_popup = None;
                             path_popup = None;
                             picker = None;
+                        }
+                    } else if capture_now
+                        && pending.is_none()
+                        && matches!(
+                            mouse_evt.kind,
+                            crossterm::event::MouseEventKind::ScrollUp
+                                | crossterm::event::MouseEventKind::ScrollDown
+                        )
+                        && (slash_popup.is_some() || path_popup.is_some())
+                    {
+                        // the wheel scrolls the list under the cursor: the
+                        // selection moves with it and the window follows
+                        let up = matches!(
+                            mouse_evt.kind,
+                            crossterm::event::MouseEventKind::ScrollUp
+                        );
+                        let mut bump = |selected: &mut usize, len: usize| {
+                            if len == 0 {
+                                return;
+                            }
+                            *selected = if up {
+                                selected.saturating_sub(WHEEL_STEP)
+                            } else {
+                                (*selected + WHEEL_STEP).min(len - 1)
+                            };
+                        };
+                        if let Some(p) = slash_popup.as_mut() {
+                            let mut sel = p.selected;
+                            bump(&mut sel, p.items.len());
+                            p.selected = sel;
+                        }
+                        if let Some(p) = path_popup.as_mut() {
+                            let mut sel = p.selected;
+                            bump(&mut sel, p.entries.len());
+                            p.selected = sel;
                         }
                     } else if modal.is_none()
                         && pending.is_none()
@@ -15609,13 +15662,14 @@ fn render(
 
     // ── slash autocomplete popup (above the composer) ─────────────
     if let Some(popup) = popup {
-        // borders + up to CAP items (hints ride the bottom border)
-        const CAP: usize = 7;
-        let rows = popup.items.len().min(CAP) as u16 + 2;
+        // borders + as many items as the room above the composer allows
+        // (hints ride the bottom border)
+        let cap = popup_cap(composer.y.saturating_sub(chunks[2].y));
+        let rows = popup.items.len().min(cap) as u16 + 2;
         let rect = Rect {
             x: composer.x,
             y: composer.y.saturating_sub(rows),
-            width: composer.width.min(64),
+            width: composer.width.min(96),
             height: rows,
         };
         popup_zone.set(Some(rect));
@@ -15628,10 +15682,10 @@ fn render(
         // filter can match far more commands than the shown rows
         let offset = popup
             .selected
-            .saturating_sub(CAP - 1)
-            .min(popup.items.len().saturating_sub(CAP));
+            .saturating_sub(cap - 1)
+            .min(popup.items.len().saturating_sub(cap));
         let mut text = Vec::new();
-        for (i, (name, desc)) in popup.items.iter().skip(offset).take(CAP).enumerate() {
+        for (i, (name, desc)) in popup.items.iter().skip(offset).take(cap).enumerate() {
             let desc = trunc_cols(desc, desc_room);
             if i + offset == popup.selected {
                 text.push(TuiLine::from(vec![
@@ -15677,12 +15731,12 @@ fn render(
 
     // ── path completion popup (above the composer) ─────────────────
     if let Some(path) = path {
-        const CAP: usize = 7;
-        let rows = path.entries.len().min(CAP) as u16 + 2;
+        let cap = popup_cap(composer.y.saturating_sub(chunks[2].y));
+        let rows = path.entries.len().min(cap) as u16 + 2;
         let rect = Rect {
             x: composer.x,
             y: composer.y.saturating_sub(rows),
-            width: composer.width.min(64),
+            width: composer.width.min(96),
             height: rows,
         };
         popup_zone.set(Some(rect));
@@ -15691,10 +15745,10 @@ fn render(
         // window the list so the selection always stays visible
         let offset = path
             .selected
-            .saturating_sub(CAP - 1)
-            .min(path.entries.len().saturating_sub(CAP));
+            .saturating_sub(cap - 1)
+            .min(path.entries.len().saturating_sub(cap));
         let mut text = Vec::new();
-        for (i, (name, is_dir)) in path.entries.iter().skip(offset).take(CAP).enumerate() {
+        for (i, (name, is_dir)) in path.entries.iter().skip(offset).take(cap).enumerate() {
             if i + offset == path.selected {
                 let shown = if *is_dir {
                     format!("{name}/")
@@ -18795,6 +18849,16 @@ mod tests {
         let wide = vec![Span::raw("a".repeat(40))];
         let empty = fit_status_left(wide, 10, 20);
         assert!(empty.is_empty(), "{empty:?}");
+    }
+
+    /// A composer popup lists as many rows as the room above the composer
+    /// allows, about twice the old fixed seven, and never fewer than three.
+    #[test]
+    fn composer_popup_height_follows_the_room() {
+        assert_eq!(popup_cap(0), 3, "a squeezed pane keeps three rows");
+        assert_eq!(popup_cap(6), 4);
+        assert_eq!(popup_cap(20), 14, "a 40-row screen shows fourteen");
+        assert_eq!(popup_cap(60), 14, "capped at fourteen");
     }
 
     /// In the click-a-prompt popup Enter runs the row the pointer is on,
