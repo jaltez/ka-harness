@@ -3133,14 +3133,99 @@ struct StripZones {
     skills: ratatui::layout::Rect,
     /// The info button.
     info: ratatui::layout::Rect,
+    /// Clickable hints elsewhere on screen (composer hint pairs, the
+    /// status line's model label and mode chip). An unused slot keeps an
+    /// empty rect.
+    hints: [(ratatui::layout::Rect, StripButton); 8],
 }
 
-/// Which strip button a click landed on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+impl StripZones {
+    /// The rect a button was drawn on (empty when it was not drawn).
+    fn rect_of(&self, button: StripButton) -> ratatui::layout::Rect {
+        match button {
+            StripButton::Todos => self.todos,
+            StripButton::Skills => self.skills,
+            StripButton::Info => self.info,
+            other => self
+                .hints
+                .iter()
+                .find(|(r, b)| *b == other && r.width > 0)
+                .map_or(ratatui::layout::Rect::default(), |(r, _)| *r),
+        }
+    }
+}
+
+/// Which strip button a click landed on: the three composer buttons, the
+/// composer hint pairs that name an action, and the status line's model
+/// label and mode chip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum StripButton {
+    #[default]
     Todos,
     Skills,
     Info,
+    Send,
+    Clear,
+    History,
+    Commands,
+    Abort,
+    Mode,
+    Model,
+}
+
+/// What a drawn hint pair does when clicked: `None` for a hint that only
+/// describes (drag to select).
+fn hint_action(key: &str, desc: &str) -> Option<StripButton> {
+    match (key, desc) {
+        ("⏎", "send") | ("⏎", "steer") => Some(StripButton::Send),
+        ("esc", "clear") => Some(StripButton::Clear),
+        ("↑↓ ^p/^n", "history") => Some(StripButton::History),
+        ("/", "commands") => Some(StripButton::Commands),
+        ("esc", "abort") => Some(StripButton::Abort),
+        _ => None,
+    }
+}
+
+/// The cells each hint pair takes when `paint_hints` draws `pairs`
+/// right-aligned inside `[left, right)` on row `y`. Pairs that do not
+/// fit are not drawn and get no rect.
+fn hint_rects<'a>(
+    pairs: &[(&'a str, &'a str)],
+    left: u16,
+    right: u16,
+    y: u16,
+) -> Vec<(ratatui::layout::Rect, &'a str, &'a str)> {
+    use unicode_width::UnicodeWidthStr;
+    let max = (right.saturating_sub(left) as usize).saturating_sub(2);
+    let mut widths = Vec::new();
+    let mut used = 0usize;
+    for (i, (k, v)) in pairs.iter().enumerate() {
+        let gap = if i == 0 { 0 } else { 2 };
+        let w = gap + k.width() + 1 + v.width();
+        if used + w > max {
+            break;
+        }
+        used += w;
+        widths.push(w);
+    }
+    let mut x = right.saturating_sub(used as u16 + 2) + 1;
+    let mut out = Vec::new();
+    for ((k, v), w) in pairs.iter().zip(widths) {
+        let gap = if out.is_empty() { 0 } else { 2 };
+        x += gap as u16;
+        out.push((
+            ratatui::layout::Rect {
+                x,
+                y,
+                width: (w - gap) as u16,
+                height: 1,
+            },
+            *k,
+            *v,
+        ));
+        x += (w - gap) as u16;
+    }
+    out
 }
 
 impl StripZones {
@@ -3154,7 +3239,10 @@ impl StripZones {
         } else if self.info.contains(pos) {
             Some(StripButton::Info)
         } else {
-            None
+            self.hints
+                .iter()
+                .find(|(r, _)| r.width > 0 && r.contains(pos))
+                .map(|(_, b)| *b)
         }
     }
 }
@@ -5830,6 +5918,9 @@ async fn app(
     // and frame can never disagree about the band/surface width
     let tx_width: std::cell::Cell<u16> = std::cell::Cell::new(0);
     let mut term_events = crossterm::event::EventStream::new();
+    // a click that means a key press (send, clear, history, commands)
+    // re-enters the loop here as that key, so it runs the same handler
+    let (pending_keys_tx, mut pending_keys_rx) = mpsc::channel::<crossterm::event::KeyEvent>(4);
     // stays armed until the update checker closes its channel (recv()
     // on a closed channel is ready forever — a no-op arm would spin)
     let mut updates_open = true;
@@ -6057,7 +6148,12 @@ async fn app(
 
         tokio::select! {
             biased;
-            maybe_term = term_events.next() => {
+            maybe_term = async {
+                tokio::select! {
+                    event = term_events.next() => event,
+                    key = pending_keys_rx.recv() => key.map(|k| Ok(crossterm::event::Event::Key(k))),
+                }
+            } => {
                 dirty = true;
                 if let Some(Ok(TermEvent::Key(key))) = maybe_term {
                     if key.kind == crossterm::event::KeyEventKind::Release {
@@ -9753,6 +9849,55 @@ async fn app(
                                             modal = Some(Modal::Info {
                                                 rows: info_rows(&sidebar, &meters, 64),
                                             });
+                                        }
+                                        Click::Send => {
+                                            let _ = pending_keys_tx
+                                                .send(crossterm::event::KeyEvent::new(
+                                                    crossterm::event::KeyCode::Enter,
+                                                    crossterm::event::KeyModifiers::NONE,
+                                                ))
+                                                .await;
+                                        }
+                                        Click::Clear | Click::Abort => {
+                                            let _ = pending_keys_tx
+                                                .send(crossterm::event::KeyEvent::new(
+                                                    crossterm::event::KeyCode::Esc,
+                                                    crossterm::event::KeyModifiers::NONE,
+                                                ))
+                                                .await;
+                                        }
+                                        Click::History => {
+                                            let _ = pending_keys_tx
+                                                .send(crossterm::event::KeyEvent::new(
+                                                    crossterm::event::KeyCode::Up,
+                                                    crossterm::event::KeyModifiers::NONE,
+                                                ))
+                                                .await;
+                                        }
+                                        Click::Commands => {
+                                            let _ = pending_keys_tx
+                                                .send(crossterm::event::KeyEvent::new(
+                                                    crossterm::event::KeyCode::Char('/'),
+                                                    crossterm::event::KeyModifiers::NONE,
+                                                ))
+                                                .await;
+                                        }
+                                        Click::Mode => {
+                                            if modal.is_none() && pending.is_none() && picker.is_none() {
+                                                picker = Some(InputPicker::Mode(ModePicker::for_mode(
+                                                    mode_of(&meters).unwrap_or(ka_protocol::Mode::Ask),
+                                                )));
+                                            }
+                                        }
+                                        Click::Model => {
+                                            if modal.is_none() && pending.is_none() {
+                                                modal = Some(Modal::Model(ModelPicker {
+                                                    models: models.clone(),
+                                                    vendor: None,
+                                                    selected: 0,
+                                                    filter: String::new(),
+                                                }));
+                                            }
                                         }
                                         Click::None => {}
                                     }
@@ -14103,6 +14248,7 @@ fn paint_strip(
             StripButton::Todos => zones.todos = rect,
             StripButton::Skills => zones.skills = rect,
             StripButton::Info => zones.info = rect,
+            _ => {}
         }
         x += w + 1;
     }
@@ -15640,22 +15786,28 @@ fn render(
         if composer.height >= 2 && composer.width >= 4 {
             let y = composer.bottom() - 1;
             let limit = composer.right() - 2;
-            let (zones, strip_end) = paint_strip(buf, composer.x + 2, limit, y);
+            let (mut zones, strip_end) = paint_strip(buf, composer.x + 2, limit, y);
+            let hints_on = ask.is_none() && modal.is_none() && popup.is_none() && path.is_none();
+            let hints = composer_hints(
+                picker.is_some(),
+                rsearch.is_some(),
+                busy,
+                !input.is_empty(),
+                mouse_captured,
+            );
+            if hints_on {
+                // a hint that names an action is a button for it
+                let clickable: Vec<_> = hint_rects(hints, strip_end, limit, y)
+                    .into_iter()
+                    .filter_map(|(rect, key, desc)| hint_action(key, desc).map(|b| (rect, b)))
+                    .collect();
+                for (slot, hit) in zones.hints.iter_mut().zip(clickable) {
+                    *slot = hit;
+                }
+            }
             strip_zone.set(Some(zones));
-            if ask.is_none() && modal.is_none() && popup.is_none() && path.is_none() {
-                paint_hints(
-                    buf,
-                    strip_end,
-                    limit,
-                    y,
-                    composer_hints(
-                        picker.is_some(),
-                        rsearch.is_some(),
-                        busy,
-                        !input.is_empty(),
-                        mouse_captured,
-                    ),
-                );
+            if hints_on {
+                paint_hints(buf, strip_end, limit, y, hints);
             }
         }
     }
@@ -15681,6 +15833,37 @@ fn render(
         // that ends on the cost
         if meters.mode.is_empty() {
             bar.push(Span::raw(" "));
+        }
+        // the status line answers to clicks too: the model label opens
+        // the model picker, the mode chip the mode picker
+        if let Some(mut zones) = strip_zone.get() {
+            let mut x = status.x;
+            for span in &bar {
+                let w = span.content.width() as u16;
+                let text = span.content.trim();
+                let button = if !meters.model.is_empty() && text == meters.model {
+                    Some(StripButton::Model)
+                } else if !meters.mode.is_empty() && text.contains(meters.mode.as_str()) {
+                    Some(StripButton::Mode)
+                } else {
+                    None
+                };
+                if let Some(button) = button
+                    && let Some(slot) = zones.hints.iter_mut().find(|s| s.0.width == 0)
+                {
+                    *slot = (
+                        Rect {
+                            x,
+                            y: status.y,
+                            width: w,
+                            height: 1,
+                        },
+                        button,
+                    );
+                }
+                x += w;
+            }
+            strip_zone.set(Some(zones));
         }
         frame.render_widget(
             Paragraph::new(TuiLine::from(bar)).style(
@@ -16918,11 +17101,7 @@ fn render(
             }
             Hover::Strip(button) => {
                 if let Some(z) = strip_zone.get() {
-                    let r = match button {
-                        StripButton::Todos => z.todos,
-                        StripButton::Skills => z.skills,
-                        StripButton::Info => z.info,
-                    };
+                    let r = z.rect_of(button);
                     for x in r.x..r.x + r.width {
                         if let Some(cell) = buf.cell_mut((x, r.y)) {
                             cell.set_fg(crate::palette::STRONG);
@@ -17649,6 +17828,14 @@ enum Click {
     Todos,
     Skills,
     Info,
+    /// A composer hint that names its action, or a status-line segment.
+    Send,
+    Clear,
+    History,
+    Commands,
+    Abort,
+    Mode,
+    Model,
     None,
 }
 
@@ -17669,6 +17856,13 @@ fn click_target(
             StripButton::Todos => Click::Todos,
             StripButton::Skills => Click::Skills,
             StripButton::Info => Click::Info,
+            StripButton::Send => Click::Send,
+            StripButton::Clear => Click::Clear,
+            StripButton::History => Click::History,
+            StripButton::Commands => Click::Commands,
+            StripButton::Abort => Click::Abort,
+            StripButton::Mode => Click::Mode,
+            StripButton::Model => Click::Model,
         };
     }
     if let Some(up) = arrows.get().and_then(|z| z.hit(col, row)) {
@@ -17769,6 +17963,13 @@ fn hover_target(
         Click::Todos => Some(Hover::Strip(StripButton::Todos)),
         Click::Skills => Some(Hover::Strip(StripButton::Skills)),
         Click::Info => Some(Hover::Strip(StripButton::Info)),
+        Click::Send => Some(Hover::Strip(StripButton::Send)),
+        Click::Clear => Some(Hover::Strip(StripButton::Clear)),
+        Click::History => Some(Hover::Strip(StripButton::History)),
+        Click::Commands => Some(Hover::Strip(StripButton::Commands)),
+        Click::Abort => Some(Hover::Strip(StripButton::Abort)),
+        Click::Mode => Some(Hover::Strip(StripButton::Mode)),
+        Click::Model => Some(Hover::Strip(StripButton::Model)),
         Click::None => None,
     }
 }
@@ -18886,6 +19087,39 @@ mod tests {
         let wide = vec![Span::raw("a".repeat(40))];
         let empty = fit_status_left(wide, 10, 20);
         assert!(empty.is_empty(), "{empty:?}");
+    }
+
+    /// The hint pairs a composer draws are buttons for the action they
+    /// name: each takes exactly the cells it was painted on, and a pair
+    /// that does not fit is not drawn and has no cells.
+    #[test]
+    fn hint_pairs_are_buttons_where_they_are_drawn() {
+        let pairs = [
+            ("⏎", "send"),
+            ("esc", "clear"),
+            ("↑↓ ^p/^n", "history"),
+            ("/", "commands"),
+        ];
+        let rects = hint_rects(&pairs, 0, 80, 38);
+        assert_eq!(rects.len(), 4, "all four fit on an 80-column row");
+        // right-aligned: the line ends at column 79, one cell of air
+        let last = rects[3].0;
+        assert_eq!(last.x + last.width, 79);
+        assert_eq!(last.width, 10, "/ commands");
+        // two cells of gap between neighbours
+        assert_eq!(rects[2].0.x + rects[2].0.width + 2, last.x);
+        // narrow rows drop pairs from the end: nothing to click there
+        let squeezed = hint_rects(&pairs, 0, 7, 38);
+        assert!(squeezed.is_empty(), "{squeezed:?}");
+        // each drawn pair knows its action; a descriptive one has none
+        assert_eq!(hint_action("⏎", "send"), Some(StripButton::Send));
+        assert_eq!(hint_action("esc", "clear"), Some(StripButton::Clear));
+        assert_eq!(
+            hint_action("↑↓ ^p/^n", "history"),
+            Some(StripButton::History)
+        );
+        assert_eq!(hint_action("/", "commands"), Some(StripButton::Commands));
+        assert_eq!(hint_action("drag", "select+copy"), None);
     }
 
     /// A composer popup lists as many rows as the room above the composer
@@ -26171,6 +26405,7 @@ mod tests {
     #[test]
     fn strip_zone_hit_testing() {
         let zone = StripZones {
+            hints: Default::default(),
             todos: ratatui::layout::Rect {
                 x: 1,
                 y: 38,
@@ -26414,6 +26649,7 @@ mod tests {
     #[test]
     fn click_target_maps_strip_arrows_and_transcript_rows() {
         let strip = std::cell::Cell::new(Some(StripZones {
+            hints: Default::default(),
             todos: ratatui::layout::Rect {
                 x: 2,
                 y: 38,
@@ -26679,6 +26915,7 @@ mod tests {
     #[test]
     fn hover_target_tracks_clickable_elements_only() {
         let strip = std::cell::Cell::new(Some(StripZones {
+            hints: Default::default(),
             todos: ratatui::layout::Rect {
                 x: 2,
                 y: 38,
