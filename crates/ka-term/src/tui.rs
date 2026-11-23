@@ -5279,6 +5279,7 @@ pub async fn run(
     notify: NotifySettings,
     mouse_capture: bool,
     fresh: bool,
+    ephemeral: bool,
     session_cwd: std::path::PathBuf,
     mut updates: mpsc::Receiver<UpdateNotice>,
 ) -> std::io::Result<Exit> {
@@ -5391,6 +5392,7 @@ pub async fn run(
         header_glyph,
         mouse_capture,
         fresh,
+        ephemeral,
         startup_notes,
         title_enabled,
         status_order,
@@ -5447,6 +5449,7 @@ async fn app(
     header_glyph: &str,
     mut mouse_captured: bool,
     mut fresh: bool,
+    ephemeral: bool,
     mut startup_notes: Vec<String>,
     title_enabled: bool,
     status_order: Option<Vec<String>>,
@@ -9883,6 +9886,7 @@ async fn app(
     let resume = resume_hint(
         &meters.session,
         meters.turns,
+        ephemeral,
         busy,
         !transcript.entries().is_empty(),
     );
@@ -9902,9 +9906,15 @@ fn term_cols() -> usize {
 /// session exists and something happened in it — a finished turn, a
 /// turn still in flight when the user quit, or history replayed from
 /// an earlier run: closing an older chat without a new turn still
-/// deserves the way back.
-fn resume_hint(session: &str, turns: u64, busy: bool, has_history: bool) -> Option<String> {
-    if session.is_empty() || (turns == 0 && !busy && !has_history) {
+/// deserves the way back. Never under --ephemeral: nothing was saved.
+fn resume_hint(
+    session: &str,
+    turns: u64,
+    busy: bool,
+    has_history: bool,
+    ephemeral: bool,
+) -> Option<String> {
+    if ephemeral || session.is_empty() || (turns == 0 && !busy && !has_history) {
         return None;
     }
     let tag = short_session(session).unwrap_or("?");
@@ -18999,19 +19009,25 @@ mod tests {
 
     #[test]
     fn resume_hint_needs_a_session_and_activity() {
-        let hint = resume_hint("s19a4f2e1b0-3f9c2a81d4b7", 1, false, false).unwrap();
+        let hint = resume_hint("s19a4f2e1b0-3f9c2a81d4b7", 1, false, false, false).unwrap();
         assert!(hint.contains("ka -c"), "{hint}");
         assert!(hint.contains("ka --session 3f9c2a81"), "{hint}");
         // text only: the terminal's history is never touched
         assert!(!hint.contains("shell-integration"), "{hint}");
         // quitting mid-turn (turns == 0, still busy) still resumes
-        assert!(resume_hint("s19a4f2e1b0-3f9c2a81d4b7", 0, true, false).is_some());
+        assert!(resume_hint("s19a4f2e1b0-3f9c2a81d4b7", 0, true, false, false).is_some());
         // an older chat replayed at startup, closed with no new turn
-        assert!(resume_hint("s19a4f2e1b0-3f9c2a81d4b7", 0, false, true).is_some());
+        assert!(resume_hint("s19a4f2e1b0-3f9c2a81d4b7", 0, false, true, false).is_some());
         // a fresh session with no turns, idle: not worth resuming
-        assert!(resume_hint("s19a4f2e1b0-3f9c2a81d4b7", 0, false, false).is_none());
+        assert!(resume_hint("s19a4f2e1b0-3f9c2a81d4b7", 0, false, false, false).is_none());
         // no session id (engine died at bootstrap): nothing to print
-        assert!(resume_hint("", 3, false, true).is_none());
+        assert!(resume_hint("", 3, false, true, false).is_none());
+        // --ephemeral saved nothing, whatever happened: no resume line
+        for (turns, busy, has_history) in [(1, false, false), (0, true, false), (0, false, true)] {
+            assert!(
+                resume_hint("s19a4f2e1b0-3f9c2a81d4b7", turns, busy, has_history, true).is_none()
+            );
+        }
     }
 
     #[test]

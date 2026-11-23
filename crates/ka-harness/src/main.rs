@@ -3025,6 +3025,7 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
         tui_notify,
         tui_mouse_capture,
         fresh,
+        cli.ephemeral,
         session_cwd,
         update_rx,
     )
