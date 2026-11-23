@@ -9523,7 +9523,7 @@ async fn app(
                             mouse_evt.kind,
                             crossterm::event::MouseEventKind::ScrollUp
                         );
-                        let mut bump = |selected: &mut usize, len: usize| {
+                        let bump = |selected: &mut usize, len: usize| {
                             if len == 0 {
                                 return;
                             }
@@ -11772,17 +11772,54 @@ pub fn mention_token(token: &str) -> Option<&str> {
 /// prefix of the entry path's last segment (case-sensitive; ordering is
 /// the walk's deterministic sort).
 pub fn mention_matches(entries: &[(String, bool)], query: &str) -> Vec<(String, bool)> {
-    let base = query.rsplit('/').next().unwrap_or("");
-    entries
+    let query = query.trim();
+    if query.is_empty() {
+        return entries.to_vec();
+    }
+    let mut scored: Vec<(std::cmp::Reverse<u32>, usize, (String, bool))> = entries
         .iter()
-        .filter(|(rel, _)| {
-            rel.trim_end_matches('/')
-                .rsplit('/')
-                .next()
-                .is_some_and(|seg| seg.starts_with(base))
+        .enumerate()
+        .filter_map(|(i, (rel, is_dir))| {
+            fuzzy_score(rel, query).map(|s| (std::cmp::Reverse(s), i, (rel.clone(), *is_dir)))
         })
-        .cloned()
-        .collect()
+        .collect();
+    scored.sort();
+    scored.into_iter().map(|(.., entry)| entry).collect()
+}
+
+/// Score of `needle` as an in-order, case-insensitive subsequence of the
+/// whole `path`, directory parts included; `None` when its characters do
+/// not all appear. A filename prefix outranks a scattered match, a match
+/// on a segment or word start outranks a mid-word one, and consecutive
+/// characters add a little. Ties keep walk order.
+fn fuzzy_score(path: &str, needle: &str) -> Option<u32> {
+    let hay: Vec<char> = path.chars().flat_map(char::to_lowercase).collect();
+    let want: Vec<char> = needle.chars().flat_map(char::to_lowercase).collect();
+    if want.is_empty() {
+        return Some(0);
+    }
+    let file_start = path.rfind('/').map_or(0, |p| p + 1);
+    let boundary = |at: usize| at == 0 || matches!(hay[at - 1], '/' | '_' | '-' | '.' | ' ');
+    let (mut score, mut hi, mut prev) = (0u32, 0usize, None);
+    for &c in &want {
+        let at = (hi..hay.len()).find(|&i| hay[i] == c)?;
+        score += if prev.is_none() && at == file_start {
+            8
+        } else if boundary(at) {
+            3
+        } else {
+            1
+        };
+        if prev == at.checked_sub(1) {
+            score += 1;
+        }
+        prev = Some(at);
+        hi = at + 1;
+    }
+    if hay[file_start..].starts_with(&want[..]) {
+        score += 6;
+    }
+    Some(score)
 }
 
 /// The whitespace-delimited word at the caret (char index). None when
@@ -23220,27 +23257,44 @@ mod tests {
     }
 
     #[test]
-    fn mention_matches_use_the_last_segment_prefix() {
+    fn mention_matches_are_fuzzy_over_the_whole_path() {
         let entries = vec![
             ("src/main.rs".to_string(), false),
             ("lib/main.rs".to_string(), false),
             ("README.md".to_string(), false),
             ("src".to_string(), true),
+            ("src/tui_snapshots.rs".to_string(), false),
         ];
+        let names = |q: &str| -> Vec<String> {
+            mention_matches(&entries, q)
+                .into_iter()
+                .map(|(n, _)| n)
+                .collect()
+        };
+        // the directory part counts: src/ma is src's main, not lib's
+        assert_eq!(names("src/ma"), vec!["src/main.rs"]);
+        // a filename prefix outranks scattered letters; ties keep walk order
+        assert_eq!(names("ma"), vec!["src/main.rs", "lib/main.rs"]);
+        // the exact segment outranks the file under it
         assert_eq!(
-            mention_matches(&entries, "src/ma"),
+            names("src"),
+            vec!["src", "src/main.rs", "src/tui_snapshots.rs"]
+        );
+        // case-insensitive, and in-order letters anywhere in the path
+        assert_eq!(names("READM"), vec!["README.md"]);
+        assert_eq!(names("tuisnap"), vec!["src/tui_snapshots.rs"]);
+        assert!(names("zzz").is_empty());
+        // an empty query right after the @ lists everything in walk order
+        assert_eq!(
+            names(""),
             vec![
-                ("src/main.rs".to_string(), false),
-                ("lib/main.rs".to_string(), false),
-            ],
-            "only the text after the last / is prefix-matched"
+                "src/main.rs",
+                "lib/main.rs",
+                "README.md",
+                "src",
+                "src/tui_snapshots.rs"
+            ]
         );
-        assert_eq!(
-            mention_matches(&entries, "src"),
-            vec![("src".to_string(), true)],
-            "segment match, not a path-prefix match"
-        );
-        assert!(mention_matches(&entries, "zzz").is_empty());
     }
 
     #[test]
