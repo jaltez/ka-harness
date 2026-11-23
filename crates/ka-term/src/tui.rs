@@ -23442,7 +23442,10 @@ mod tests {
         let sidebar = SidebarState {
             known_tools: vec!["read".into(), "bash".into()],
             inventory: Inventory {
-                skills: vec!["pdf".into()],
+                skills: vec![ka_protocol::SkillEntry {
+                    name: "pdf".into(),
+                    source: String::new(),
+                }],
                 ..Default::default()
             },
             ..Default::default()

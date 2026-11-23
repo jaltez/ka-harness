@@ -459,7 +459,13 @@ fn live_sidebar() -> SidebarState {
                 "migration",
                 "api-review",
                 "perf-trace",
-            ]),
+            ])
+            .into_iter()
+            .map(|name| ka_protocol::SkillEntry {
+                name,
+                source: String::new(),
+            })
+            .collect(),
             prompts: ids(&[
                 "github/review-pr (owner, repo, number)",
                 "github/issue (number)",
