@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — feature lots (2026-11-22)
+## 0.8.0 — 2026-11-23
 
 ### Batch 5 — customizable TUI
 - Themes as data: `[tui] theme` + `/theme` picker (`.ka/themes/*.toml`, user dir; Nocturne fallback).
