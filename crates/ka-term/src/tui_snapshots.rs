@@ -1423,14 +1423,17 @@ fn running_call() -> LiveTool {
 }
 
 fn busy_text() -> RenderInput {
-    busy(
+    // the live-region scenes test the full-height transcript: no todos to pin
+    let mut input = busy(
         RenderInput {
             current_assistant: STREAMING_MD.into(),
             ..base()
         },
         Vec::new(),
         37,
-    )
+    );
+    input.sidebar.todos.clear();
+    input
 }
 
 fn busy_thinking() -> RenderInput {
@@ -1445,7 +1448,8 @@ fn busy_thinking() -> RenderInput {
 }
 
 fn busy_tool() -> RenderInput {
-    busy(
+    // the live-region scenes test the full-height transcript: no todos to pin
+    let mut input = busy(
         RenderInput {
             current_tool: tool_header("bash", "cargo test -p ka-term --lib"),
             live_tool: Some(running_call()),
@@ -1453,11 +1457,14 @@ fn busy_tool() -> RenderInput {
         },
         Vec::new(),
         37,
-    )
+    );
+    input.sidebar.todos.clear();
+    input
 }
 
 fn busy_everything() -> RenderInput {
-    busy(
+    // the live-region scenes test the full-height transcript: no todos to pin
+    let mut input = busy(
         RenderInput {
             current_thought: THOUGHT.into(),
             current_tool: tool_header("bash", "cargo test -p ka-term --lib"),
@@ -1467,7 +1474,9 @@ fn busy_everything() -> RenderInput {
         },
         Vec::new(),
         37,
-    )
+    );
+    input.sidebar.todos.clear();
+    input
 }
 
 fn draft(text: &str) -> InputBuffer {
@@ -2090,6 +2099,32 @@ fn busy_scenes() -> Vec<Scene> {
             "busy",
             ["Working", "test result: ok", "Findings"],
             |_| busy_everything(),
+        ),
+        Scene::new(
+            "busy-todos-pinned",
+            "Busy with a todo list: the list stays pinned above the composer",
+            "busy",
+            [
+                "todos",
+                "Map every Modal variant",
+                "Land the harness commit",
+            ],
+            |_| {
+                let mut state = busy_everything();
+                state.sidebar.todos = vec![
+                    ka_protocol::TodoItem {
+                        text: "Map every Modal variant to a scene".into(),
+                        state: ka_protocol::TodoState::Done,
+                        confidence: None,
+                    },
+                    ka_protocol::TodoItem {
+                        text: "Land the harness commit".into(),
+                        state: ka_protocol::TodoState::Pending,
+                        confidence: None,
+                    },
+                ];
+                state
+            },
         ),
     ]
 }

@@ -2203,6 +2203,18 @@ fn rail_drag_anchor(
 fn visible_rows(term_h: u16, input_h: u16) -> usize {
     term_h.saturating_sub(input_h + 4) as usize
 }
+
+/// Rows of the pinned todo panel: while a turn runs and the todo hand has
+/// a list, the list stays in view beside the streaming text — a title row
+/// plus up to four items. Idle, or with no todos, it takes no room (the
+/// strip button still opens the full list).
+fn pinned_todos_h(busy: bool, todos: &[ka_protocol::TodoItem]) -> usize {
+    if busy && !todos.is_empty() {
+        1 + todos.len().min(4)
+    } else {
+        0
+    }
+}
 /// Cursor `(row, col)` in `text` for a char-index cursor position.
 fn cursor_row_col(text: &str, cursor_chars: usize) -> (usize, usize) {
     let before: String = text.chars().take(cursor_chars).collect();
@@ -6071,7 +6083,8 @@ async fn app(
                 live_cache = None;
                 None
             };
-            view_rows = visible_rows(term_h, input_h);
+            view_rows = visible_rows(term_h, input_h)
+                .saturating_sub(pinned_todos_h(busy_now, &sidebar.todos));
             turn_ended = false;
             let cursor = input.cursor;
             terminal.draw(|frame| {
@@ -15334,7 +15347,16 @@ fn render(
     ])
     .split(full);
     let header = chunks[0];
-    let tx_area = chunks[2].inner(ratatui::layout::Margin::new(1, 0));
+    // the transcript chunk gives its bottom rows to the pinned todo panel
+    let todos_h = pinned_todos_h(busy, &sidebar.todos) as u16;
+    let (tx_chunk, todos_area) = if todos_h > 0 {
+        let [above, panel] =
+            ratatui::layout::Layout::vertical([Min(0), Length(todos_h)]).areas(chunks[2]);
+        (above, panel)
+    } else {
+        (chunks[2], Rect::default())
+    };
+    let tx_area = tx_chunk.inner(ratatui::layout::Margin::new(1, 0));
     let composer = chunks[3].inner(ratatui::layout::Margin::new(1, 0));
     let status = chunks[5];
     let tx_inner = tx_area.width.saturating_sub(2);
@@ -15358,7 +15380,7 @@ fn render(
     let visible = tx_area.height as usize;
     debug_assert_eq!(
         visible,
-        visible_rows(full.height, composer.height),
+        visible_rows(full.height, composer.height).saturating_sub(todos_h as usize),
         "viewport arithmetic must agree with the layout"
     );
     let (start, pinned) = window_range(total, visible, scroll);
@@ -15877,7 +15899,26 @@ fn render(
 
     // modals and the ask own the eye: the transcript recedes
     if modal.is_some() || ask.is_some() {
-        dim_backdrop(frame.buffer_mut(), chunks[2]);
+        dim_backdrop(frame.buffer_mut(), tx_chunk);
+    }
+
+    // ── pinned todo panel (only while a turn runs) ────────────────
+    if todos_h > 0 {
+        let shown = sidebar.todos.len().min(4);
+        let mut lines = vec![TuiLine::styled(
+            format!(
+                "{} todos · {shown} of {}",
+                crate::icons::strip_todos(),
+                sidebar.todos.len()
+            ),
+            crate::palette::ACCENT_BOLD,
+        )];
+        lines.extend(
+            todos_rows(sidebar, todos_area.width.saturating_sub(2) as usize)
+                .into_iter()
+                .take(shown),
+        );
+        frame.render_widget(Paragraph::new(lines), todos_area);
     }
 
     // ── slash autocomplete popup (above the composer) ─────────────
@@ -19120,6 +19161,23 @@ mod tests {
         );
         assert_eq!(hint_action("/", "commands"), Some(StripButton::Commands));
         assert_eq!(hint_action("drag", "select+copy"), None);
+    }
+
+    /// The todo list is pinned only while a turn runs: a title row plus up
+    /// to four items, and nothing idle or without a list.
+    #[test]
+    fn todos_pin_only_while_a_turn_runs() {
+        let todo = |text: &str| ka_protocol::TodoItem {
+            text: text.into(),
+            state: ka_protocol::TodoState::Pending,
+            confidence: None,
+        };
+        let two = [todo("a"), todo("b")];
+        assert_eq!(pinned_todos_h(false, &two), 0, "idle: no panel");
+        assert_eq!(pinned_todos_h(true, &[]), 0, "busy without todos: no panel");
+        assert_eq!(pinned_todos_h(true, &two), 3, "title + two items");
+        let six: Vec<_> = (0..6).map(|i| todo(&i.to_string())).collect();
+        assert_eq!(pinned_todos_h(true, &six), 5, "capped at four items");
     }
 
     /// A composer popup lists as many rows as the room above the composer
