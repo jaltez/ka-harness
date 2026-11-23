@@ -3200,6 +3200,28 @@ fn typed_char(key: &crossterm::event::KeyEvent) -> Option<char> {
     }
 }
 
+/// The key the loop handles for a quit chord, and whether that chord
+/// reaches its chain. Over an open modal or composer popup it does
+/// not: Ctrl+C backs out of the overlay like Esc, and the draft behind
+/// it, the turn, and the quit arm all stay as they were.
+fn ctrl_c_key(
+    key: crossterm::event::KeyEvent,
+    quit_chord: bool,
+    overlay_open: bool,
+) -> (crossterm::event::KeyEvent, bool) {
+    if quit_chord && overlay_open {
+        (
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Esc,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            false,
+        )
+    } else {
+        (key, quit_chord)
+    }
+}
+
 fn esc_action(
     focus_on: bool,
     scrolled: bool,
@@ -5854,6 +5876,10 @@ async fn app(
                     let quit_chord = (key.code, key.modifiers)
                         == (KeyCode::Char('c'), KeyModifiers::CONTROL)
                         || bindings.matches_custom(&key, "session.quit");
+                    let overlay_open =
+                        modal.is_some() || slash_popup.is_some() || path_popup.is_some();
+                    let (key, quit_chord) =
+                        ctrl_c_key(key, quit_chord, overlay_open);
                     if quit_chord {
                         let action = ctrl_c_action(
                             busy,
@@ -19504,6 +19530,25 @@ mod tests {
         }
         assert_eq!(types(KeyCode::Enter, KeyModifiers::NONE), None);
         assert_eq!(types(KeyCode::Backspace, KeyModifiers::NONE), None);
+    }
+
+    #[test]
+    fn ctrl_c_inside_a_modal_backs_out_first() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let ctrl_c = crossterm::event::KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let esc = crossterm::event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        // nothing open: the chord reaches its chain unchanged
+        let (key, reaches) = ctrl_c_key(ctrl_c, true, false);
+        assert_eq!((key, reaches), (ctrl_c, true));
+        // a modal or popup open: the press is Esc and never reaches the
+        // chain — no clear, no abort, no quit arm
+        let (key, reaches) = ctrl_c_key(ctrl_c, true, true);
+        assert_eq!(key.code, KeyCode::Esc);
+        assert_eq!(key.modifiers, KeyModifiers::NONE);
+        assert!(!reaches);
+        // any other key passes through untouched, overlay or not
+        let (key, reaches) = ctrl_c_key(esc, false, true);
+        assert_eq!((key, reaches), (esc, false));
     }
 
     #[test]
