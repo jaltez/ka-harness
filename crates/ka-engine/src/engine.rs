@@ -152,7 +152,9 @@ pub fn spawn_with_speaker(
 /// Contract-test spawn (EXT-12): [`spawn_with_speaker`] plus a factory
 /// the team table uses to give every spawned member its own scripted
 /// speaker. Production passes None — members inherit the session model
-/// through the parent config.
+/// through the parent config. Test-only (`team_contracts.rs` is the
+/// sole consumer), gated like `trust::test_support`.
+#[cfg(any(test, feature = "test-util"))]
 pub fn spawn_with_team_speakers(
     config: Config,
     catalog: ka_dialect::Catalog,
@@ -520,6 +522,10 @@ struct EngineState {
     model: Option<String>,
     effort: Option<ka_protocol::Effort>,
     mode: Mode,
+    /// Live mirror of [`EngineState::mode`], shared with the code
+    /// router's gate (see [`ModeSlot`]). Every mutation of `mode`
+    /// goes through [`EngineState::set_live_mode`].
+    mode_slot: ModeSlot,
     queue: VecDeque<String>,
     steers: Vec<String>,
     /// Record ids of persisted history messages, aligned with
@@ -633,6 +639,17 @@ struct LoopRuntime {
     /// measures from; refreshed on every completed turn.
     last_settle: std::time::Instant,
 }
+impl EngineState {
+    /// The single mutation path for the session mode: updates the
+    /// plain field AND the live cell the code router's gate reads.
+    /// Callers still forward to `Voice::set_mode` themselves (the
+    /// voice keeps its own copy for the admit gate).
+    fn set_live_mode(&mut self, mode: Mode) {
+        self.mode = mode;
+        *self.mode_slot.write() = mode;
+    }
+}
+
 impl From<Config> for EngineState {
     fn from(c: Config) -> Self {
         let mode = c.effective_mode();
@@ -641,6 +658,7 @@ impl From<Config> for EngineState {
             model: c.model,
             effort: c.effort,
             mode,
+            mode_slot: std::sync::Arc::new(parking_lot::RwLock::new(mode)),
             queue: VecDeque::new(),
             steers: Vec::new(),
             record_ids: Vec::new(),
@@ -676,6 +694,15 @@ impl From<Config> for EngineState {
 }
 
 type DynError = Box<dyn std::error::Error + Send + Sync>;
+
+/// The session permission mode, shared live with the code hand's
+/// router (the [`crate::features::FeatureSlot`] pattern): the engine
+/// mirrors every `Voice::set_mode` site into this cell
+/// ([`EngineState::set_live_mode`]), so `/mode`, a strand restore and
+/// hook steering all re-arm the router's gate instead of leaving it on
+/// a bootstrap-frozen snapshot. Defined here, ungated: mirroring the
+/// mode is core state work even when the `code` hand compiles out.
+pub(crate) type ModeSlot = std::sync::Arc<parking_lot::RwLock<Mode>>;
 
 /// The engine's owned state bundle: one place, passed to every command
 /// handler. Replaces the run()/side_command() split where arms were
@@ -1045,12 +1072,26 @@ async fn run(
     // `team_max = 0` keeps the hand registered so `team_spawn` refuses
     // informatively. Members never register it (leaf).
     if !leaf && !crate::conventions::bare_mode() {
+        // the member template follows the parent's LIVE state, not the
+        // config snapshot: the early `member_template` clone predates
+        // `attach_strand`, so a resumed session's restored
+        // settings.model would be lost. Re-pin model + feature posture
+        // here — post-restore, like the `ctx.state.mode` argument below
+        // (members start where the parent is; the same live-follow
+        // delegate children get through the pathfinder slot).
+        let mut member_template = member_template;
+        member_template.model = ctx.state.model.clone();
+        {
+            let toggles = features.read();
+            member_template.features.disable = toggles.disabled_specs();
+            member_template.features.allow = toggles.allow_entries();
+        }
         let table = crate::hands::teams::TeamTable::new(
             team_max,
             &ctx.cwd,
             teams_catalog,
             member_template,
-            ctx.state.mode,
+            ctx.state.mode_slot.clone(),
             ctx.events.clone(),
             &ctx.strand,
             team_speakers,
@@ -1164,7 +1205,7 @@ async fn run(
                 ctx.voice.tables().clone(),
             ),
             code_rules,
-            mode,
+            ctx.state.mode_slot.clone(),
             code_prompt_policy,
             code_allowed_tools,
             features.clone(),
@@ -2505,7 +2546,7 @@ async fn handle_command(
             ctx.events.send(Event::Idle).await.ok();
         }
         Command::SetMode { mode } => {
-            ctx.state.mode = mode;
+            ctx.state.set_live_mode(mode);
             ctx.voice.set_mode(mode);
             let _ = ctx.strand.append(ka_strand::Record::Change {
                 id: ka_strand::new_record_id(),
@@ -3706,7 +3747,7 @@ async fn attach_strand(
         state.effort = settings.effort;
     }
     if settings.mode.is_some() {
-        state.mode = settings.mode.unwrap_or_default();
+        state.set_live_mode(settings.mode.unwrap_or_default());
         voice.set_mode(state.mode);
     }
     voice.pathfinder_slot().write().model = state.model.clone();
@@ -5333,7 +5374,7 @@ async fn apply_steering(
 ) {
     let Some(s) = steer else { return };
     if let Some(mode) = s.mode {
-        state.mode = mode;
+        state.set_live_mode(mode);
         voice.set_mode(mode);
         let _ = strand.append(ka_strand::Record::Change {
             id: ka_strand::new_record_id(),
@@ -5975,7 +6016,7 @@ async fn auto_commit(stage: &AutoCommitStage, turn: Option<&(String, String)>) {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use ka_dialect::speaker::{SpeakFuture, SpeakRequest, Speaker, StreamEvent};
+    use ka_dialect::speaker::{SpeakFuture, SpeakRequest, Speaker, StreamEvent, ToolCall};
     use ka_protocol::{Command, ErrorClass, Event, Stop, Usage};
     use std::time::Duration;
     use tokio::sync::mpsc;
@@ -5983,6 +6024,7 @@ mod tests {
     use crate::config::Config;
     use crate::engine::{
         EngineHandle, StrandChoice, commit_role_selector, spawn, spawn_with_speaker,
+        spawn_with_team_speakers,
     };
 
     async fn drain_until_finished(events: &mut mpsc::Receiver<Event>) -> Vec<Event> {
@@ -8821,6 +8863,181 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&work);
     }
+
+    /// The parent's scripted speaker: one team-spawn tool call on the
+    /// first request, plain text afterwards (team_contracts fixture
+    /// shape, in-crate minimal).
+    struct TeamSpawnOnce(std::sync::atomic::AtomicBool);
+
+    impl Speaker for TeamSpawnOnce {
+        fn speak<'a>(
+            &'a self,
+            _req: SpeakRequest,
+            out: mpsc::Sender<StreamEvent>,
+        ) -> SpeakFuture<'a> {
+            Box::pin(async move {
+                if !self.0.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    out.send(StreamEvent::Call(ToolCall {
+                        id: "c1".into(),
+                        tool: "team".into(),
+                        arguments: serde_json::json!({
+                            "action": "spawn",
+                            "name": "scout",
+                            "prompt": "survey the repo"
+                        }),
+                    }))
+                    .await
+                    .ok();
+                } else {
+                    out.send(StreamEvent::Text("spawned the scout.".into()))
+                        .await
+                        .ok();
+                }
+                out.send(StreamEvent::Finished {
+                    stop: Stop::Done,
+                    usage: Usage::default(),
+                })
+                .await
+                .ok();
+            })
+        }
+    }
+
+    /// A member speaker that records the model id of every request it
+    /// receives — the probe for what model the member actually runs
+    /// on. The vec is shared across instances (one spawn here, but the
+    /// shape matches the team_contracts factory).
+    struct ModelProbeMember(std::sync::Arc<parking_lot::Mutex<Vec<String>>>);
+
+    impl Speaker for ModelProbeMember {
+        fn speak<'a>(
+            &'a self,
+            req: SpeakRequest,
+            out: mpsc::Sender<StreamEvent>,
+        ) -> SpeakFuture<'a> {
+            Box::pin(async move {
+                self.0.lock().push(req.model_id);
+                out.send(StreamEvent::Text("done".into())).await.ok();
+                out.send(StreamEvent::Finished {
+                    stop: Stop::Done,
+                    usage: Usage::default(),
+                })
+                .await
+                .ok();
+            })
+        }
+    }
+
+    /// P2: team members spawn on the parent's LIVE model — the member
+    /// template is re-pinned from the live state AFTER `attach_strand`
+    /// restored the strand's `settings.model`, so a resumed session
+    /// whose strand baseline is `test/b` spawns members on `test/b`,
+    /// not on the config baseline `test/a` the early template clone
+    /// carried.
+    #[tokio::test]
+    async fn team_members_spawn_on_the_parent_live_model() {
+        let dir = std::env::temp_dir().join(format!("ka-team-live-{}", std::process::id()));
+        let data = std::env::temp_dir().join(format!("ka-team-live-data-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&data);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        // thread-local: the current-thread test runtime shares it with
+        // the spawned member engines (the team_contracts redirect
+        // pattern)
+        ka_strand::set_data_dir_override(Some(data.clone()));
+
+        // a resumable strand carrying a restored model baseline: the
+        // Change record folds into Settings.model at open time
+        let mut strand = ka_strand::StrandFile::create(&dir, None).unwrap();
+        strand
+            .append(ka_strand::Record::Change {
+                id: ka_strand::new_record_id(),
+                model: Some("test/b".into()),
+                effort: None,
+                mode: None,
+                features: None,
+                sandbox: None,
+            })
+            .unwrap();
+        let strand_path = strand.path().unwrap().to_path_buf();
+        drop(strand);
+
+        let models = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let member_speakers: crate::hands::teams::MemberSpeakers = {
+            let models = std::sync::Arc::clone(&models);
+            std::sync::Arc::new(move || {
+                (
+                    ka_dialect::Wire::OpenaiChat,
+                    std::sync::Arc::new(ModelProbeMember(std::sync::Arc::clone(&models)))
+                        as std::sync::Arc<dyn Speaker>,
+                )
+            })
+        };
+
+        let catalog = ka_dialect::Catalog::parse(
+            "[dialects.\"test/a\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000000\n\
+             [dialects.\"test/b\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000000\n",
+        )
+        .unwrap();
+        let cfg = Config {
+            cwd: Some(dir.display().to_string()),
+            model: Some("test/a".into()),
+            ..Default::default()
+        };
+        let mut handle = spawn_with_team_speakers(
+            cfg,
+            catalog,
+            StrandChoice::Path(strand_path),
+            ka_dialect::Wire::OpenaiChat,
+            std::sync::Arc::new(TeamSpawnOnce(std::sync::atomic::AtomicBool::new(false))),
+            member_speakers,
+        );
+        handle
+            .commands
+            .send(Command::Prompt {
+                allowed_tools: None,
+                model: None,
+                text: "spawn a scout".into(),
+                schema: None,
+                images: Vec::new(),
+                skills: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        // the member's opening turn completes with exactly one note
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        let mut note = String::new();
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_secs(2), handle.events.recv()).await {
+                Ok(Some(Event::Note { message }))
+                    if message.starts_with(crate::hands::teams::TEAM_NOTE_PREFIX) =>
+                {
+                    note = message;
+                    break;
+                }
+                Ok(Some(_)) => {}
+                _ => break,
+            }
+        }
+        assert!(
+            note.starts_with("team · scout — "),
+            "the member opening turn completed: {note:?}"
+        );
+        // the member ran on the parent's LIVE model — the
+        // strand-restored settings.model — not on the config baseline
+        // the early template clone carried
+        let seen = models.lock();
+        assert_eq!(
+            seen.as_slice(),
+            ["test/b"],
+            "member request model ids (config baseline is test/a)"
+        );
+        ka_strand::set_data_dir_override(None);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&data);
+    }
 }
 
 /// CTX-06 (unit): the loop fire gate — armed, queue drained, interval
@@ -8850,4 +9067,18 @@ fn loop_prompt_due_gates_on_interval_and_queue() {
         l.interval = Duration::from_secs(60);
     }
     assert!(loop_prompt_due(&mut state).is_none());
+}
+
+/// P1: every live mode switch mirrors into the shared cell the code
+/// router's gate reads ([`ModeSlot`]) — `set_live_mode` is the single
+/// mutation path (SetMode, strand restore, hook steering all call it).
+#[test]
+fn set_live_mode_updates_the_shared_cell() {
+    let mut state = EngineState::from(Config::default());
+    assert_eq!(*state.mode_slot.read(), state.mode);
+    state.set_live_mode(Mode::Readonly);
+    assert_eq!(state.mode, Mode::Readonly);
+    assert_eq!(*state.mode_slot.read(), Mode::Readonly);
+    state.set_live_mode(Mode::Allow);
+    assert_eq!(*state.mode_slot.read(), Mode::Allow);
 }

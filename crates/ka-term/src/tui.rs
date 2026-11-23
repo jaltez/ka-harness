@@ -11623,9 +11623,14 @@ pub fn usage_tan() -> &'static str {
 
 /// Does this dispatch arm a tangential job? A `/tan` spawn yes;
 /// listing and cancellation dispatches no — their notes carry the
-/// end-of-job signal instead.
+/// end-of-job signal instead. Trimmed like the engine's `parse_tan`
+/// so both sides agree on what counts as a spawn (whitespace-padded
+/// input must not leak a pill count).
 fn tan_spawn_dispatch(evt: &Command) -> bool {
-    matches!(evt, Command::Tan { text } if !text.is_empty() && !text.starts_with("cancel"))
+    matches!(evt, Command::Tan { text } if {
+        let text = text.trim();
+        !text.is_empty() && !text.starts_with("cancel")
+    })
 }
 
 pub fn slash_command(text: &str) -> Option<Slash> {
@@ -12031,8 +12036,34 @@ blocker > major > minor > nit, each as `file:line — issue — concrete fix`, \
                         }),
                     }
                 }
+                Some(q) if q.trim().is_empty() => Some(Slash {
+                    // whitespace-only rest is a listing request, not an
+                    // ask — no ack note, no pill arm (the engine's
+                    // parse_tan trims and answers with the listing)
+                    note: None,
+                    event: Some(Command::Tan {
+                        text: String::new(),
+                    }),
+                    quit: false,
+                    followup: None,
+                    modal: None,
+                }),
+                Some(_) if ka_engine::conventions::bare_mode() => Some(Slash {
+                    // safe mode refuses the spawn engine-side with a
+                    // prefix-less note — refuse here instead so the
+                    // pill never arms for a job that cannot start
+                    // (custom_command precedent)
+                    note: Some("tan is unavailable in safe mode".to_string()),
+                    event: None,
+                    quit: false,
+                    followup: None,
+                    modal: None,
+                }),
                 Some(q) => Some(Slash {
-                    note: Some("tan · asked — the answer arrives as a note".to_string()),
+                    note: Some(format!(
+                        "{}asked — the answer arrives as a note",
+                        ka_protocol::TAN_NOTE_PREFIX
+                    )),
                     event: Some(Command::Tan {
                         text: q.to_string(),
                     }),

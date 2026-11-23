@@ -83,8 +83,12 @@ pub struct CodeRouter {
     hands: Vec<Arc<dyn Hand>>,
     /// `[[rules]]`, first-match-wins (same evaluation the gate uses).
     rules: Vec<Rule>,
-    /// Session permission mode.
-    mode: Mode,
+    /// Session permission mode, SHARED LIVE with the engine
+    /// ([`crate::engine::ModeSlot`]): the engine mirrors every
+    /// `Voice::set_mode` site into the cell, so a `/mode` switch, a
+    /// strand-restore or hook steering re-arms this gate mid-session
+    /// instead of leaving it on a bootstrap-frozen snapshot.
+    mode: crate::engine::ModeSlot,
     /// `[permissions] prompt_policy` for reviewable asks.
     prompt_policy: PromptPolicy,
     /// `[permissions] allow` persistent allowlist.
@@ -119,7 +123,7 @@ impl CodeRouter {
     pub(crate) fn new(
         hands: Vec<Arc<dyn Hand>>,
         rules: Vec<Rule>,
-        mode: Mode,
+        mode: crate::engine::ModeSlot,
         prompt_policy: PromptPolicy,
         allowed_tools: Vec<String>,
         features: crate::features::FeatureSlot,
@@ -221,7 +225,7 @@ impl CodeRouter {
         let clearance = hand.clearance_for(args);
         // protected paths outrank every posture below (except readonly
         // mode, which already denies the same set via the plans-dir rule)
-        if clearance == Clearance::Write && self.mode != Mode::Readonly {
+        if clearance == Clearance::Write && *self.mode.read() != Mode::Readonly {
             if let Some(reason) = super::protected::reason(&hctx.cwd, &primary) {
                 return self.ask(
                     format!("PROTECTED — {reason}: `{primary}`. Proceed anyway?"),
@@ -245,7 +249,7 @@ impl CodeRouter {
         }
         match clearance {
             Clearance::Read => Decision::Allow,
-            Clearance::Write => match self.mode {
+            Clearance::Write => match *self.mode.read() {
                 Mode::Allow | Mode::AcceptEdits => Decision::Allow,
                 Mode::Ask | Mode::DontAsk => {
                     self.ask(format!("allow {name} to modify files?"), true)
@@ -281,7 +285,7 @@ impl CodeRouter {
                 if super::bashp::all_readonly(&analysis) {
                     return Decision::Allow;
                 }
-                match self.mode {
+                match *self.mode.read() {
                     Mode::Allow => Decision::Allow,
                     Mode::Readonly => self.ask(
                         format!("plan mode: run `{command}`? (build with /build)"),
@@ -303,7 +307,7 @@ impl CodeRouter {
         if reviewable && self.prompt_policy == PromptPolicy::Deny {
             return Decision::Deny(format!("prompt policy denies: {question}"));
         }
-        if self.mode == Mode::DontAsk {
+        if *self.mode.read() == Mode::DontAsk {
             return Decision::Deny(format!("dontAsk mode denies: {question}"));
         }
         Decision::Ask { question }
@@ -768,6 +772,28 @@ mod tests {
         }
     }
 
+    /// Write-tier fixture: an ordinary edit surface for mode-gate tests.
+    struct WriterHand;
+    impl Hand for WriterHand {
+        fn def(&self) -> HandDef {
+            HandDef {
+                name: "writer".to_string(),
+                description: "test fixture: write tier".to_string(),
+                parameters: json!({"type": "object"}),
+                clearance: Clearance::Write,
+                read_only: false,
+            }
+        }
+
+        fn execute<'a>(
+            &'a self,
+            _args: &'a Value,
+            _ctx: &'a HandContext,
+        ) -> std::pin::Pin<Box<dyn Future<Output = ToolOutput> + Send + 'a>> {
+            Box::pin(async move { ToolOutput::ok("wrote".to_string()) })
+        }
+    }
+
     /// A fast-role speaker that always replies with one fixed label.
     struct LabelSpeaker(&'static str);
     impl ka_dialect::speaker::Speaker for LabelSpeaker {
@@ -812,12 +838,27 @@ mod tests {
         disabled: Vec<ka_protocol::FeatureSpec>,
         fast_role: Option<AuxRole>,
     ) -> (Arc<CodeRouter>, tokio::sync::mpsc::Receiver<Event>) {
+        let slot: crate::engine::ModeSlot = Arc::new(parking_lot::RwLock::new(mode));
+        router_with_slot(hands, rules, &slot, disabled, fast_role)
+    }
+
+    /// Like [`test_router`], but the caller keeps the shared mode cell
+    /// so a test can switch the session mode BETWEEN routed calls (the
+    /// engine does exactly that on `/mode`, strand restore, hook
+    /// steering).
+    fn router_with_slot(
+        hands: Vec<Arc<dyn Hand>>,
+        rules: Vec<Rule>,
+        mode: &crate::engine::ModeSlot,
+        disabled: Vec<ka_protocol::FeatureSpec>,
+        fast_role: Option<AuxRole>,
+    ) -> (Arc<CodeRouter>, tokio::sync::mpsc::Receiver<Event>) {
         let (events, rx) = tokio::sync::mpsc::channel(16);
         (
             Arc::new(CodeRouter::new(
                 hands,
                 rules,
-                mode,
+                mode.clone(),
                 PromptPolicy::Ask,
                 Vec::new(),
                 crate::features::FeatureToggles::slot(disabled),
@@ -1037,6 +1078,77 @@ mod tests {
             out.content
         );
         assert!(rx.try_recv().is_ok(), "hardstop ask surfaced to the user");
+    }
+
+    /// The gate reads the SHARED mode cell, not a bootstrap-frozen
+    /// snapshot: switching the cell between routed calls (what the
+    /// engine does on `/mode`, a strand restore, hook steering)
+    /// re-arms every tier — write tier, exec tier and the ask posture.
+    #[tokio::test]
+    async fn mode_switches_re_arm_the_routed_gate_mid_session() {
+        let slot: crate::engine::ModeSlot = Arc::new(parking_lot::RwLock::new(Mode::Ask));
+        let (router, mut rx) = router_with_slot(
+            vec![Arc::new(WriterHand), Arc::new(RunnerHand)],
+            Vec::new(),
+            &slot,
+            Vec::new(),
+            None,
+        );
+        let hand = test_hand(router, code_limits(None, None));
+        let write_call = "return await ka.tools.call(\"writer\", \
+                          JSON.stringify({path: \"notes.txt\", content: \"x\"}))";
+        let exec_call =
+            "return await ka.tools.call(\"runner\", JSON.stringify({command: \"make build\"}))";
+        let drain_notes = |rx: &mut tokio::sync::mpsc::Receiver<Event>| {
+            while let Ok(note) = rx.try_recv() {
+                assert!(
+                    matches!(note, Event::Note { .. }),
+                    "only ask notes surface, got {note:?}"
+                );
+            }
+        };
+
+        // Ask posture: both tiers ask; asks surface as notes and deny
+        // the script
+        let out = run(&hand, write_call).await;
+        assert!(
+            out.content
+                .contains("denied: allow writer to modify files?"),
+            "got: {}",
+            out.content
+        );
+        let out = run(&hand, exec_call).await;
+        assert!(
+            out.content.contains("denied: run `make build`?"),
+            "got: {}",
+            out.content
+        );
+        drain_notes(&mut rx);
+
+        // /mode allow: the SAME router now lets both through — a
+        // frozen snapshot would keep denying
+        *slot.write() = Mode::Allow;
+        let out = run(&hand, write_call).await;
+        assert_eq!(out.content, "\"wrote\"");
+        let out = run(&hand, exec_call).await;
+        assert_eq!(out.content, "\"ran\"");
+        drain_notes(&mut rx);
+
+        // hook steering to readonly: writes deny via the plans-dir
+        // rule, exec asks (all of it reads the same live cell)
+        *slot.write() = Mode::Readonly;
+        let out = run(&hand, write_call).await;
+        assert!(
+            out.content.contains("plan mode is read-only"),
+            "got: {}",
+            out.content
+        );
+        let out = run(&hand, exec_call).await;
+        assert!(
+            out.content.contains("denied: plan mode: run `make build`?"),
+            "got: {}",
+            out.content
+        );
     }
 
     #[tokio::test]

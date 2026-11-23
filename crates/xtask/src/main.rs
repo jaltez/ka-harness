@@ -321,52 +321,65 @@ fn size(rest: &[String]) -> i32 {
 /// that keeps resident-agent concerns (messaging channels, web
 /// frameworks, schedulers, plugin runtimes; see
 /// research/ka-harness/agent-boundary.md) out of the shipped binary, and makes
-/// any new dependency a deliberate, reviewed act. Compares
-/// `cargo tree -p ka-harness` (default features, normal edges) against
-/// `crates/xtask/deps-allowlist.txt` (crate names, one per line).
-/// Unknown names in the graph fail; names gone from the graph are
-/// reported as stale (platform-specific entries, prune when real).
+/// any new dependency a deliberate, reviewed act. Compares the union of
+/// `cargo tree -p ka-harness` with and without `--features ka-engine/code`
+/// (normal edges) against `crates/xtask/deps-allowlist.txt` (crate names,
+/// one per line). The opt-in feature graph is included so its entries
+/// enforce something and never read as stale. Unknown names in the graph
+/// fail; names gone from BOTH graphs are reported as stale
+/// (platform-specific entries, prune when real).
 fn deps() -> i32 {
     let allowlist = repo_root().join("crates/xtask/deps-allowlist.txt");
     let Ok(text) = fs::read_to_string(&allowlist) else {
         eprintln!("xtask: {} missing", allowlist.display());
         return 2;
     };
-    let allowed: BTreeSet<&str> = text
+    let allowed: BTreeSet<String> = text
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(String::from)
         .collect();
-    let Ok(output) = Command::new("cargo")
-        .args([
-            "tree",
-            "-p",
-            "ka-harness",
-            "--edges",
-            "normal",
-            "--prefix",
-            "none",
-            "--format",
-            "{p}",
-        ])
-        .current_dir(repo_root())
-        .output()
-    else {
-        eprintln!("xtask: cargo tree failed to start");
-        return 2;
-    };
-    if !output.status.success() {
-        eprintln!("xtask: cargo tree failed");
-        return 2;
+    let mut graph: BTreeSet<String> = BTreeSet::new();
+    for features in ["", "--features ka-engine/code"] {
+        let mut args = vec![
+            "tree".to_string(),
+            "-p".to_string(),
+            "ka-harness".to_string(),
+            "--edges".to_string(),
+            "normal".to_string(),
+            "--prefix".to_string(),
+            "none".to_string(),
+            "--format".to_string(),
+            "{p}".to_string(),
+        ];
+        if !features.is_empty() {
+            args.push("--features".to_string());
+            args.push("ka-engine/code".to_string());
+        }
+        let Ok(output) = Command::new("cargo")
+            .args(&args)
+            .current_dir(repo_root())
+            .output()
+        else {
+            eprintln!("xtask: cargo tree failed to start");
+            return 2;
+        };
+        if !output.status.success() {
+            eprintln!("xtask: cargo tree failed");
+            return 2;
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        graph.extend(
+            stdout
+                .lines()
+                .filter_map(|l| l.split_whitespace().next())
+                .map(|spec| spec.split_once(' ').map_or(spec, |(name, _)| name))
+                .map(String::from),
+        );
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let graph: BTreeSet<&str> = stdout
-        .lines()
-        .filter_map(|l| l.split_whitespace().next())
-        .map(|spec| spec.split_once(' ').map_or(spec, |(name, _)| name))
-        .collect();
-    let added: Vec<&str> = graph.difference(&allowed).copied().collect();
-    let stale: Vec<&str> = allowed.difference(&graph).copied().collect();
+    let added: Vec<String> = graph.difference(&allowed).cloned().collect();
+    let stale: Vec<String> = allowed.difference(&graph).cloned().collect();
     if !stale.is_empty() {
         println!(
             "stale allowlist entries (not in today's graph — platform-specific or pruned): {}",

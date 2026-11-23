@@ -64,5 +64,11 @@ required-features = ["test-util"]
 name = "context_contracts"
 required-features = ["test-util"]
 
+# team_contracts drives `spawn_with_team_speakers` (test-util-gated:
+# production builds never expose the member-speaker factory).
+[[test]]
+name = "team_contracts"
+required-features = ["test-util"]
+
 [lints]
 workspace = true

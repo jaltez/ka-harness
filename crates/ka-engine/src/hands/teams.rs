@@ -171,8 +171,9 @@ struct TeamInner {
     /// identity); leaf bootstrap strips MCP servers and the session
     /// lifecycle hooks at member start.
     member_template: crate::config::Config,
-    /// The parent's live permission mode (post strand restore).
-    mode: ka_protocol::Mode,
+    /// The parent's live permission mode (shared cell — mid-session
+    /// `SetMode`/strand restore reach members spawned afterwards).
+    mode: crate::engine::ModeSlot,
     events: mpsc::Sender<ka_protocol::Event>,
     stem: String,
     speakers: Option<MemberSpeakers>,
@@ -197,7 +198,7 @@ impl TeamTable {
         cwd: &std::path::Path,
         catalog: ka_dialect::Catalog,
         member_template: crate::config::Config,
-        mode: ka_protocol::Mode,
+        mode: crate::engine::ModeSlot,
         events: mpsc::Sender<ka_protocol::Event>,
         strand: &ka_strand::StrandFile,
         speakers: Option<MemberSpeakers>,
@@ -240,25 +241,33 @@ impl TeamTable {
             ));
         }
         {
-            let members = self.inner.members.lock();
+            let mut members = self.inner.members.lock();
+            // dismissed rows keep their last reply readable but hold no
+            // name or slot: a dismissed name is respawneable and the cap
+            // counts live members only
+            members.retain(|m| !(m.name == name && m.state == MemberState::Dead));
             if members.iter().any(|m| m.name == name) {
                 return Err(format!("team: member '{name}' already exists"));
             }
-            if members.len() as u32 >= self.inner.max {
+            let live = members
+                .iter()
+                .filter(|m| m.state != MemberState::Dead)
+                .count();
+            if live as u32 >= self.inner.max {
                 return Err(format!(
-                    "team: the team is full ({}/{} members) — dismiss one first \
+                    "team: the team is full ({live}/{} members) — dismiss one first \
                      ([delegate] team_max)",
-                    members.len(),
                     self.inner.max
                 ));
             }
         }
         let session_name = format!("{}/team/{name}", self.inner.stem);
         // the member template with the parent's live cwd + mode pinned
-        // (config-level mode would miss strand-restored overrides)
+        // (config-level mode would miss strand-restored overrides; the
+        // slot keeps later SetMode/steering changes live for spawns too)
         let mut member_cfg = self.inner.member_template.clone();
         member_cfg.cwd = Some(self.inner.cwd.to_string_lossy().into_owned());
-        member_cfg.mode = Some(self.inner.mode);
+        member_cfg.mode = Some(*self.inner.mode.read());
         let speaker = self.inner.speakers.as_ref().map(|f| f());
         let (handle, task) =
             crate::engine::spawn_leaf(member_cfg, self.inner.catalog.clone(), speaker);
@@ -314,45 +323,57 @@ impl TeamTable {
         if crate::conventions::bare_mode() {
             return Err("team: unavailable in safe mode".to_string());
         }
-        let (cmds, state) = {
-            let members = self.inner.members.lock();
+        // state read and Working-marking share one lock critical
+        // section: two concurrent `team send` calls must not both take
+        // the Prompt path (the member engine silently discards a second
+        // Prompt mid-turn — the loser has to land on Queue instead).
+        // Known residual window: a Queue aimed at a member that just
+        // went idle (watcher not yet scheduled) parks in the engine's
+        // main-loop queue until the member's next turn — it replays
+        // then, out of order but never lost. v1 accepts this; a fix
+        // needs an engine-side idle-Queue dispatch.
+        let (cmds, cmd) = {
+            let mut members = self.inner.members.lock();
             let m = members
-                .iter()
+                .iter_mut()
                 .find(|m| m.name == name)
                 .ok_or_else(|| self.no_such_member(name))?;
-            (
-                m.cmds.clone().ok_or_else(|| {
-                    format!("team: member '{name}' is dismissed — team_spawn creates a new one")
-                })?,
-                m.state,
-            )
-        };
-        let cmd = match state {
-            MemberState::Working => ka_protocol::Command::Queue {
-                text: message.to_string(),
-            },
-            MemberState::Dead => {
-                return Err(format!(
-                    "team: member '{name}' is dismissed — team_spawn creates a new one"
-                ));
+            let cmds = m.cmds.clone().ok_or_else(|| {
+                format!("team: member '{name}' is dismissed — team_spawn creates a new one")
+            })?;
+            match m.state {
+                MemberState::Working => (
+                    cmds,
+                    ka_protocol::Command::Queue {
+                        text: message.to_string(),
+                    },
+                ),
+                MemberState::Dead => {
+                    return Err(format!(
+                        "team: member '{name}' is dismissed — team_spawn creates a new one"
+                    ));
+                }
+                _ => {
+                    m.state = MemberState::Working;
+                    (
+                        cmds,
+                        ka_protocol::Command::Prompt {
+                            text: message.to_string(),
+                            schema: None,
+                            images: Vec::new(),
+                            allowed_tools: None,
+                            model: None,
+                            skills: Vec::new(),
+                        },
+                    )
+                }
             }
-            _ => ka_protocol::Command::Prompt {
-                text: message.to_string(),
-                schema: None,
-                images: Vec::new(),
-                allowed_tools: None,
-                model: None,
-                skills: Vec::new(),
-            },
         };
         if cmds.send(cmd).await.is_err() {
             self.set_state(name, MemberState::Dead);
             return Err(format!(
                 "team: member '{name}' is gone (its engine ended) — team_spawn creates a new one"
             ));
-        }
-        if state != MemberState::Working {
-            self.set_state(name, MemberState::Working);
         }
         Ok(format!(
             "team: message sent to {name} — the reply arrives as a `{}{name} — …` note",
@@ -512,14 +533,15 @@ impl TeamTable {
     }
 }
 
-impl Drop for TeamTable {
+impl Drop for TeamInner {
     /// The parent engine is dropping its table: kill every member
     /// engine (the members die with the parent — nothing cross-process
     /// survives) and drop their command senders. Watchers need no
     /// aborts: every one exits when its member's event channel closes,
-    /// which the aborts cause.
+    /// which the aborts cause. Implemented on the shared inner so the
+    /// cleanup fires when the LAST clone dies, not on any clone.
     fn drop(&mut self) {
-        let mut members = self.inner.members.lock();
+        let mut members = self.members.lock();
         for m in members.drain(..) {
             m.engine.abort();
             drop(m.cmds);
@@ -842,7 +864,7 @@ mod tests {
             )
             .unwrap(),
             crate::config::Config::default(),
-            ka_protocol::Mode::Allow,
+            std::sync::Arc::new(parking_lot::RwLock::new(ka_protocol::Mode::Allow)),
             events,
             &strand,
             None,

@@ -363,13 +363,31 @@ pub fn discover_skills(cwd: &Path) -> Vec<Skill> {
 
 /// [`discover_skills`] with explicit roots and trust decision: untrusted
 /// projects contribute no roots, user scope always loads (tests).
+/// Precedence survives the catalog cap: project skills fill the
+/// catalog first and user scope only tops up the remainder — a rich
+/// user scope (30+ alphabetically-early skills) must never push
+/// trusted-project skills out of the 20-entry catalog.
 pub fn discover_skills_scoped(
     project: Vec<PathBuf>,
     user: Vec<PathBuf>,
     project_trusted: bool,
 ) -> Vec<Skill> {
     let project = if project_trusted { project } else { Vec::new() };
-    discover_in(project, user)
+    let mut skills = discover_skills_in(project);
+    if skills.len() < SKILL_CATALOG_CAP {
+        let taken: std::collections::HashSet<String> =
+            skills.iter().map(|s| s.name.clone()).collect();
+        for skill in discover_skills_in(user) {
+            if skills.len() >= SKILL_CATALOG_CAP {
+                break;
+            }
+            if !taken.contains(skill.name.as_str()) {
+                skills.push(skill);
+            }
+        }
+        skills.sort_by(|a, b| a.name.cmp(&b.name));
+    }
+    skills
 }
 
 /// Merge pre-gated project roots with always-on user roots; earlier roots
@@ -415,9 +433,14 @@ pub fn discover_skills_in(roots: Vec<PathBuf>) -> Vec<Skill> {
         }
     }
     skills.sort_by(|a, b| a.name.cmp(&b.name));
-    skills.truncate(20);
+    skills.truncate(SKILL_CATALOG_CAP);
     skills
 }
+
+/// Catalog cap for skill discovery: the model sees at most this many
+/// skills per resolution (conventions doc: a curated catalog, not a
+/// directory dump).
+const SKILL_CATALOG_CAP: usize = 20;
 /// Whether a project style resolves (EXT-09): trusted-project
 /// `.ka/styles/<name>.md` first, then the user
 /// `~/.config/ka/styles/<name>.md`. Both must hold prose identity text
@@ -641,6 +664,38 @@ mod tests {
         assert_eq!(skills.len(), 1, "project root wins over user: {skills:?}");
         assert_eq!(skills[0].description, "How we ship");
         assert!(skills[0].path.starts_with(&root));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn user_scope_flood_cannot_displace_project_skills() {
+        // regression: the catalog cap sorted alphabetically after the
+        // flat merge, so 20+ alphabetically-early user skills pushed a
+        // trusted-project skill out of the catalog entirely
+        let root = temp_tree("skillflood");
+        let proj = root.join("proj/.ka/skills/ship");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join("SKILL.md"),
+            "---\ndescription: How we ship\n---\nbody",
+        )
+        .unwrap();
+        let user = root.join("user/skills");
+        for name in [
+            "aa", "ab", "ac", "ad", "ae", "af", "ag", "ah", "ai", "aj", "ak", "al", "am", "an",
+            "ao", "ap", "aq", "ar", "as", "at", "au",
+        ] {
+            let dir = user.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("SKILL.md"), "---\ndescription: x\n---\n").unwrap();
+        }
+        let skills = discover_skills_scoped(vec![root.join("proj/.ka/skills")], vec![user], true);
+        assert!(
+            skills.iter().any(|s| s.name == "ship"),
+            "project skill survives a flooded user scope: {:?}",
+            skills.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+        assert!(skills.len() <= SKILL_CATALOG_CAP);
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -24,8 +24,13 @@ pub mod wire;
 pub use config::{Config, ConfigError};
 pub use engine::{
     EngineHandle, StrandChoice, effective_debug_cfg, effective_lsp_cfg, lsp_hands, read_waypoint,
-    spawn, spawn_full, spawn_with, spawn_with_speaker, spawn_with_team_speakers,
+    spawn, spawn_full, spawn_with, spawn_with_speaker,
 };
+// Contract-test-only spawn (team_contracts.rs is the sole consumer):
+// hidden from production builds like `trust::test_support`. The
+// `team_contracts` suite declares `required-features = ["test-util"]`.
+#[cfg(any(test, feature = "test-util"))]
+pub use engine::spawn_with_team_speakers;
 
 use std::path::{Path, PathBuf};
 

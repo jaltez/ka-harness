@@ -336,19 +336,26 @@ async fn watch_tan(
     match runner.await {
         Ok(Ok(answer)) => {
             forget(&inner, id);
-            send_note(&inner, tan_answer_note(&subject, &answer)).await;
+            // settle the shared task-table row like the delegate watcher
+            // does; `finish` is first-write-wins, so a cancel's state
+            // stands and its note is the only one (never double-note)
+            if inner.tasks.finish(id, Ok(answer.clone())) {
+                send_note(&inner, tan_answer_note(&subject, &answer)).await;
+            }
         }
         Ok(Err(reason)) => {
             forget(&inner, id);
-            send_note(
-                &inner,
-                format!(
-                    "{}{subject} — failed: {}",
-                    ka_protocol::TAN_NOTE_PREFIX,
-                    super::delegate::truncate_for_note(&reason, NOTE_CAP)
-                ),
-            )
-            .await;
+            if inner.tasks.finish(id, Err(reason.clone())) {
+                send_note(
+                    &inner,
+                    format!(
+                        "{}{subject} — failed: {}",
+                        ka_protocol::TAN_NOTE_PREFIX,
+                        super::delegate::truncate_for_note(&reason, NOTE_CAP)
+                    ),
+                )
+                .await;
+            }
         }
         // `/tan cancel` already noted the end and forgot the job; a
         // cancel through the `tasks` hand did neither — end it here
@@ -553,6 +560,15 @@ mod tests {
             got[0]
         );
         assert!(t.inner.live.lock().is_empty(), "the job left the registry");
+        // the shared row settled too (not wedged `Running`): /tasks read,
+        // send and cancel keep behaving for the id after a natural end
+        let rows = t.inner.tasks.rows();
+        assert_eq!(rows.len(), 1, "{}", rows.join("\n"));
+        assert!(
+            rows[0].contains("failed") && !rows[0].contains("running"),
+            "the row must not stay running: {}",
+            rows[0]
+        );
     }
 
     #[test]

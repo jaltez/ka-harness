@@ -286,7 +286,7 @@ async fn safe_mode_never_spawns_team_members() {
         )
         .unwrap(),
         ka_engine::Config::default(),
-        ka_protocol::Mode::Allow,
+        std::sync::Arc::new(parking_lot::RwLock::new(ka_protocol::Mode::Allow)),
         events,
         &strand,
         None,
@@ -327,22 +327,27 @@ async fn safe_mode_never_spawns_team_members() {
         );
     }
     // outside safe mode the same hand reaches its grammar (nothing
-    // spawns for an invalid name — the refusal is the name, not the mode)
-    let out = hand
-        .execute(
-            &serde_json::json!({
-                "action": "spawn",
-                "name": "Scout!",
-                "prompt": "survey the repo"
-            }),
-            &ctx,
-        )
-        .await;
-    assert!(
-        out.is_error && out.content.contains("invalid name"),
-        "outside safe mode the refusal is the name grammar: {}",
-        out.content
-    );
+    // spawns for an invalid name — the refusal is the name, not the mode).
+    // Still under FLAG_LOCK: sibling tests flip the process-global bare
+    // flag while holding it, and this execute reads the flag at its top.
+    {
+        let _guard = FLAG_LOCK.lock();
+        let out = hand
+            .execute(
+                &serde_json::json!({
+                    "action": "spawn",
+                    "name": "Scout!",
+                    "prompt": "survey the repo"
+                }),
+                &ctx,
+            )
+            .await;
+        assert!(
+            out.is_error && out.content.contains("invalid name"),
+            "outside safe mode the refusal is the name grammar: {}",
+            out.content
+        );
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 

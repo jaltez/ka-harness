@@ -139,7 +139,7 @@ fn team_table(
         cwd,
         test_catalog(),
         template,
-        ka_protocol::Mode::Allow,
+        std::sync::Arc::new(parking_lot::RwLock::new(ka_protocol::Mode::Allow)),
         events,
         &strand,
         factory,
@@ -332,6 +332,25 @@ async fn team_lifecycle_spawn_send_status_read_dismiss() {
         )
         .await;
     assert!(read.content.contains("README summary ready."));
+
+    // a dismissed name is respawneable: the dead row holds no name or
+    // slot (dismiss → respawn cycle must not refuse with "already
+    // exists" or a full table)
+    let out = h
+        .execute(
+            &serde_json::json!({
+                "action": "spawn",
+                "name": "scout",
+                "prompt": "second survey"
+            }),
+            &ctx,
+        )
+        .await;
+    assert!(
+        !out.is_error,
+        "respawn after dismiss must work: {}",
+        out.content
+    );
 
     ka_strand::set_data_dir_override(None);
     let _ = std::fs::remove_dir_all(&dir);
