@@ -8639,7 +8639,11 @@ async fn app(
                                 Command::Steer { text }
                             } else {
                                 // plain new turn: the /retry target; staged
-                                // attachments ride in chip order
+                                // attachments ride in chip order. The view
+                                // returns to the tail so the new prompt and
+                                // its answer are in sight, wherever it was
+                                // scrolled to
+                                scroll = None;
                                 last_user = Some(text.clone());
                                 for img in &outgoing {
                                     let kb = img.data.len() * 3 / 4 / 1024;
