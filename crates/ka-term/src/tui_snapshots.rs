@@ -2983,9 +2983,9 @@ fn modal_scenes() -> Vec<Scene> {
         ),
         Scene::new(
             "modal-task-detail",
-            "Paged result of a background task (/tasks, ⏎ on a row)",
+            "Paged result of a background task (/tasks, ⏎ on a row): opens at the top",
             "modal",
-            ["task t-17", "step "],
+            ["task t-17", "step 1:", "… ↓ "],
             |_| {
                 opens(Modal::TaskDetail {
                     id: 17,
@@ -2995,15 +2995,15 @@ fn modal_scenes() -> Vec<Scene> {
             },
         ),
         Scene::new(
-            "modal-task-detail-top",
-            "Paged task result: scrolled to the top",
+            "modal-task-detail-scrolled",
+            "Paged task result: scrolled into the middle",
             "modal",
-            ["task t-17", "step 1:"],
+            ["task t-17", "… ↑ ", "… ↓ "],
             |_| {
                 opens(Modal::TaskDetail {
                     id: 17,
                     text: task_result(),
-                    scroll: Some(0),
+                    scroll: Some(12),
                 })
             },
         ),
@@ -3230,9 +3230,9 @@ fn modal_scenes() -> Vec<Scene> {
         ),
         Scene::new(
             "modal-changelog",
-            "Changelog (/changelog)",
+            "Changelog (/changelog): opens at the top",
             "modal",
-            ["changelog"],
+            ["changelog", "# Changelog", "… ↓ "],
             |_| {
                 opens(Modal::Changelog {
                     rows: changelog_rows(),
@@ -3242,9 +3242,9 @@ fn modal_scenes() -> Vec<Scene> {
         ),
         Scene::new(
             "modal-changelog-scrolled",
-            "Changelog: scrolled",
+            "Changelog: scrolled into the middle",
             "modal",
-            ["changelog"],
+            ["changelog", "… ↑ ", "… ↓ "],
             |_| {
                 opens(Modal::Changelog {
                     rows: changelog_rows(),
@@ -3268,7 +3268,7 @@ fn modal_scenes() -> Vec<Scene> {
             "modal-hooks",
             "Hooks panel (/hooks)",
             "modal",
-            ["hooks", "file hooks", "(absent)"],
+            ["hooks", "file hooks", "(absent)", "sources:"],
             |_| {
                 opens(Modal::Hooks {
                     rows: hooks_rows(),
@@ -3280,7 +3280,7 @@ fn modal_scenes() -> Vec<Scene> {
             "modal-permissions",
             "Permissions panel (/permissions)",
             "modal",
-            ["permissions", "protected paths"],
+            ["permissions", "mode: allow", "rules", "protected paths"],
             |_| {
                 opens(Modal::Permissions {
                     rows: permissions_rows(),
@@ -3292,7 +3292,7 @@ fn modal_scenes() -> Vec<Scene> {
             "modal-doctor",
             "Doctor panel (/doctor)",
             "modal",
-            ["doctor", "session:"],
+            ["doctor", "model:", "session:"],
             |_| {
                 opens(Modal::Doctor {
                     rows: doctor_rows(),

@@ -2087,6 +2087,79 @@ fn window_range(total: usize, visible: usize, scroll: Option<usize>) -> (usize, 
     }
 }
 
+/// Doc-view window over `total` rows: unlike the transcript, `None` is the
+/// TOP of a panel. Returns `(start_row, at_end)`.
+fn doc_window(total: usize, visible: usize, scroll: Option<usize>) -> (usize, bool) {
+    let max_start = total.saturating_sub(visible);
+    let start = scroll.unwrap_or(0).min(max_start);
+    (start, visible > 0 && start >= max_start && total > visible)
+}
+
+/// The body of a doc pager: windowed over RENDERED rows (pager text wraps,
+/// and a window counted in source lines pushes its markers out of the box),
+/// with a `… ↑` marker on the first row and a `… ↓` marker on the last when
+/// the content is clipped. Markers replace rows, so the body never grows
+/// past `visible`.
+fn doc_body<S: AsRef<str>>(
+    rows: &[S],
+    inner_w: usize,
+    visible: usize,
+    scroll: Option<usize>,
+    style_of: impl Fn(&str) -> ratatui::style::Style,
+) -> Vec<ratatui::text::Line<'static>> {
+    use ratatui::text::Line as TuiLine;
+    let flat: Vec<String> = rows
+        .iter()
+        .flat_map(|row| {
+            wrap_rows(row.as_ref(), inner_w)
+                .into_iter()
+                .map(|vr| vr.text)
+        })
+        .collect();
+    let (start, _) = doc_window(flat.len(), visible, scroll);
+    let end = (start + visible).min(flat.len());
+    let mut body: Vec<TuiLine<'static>> = flat[start..end]
+        .iter()
+        .map(|row| TuiLine::styled(row.clone(), style_of(row)))
+        .collect();
+    let faint = ratatui::style::Style::new().fg(crate::palette::FAINT);
+    if start > 0 && !body.is_empty() {
+        body[0] = TuiLine::styled(format!("… ↑ {start} above"), faint);
+    }
+    let below = flat.len().saturating_sub(end);
+    if below > 0 && !body.is_empty() {
+        let last = body.len() - 1;
+        body[last] = TuiLine::styled(format!("… ↓ {below} more"), faint);
+    }
+    body
+}
+
+/// Keys for a doc pager (`None` = top): line and page keys move the
+/// window, Home/End jump to the ends. Only Esc closes, so a stray letter
+/// never dismisses a panel.
+fn doc_pager_keys(
+    code: crossterm::event::KeyCode,
+    total: usize,
+    scroll: &mut Option<usize>,
+    visible: usize,
+) -> bool {
+    use crossterm::event::KeyCode;
+    let max_start = total.saturating_sub(visible);
+    let cur = scroll.unwrap_or(0).min(max_start);
+    let page = visible.saturating_sub(1).max(1);
+    match code {
+        KeyCode::Esc => return true,
+        KeyCode::Up => *scroll = Some(cur.saturating_sub(1)),
+        KeyCode::Down => *scroll = Some((cur + 1).min(max_start)),
+        KeyCode::PageUp => *scroll = Some(cur.saturating_sub(page)),
+        KeyCode::PageDown => *scroll = Some((cur + page).min(max_start)),
+        KeyCode::Home => *scroll = Some(0),
+        KeyCode::End => *scroll = Some(max_start),
+        _ => {}
+    }
+    false
+}
+
 /// The scrollbar rail's published geometry: (rect, total rows, visible
 /// rows, thumb position, thumb length).
 type RailZone = (ratatui::layout::Rect, usize, usize, usize, usize);
@@ -5167,40 +5240,6 @@ fn modal_key(key: crossterm::event::KeyEvent) -> crossterm::event::KeyEvent {
     }
 }
 
-/// Key handling shared by the pager modals (TaskDetail, Debug): the
-/// page keys scroll the window, Home jumps to the top, End re-pins to
-/// the tail; any other key closes. Returns true when the modal should
-/// close. `visible` mirrors the renderer's window height.
-fn pager_keys(
-    code: crossterm::event::KeyCode,
-    total: usize,
-    scroll: &mut Option<usize>,
-    visible: usize,
-) -> bool {
-    use crossterm::event::KeyCode;
-    match code {
-        KeyCode::PageUp => {
-            page_up(scroll, total, visible);
-            false
-        }
-        KeyCode::PageDown => {
-            page_down(scroll, total, visible);
-            false
-        }
-        KeyCode::Home => {
-            if total > visible {
-                *scroll = Some(0);
-            }
-            false
-        }
-        KeyCode::End => {
-            *scroll = None;
-            false
-        }
-        _ => true,
-    }
-}
-
 /// API key entry for a provider's env var.
 #[derive(Debug, Clone)]
 pub struct KeyPrompt {
@@ -6827,7 +6866,7 @@ async fn app(
                             },
                             Modal::TaskDetail { text, scroll, .. } => {
                                 let visible = pager_visible(view_rows);
-                                if pager_keys(key.code, text.lines().count(), scroll, visible) {
+                                if doc_pager_keys(key.code, text.lines().count(), scroll, visible) {
                                     modal = None;
                                 }
                             }
@@ -7003,13 +7042,13 @@ async fn app(
                             | Modal::Permissions { rows, scroll }
                             | Modal::Doctor { rows, scroll } => {
                                 let visible = pager_visible(view_rows);
-                                if pager_keys(key.code, rows.len(), scroll, visible) {
+                                if doc_pager_keys(key.code, rows.len(), scroll, visible) {
                                     modal = None;
                                 }
                             }
                             Modal::Debug { rows, scroll } => {
                                 let visible = pager_visible(view_rows);
-                                if pager_keys(key.code, rows.len(), scroll, visible) {
+                                if doc_pager_keys(key.code, rows.len(), scroll, visible) {
                                     modal = None;
                                 }
                             }
@@ -7260,7 +7299,7 @@ async fn app(
                             },
                             Modal::Changelog { rows, scroll } => {
                                 let visible = pager_visible(view_rows);
-                                if pager_keys(key.code, rows.len(), scroll, visible) {
+                                if doc_pager_keys(key.code, rows.len(), scroll, visible) {
                                     modal = None;
                                 }
                             }
@@ -13692,13 +13731,13 @@ fn modal_hints(open: &Modal) -> &'static [(&'static str, &'static str)] {
             }
         },
         Modal::TaskDetail { .. } | Modal::Debug { .. } => &[
-            ("pgup/pgdn", "scroll"),
+            ("↑↓/pgup/pgdn", "scroll"),
             ("home/end", "top/tail"),
             ("esc", "close"),
         ],
         // TUI-18: read-only panels page like the debug overlay
         Modal::Hooks { .. } | Modal::Permissions { .. } | Modal::Doctor { .. } => &[
-            ("pgup/pgdn", "scroll"),
+            ("↑↓/pgup/pgdn", "scroll"),
             ("home/end", "top/tail"),
             ("esc", "close"),
         ],
@@ -13712,7 +13751,7 @@ fn modal_hints(open: &Modal) -> &'static [(&'static str, &'static str)] {
         Modal::CopyPick { .. } => &[("↑↓", "choose"), ("⏎", "copy"), ("w", "save to file")],
         Modal::Search { .. } => &[("type", "refine"), ("↑↓", "choose"), ("⏎", "jump")],
         Modal::Changelog { .. } => &[
-            ("pgup/pgdn", "scroll"),
+            ("↑↓/pgup/pgdn", "scroll"),
             ("home/end", "top/tail"),
             ("esc", "close"),
         ],
@@ -16069,11 +16108,7 @@ fn render(
                 let height = (rows.len() as u16 + 5).clamp(7, 30).min(fh);
                 let width = 90.min(fw);
                 let visible = (height as usize).saturating_sub(5);
-                let (first, _) = window_range(rows.len(), visible, *scroll);
-                let body = rows[first..(first + visible).min(rows.len())]
-                    .iter()
-                    .map(|row| TuiLine::raw(row.clone()))
-                    .collect();
+                let body = doc_body(rows, inner(width), visible, *scroll, |_| Style::new());
                 let title = format!("{} hooks", crate::icons::tool_icon("hooks"));
                 (width, height, title, body)
             }
@@ -16081,11 +16116,7 @@ fn render(
                 let height = (rows.len() as u16 + 5).clamp(7, 30).min(fh);
                 let width = 90.min(fw);
                 let visible = (height as usize).saturating_sub(5);
-                let (first, _) = window_range(rows.len(), visible, *scroll);
-                let body = rows[first..(first + visible).min(rows.len())]
-                    .iter()
-                    .map(|row| TuiLine::raw(row.clone()))
-                    .collect();
+                let body = doc_body(rows, inner(width), visible, *scroll, |_| Style::new());
                 let title = format!("{} permissions", crate::icons::tool_icon("permissions"));
                 (width, height, title, body)
             }
@@ -16093,11 +16124,7 @@ fn render(
                 let height = (rows.len() as u16 + 5).clamp(7, 30).min(fh);
                 let width = 90.min(fw);
                 let visible = (height as usize).saturating_sub(5);
-                let (first, _) = window_range(rows.len(), visible, *scroll);
-                let body = rows[first..(first + visible).min(rows.len())]
-                    .iter()
-                    .map(|row| TuiLine::raw(row.clone()))
-                    .collect();
+                let body = doc_body(rows, inner(width), visible, *scroll, |_| Style::new());
                 let title = format!("{} doctor", crate::icons::tool_icon("doctor"));
                 (width, height, title, body)
             }
@@ -16108,11 +16135,7 @@ fn render(
                 let height = (lines.len() as u16 + 5).clamp(7, 30).min(fh);
                 let width = 90.min(fw);
                 let visible = (height as usize).saturating_sub(5);
-                let (first, _) = window_range(lines.len(), visible, *scroll);
-                let body = lines[first..(first + visible).min(lines.len())]
-                    .iter()
-                    .map(|line| TuiLine::raw((*line).to_string()))
-                    .collect();
+                let body = doc_body(&lines, inner(width), visible, *scroll, |_| Style::new());
                 let title = format!("{} task t-{id}", crate::icons::tool_icon("tasks"));
                 (width, height, title, body)
             }
@@ -16122,11 +16145,7 @@ fn render(
                 let height = (rows.len() as u16 + 5).clamp(7, 30).min(fh);
                 let width = 90.min(fw);
                 let visible = (height as usize).saturating_sub(5);
-                let (first, _) = window_range(rows.len(), visible, *scroll);
-                let body = rows[first..(first + visible).min(rows.len())]
-                    .iter()
-                    .map(|row| TuiLine::styled(row.clone(), meta))
-                    .collect();
+                let body = doc_body(rows, inner(width), visible, *scroll, |_| meta);
                 let title = format!("{} debug sessions", crate::icons::tool_icon("debug"));
                 (width, height, title, body)
             }
@@ -16444,27 +16463,16 @@ fn render(
             Modal::Changelog { rows, scroll } => {
                 let height = 34u16.min(fh);
                 let width = 88.min(fw);
-                let cap = (height as usize).saturating_sub(4);
-                let total = rows.len();
-                let offset = scroll.unwrap_or(0).min(total.saturating_sub(cap));
-                let mut text: Vec<TuiLine<'static>> = rows
-                    .iter()
-                    .skip(offset)
-                    .take(cap)
-                    .map(|row| {
-                        if row.starts_with("## ") || row.starts_with("# ") {
-                            TuiLine::styled(row.clone(), crate::palette::ACCENT_BOLD)
-                        } else if row.starts_with("### ") {
-                            TuiLine::styled(row.clone(), crate::palette::ACCENT_STYLE)
-                        } else {
-                            TuiLine::raw(row.clone())
-                        }
-                    })
-                    .collect();
-                let more = total.saturating_sub(offset + cap);
-                if more > 0 {
-                    text.push(TuiLine::styled(format!("… ↓ +{more} more"), meta));
-                }
+                let visible = (height as usize).saturating_sub(4);
+                let text = doc_body(rows, inner(width), visible, *scroll, |row| {
+                    if row.starts_with("## ") || row.starts_with("# ") {
+                        crate::palette::ACCENT_BOLD
+                    } else if row.starts_with("### ") {
+                        crate::palette::ACCENT_STYLE
+                    } else {
+                        Style::new()
+                    }
+                });
                 (width, height, modal_title("changelog"), text)
             }
             Modal::Queue { items, selected } => {
@@ -18620,6 +18628,44 @@ mod tests {
         assert_eq!(window_range(100, 20, Some(95)), (80, true));
         // zero visible
         assert_eq!(window_range(100, 0, Some(10)), (0, true));
+    }
+
+    /// A doc pager opens at the TOP (unlike the transcript's tail pin),
+    /// pages from there, lands on the last page with End, keeps its
+    /// window height with markers inside it, and closes only on Esc.
+    #[test]
+    fn doc_pagers_open_at_the_top_and_only_esc_closes() {
+        use crossterm::event::KeyCode;
+        assert_eq!(doc_window(100, 20, None), (0, false));
+        assert_eq!(doc_window(100, 20, Some(95)), (80, true));
+        let mut s = None;
+        assert!(!doc_pager_keys(KeyCode::PageDown, 100, &mut s, 20));
+        assert_eq!(s, Some(19));
+        assert!(!doc_pager_keys(KeyCode::End, 100, &mut s, 20));
+        assert_eq!(s, Some(80));
+        assert!(!doc_pager_keys(KeyCode::Home, 100, &mut s, 20));
+        assert_eq!(s, Some(0));
+        assert!(!doc_pager_keys(KeyCode::Down, 100, &mut s, 20));
+        assert_eq!(s, Some(1));
+        // a stray letter keeps the panel open; only Esc closes
+        assert!(!doc_pager_keys(KeyCode::Char('x'), 100, &mut s, 20));
+        assert!(!doc_pager_keys(KeyCode::Enter, 100, &mut s, 20));
+        assert!(doc_pager_keys(KeyCode::Esc, 100, &mut s, 20));
+        // markers replace rows: the body never grows past the window
+        let rows: Vec<String> = (0..100).map(|i| format!("r{i}")).collect();
+        let text = |l: &ratatui::text::Line| {
+            l.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        };
+        let body = doc_body(&rows, 20, 20, Some(40), |_| ratatui::style::Style::new());
+        assert_eq!(body.len(), 20);
+        assert_eq!(text(&body[0]), "… ↑ 40 above");
+        assert_eq!(text(&body[19]), "… ↓ 40 more");
+        let top = doc_body(&rows, 20, 20, None, |_| ratatui::style::Style::new());
+        assert_eq!(text(&top[0]), "r0");
+        assert_eq!(text(&top[19]), "… ↓ 80 more");
     }
     #[test]
     fn user_entry_rows_tracks_user_message_positions() {
