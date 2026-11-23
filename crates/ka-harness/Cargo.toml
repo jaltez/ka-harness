@@ -25,7 +25,7 @@ ka-dialect = { workspace = true }
 # `passport` feature. Not in [workspace.dependencies] on purpose —
 # default builds never see it (keys-only core, ratified 2026-09-29);
 # `passport` also flips ka-dialect's registry consult on.
-ka-passport = { path = "../ka-passport", version = "0.9.0", optional = true }
+ka-passport = { path = "../ka-passport", version = "0.10.0", optional = true }
 ka-strand = { workspace = true }
 ka-term = { workspace = true }
 ka-protocol = { workspace = true }

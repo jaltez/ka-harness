@@ -1,18 +1,30 @@
 # Changelog
 
-## Unreleased
+## 0.10.0 — 2026-11-24
 
 ### TUI
-- Composer popups (commands, `@` files) list up to 14 rows in a 96-column box instead of 7 in 64, and the mouse wheel moves the highlighted row; the dim ghost completes the highlighted command, since Enter runs it.
-- `@` mentions complete with a fuzzy search over the whole path (directories included): `src/ma` finds `src/main.rs`, `tuisnap` finds `src/tui_snapshots.rs`.
+- Click a past user prompt (capture mouse mode) for a rewind popup: `⏎` runs the highlighted row · `r` rewind there · `e` rewind & edit · `f` fork from there (the same actions as the double-esc menu and `/tree`; `/focus` digest rows answer the same way).
+- Composer popups (commands, `@` files) list up to 14 rows in a 96-column box instead of 7 in 64, and the mouse wheel moves the highlighted row; the ghost completes the highlighted command, since Enter runs it.
+- `@` opens the file list the moment the sigil is typed and re-ranks it on every character with a fuzzy search over the whole path (directories included): `src/ma` finds `src/main.rs`, `tuisnap` finds `src/tui_snapshots.rs`.
 - In capture mouse mode the composer hints are buttons for what they name (send, clear, history, commands); on the status line the mode chip opens the mode picker and the model label the model picker.
 - While a turn runs, the todo list is pinned above the composer beside the streaming text; the strip button still opens the full list.
-- UX pass over every surface, checked with a 214-scene frame harness at three terminal sizes: unknown slash commands are refused instead of sent to the model, Enter runs the highlighted command, Escape clears a draft, modified keys never act as their bare letter in a modal, a click outside keeps typed work, every list keeps its selection on screen, doc pagers open at the top and keep their markers inside the box, the permission ask shows the changed lines and all of its options at 80x24, the status line drops whole segments instead of cutting the cost or the mode chip, plain mode clears its pane and says a verdict once, and commands echo as one dim line.
+- Skills carry their origin root (`.claude`, `.agents`) and the model picker aligns its columns and grows for long ids.
+- A frame harness renders 215 TUI scenes at three terminal sizes on every test run.
 
-- Click a past user prompt (capture mouse mode) → rewind popup: `⏎/r` rewind there · `e` rewind & edit · `f` fork from there (same actions as the double-esc menu and `/tree`; `/focus` digest rows answer the same way).
-- Fixed: the 10 s background-task poll printed `▸ background tasks` + its rows into the transcript on every tick (twice at startup on a clean session, then every 10 s) — a roster snapshot now only feeds the job pill and an open `/tasks`.
-- Fixed: transcript click/hover mapping with several prompts — the `/focus` row mapping was applied with `/focus` off, shifting or deadening rows (tool cards in earlier turns answered the wrong click).
-- Fixed: `/update` in-session resume re-exec failed with ENOENT after the binary swap.
+### Fixed
+- Traps: an unknown or partial slash command no longer reaches the model (Enter runs the highlighted one); Escape clears a draft; a modified key never acts as its bare letter inside a modal (Ctrl+R no longer rewinds from the rewind menu, Ctrl+A no longer stages everything in `/git`); a click outside a panel keeps a typed api key, settings edit or save path; Enter on a filter that matches nothing no longer starts a new session.
+- Keys: reverse search takes typed characters; Ctrl+C backs out of a modal first, and a second press during a turn quits; history keeps the half-typed draft and holds prompts only; sending returns the view to the tail; the mouse toggle left Ctrl+M (Enter on legacy terminals) for Alt+M; `--ephemeral` no longer prints a resume hint.
+- Sizing: modals are sized against the area they are drawn in (rows no longer wrap two columns wide at 80 columns); every list keeps its selection on screen; doc pagers (changelog, hooks, permissions, doctor, debug, task detail) open at the top, page to the end, scroll with the line keys, and keep their markers inside the box.
+- The permission ask shows the changed lines of the diff (never the file headers) and all of its options at 80x24.
+- The status line drops whole segments instead of cutting the cost or the mode chip.
+- Plain mode (the screen-reader view) clears its pane for a modal, wraps its rows, and says a verdict once.
+- Slash commands echo as one dim line instead of a full prompt band.
+- The 10 s background-task poll printed `▸ background tasks` and its rows into the transcript on every tick (twice at startup on a clean session).
+- Transcript click and hover mapping with several prompts: the `/focus` row mapping was applied with `/focus` off, so tool cards in earlier turns answered the wrong click.
+- `/update` in-session resume re-exec failed with ENOENT after the binary swap.
+
+### Protocol
+- `Event::Inventory.skills` carries `SkillEntry { name, source }` instead of bare names on the NDJSON/RPC stream. Deserialization accepts both shapes; a host that parsed `skills` as strings reads `.name` now.
 
 ## 0.8.0 — 2026-11-23
 
