@@ -40,6 +40,14 @@ Each landed as its own commit with its test or its harness scene.
 - Commands echo as one dim line instead of a full prompt band.
 - The snapshot harness itself is the durable part: 214 scenes, asserted on every run.
 
+## Added during the run, at the user's request
+
+- The click-a-prompt popup: Enter runs the highlighted row (`r`, `e`, `f` still jump straight to their action).
+- Composer popups list up to 14 rows in a 96-column box (from 7 in 64), the mouse wheel moves the highlight while one is open, and the ghost completes the highlighted command.
+- `@` mentions match fuzzily over the whole path, ranked: a filename prefix first, then segment starts, then scattered letters.
+- The composer hints that name an action are buttons for it (send, clear, history, commands); the status line's mode chip and model label open their pickers. A click is replayed as the equivalent key press through the real handler, so nothing is implemented twice.
+- The todo list is pinned above the composer while a turn runs, so it stays in view beside the streaming text.
+
 ## Open findings
 
 Every row has frames and a `file:line` at `/tmp/ka-ux-vis-*/findings.tsv`, `/tmp/ka-ux-beh-*/findings.tsv` and `.audit/tui-ux-findings.tsv` (all on the run's worktree). Grouped by what they need.

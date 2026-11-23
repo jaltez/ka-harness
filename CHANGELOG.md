@@ -3,6 +3,10 @@
 ## Unreleased
 
 ### TUI
+- Composer popups (commands, `@` files) list up to 14 rows in a 96-column box instead of 7 in 64, and the mouse wheel moves the highlighted row; the dim ghost completes the highlighted command, since Enter runs it.
+- `@` mentions complete with a fuzzy search over the whole path (directories included): `src/ma` finds `src/main.rs`, `tuisnap` finds `src/tui_snapshots.rs`.
+- In capture mouse mode the composer hints are buttons for what they name (send, clear, history, commands); on the status line the mode chip opens the mode picker and the model label the model picker.
+- While a turn runs, the todo list is pinned above the composer beside the streaming text; the strip button still opens the full list.
 - UX pass over every surface, checked with a 214-scene frame harness at three terminal sizes: unknown slash commands are refused instead of sent to the model, Enter runs the highlighted command, Escape clears a draft, modified keys never act as their bare letter in a modal, a click outside keeps typed work, every list keeps its selection on screen, doc pagers open at the top and keep their markers inside the box, the permission ask shows the changed lines and all of its options at 80x24, the status line drops whole segments instead of cutting the cost or the mode chip, plain mode clears its pane and says a verdict once, and commands echo as one dim line.
 
 - Click a past user prompt (capture mouse mode) → rewind popup: `⏎/r` rewind there · `e` rewind & edit · `f` fork from there (same actions as the double-esc menu and `/tree`; `/focus` digest rows answer the same way).
