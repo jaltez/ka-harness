@@ -49,6 +49,8 @@
 ### Batch 11 — models
 - ka-passport (new opt-in crate + `passport` cargo feature): TokenSource trait per the ratified design stub, Claude Pro/Max OAuth (PKCE, loopback callback, keyring service `ka-passport`, proactive refresh) exposed as a claude-plan vendor (anthropic wire + oauth beta header) · Curated community providers: perplexity, nebius, sambanova, upstage · `[model] service_tier` passthrough on all three wires · Idle cache warming (`[context] cache_warming = "idle"`, ≥$0.05 turns) · `ka models --update` runtime catalog overlay from models.dev.
 
+## 0.9.0 — 2026-11-23
+
 ### Batch 13 — deferred items (part 1)
 - **Code mode** (`code` cargo feature + runtime toggle `tool:code`) — the model writes a JavaScript script that orchestrates ka tools and only the final result returns to the model: `ka.tools.call(name, argsJson)` routes every call through the full clearance gate (asks resolve to a denied-with-instruction error — pre-approve via rules/`[permissions] allow` and re-run), `ka.models.classify(text, labels)` rides the fast role; fresh QuickJS runtime per invocation (rquickjs 0.14, chosen over Boa by measured musl footprint: ~1.2 MB net vs a 9.5 MB binary alone), `[code] timeout_ms` (10 s) + `memory_mb` (16) limits, interrupt handler + tokio timeout belt, no fs/net/stdio bindings (fail-closed); default binary unchanged (7.25 MB, feature off).
 - **`/tan <question>`** — tangential background question on a read-only child session: the answer arrives as a `tan · …` note while the conversation continues (never a turn); `/tan` lists live jobs, `/tan cancel [id]` cancels; `tan:N` status pill; delegate's background path refactored into a shared `arm_background` spawn (delegate semantics unchanged); off in safe-mode.
