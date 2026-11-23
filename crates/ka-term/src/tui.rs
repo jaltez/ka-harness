@@ -17233,6 +17233,11 @@ where
         .unwrap_or_default()
 }
 
+/// Snapshot scenes for `render`, every surface at real terminal sizes (`tui_snapshots.rs`).
+#[cfg(test)]
+#[path = "tui_snapshots.rs"]
+mod snapshots;
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
