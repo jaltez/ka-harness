@@ -2819,6 +2819,10 @@ pub struct Meters {
     /// roster snapshot — `(running tasks, running jobs, dap sessions)`.
     /// All zero = the pill disappears from the status line.
     pub jobs: JobsPill,
+    /// TUI-16: live tangential (`/tan`) jobs — armed on a `/tan`
+    /// spawn dispatch, counted down by each `tan · ` completion,
+    /// failure, or cancellation note. 0 hides the `tan:N` pill.
+    pub tan: u32,
 }
 
 /// Running background-work counts behind the status-line pill (see
@@ -8098,6 +8102,11 @@ async fn app(
                                         is_switch = true;
                                         fresh = id == "new";
                                     }
+                                    // TUI-16: a /tan spawn arms the pill;
+                                    // the completion note counts it down
+                                    if tan_spawn_dispatch(&evt) {
+                                        meters.tan = meters.tan.saturating_add(1);
+                                    }
                                     // the session's trigger record keeps
                                     // bare /autocompact truthful
                                     if let Command::SetAutoCompact { pct } = &evt {
@@ -9235,6 +9244,12 @@ async fn app(
                                             if let Command::Prompt { text, .. } = &event {
                                                 last_user = Some(text.clone());
                                             }
+                                            // TUI-16: a queued /tan spawn
+                                            // arms the pill like a direct
+                                            // dispatch would
+                                            if tan_spawn_dispatch(&event) {
+                                                meters.tan = meters.tan.saturating_add(1);
+                                            }
                                             if matches!(
                                                 event,
                                                 Command::SetMode {
@@ -9939,6 +9954,12 @@ fn apply_event(
             // state (the badge renders from `meters` every frame)
             note_goal_state(message, &mut meters.goal);
             note_loop_state(message, &mut meters.loop_task);
+            // TUI-16: exactly one `tan · ` note ends each tangential
+            // job (completion, failure, or cancellation) — count the
+            // pill down; control lines (`tan: …`) never touch it
+            if message.starts_with(ka_protocol::TAN_NOTE_PREFIX) {
+                meters.tan = meters.tan.saturating_sub(1);
+            }
             // CTX-01: a compact-from note means the engine cut the last
             // N turns — drop the same rows from the view BEFORE the
             // note lands, so the confirmation survives the cut
@@ -10663,6 +10684,11 @@ fn builtin_slash_commands() -> Vec<(String, String)> {
         (
             "/btw".to_string(),
             "side question on the fast role (answer arrives as a note)".to_string(),
+        ),
+        (
+            "/tan".to_string(),
+            "background side question on a child agent: /tan <question> | /tan cancel [id]"
+                .to_string(),
         ),
         (
             "/goal".to_string(),
@@ -11589,6 +11615,19 @@ pub fn skill_invocation(text: &str, inventory: &Inventory) -> Option<Result<Comm
     }))
 }
 
+/// The `/tan` usage row (slash refuses with it; the engine repeats it
+/// for surfaces that dispatch a mistyped control form).
+pub fn usage_tan() -> &'static str {
+    "usage: /tan <question> — background side question (/tan lists live jobs, /tan cancel [id])"
+}
+
+/// Does this dispatch arm a tangential job? A `/tan` spawn yes;
+/// listing and cancellation dispatches no — their notes carry the
+/// end-of-job signal instead.
+fn tan_spawn_dispatch(evt: &Command) -> bool {
+    matches!(evt, Command::Tan { text } if !text.is_empty() && !text.starts_with("cancel"))
+}
+
 pub fn slash_command(text: &str) -> Option<Slash> {
     let mut parts = text.splitn(2, ' ');
     let head = parts.next()?.trim();
@@ -11636,6 +11675,7 @@ pub fn slash_command(text: &str) -> Option<Slash> {
             | "/permissions"
             | "/doctor"
             | "/pr"
+            | "/tan"
             | "/git"
     ) {
         if let Some((fm, body)) = custom_command(head, rest) {
@@ -11935,6 +11975,67 @@ blocker > major > minor > nit, each as `file:line — issue — concrete fix`, \
                 _ => Some(Slash {
                     note: Some("usage: /btw <question> — off-the-record side question".to_string()),
                     event: None,
+                    quit: false,
+                    followup: None,
+                    modal: None,
+                }),
+            }
+        }
+        "/tan" => {
+            // TUI-16: a tangential job — background child, the answer
+            // arrives as a note and nothing interrupts the main thread.
+            // Strict parse: `cancel` takes an id (the engine resolves a
+            // bare `cancel` to the single live job); anything
+            // unparseable after `cancel` is refused with the usage row,
+            // never read as a question.
+            match rest {
+                None => Some(Slash {
+                    // bare /tan: list the live jobs (ids + first lines
+                    // arrive as a note from the engine)
+                    note: None,
+                    event: Some(Command::Tan {
+                        text: String::new(),
+                    }),
+                    quit: false,
+                    followup: None,
+                    modal: None,
+                }),
+                Some("cancel") => Some(Slash {
+                    note: None,
+                    event: Some(Command::Tan {
+                        text: "cancel".to_string(),
+                    }),
+                    quit: false,
+                    followup: None,
+                    modal: None,
+                }),
+                Some(rest) if rest.starts_with("cancel ") => {
+                    let id = rest["cancel ".len()..].trim();
+                    let digits = id.strip_prefix("t-").unwrap_or(id);
+                    match digits.parse::<u64>() {
+                        Ok(n) => Some(Slash {
+                            note: None,
+                            event: Some(Command::Tan {
+                                text: format!("cancel {n}"),
+                            }),
+                            quit: false,
+                            followup: None,
+                            modal: None,
+                        }),
+                        Err(_) => Some(Slash {
+                            note: Some(usage_tan().to_string()),
+                            event: None,
+                            quit: false,
+                            followup: None,
+                            modal: None,
+                        }),
+                    }
+                }
+                Some(q) => Some(Slash {
+                    note: Some("tan · asked — the answer arrives as a note".to_string()),
+                    event: Some(Command::Tan {
+                        text: q.to_string(),
+                    }),
                     quit: false,
                     followup: None,
                     modal: None,
@@ -13139,6 +13240,11 @@ fn status_left(meters: &Meters) -> Vec<ratatui::text::Span<'static>> {
         // /tasks roster snapshot
         push(pill, crate::palette::TOOL);
     }
+    if meters.tan > 0 {
+        // TUI-16: tangential jobs alive — background children whose
+        // answers arrive as notes; the pill counts off `tan · ` notes
+        push(format!("tan:{}", meters.tan), crate::palette::TOOL);
+    }
     segs
 }
 
@@ -13387,6 +13493,15 @@ pub fn status_segments(meters: &Meters, order: &[String]) -> Vec<ratatui::text::
         // EXT-09: state badge like goal/loop — an armed style never
         // hides behind a custom segment order
         push(&mut segs, format!("\u{00b6} {style}"), crate::palette::META);
+    }
+    if meters.tan > 0 {
+        // TUI-16: state badge like goal/loop — live tangential jobs
+        // (`tan:N`) never hide behind a custom segment order
+        push(
+            &mut segs,
+            format!("tan:{}", meters.tan),
+            crate::palette::TOOL,
+        );
     }
     segs
 }
@@ -16226,6 +16341,10 @@ pub(crate) fn help_modal_rows(width: usize) -> Vec<ratatui::text::Line<'static>>
             ("/rewind", "drop the last N exchanges"),
             ("/compactfrom", "rewind N turns, keep a summary [N] [focus]"),
             ("/btw", "side question — fast role, off the record"),
+            (
+                "/tan",
+                "background side question: /tan <question> | /tan cancel [id]",
+            ),
             ("/recap", "one-line recap (latest stored recap, else local)"),
             ("/undo", "restore the last edited file"),
             ("/checkpoint", "snapshot the working tree (git)"),
@@ -19481,6 +19600,100 @@ mod tests {
         assert!(rows[1].contains("/spills"), "{rows:?}");
         // …and a plain note stays a single row
         assert_eq!(apply("goal paused").len(), 1);
+    }
+
+    /// TUI-16: one `tan · ` note ends one tangential job — the pill
+    /// counts down and the note lands in the transcript. The user's
+    /// draft is untouched by construction: `apply_event` receives no
+    /// draft buffer at all, so no event — a tan note included — can
+    /// reach the composer; this test pins the observable half (note
+    /// row + pill arithmetic).
+    #[test]
+    fn tan_note_lands_and_counts_the_pill_down() {
+        let apply = |message: &str, tan: u32| {
+            let mut lines = Transcript::default();
+            let (mut busy, mut busy_since) = (false, None);
+            let mut meters = Meters {
+                tan,
+                ..Meters::default()
+            };
+            let mut pending = None;
+            let mut orphaned: Vec<(String, usize)> = Vec::new();
+            let mut usage = None;
+            let (mut a, mut t, mut tool) = (String::new(), String::new(), String::new());
+            let mut live_tool: Option<LiveTool> = None;
+            let mut last_user: Option<String> = None;
+            let mut last_error: Option<String> = None;
+            let mut spills: Vec<String> = Vec::new();
+            let mut sidebar = SidebarState::default();
+            let _ = apply_event(
+                &Event::Note {
+                    message: message.to_string(),
+                },
+                &mut lines,
+                &mut busy,
+                &mut busy_since,
+                &mut meters,
+                &mut pending,
+                &mut orphaned,
+                &mut usage,
+                &mut a,
+                &mut t,
+                &mut tool,
+                &mut live_tool,
+                &mut last_user,
+                &mut last_error,
+                &mut spills,
+                &mut sidebar,
+            );
+            (meters.tan, lines)
+        };
+        // completion note: pill 2 → 1, note row in the transcript
+        let (tan, lines) = apply("tan · why is the sky blue — Rayleigh scattering.", 2);
+        assert_eq!(tan, 1);
+        assert!(lines.entries().iter().any(|l| matches!(
+            l,
+            Line::Info(m) if m.starts_with("tan · why is the sky blue")
+        )));
+        // failure and cancellation notes count down the same way
+        assert_eq!(apply("tan · big — failed: timeout", 1).0, 0);
+        assert_eq!(apply("tan · big — cancelled", 3).0, 2);
+        // a control line (`tan: …`) never touches the pill
+        assert_eq!(
+            apply(
+                "tan: no tangential jobs running — usage: /tan <question>",
+                1
+            )
+            .0,
+            1
+        );
+        // and the pill never underflows
+        assert_eq!(apply("tan · x — done", 0).0, 0);
+    }
+
+    #[test]
+    fn tan_pill_renders_only_when_jobs_are_alive() {
+        let text = |m: &Meters| {
+            status_left(m)
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        };
+        let mut m = Meters::default();
+        assert!(
+            !text(&m).contains("tan:"),
+            "no pill without live jobs: {}",
+            text(&m)
+        );
+        m.tan = 1;
+        assert_eq!(text(&m), "tan:1");
+        m.tan = 3;
+        assert_eq!(text(&m), "tan:3");
+        // custom [tui] status_line orders still show it: a state badge,
+        // not a segment (it never hides behind a reordered row)
+        let segs = status_segments(&m, &["model".to_string(), "cost".to_string()]);
+        let joined = segs.iter().map(|s| s.content.as_ref()).collect::<String>();
+        assert!(joined.contains("tan:3"), "{joined}");
     }
 
     #[test]

@@ -5,7 +5,9 @@
 //! * background delegate tasks: `t-{id}  {state}  {elapsed}  {agent} — {head}${cost}`
 //!   (the `$cost` tail appears only once the runner reported usage);
 //! * bash jobs: ``job-{id}`  {state}  {cmd}``;
-//! * DAP sessions: `dap {id}  {status}  breakpoints in {n} file(s)`.
+//! * DAP sessions: `dap {id}  {status}  breakpoints in {n} file(s)`;
+//! * team members (EXT-12, display-only for ka-term): `team {name}  {state}  turns {n}  {head}`
+//!   — the pill ignores them (member work surfaces as `team · ` notes).
 //!
 //! Feeds the status-line job pill (running counts) and the /tasks
 //! Agent-Hub extras (per-row cost + a summed footer).

@@ -22,11 +22,16 @@ regex = { workspace = true }
 flate2 = { workspace = true }
 ka-sandbox = { workspace = true }
 parking_lot = { workspace = true }
+rquickjs = { workspace = true, optional = true }
 
 [dev-dependencies]
 parking_lot = { workspace = true }
 
 [features]
+# TOOL-04 code mode: the `code` hand runs a short JavaScript script in an
+# embedded QuickJS runtime (rquickjs) and returns only the final value to
+# the model. Default-OFF — the default binary stays byte-identical.
+code = ["dep:rquickjs"]
 # Exposes trust-store test redirection so integration contract suites
 # can approve temp projects without touching the real trust file.
 test-util = []

@@ -260,6 +260,92 @@ async fn safe_mode_never_arms_cron() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// EXT-12: the team hand NEVER spawns members in safe mode —
+/// session-spawning automation is a customization-tier risk the bare
+/// surface pins off (the cron/monitor precedent). `team_spawn` refuses
+/// with a safe-mode error, no member engine ever arms; the same hand
+/// outside safe mode reaches its normal validation (an invalid name
+/// fails on the grammar, not on safe mode — and nothing spawns).
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn safe_mode_never_spawns_team_members() {
+    {
+        let _guard = FLAG_LOCK.lock();
+        conventions::set_bare_mode(true);
+    }
+    let dir = std::env::temp_dir().join(format!("ka-bare-team-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let strand = ka_strand::StrandFile::create(&dir, None).unwrap();
+    let (events, _rx) = tokio::sync::mpsc::channel(16);
+    let table = ka_engine::hands::teams::TeamTable::new(
+        8,
+        &dir,
+        ka_dialect::Catalog::parse(
+            "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000000\n",
+        )
+        .unwrap(),
+        ka_engine::Config::default(),
+        ka_protocol::Mode::Allow,
+        events,
+        &strand,
+        None,
+    );
+    let hand = ka_engine::hands::teams::TeamsHand::new(table);
+    let ctx = ka_engine::hands::HandContext {
+        cwd: dir.clone(),
+        ledger: std::sync::Arc::new(parking_lot::Mutex::new(ka_engine::hands::Ledger::default())),
+        spill: std::sync::Arc::new(ka_engine::hands::Spill::new()),
+        snapshots: std::sync::Arc::new(parking_lot::Mutex::new(
+            ka_engine::hands::snapshots::Snapshots::inert(),
+        )),
+        jobs: std::sync::Arc::new(ka_engine::hands::jobs::JobTable::new()),
+        bash_background_ms: 0,
+        max_image_mb: 5,
+        web_allow_private: false,
+        sandbox: ka_sandbox::Policy::Off,
+        shell_env: Default::default(),
+    };
+    {
+        let _guard = FLAG_LOCK.lock();
+        conventions::set_bare_mode(true);
+        let out = hand
+            .execute(
+                &serde_json::json!({
+                    "action": "spawn",
+                    "name": "scout",
+                    "prompt": "survey the repo"
+                }),
+                &ctx,
+            )
+            .await;
+        conventions::set_bare_mode(false);
+        assert!(
+            out.is_error && out.content.contains("safe mode"),
+            "team spawn must refuse in safe mode: {}",
+            out.content
+        );
+    }
+    // outside safe mode the same hand reaches its grammar (nothing
+    // spawns for an invalid name — the refusal is the name, not the mode)
+    let out = hand
+        .execute(
+            &serde_json::json!({
+                "action": "spawn",
+                "name": "Scout!",
+                "prompt": "survey the repo"
+            }),
+            &ctx,
+        )
+        .await;
+    assert!(
+        out.is_error && out.content.contains("invalid name"),
+        "outside safe mode the refusal is the name grammar: {}",
+        out.content
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// CTX-06: the loop never arms in safe mode — an unattended repeat
 /// executor is a customization-tier risk the bare surface pins off.
 /// Set is refused with a note, no cycle ever fires.

@@ -8,7 +8,8 @@ use ka_protocol::Command;
 use ka_term::tui::{
     Inventory, Meters, ModalKind, NotifySettings, SKILLS, SessionPicker, Transcript,
     accept_memory_note, available_slash_commands, memory_modal_rows, read_memory_inbox,
-    skill_invocation, slash_command, status_segments, update_suggestions, write_memory_inbox,
+    skill_invocation, slash_command, status_segments, update_suggestions, usage_tan,
+    write_memory_inbox,
 };
 
 /// Every built-in slash command documented in the README parses. A
@@ -59,6 +60,7 @@ fn every_documented_slash_command_parses() {
         "/tree",
         "/memory",
         "/pr",
+        "/tan",
         "/git",
     ];
     let mut missing = Vec::new();
@@ -83,6 +85,101 @@ fn every_documented_slash_command_parses() {
     // Mouse capture toggles with Ctrl+M, not a slash command. They are
     // covered by the input-layer unit tests in src; if you move one
     // into slash_command, add it above.
+}
+
+/// TUI-16: /tan — a tangential background question. The spawn carries
+/// the question verbatim (the answer arrives as a note, the transcript
+/// is never interrupted), bare /tan asks for the live listing, cancel
+/// forms carry the `t-<id>` roster id, and a mistyped cancel refuses
+/// with the usage row instead of reading as a question.
+#[test]
+fn tan_slash_contract() {
+    // documented in the registry
+    let cmds = available_slash_commands();
+    let (_, hint) = cmds
+        .iter()
+        .find(|(n, _)| n == "/tan")
+        .expect("/tan registered");
+    assert!(hint.contains("background side question"), "{hint}");
+
+    // spawn: the question rides verbatim, the transcript confirms with
+    // the same prefix the completion note (and the pill) uses
+    let spawn = slash_command("/tan why does the spill GC keep files").expect("/tan <question>");
+    assert!(
+        matches!(
+            &spawn.event,
+            Some(Command::Tan { text }) if text == "why does the spill GC keep files"
+        ),
+        "{:?}",
+        spawn.event
+    );
+    assert!(
+        spawn
+            .note
+            .as_deref()
+            .is_some_and(|n| n.starts_with(ka_protocol::TAN_NOTE_PREFIX)),
+        "{:?}",
+        spawn.note
+    );
+    assert!(spawn.modal.is_none() && !spawn.quit);
+
+    // bare /tan: the listing request (ids + first lines arrive as a
+    // note from the engine)
+    let list = slash_command("/tan").expect("bare /tan parses");
+    assert!(
+        matches!(&list.event, Some(Command::Tan { text }) if text.is_empty()),
+        "{:?}",
+        list.event
+    );
+
+    // cancel: bare resolves to the single live job engine-side; an id
+    // normalizes (the t- prefix strips); a non-id refuses with usage
+    let cancel = slash_command("/tan cancel").expect("/tan cancel parses");
+    assert!(
+        matches!(&cancel.event, Some(Command::Tan { text }) if text == "cancel"),
+        "{:?}",
+        cancel.event
+    );
+    for form in ["/tan cancel t-3", "/tan cancel 3"] {
+        let cancel_id = slash_command(form).expect(form);
+        assert!(
+            matches!(&cancel_id.event, Some(Command::Tan { text }) if text == "cancel 3"),
+            "{form}: {:?}",
+            cancel_id.event
+        );
+        assert!(cancel_id.note.is_none(), "{form}: the engine answers");
+    }
+    let bad = slash_command("/tan cancel why did it break").expect("parses to refuse");
+    assert!(bad.event.is_none(), "a mistyped cancel must not spawn");
+    assert!(
+        bad.note.as_deref().is_some_and(|n| n.starts_with("usage:")),
+        "{:?}",
+        bad.note
+    );
+
+    // the usage row names the whole grammar
+    let usage = usage_tan();
+    assert!(usage.starts_with("usage: /tan <question>"), "{usage}");
+    assert!(usage.contains("/tan cancel [id]"), "{usage}");
+}
+
+/// TUI-16: the status-line pill — `tan:N` while N tangential jobs are
+/// alive, hidden at zero, and immune to a custom [tui] status_line
+/// order (a state badge, like goal/loop).
+#[test]
+fn tan_pill_contract() {
+    let mut meters = Meters::default();
+    let joined = |m: &Meters| {
+        status_segments(m, &[])
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>()
+    };
+    assert!(!joined(&meters).contains("tan:"), "{}", joined(&meters));
+    meters.tan = 1;
+    assert!(joined(&meters).contains("tan:1"), "{}", joined(&meters));
+    meters.tan = 12;
+    assert!(joined(&meters).contains("tan:12"), "{}", joined(&meters));
 }
 
 /// CTX-02: /shake parses bare (stale-output-only trim) and with modes
@@ -1135,6 +1232,32 @@ fn tasks_roster_feeds_pill_and_cost() {
     assert!((total - 0.1234).abs() < 1e-9);
     assert_eq!(agents, 1);
     assert!(cost_summary(&["t-4  done  5s  a — b".to_string()]).is_none());
+}
+
+/// EXT-12: `team <name>  <state>  turns N  <head>` rows ride the same
+/// /tasks roster. They are display-only for ka-term: the pill ignores
+/// them (member work is tracked via `team · ` completion notes) and the
+/// cost footer never invents member costs.
+#[test]
+fn team_roster_rows_are_display_only_for_the_pill() {
+    use ka_term::roster::{cost_summary, pill_counts, pill_text};
+
+    let team_rows = vec![
+        "team scout  done     turns 1   Survey done: 3 crates.".to_string(),
+        "team writer  working  turns 0   -".to_string(),
+        "team dismissed  dead   turns 2  final word".to_string(),
+    ];
+    assert_eq!(pill_counts(&team_rows), (0, 0, 0));
+    assert_eq!(pill_text(&team_rows), None);
+    assert_eq!(cost_summary(&team_rows), None);
+    // mixed with task rows: only the `t-` rows count
+    let mixed = vec![
+        "t-1  running   3s  scout — x".to_string(),
+        "team scout  working  turns 0   -".to_string(),
+    ];
+    assert_eq!(pill_counts(&mixed), (1, 0, 0));
+    // Enter on a team row resolves no task id (no detail fetch)
+    assert_eq!(ka_term::roster::parse_task_row(&team_rows[0]), None);
 }
 
 /// TUI-03: the composer vim layer — motions, operators with counts and

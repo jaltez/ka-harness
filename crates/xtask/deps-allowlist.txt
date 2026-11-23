@@ -6,6 +6,11 @@
 adler2
 aho-corasick
 allocator-api2
+# TOOL-04 (code hand, default-OFF `code` feature): rquickjs's executor
+# tables — async-lock/event-listener drive the JS job queue, the
+# hashbrown/foldhash/allocator-api2/equivalent stack is its internal
+# containers. Never in the default binary graph (feature off).
+async-lock
 anstream
 anstyle
 anstyle-parse
@@ -47,6 +52,8 @@ enumflags2
 enumflags2_derive
 equivalent
 errno
+event-listener
+event-listener-strategy
 flate2
 fnv
 foldhash
@@ -120,6 +127,13 @@ regex
 regex-automata
 regex-syntax
 reqwest
+# TOOL-04 (code hand, default-OFF `code` feature): the embedded QuickJS
+# engine (rquickjs + -core + -sys, C sources compiled by cc inside -sys).
+# Never in the default binary graph (feature off) — see the workspace
+# Cargo.toml entry for the size spike rationale.
+rquickjs
+rquickjs-core
+rquickjs-sys
 ring
 rustix
 rustls

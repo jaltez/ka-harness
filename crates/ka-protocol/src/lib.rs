@@ -324,6 +324,12 @@ pub enum LoopAction {
     Off,
 }
 
+/// The transcript prefix every tangential (`/tan`) job ends with: one
+/// `tan · ` note per job — completion, failure, or cancellation — so
+/// surfaces count live jobs off the notes (`tan:N` status pill) and
+/// never mistake a control line (`tan: …`) for one.
+pub const TAN_NOTE_PREFIX: &str = "tan · ";
+
 /// Surface → engine commands.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -492,6 +498,25 @@ pub enum Command {
     /// back as an `Event::Note`).
     SideQuestion {
         /// The question text.
+        text: String,
+    },
+    /// TUI-16: tangential work — a lateral question or small job that
+    /// runs detached on its own nested voice (the same child
+    /// construction, clearance, ask policy, and turn cap as a
+    /// `delegate` child) and NEVER interrupts the main thread: the
+    /// result lands as an `Event::Note` prefixed [`TAN_NOTE_PREFIX`]
+    /// (`tan · <subject> — <first line>`), with the full answer parked
+    /// on the spill store when it exceeds 32 KiB. Asks inside the
+    /// child auto-deny — it works only with what is already allowed.
+    ///
+    /// The `text` shape: the question verbatim spawns a job; `""`
+    /// lists live jobs (ids + first line, as a note); `"cancel"`
+    /// cancels the only live job; `"cancel <id>"` cancels one by its
+    /// `t-<id>` roster id. Anything else after `cancel` is refused as
+    /// a usage note (a question cannot start with `cancel` — rephrase).
+    Tan {
+        /// The question, or an empty / `cancel [id]` control form (see
+        /// the variant doc).
         text: String,
     },
     /// CTX-01: rewind the last `turns` user turns AND keep what was
@@ -1015,6 +1040,15 @@ mod tests {
         roundtrip_command(Command::Answer {
             question: AskId("q1".into()),
             choice: 0,
+        });
+        roundtrip_command(Command::Tan {
+            text: "why does the spill GC keep the newest file".into(),
+        });
+        roundtrip_command(Command::Tan {
+            text: String::new(),
+        });
+        roundtrip_command(Command::Tan {
+            text: "cancel t-3".into(),
         });
         roundtrip_command(Command::ExportMarkdown {
             out: Some(std::path::PathBuf::from("x.md")),

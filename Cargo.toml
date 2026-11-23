@@ -65,6 +65,15 @@ sha2 = { version = "0.10", default-features = false, features = ["std"] }
 # OS randomness for ka-passport PKCE (BCryptGenRandom/urandom); optional
 # default-OFF feature, ~20 KB — review-fix 0.8.0 (non-CSPRNG fallback).
 getrandom = "0.3"
+# Embedded QuickJS engine behind the `code` hand (TOOL-04): scripts run in
+# a per-invocation runtime that orchestrates ka tools, so multi-step tool
+# chains cost one model round-trip instead of one per step. Optional
+# default-OFF feature; ~1.2 MB net musl measured in the spike (Boa
+# rejected: 9.5 MB alone breaks the footprint contract). `futures` drives
+# the async ka.* bindings; `parallel` makes the runtime handles Send (the
+# Hand trait requires Send futures) at zero extra crates; no fs/net/stdio
+# host modules exist to bind.
+rquickjs = { version = "0.14", features = ["futures", "parallel"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

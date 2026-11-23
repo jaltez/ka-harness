@@ -12,6 +12,8 @@ use serde_json::Value;
 
 pub mod bash;
 pub mod checkpoint;
+#[cfg(feature = "code")]
+pub mod code;
 pub mod cron;
 pub mod delegate;
 pub use bash::BashHand;
@@ -32,7 +34,9 @@ pub mod protected;
 pub mod read;
 pub mod secrets;
 pub mod snapshots;
+pub mod tangential;
 pub mod tasks;
+pub mod teams;
 pub mod todo;
 pub mod tool_search;
 pub mod web;

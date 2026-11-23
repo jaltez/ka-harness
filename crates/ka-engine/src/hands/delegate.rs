@@ -190,65 +190,32 @@ track it with the tasks tool.",
             // background: register, spawn, return immediately — the
             // model tracks it via the tasks hand (single tasks only)
             if args.get("background").and_then(Value::as_bool) == Some(true) {
-                let id = self.tasks.register(agent_name, task);
-                let roster = Some(self.tasks.rows_except(Some(id)));
-                let def = def.clone();
-                let task = task.to_string();
-                let cwd = ctx.cwd.clone();
+                // bound ahead of the await: the read guard must not
+                // live across the spawn (it is not Send)
                 let source = self.source.read().clone();
-                let parent_mode = self.parent_mode;
-                let tasks = self.tasks.clone();
-                let events = self.events.clone();
-                let tasks_in = tasks.clone();
-                // EXT-01: subagent_start fires once the spawn is armed
-                fire_subagent_hook(
-                    &self.hooks,
-                    &self.features,
-                    &self.events,
-                    crate::config::HookEvent::SubagentStart,
-                    agent_name,
-                    &task,
-                    None,
+                let run = arm_background(
+                    def.clone(),
+                    task,
                     &ctx.cwd,
+                    source,
+                    self.parent_mode,
+                    self.tasks.clone(),
+                    &self.events,
+                    self.hooks.clone(),
+                    self.features.clone(),
                 )
                 .await;
-                let hooks_in = self.hooks.clone();
-                let features_in = self.features.clone();
-                let events_in = self.events.clone();
-                let agent_hook = agent_name.to_string();
-                let task_hook = task.clone();
-                let hook_cwd_in = ctx.cwd.clone();
-                let runner = tokio::spawn(async move {
-                    let (outcome, branch, cost) =
-                        run_agent(def, task.clone(), cwd, source, parent_mode, roster, |tx| {
-                            tasks_in.attach_cmds(id, tx)
-                        })
-                        .await;
-                    // EXT-01: subagent_stop fires when the runner
-                    // settled (cancelled tasks never reach this)
-                    fire_subagent_hook(
-                        &hooks_in,
-                        &features_in,
-                        &events_in,
-                        crate::config::HookEvent::SubagentStop,
-                        &agent_hook,
-                        &task_hook,
-                        Some(&outcome),
-                        &hook_cwd_in,
-                    )
-                    .await;
-                    tasks_in.set_cost(id, cost);
-                    if let Some(branch) = &branch {
-                        tasks_in.set_branch(id, branch.clone());
-                    }
-                    outcome
-                });
                 // the runner never writes final state or notes; the
                 // watcher alone does — a cancel aborts the runner and
                 // its state stands, a panic fails the task instead of
                 // wedging it Running forever
-                tasks.attach(id, runner.abort_handle());
-                tokio::spawn(super::tasks::watch_runner(tasks, events, id, runner));
+                let id = run.id;
+                tokio::spawn(super::tasks::watch_runner(
+                    self.tasks.clone(),
+                    self.events.clone(),
+                    id,
+                    run.completion,
+                ));
                 return ToolOutput::ok(format!(
                     "background task t-{id} started (agent {agent_name}); continue other work \
                      and check the tasks tool for the result"
@@ -294,6 +261,133 @@ track it with the tasks tool.",
                 Err(e) => ToolOutput::err(e),
             }
         })
+    }
+}
+
+/// One detached delegate run armed by [`arm_background`]: the shared
+/// spawn behind `delegate {background: true}` and the tangential
+/// (`/tan`) child.
+///
+/// Flows that don't retain the handle (the `tasks` hand, `/tan
+/// cancel` on an id) drive the same state through the shared table —
+/// first-write-wins lives there — so `prompt`/`cancel` serve only
+/// direct handle holders; both are contract-tested.
+pub(crate) struct BackgroundRun {
+    /// 1-based id in the shared [`super::tasks::AgentTaskTable`] (the
+    /// `t-<id>` roster prefix).
+    pub id: u64,
+    /// The child's opening prompt: the agent's system body, the task
+    /// text, and the sibling-task roster lines — what the nested voice
+    /// receives before any output-schema retry rewrites the task.
+    #[allow(dead_code)] // handle-holder surface, contract-tested
+    pub prompt: String,
+    /// Completion channel: the runner's `JoinHandle`. Awaiting it
+    /// yields the outcome (`Ok` summary / `Err` reason), a cancel
+    /// (`Err`, `is_cancelled`), or a panic (`Err`, anything else) —
+    /// the same discrimination [`super::tasks::watch_runner`] makes.
+    /// Progress (elapsed, state) reads off the task-table row.
+    pub completion: tokio::task::JoinHandle<Result<String, String>>,
+    tasks: Arc<super::tasks::AgentTaskTable>,
+}
+
+impl BackgroundRun {
+    /// Cancel the run: aborts the runner and marks the task cancelled
+    /// in the shared table. First-write-wins: a late runner result
+    /// never overwrites the cancellation.
+    #[allow(dead_code)] // handle-holder surface, contract-tested
+    pub fn cancel(&self) -> Result<String, String> {
+        self.tasks.cancel(self.id)
+    }
+}
+
+/// Arm one detached delegate run: register it in the shared task
+/// table, fire the EXT-01 `subagent_start` hook, and spawn the runner
+/// — the same child construction, clearance, ask policy (asks auto-
+/// deny: nobody is there to answer), and turn cap as every delegate
+/// run ([`run_agent`] over a nested read-only voice). The caller owns
+/// completion: `tokio::spawn(watch_runner(...))` for delegate paths,
+/// the tangential module's own watcher for `/tan`.
+#[allow(clippy::too_many_arguments)] // one spawn, every arg a distinct engine handle
+pub(crate) async fn arm_background(
+    def: AgentDef,
+    task: &str,
+    cwd: &std::path::Path,
+    source: super::pathfinder::PathfinderSource,
+    parent_mode: ka_protocol::Mode,
+    tasks: Arc<super::tasks::AgentTaskTable>,
+    events: &mpsc::Sender<ka_protocol::Event>,
+    hooks: Arc<Vec<crate::config::Hook>>,
+    features: crate::features::FeatureSlot,
+) -> BackgroundRun {
+    let id = tasks.register(&def.name, task);
+    let roster = Some(tasks.rows_except(Some(id)));
+    let mut prompt = format!("{}\n\nTask: {}", def.system, task);
+    if let Some(rows) = roster.as_deref().filter(|r| !r.is_empty()) {
+        prompt.push_str(&format!(
+            "\n\nSibling tasks also in flight (context only — do not wait on them):\n{}",
+            rows.join("\n")
+        ));
+    }
+    // EXT-01: subagent_start fires once the spawn is armed
+    fire_subagent_hook(
+        &hooks,
+        &features,
+        events,
+        crate::config::HookEvent::SubagentStart,
+        &def.name,
+        task,
+        None,
+        cwd,
+    )
+    .await;
+    let tasks_in = tasks.clone();
+    let hooks_in = hooks.clone();
+    let features_in = features.clone();
+    let events_in = events.clone();
+    let agent_hook = def.name.clone();
+    let task_hook = task.to_string();
+    // the runner is 'static: it takes an owned cwd, and the stop hook
+    // (fired after run_agent consumes it) takes its own copy
+    let cwd = cwd.to_path_buf();
+    let hook_cwd_in = cwd.clone();
+    let runner = tokio::spawn(async move {
+        let (outcome, branch, cost) = run_agent(
+            def,
+            task_hook.clone(),
+            cwd,
+            source,
+            parent_mode,
+            roster,
+            |tx| tasks_in.attach_cmds(id, tx),
+        )
+        .await;
+        // EXT-01: subagent_stop fires when the runner
+        // settled (cancelled tasks never reach this)
+        fire_subagent_hook(
+            &hooks_in,
+            &features_in,
+            &events_in,
+            crate::config::HookEvent::SubagentStop,
+            &agent_hook,
+            &task_hook,
+            Some(&outcome),
+            &hook_cwd_in,
+        )
+        .await;
+        tasks_in.set_cost(id, cost);
+        if let Some(branch) = &branch {
+            tasks_in.set_branch(id, branch.clone());
+        }
+        outcome
+    });
+    // a cancel needs the runner's abort handle in the table (the
+    // `tasks` hand and [`BackgroundRun::cancel`] share it)
+    tasks.attach(id, runner.abort_handle());
+    BackgroundRun {
+        id,
+        prompt,
+        completion: runner,
+        tasks,
     }
 }
 
@@ -1073,6 +1167,117 @@ mod tests {
         assert!(a.isolate);
         let b = AgentDef::parse("plain body", "b");
         assert!(!b.isolate);
+    }
+
+    /// TUI-16: the shared spawn arm behind `background: true` and the
+    /// `/tan` child — registers in the shared table, carries the child's
+    /// opening prompt, and cancels through the same table path the
+    /// `tasks` hand uses.
+    #[tokio::test]
+    async fn arm_background_registers_prompt_and_cancels() {
+        let tasks = crate::hands::tasks::AgentTaskTable::new();
+        let (events, _rx) = mpsc::channel(16);
+        let def = AgentDef {
+            name: "reviewer".to_string(),
+            description: String::new(),
+            system: "You review.".to_string(),
+            max_steps: 8,
+            isolate: false,
+            model: None,
+            effort: None,
+            tools: None,
+            output: None,
+        };
+        let run = arm_background(
+            def,
+            "review the diff",
+            std::env::temp_dir().as_path(),
+            PathfinderSource::default(),
+            ka_protocol::Mode::Allow,
+            tasks.clone(),
+            &events,
+            std::sync::Arc::new(Vec::new()),
+            crate::features::FeatureToggles::slot(Vec::new()),
+        )
+        .await;
+        assert_eq!(run.id, 1, "first registration is t-1");
+        assert!(
+            run.prompt.contains("You review.") && run.prompt.contains("Task: review the diff"),
+            "{}",
+            run.prompt
+        );
+        // the table sees the live task under the agent's name
+        let rows = tasks.rows();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].contains("t-1"), "{}", rows[0]);
+        assert!(rows[0].contains("reviewer"), "{}", rows[0]);
+        // cancel goes through the table: state stands, the runner is
+        // aborted (with no model it may already have settled — either
+        // the outcome or the cancellation resolves the handle)
+        assert_eq!(
+            run.cancel().unwrap(),
+            "t-1 cancelled",
+            "cancel marks the task"
+        );
+        let _ = run.completion.await;
+        assert!(
+            tasks.result(1).is_some_and(|r| r.contains("cancelled")),
+            "{}",
+            tasks.result(1).unwrap_or_default()
+        );
+    }
+
+    #[tokio::test]
+    async fn background_delegate_spawn_reports_the_task_row() {
+        let tasks = crate::hands::tasks::AgentTaskTable::new();
+        let (events, _rx) = mpsc::channel(16);
+        let agents = vec![AgentDef {
+            name: "reviewer".to_string(),
+            description: "reviews diffs".to_string(),
+            system: "You review.".to_string(),
+            max_steps: 8,
+            isolate: false,
+            model: None,
+            effort: None,
+            tools: None,
+            output: None,
+        }];
+        let h = DelegateHand::new(
+            agents,
+            std::sync::Arc::new(parking_lot::RwLock::new(PathfinderSource::default())),
+            ka_protocol::Mode::Allow,
+            tasks.clone(),
+            events,
+            crate::features::FeatureToggles::slot(Vec::new()),
+        );
+        let ctx = ctx_for();
+        let out = h
+            .execute(
+                &serde_json::json!({"agent": "reviewer", "task": "review x", "background": true}),
+                &ctx,
+            )
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(
+            out.content
+                .starts_with("background task t-1 started (agent reviewer)"),
+            "{}",
+            out.content
+        );
+        // the roster row is live under the shared table
+        let rows = tasks.rows();
+        assert_eq!(rows.len(), 1, "{}", rows.join("\n"));
+        // no model configured: the runner settles failed on its own —
+        // give it a beat, then the row reads finished-work state
+        let mut failed = false;
+        for _ in 0..50 {
+            if tasks.result(1).is_some_and(|r| r.contains("failed")) {
+                failed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(failed, "runner should fail fast without a model");
     }
 
     #[test]

@@ -79,6 +79,7 @@ pub fn syntax_ghost(input: &str) -> Option<Ghost> {
         "/goal" => "<condition>",
         "/loop" => "[--every <secs>] <task>",
         "/pr" => "<n|url|branch> [fix]",
+        "/tan" => "<question>",
         _ => return None,
     };
     match args {
@@ -248,6 +249,9 @@ mod tests {
         assert_eq!(g.suffix("/loop"), " [--every <secs>] <task>");
         let g = syntax_ghost("/pr").expect("prefix matches");
         assert_eq!(g.suffix("/pr"), " <n|url|branch> [fix]");
+        // TUI-16: /tan shows the question shape the same way
+        let g = syntax_ghost("/tan").expect("prefix matches");
+        assert_eq!(g.suffix("/tan"), " <question>");
         // trailing space: the template continues right at the caret
         let g = syntax_ghost("/goal ").expect("prefix matches");
         assert_eq!(g.suffix("/goal "), "<condition>");

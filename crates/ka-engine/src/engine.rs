@@ -132,7 +132,7 @@ pub fn spawn_full(
     catalog: ka_dialect::Catalog,
     strand: StrandChoice,
 ) -> EngineHandle {
-    spawn_speaked(config, catalog, strand, None)
+    spawn_speaked(config, catalog, strand, None, None)
 }
 
 /// Spawn with a scripted speaker for one wire (contract tests): the
@@ -146,7 +146,28 @@ pub fn spawn_with_speaker(
     wire: ka_dialect::Wire,
     speaker: std::sync::Arc<dyn ka_dialect::speaker::Speaker>,
 ) -> EngineHandle {
-    spawn_speaked(config, catalog, strand, Some((wire, speaker)))
+    spawn_speaked(config, catalog, strand, Some((wire, speaker)), None)
+}
+
+/// Contract-test spawn (EXT-12): [`spawn_with_speaker`] plus a factory
+/// the team table uses to give every spawned member its own scripted
+/// speaker. Production passes None — members inherit the session model
+/// through the parent config.
+pub fn spawn_with_team_speakers(
+    config: Config,
+    catalog: ka_dialect::Catalog,
+    strand: StrandChoice,
+    wire: ka_dialect::Wire,
+    speaker: std::sync::Arc<dyn ka_dialect::speaker::Speaker>,
+    member_speakers: crate::hands::teams::MemberSpeakers,
+) -> EngineHandle {
+    spawn_speaked(
+        config,
+        catalog,
+        strand,
+        Some((wire, speaker)),
+        Some(member_speakers),
+    )
 }
 
 fn spawn_speaked(
@@ -157,11 +178,23 @@ fn spawn_speaked(
         ka_dialect::Wire,
         std::sync::Arc<dyn ka_dialect::speaker::Speaker>,
     )>,
+    team_speakers: Option<crate::hands::teams::MemberSpeakers>,
 ) -> EngineHandle {
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
     let (evt_tx, evt_rx) = mpsc::channel(256);
     tokio::spawn(async move {
-        if let Err(e) = run(cmd_rx, evt_tx, config, catalog, strand, speaker).await {
+        if let Err(e) = run(
+            cmd_rx,
+            evt_tx,
+            config,
+            catalog,
+            strand,
+            speaker,
+            false,
+            team_speakers,
+        )
+        .await
+        {
             // The events channel is gone or the engine hit an unrecoverable
             // state; surface-level diagnostics only.
             eprintln!("ka engine ended: {e}");
@@ -171,6 +204,47 @@ fn spawn_speaked(
         commands: cmd_tx,
         events: evt_rx,
     }
+}
+
+/// Spawn one EXT-12 team member: a full engine session on a fresh
+/// strand (the parent's cwd) with the delegate/teams hands stripped —
+/// a leaf: no nested spawns, and bootstrap skips MCP servers, the
+/// session lifecycle hooks, and the jobs-file adoption. Returns the
+/// surface handle plus the engine task so the team table can cancel it
+/// (dismiss, parent drop). Test fixtures script the member's speaker.
+pub(crate) fn spawn_leaf(
+    config: Config,
+    catalog: ka_dialect::Catalog,
+    speaker: Option<(
+        ka_dialect::Wire,
+        std::sync::Arc<dyn ka_dialect::speaker::Speaker>,
+    )>,
+) -> (EngineHandle, tokio::task::JoinHandle<()>) {
+    let (cmd_tx, cmd_rx) = mpsc::channel(64);
+    let (evt_tx, evt_rx) = mpsc::channel(256);
+    let task = tokio::spawn(async move {
+        if let Err(e) = run(
+            cmd_rx,
+            evt_tx,
+            config,
+            catalog,
+            StrandChoice::New,
+            speaker,
+            true,
+            None,
+        )
+        .await
+        {
+            eprintln!("ka team member ended: {e}");
+        }
+    });
+    (
+        EngineHandle {
+            commands: cmd_tx,
+            events: evt_rx,
+        },
+        task,
+    )
 }
 
 /// Resolve a strand choice into an open strand (creating when allowed),
@@ -626,6 +700,11 @@ struct Ctx {
     mcp_lazy: bool,
     /// Background delegate-task registry (/tasks rows).
     agent_tasks: std::sync::Arc<crate::hands::tasks::AgentTaskTable>,
+    /// EXT-12: the team member table (`team` hand + /tasks rows). None
+    /// for leaf members (no nested teams) and safe mode.
+    teams: Option<crate::hands::teams::TeamTable>,
+    /// TUI-16: tangential jobs (`/tan`) — notes only, never a turn.
+    tangential: std::sync::Arc<crate::hands::tangential::Tangential>,
     /// Live DAP sessions (/tasks rows), when the [debug] tier is on.
     debug: Option<std::sync::Arc<crate::dap::DebugManager>>,
     /// Configured MCP servers (spawn-on-enable source of truth; the
@@ -649,6 +728,7 @@ struct Ctx {
     roles_cfg: crate::config::Roles,
 }
 
+#[allow(clippy::too_many_arguments)] // one engine bootstrap, every arg a distinct concern
 async fn run(
     mut commands: mpsc::Receiver<Command>,
     events: mpsc::Sender<Event>,
@@ -659,6 +739,8 @@ async fn run(
         ka_dialect::Wire,
         std::sync::Arc<dyn ka_dialect::speaker::Speaker>,
     )>,
+    leaf: bool,
+    team_speakers: Option<crate::hands::teams::MemberSpeakers>,
 ) -> Result<(), DynError> {
     let cwd = config
         .cwd
@@ -685,12 +767,21 @@ async fn run(
         config.model = Some(resolved);
     }
     // safe mode: config-file hooks are customizations too — built-ins,
-    // config chain, rules, and auth stay
-    let mcp_servers = if crate::conventions::bare_mode() {
+    // config chain, rules, and auth stay. Team members (leaf) skip MCP
+    // servers outright: spawning every user server per member is both
+    // heavy and a side-effect multiplier.
+    let mcp_servers = if crate::conventions::bare_mode() || leaf {
         Vec::new()
     } else {
         config.mcp.clone()
     };
+    // EXT-12: the member template rides the parent's config (same
+    // model, rules, identity) — captured here, after pin/role
+    // resolution reshaped `model`, before `EngineState::from` consumes
+    // the config. `team_max` is read at the same point. (Leaf members
+    // never read it; the clone is once-per-engine trivia.)
+    let member_template = config.clone();
+    let team_max = config.delegate.effective_team_max();
     let mode = config.effective_mode();
     let max_steps = config.effective_max_steps();
     // profiles activate ahead of [[rules]] (PERM-01/06): the gate list
@@ -699,6 +790,11 @@ async fn run(
     let rules = config.effective_rules();
     let prompt_policy = config.effective_prompt_policy();
     let allowed_tools = config.permissions.allow.clone();
+    // TOOL-04 code mode: the `code` hand's script-facing gate mirrors
+    // this posture; the locals below move into the voice, so snapshot
+    // them now (cfg-gated — no cost without the `code` feature)
+    #[cfg(feature = "code")]
+    let code_gate = (rules.clone(), prompt_policy, allowed_tools.clone());
     let hooks = if crate::conventions::bare_mode() {
         Vec::new()
     } else {
@@ -756,6 +852,9 @@ async fn run(
     // the same way (EXT-11)
     let roles_table = config.roles.clone();
     let pathfinder_catalog = catalog.clone();
+    // EXT-12: the team table clones the catalog too — members are full
+    // engine sessions resolving roles/dialects exactly like the parent
+    let teams_catalog = catalog.clone();
     let search_providers = config.effective_search();
     let web_allow_private = config.effective_web_allow_private();
     // resolve [generate_image] BEFORE the config is consumed by
@@ -847,6 +946,10 @@ async fn run(
     }
     let mcp_lazy = config.effective_mcp_lazy();
     let sandbox_cfg = config.sandbox.clone();
+    // TOOL-04 code mode: the `[code]` limits ride the hand; resolved
+    // now, before the config is consumed by EngineState (cfg-gated)
+    #[cfg(feature = "code")]
+    let code_cfg = config.effective_code();
     let mut state = EngineState::from(config);
     state.roles = roles;
     state.roles.commit = commit_role;
@@ -874,6 +977,9 @@ async fn run(
     let agent_tasks = crate::hands::tasks::AgentTaskTable::new();
     let (maintenance_tx, maintenance_rx) = mpsc::channel(16);
     let tables = voice.tables().clone();
+    // TUI-16: capture the pathfinder slot before `voice` moves into Ctx.
+    let tangential_slot = voice.pathfinder_slot();
+    let tangential_events = events.clone();
     let mut ctx = Ctx {
         cwd,
         events,
@@ -886,6 +992,15 @@ async fn run(
         maintenance: maintenance_rx,
         mcp_lazy,
         agent_tasks: agent_tasks.clone(),
+        teams: None,
+        tangential: std::sync::Arc::new(crate::hands::tangential::Tangential::new(
+            tangential_slot,
+            mode,
+            agent_tasks.clone(),
+            tangential_events,
+            features.clone(),
+            std::sync::Arc::new(hooks.clone()),
+        )),
         debug: None,
         mcp_servers_cfg: mcp_servers.clone(),
         maintenance_tx: maintenance_tx.clone(),
@@ -899,8 +1014,8 @@ async fn run(
     // markdown agents: .ka/agents/*.md etc. become one `delegate` hand
     // (empty in safe mode). The hands register even when `agents` is
     // toggled off — disabling hides, so a re-enable is pure set
-    // membership.
-    let agents = if crate::conventions::bare_mode() {
+    // membership. Team members are leaves: no delegate, no tasks hand.
+    let agents = if crate::conventions::bare_mode() || leaf {
         Vec::new()
     } else {
         crate::agents::AgentDef::discover(&ctx.cwd)
@@ -922,6 +1037,29 @@ async fn run(
             .push_hand(std::sync::Arc::new(crate::hands::tasks::TasksHand::new(
                 agent_tasks.clone(),
             )));
+    }
+    // EXT-12 agent teams: one `team` hand over the shared member table
+    // — the parent is the star router, members are leaf engines
+    // (`spawn_leaf`). Safe mode pins the tier off (the cron/monitor
+    // precedent: session-spawning automation is a customization tier);
+    // `team_max = 0` keeps the hand registered so `team_spawn` refuses
+    // informatively. Members never register it (leaf).
+    if !leaf && !crate::conventions::bare_mode() {
+        let table = crate::hands::teams::TeamTable::new(
+            team_max,
+            &ctx.cwd,
+            teams_catalog,
+            member_template,
+            ctx.state.mode,
+            ctx.events.clone(),
+            &ctx.strand,
+            team_speakers,
+        );
+        ctx.voice
+            .push_hand(std::sync::Arc::new(crate::hands::teams::TeamsHand::new(
+                table.clone(),
+            )));
+        ctx.teams = Some(table);
     }
     // memory inbox: the model stages durable notes for user review
     // (customization tier — inert in safe mode)
@@ -995,6 +1133,49 @@ async fn run(
             crate::hands::generate_image::GenerateImageHand::new(gen_cfg),
         ));
     }
+    // code hand (TOOL-04): one JavaScript script per call orchestrating
+    // ka tools, only the final value back to the model. Gated on the
+    // `code` CARGO feature (default-OFF — the default binary stays
+    // byte-identical) + the session `tool:code` runtime toggle, in the
+    // spirit of the cron/monitor feature toggles: registered last so
+    // its router snapshot sees every hand the model can call, and
+    // hidden by the toggle both at registration (here) and at admit
+    // time (the voice's stray-call guard) when disabled mid-session.
+    #[cfg(feature = "code")]
+    if !features
+        .read()
+        .is_disabled(&ka_protocol::FeatureSpec::Tool("code".into()))
+    {
+        let (code_rules, code_prompt_policy, code_allowed_tools) = code_gate;
+        let fast_role = ctx
+            .state
+            .roles
+            .fast
+            .clone()
+            .and_then(|selector| ctx.voice.aux_handle(&selector));
+        let router = std::sync::Arc::new(crate::hands::code::CodeRouter::new(
+            // the built-in session registry, sharing the live tables
+            // (jobs/cron/monitors/checkpoints) and the pathfinder slot —
+            // routed calls execute through hands that see the same
+            // session state the model's calls do
+            crate::hands::registry_with_pathfinder(
+                ctx.voice.pathfinder_slot(),
+                ctx.voice.todo_slot().clone(),
+                ctx.voice.tables().clone(),
+            ),
+            code_rules,
+            mode,
+            code_prompt_policy,
+            code_allowed_tools,
+            features.clone(),
+            ctx.events.clone(),
+            fast_role,
+        ));
+        ctx.voice
+            .push_hand(std::sync::Arc::new(crate::hands::code::CodeHand::new(
+                router, code_cfg,
+            )));
+    }
     // lazy `mcp_call` + meta `mcp` hands: rebuild_mcp_meta_hands — run
     // by ensure_mcp_server on every path that grows the connected set —
     // is their sole registrar. Pushing either here used to register a
@@ -1008,23 +1189,32 @@ async fn run(
         .send(Event::Todos { items: Vec::new() })
         .await
         .ok();
-    // session_start hook (roadmap 9.2): strand attached, inventory out
-    ctx.voice
-        .lifecycle_hook(
-            crate::config::HookEvent::SessionStart,
-            serde_json::json!({
-                "event": "session_start",
-                "cwd": ctx.cwd.display().to_string(),
-            }),
-            &ctx.events,
-        )
-        .await;
+    // session_start hook (roadmap 9.2): strand attached, inventory out.
+    // Team members skip it — they are subagent-class sessions, and the
+    // delegate children they mirror never fire session hooks either.
+    if !leaf {
+        ctx.voice
+            .lifecycle_hook(
+                crate::config::HookEvent::SessionStart,
+                serde_json::json!({
+                    "event": "session_start",
+                    "cwd": ctx.cwd.display().to_string(),
+                }),
+                &ctx.events,
+            )
+            .await;
+    }
     // attach the jobs persistence file BEFORE the command loop: every
     // registration during the session must persist (adoption of
     // survivors from earlier sessions happens here, at startup — the
-    // documented `set_path` semantic)
-    if let Some(path) = crate::hands::jobs::default_jobs_file() {
-        ctx.voice.jobs().set_path(path);
+    // documented `set_path` semantic). Team members skip the shared
+    // file: adoption would pull the parent's persisted jobs into every
+    // member (double execution); a member's own bash backgrounds stay
+    // in-memory and die with it.
+    if !leaf {
+        if let Some(path) = crate::hands::jobs::default_jobs_file() {
+            ctx.voice.jobs().set_path(path);
+        }
     }
     // opportunistic spill-dir GC: detached-job spill files older than
     // the retention window are deleted once per engine start
@@ -1070,17 +1260,20 @@ async fn run(
         }
     }
     // session_end hook (roadmap 9.2): the command channel closed; the
-    // surface may already be gone, so steering surfaces best-effort
-    ctx.voice
-        .lifecycle_hook(
-            crate::config::HookEvent::SessionEnd,
-            serde_json::json!({
-                "event": "session_end",
-                "cwd": ctx.cwd.display().to_string(),
-            }),
-            &ctx.events,
-        )
-        .await;
+    // surface may already be gone, so steering surfaces best-effort.
+    // Skipped for team members (the session_start twin).
+    if !leaf {
+        ctx.voice
+            .lifecycle_hook(
+                crate::config::HookEvent::SessionEnd,
+                serde_json::json!({
+                    "event": "session_end",
+                    "cwd": ctx.cwd.display().to_string(),
+                }),
+                &ctx.events,
+            )
+            .await;
+    }
     Ok(())
 }
 
@@ -2484,6 +2677,11 @@ async fn handle_command(
         Command::ListTasks => {
             // /tasks dashboard rows: background delegates + bash jobs
             let mut rows = ctx.agent_tasks.rows();
+            if let Some(teams) = &ctx.teams {
+                // EXT-12 member rows (`team <name> …` — the TUI pill
+                // ignores them; the modal shows them like any roster)
+                rows.extend(teams.rows());
+            }
             for j in ctx.voice.jobs().snapshot() {
                 let state = match j.state {
                     crate::hands::jobs::JobState::Running => "running".to_string(),
@@ -2535,6 +2733,22 @@ async fn handle_command(
         }
         Command::Steer { text } => ctx.state.steers.push(text),
         Command::Queue { text } => ctx.state.queue.push_back(text),
+        // TUI-16: tangential spawn/list/cancel — answers arrive as Notes,
+        // never as a turn. Safe mode strips session-spawning tools (the
+        // cron/monitor precedent), so `/tan` refuses there too.
+        Command::Tan { text } => {
+            if crate::conventions::bare_mode() {
+                ctx.events
+                    .send(Event::Note {
+                        message: "tan is unavailable in safe mode".to_string(),
+                    })
+                    .await
+                    .ok();
+            } else {
+                ctx.tangential.handle(&text, &ctx.cwd).await;
+            }
+            ctx.events.send(Event::Idle).await.ok();
+        }
         // TRUST INVARIANT: Command::Shell is only ever sent by the local
         // TUI (see the variant docs in ka-protocol) — that is what makes
         // running it without the permission gate sound.
@@ -7107,9 +7321,11 @@ mod tests {
             }]
         );
         // 7 built-ins + todo + jobs + checkpoint + cron + monitor +
-        // tool_search + delegate + tasks + remember + web_fetch (search
-        // registers only with a configured [[search]] provider)
-        assert_eq!(tools.len(), 17, "tools: {tools:?}");
+        // tool_search + delegate + tasks + team + remember + web_fetch
+        // (search registers only with a configured [[search]] provider),
+        // plus `code` when the TOOL-04 cargo feature is compiled in
+        let expected = 18 + usize::from(cfg!(feature = "code"));
+        assert_eq!(tools.len(), expected, "tools: {tools:?}");
         assert!(tools.contains(&"delegate".to_string()), "tools: {tools:?}");
         assert!(tools.contains(&"todo".to_string()), "tools: {tools:?}");
         assert!(tools.contains(&"jobs".to_string()), "tools: {tools:?}");

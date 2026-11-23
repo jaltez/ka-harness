@@ -24,7 +24,7 @@ pub mod wire;
 pub use config::{Config, ConfigError};
 pub use engine::{
     EngineHandle, StrandChoice, effective_debug_cfg, effective_lsp_cfg, lsp_hands, read_waypoint,
-    spawn, spawn_full, spawn_with, spawn_with_speaker,
+    spawn, spawn_full, spawn_with, spawn_with_speaker, spawn_with_team_speakers,
 };
 
 use std::path::{Path, PathBuf};

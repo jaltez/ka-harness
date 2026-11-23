@@ -409,6 +409,66 @@ pub struct Git {
     pub trailers: Vec<String>,
 }
 
+/// Code-mode script budget ([code]; TOOL-04). The `code` hand runs one
+/// JavaScript script per invocation in a fresh embedded QuickJS runtime;
+/// these are its two hard limits. Both are opt-in keys with defaults in
+/// code (`DEFAULT_CODE_TIMEOUT_MS` / `DEFAULT_CODE_MEMORY_MB`); a value
+/// of 0 is refused at parse-validate time (`timeout_ms` 0 would abort
+/// every script instantly; `memory_mb` 0 is QuickJS "unlimited").
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct Code {
+    /// Wall-clock budget for one script run, milliseconds (default
+    /// 10000). The runtime interrupt handler aborts execution when it
+    /// passes; a hung tool binding is cut off by the same deadline.
+    pub timeout_ms: Option<u64>,
+    /// QuickJS heap cap for one script run, megabytes (default 16).
+    /// Exceeding it surfaces as an out-of-memory error to the model.
+    pub memory_mb: Option<u32>,
+}
+
+/// Default wall-clock budget for one `code` script run (milliseconds).
+pub const DEFAULT_CODE_TIMEOUT_MS: u64 = 10_000;
+/// Default QuickJS heap cap for one `code` script run (megabytes).
+pub const DEFAULT_CODE_MEMORY_MB: u32 = 16;
+
+/// Delegate & team settings ([delegate]; EXT-12). The `delegate` hand
+/// itself needs no config; this table currently carries only the agent
+/// teams cap.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct Delegate {
+    /// EXT-12 agent teams: the maximum number of live team members one
+    /// session may hold (default 8). A spawn over the cap refuses; `0`
+    /// disables teams outright — `team_spawn` refuses with an
+    /// informative error (the hand still registers, safe mode aside).
+    /// Members are persistent child sessions (own strands, named
+    /// `<parent-stem>/team/<name>`) the parent drives multi-turn via
+    /// `team_send`.
+    pub team_max: Option<u32>,
+}
+
+impl Delegate {
+    /// The effective live-member cap (`[delegate] team_max`; default
+    /// 8, `0` = teams disabled).
+    pub fn effective_team_max(&self) -> u32 {
+        self.team_max
+            .unwrap_or(crate::hands::teams::TEAM_MAX_DEFAULT)
+    }
+}
+
+impl Code {
+    /// The effective per-run timeout (config value or the default).
+    pub fn effective_timeout_ms(&self) -> u64 {
+        self.timeout_ms.unwrap_or(DEFAULT_CODE_TIMEOUT_MS)
+    }
+
+    /// The effective per-run memory cap (config value or the default).
+    pub fn effective_memory_mb(&self) -> u32 {
+        self.memory_mb.unwrap_or(DEFAULT_CODE_MEMORY_MB)
+    }
+}
+
 /// Role → model-selector mappings.
 ///
 /// EXT-11 TOML shape: the two built-in names stay flat
@@ -1050,6 +1110,12 @@ pub struct Config {
     /// Git automation ([git]).
     #[serde(default)]
     pub git: Git,
+    /// Delegate & team settings ([delegate]; the EXT-12 teams cap).
+    #[serde(default)]
+    pub delegate: Delegate,
+    /// Code-mode script budget ([code]; the `code` hand, TOOL-04).
+    #[serde(default)]
+    pub code: Code,
     /// Post-edit verification ([verify]).
     #[serde(default)]
     pub verify: Verify,
@@ -1196,6 +1262,19 @@ impl Config {
                     ));
                 }
             }
+        }
+        // [code]: both limits must be positive — 0 ms aborts every
+        // script instantly and 0 MB is QuickJS "unlimited" (fail-closed
+        // config culture: the dangerous reading is the rejected one)
+        if self.code.timeout_ms.is_some_and(|t| t == 0) {
+            return Err("[code] timeout_ms must be >= 1 (0 would abort every \
+                        script instantly)"
+                .to_string());
+        }
+        if self.code.memory_mb.is_some_and(|m| m == 0) {
+            return Err("[code] memory_mb must be >= 1 (0 means unlimited for \
+                        the QuickJS heap)"
+                .to_string());
         }
         // [virtual_models] EXT-11: each router needs at least one
         // member selector, and members must parse as selectors so a
@@ -1357,6 +1436,15 @@ impl Config {
         }
         if !other.git.trailers.is_empty() {
             self.git.trailers = other.git.trailers.clone();
+        }
+        if other.delegate.team_max.is_some() {
+            self.delegate.team_max = other.delegate.team_max;
+        }
+        if other.code.timeout_ms.is_some() {
+            self.code.timeout_ms = other.code.timeout_ms;
+        }
+        if other.code.memory_mb.is_some() {
+            self.code.memory_mb = other.code.memory_mb;
         }
         if other.lsp.enable.is_some() {
             self.lsp.enable = other.lsp.enable;
@@ -1530,6 +1618,12 @@ impl Config {
         self.max_steps.unwrap_or(20)
     }
 
+    /// The effective agent-teams cap (`[delegate] team_max`; default 8,
+    /// `0` = teams disabled). EXT-12.
+    pub fn effective_team_max(&self) -> u32 {
+        self.delegate.effective_team_max()
+    }
+
     /// Effective bash auto-background threshold (default 30000, 0 = off).
     pub fn effective_bash_background_after_ms(&self) -> u64 {
         self.tools
@@ -1537,6 +1631,16 @@ impl Config {
             .background_after_ms
             .unwrap_or(DEFAULT_BACKGROUND_AFTER_MS)
     }
+
+    /// The resolved code-mode limits ([code]): config values or the
+    /// code-side defaults.
+    pub fn effective_code(&self) -> Code {
+        Code {
+            timeout_ms: Some(self.code.effective_timeout_ms()),
+            memory_mb: Some(self.code.effective_memory_mb()),
+        }
+    }
+
     /// The title glyph (default ◆).
     pub fn effective_header_glyph(&self) -> String {
         self.tui
@@ -2075,6 +2179,83 @@ mod tests {
 
         // strict parse: unknown [git] keys stay a hard error
         let err = Config::parse_layer("[git]\ncommit_rol = \"fast\"\n", "u")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown field"), "got: {err}");
+    }
+
+    /// TOOL-04: `[code]` limits parse, overlay layer-by-layer, keep the
+    /// code-side defaults when unset, and refuse the dangerous zeroes.
+    #[test]
+    fn code_limits_parse_overlay_and_default() {
+        let cfg =
+            Config::parse_layer("[code]\ntimeout_ms = 2500\nmemory_mb = 8\n", "user").unwrap();
+        assert_eq!(cfg.code.timeout_ms, Some(2500));
+        assert_eq!(cfg.code.memory_mb, Some(8));
+        assert_eq!(cfg.effective_code().effective_timeout_ms(), 2500);
+        assert_eq!(cfg.effective_code().effective_memory_mb(), 8);
+
+        // defaults: unset keys resolve to the code-side constants
+        let defaults = Config::default();
+        assert_eq!(defaults.code.timeout_ms, None);
+        assert_eq!(defaults.code.memory_mb, None);
+        assert_eq!(
+            defaults.code.effective_timeout_ms(),
+            DEFAULT_CODE_TIMEOUT_MS
+        );
+        assert_eq!(defaults.code.effective_memory_mb(), DEFAULT_CODE_MEMORY_MB);
+
+        // a later layer overrides only what it sets
+        let mut merged = cfg;
+        merged.overlay(Config::parse_layer("[code]\nmemory_mb = 32\n", "project").unwrap());
+        assert_eq!(merged.code.timeout_ms, Some(2500), "lower layer kept");
+        assert_eq!(merged.code.memory_mb, Some(32), "upper layer wins");
+
+        // strict parse: unknown [code] keys stay a hard error
+        let err = Config::parse_layer("[code]\ntimeout = 1\n", "u")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown field"), "got: {err}");
+
+        // the zero values are refused with an instructive message
+        let err = Config::parse_layer("[code]\ntimeout_ms = 0\n", "u")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("timeout_ms"), "got: {err}");
+        let err = Config::parse_layer("[code]\nmemory_mb = 0\n", "u")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("memory_mb"), "got: {err}");
+    }
+
+    /// EXT-12: `[delegate] team_max` parses, overlays layer-by-layer,
+    /// defaults to 8, keeps 0 legal (= teams disabled), and stays a
+    /// strict table.
+    #[test]
+    fn delegate_team_max_parses_overlays_and_defaults() {
+        let cfg = Config::parse_layer("[delegate]\nteam_max = 3\n", "user").unwrap();
+        assert_eq!(cfg.delegate.team_max, Some(3));
+        assert_eq!(cfg.effective_team_max(), 3);
+
+        // defaults: unset → 8
+        let defaults = Config::default();
+        assert_eq!(defaults.delegate.team_max, None);
+        assert_eq!(defaults.delegate.effective_team_max(), 8);
+
+        // a later layer overrides only what it sets
+        let mut merged = cfg;
+        merged.overlay(Config::parse_layer("[delegate]\nteam_max = 5\n", "project").unwrap());
+        assert_eq!(merged.delegate.team_max, Some(5), "upper layer wins");
+        // and a layer without the key leaves the lower value alone
+        merged.overlay(Config::parse_layer("[git]\ntrailers = [\"x\"]\n", "user").unwrap());
+        assert_eq!(merged.delegate.team_max, Some(5));
+
+        // 0 is a legal, meaningful value (teams disabled), not an error
+        let cfg = Config::parse_layer("[delegate]\nteam_max = 0\n", "user").unwrap();
+        assert_eq!(cfg.effective_team_max(), 0);
+
+        // strict parse: unknown [delegate] keys stay a hard error
+        let err = Config::parse_layer("[delegate]\nteam_cap = 3\n", "u")
             .unwrap_err()
             .to_string();
         assert!(err.contains("unknown field"), "got: {err}");
