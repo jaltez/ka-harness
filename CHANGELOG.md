@@ -29,10 +29,13 @@
 - See `research/ka-harness/` and the GitHub release notes.
 
 ### Batch 6 — interactive TUI
-- `/vim` (INSERT/NORMAL/VISUAL sobre el draft, motions/counts/text objects mínimos) · `/screen` alt-screen fullscreen con dump limpio al scrollback · ghost text en el composer (slash/paths, Tab acepta) · `/recap` + recap automático al recuperar foco tras >5 min · `/plain` render para lectores de pantalla · paneles `/hooks` //`/permissions` //`/doctor` de solo lectura · pill de jobs/DAP en la status line · Agent Hub ligero en `/tasks` (coste por subagente cuando los Usage lo traen). `/tan` difiere (refactor del spawn de delegados).
+- `/vim` (INSERT/NORMAL/VISUAL over the draft, minimal motions/counts/text objects) · `/screen` alt-screen fullscreen with a clean dump to the scrollback on exit · ghost text in the composer (slash/paths, Tab accepts) · `/recap` + automatic recap when focus returns after >5 min · `/plain` screen-reader render · read-only `/hooks` //`/permissions` //`/doctor` panels · jobs/DAP pill in the status line · light Agent Hub in `/tasks` (per-subagent cost when Usage carries it). `/tan` deferred (delegate spawn refactor).
 
 ### Batch 7 — cheap session tools
 - `checkpoint` hand (git snapshot on demand, restorable) · `cron` hand (session-scoped scheduled prompts; off in safe-mode) · `monitor` hand (detached command with pollable output + kill) · `tool_search` hand (keyword search over MCP catalogs + hands) · `generate_image` hand (gated: provider + key required). Feature toggles: `cron`/`monitor`/`generate_image`. PowerShell tool deferred (Windows not a current target).
+
+### Batch 8 — rich readers & search
+- Rich `read` backends: PDF (text extraction) and archive members (ZIP/JAR/APK/WHL + tar/tar.gz, CRC-verified, clear errors on encrypted/corrupt) via `archive_entry`; >32 KiB spills · `[[search]]` keyless duckduckgo and searxng backends with per-site scoping and first-success-wins fallback · TUI: multiple staged images become positional `[Image #N]` chips, `spill://` pointers register in `/spills`, ghost text for `/goal` and `/loop`. DOCX/PPTX/XLSX/EPUB/notebooks/SQLite documented out of scope v1; `code mode` deferred to its own spike cycle (footprint decision pending).
 
 ### Batch 9 — permissions
 - Named permission profiles with one-level `extends`, activated by `[permissions] profile`; profile rules sort before `[[rules]]` · `ka rules check <command>` dry-runs your rules · `dontAsk` mode denies reviewable asks (hardstops still confirm) · `[permissions] prompt_policy = "deny"` for serve/CI · auto-review extended to write-tier asks (`auto_review_tier = "exec+write"`) · web-result prompt-injection screening (heuristic always, optional fast-role classifier) · `[shell]` env policy (all/core/none + keep/set).

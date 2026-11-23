@@ -217,7 +217,7 @@ pub fn analyze(line: &str) -> Analysis {
         segments,
         redirects,
         has_compounds,
-        has_substitution: line.contains("$(") || line.contains('`'),
+        has_substitution: line.contains('$') || line.contains('`'),
         resolved,
     }
 }
@@ -628,6 +628,11 @@ mod tests {
         // command substitution is never parsed — treat as non-readonly
         assert!(!all_readonly(&analyze("ls $(rm -rf build)")));
         assert!(!all_readonly(&analyze("echo `whoami`")));
+        // env expansion is disclosure, not a read-only read: `echo $KEY`
+        // leaks the value a child would see, so it must never auto-allow
+        assert!(!all_readonly(&analyze("echo $KA_ANTHROPIC_API_KEY")));
+        assert!(!all_readonly(&analyze("echo ${KEY}")));
+        assert!(!all_readonly(&analyze("ls $HOME/build")));
     }
 
     #[test]

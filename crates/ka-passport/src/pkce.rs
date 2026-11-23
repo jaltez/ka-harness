@@ -1,10 +1,12 @@
 //! PKCE (RFC 7636) S256: code verifier + derived challenge + state, for
 //! the Claude public-client OAuth flow (no client secret).
 //!
-//! Entropy: `/dev/urandom` where present; the fallback mixes wall-clock
-//! nanoseconds, the pid, a process-lifetime counter and an address
-//! through SHA-256 — unique-per-login material for a verifier, not a
-//! CSPRNG contract. The verifier is base64url (`A-Z a-z 0-9 - _`, no
+//! Entropy: the OS CSPRNG via `getrandom` on every target (Linux
+//! `getrandom(2)`, Windows `BCryptGenRandom`); the hash-stretch fallback
+//! mixes wall-clock nanoseconds, the pid, a process-lifetime counter and
+//! an address through SHA-256 and exists only if the OS randomness
+//! source itself fails — unique-per-login material, not a CSPRNG
+//! contract. The verifier is base64url (`A-Z a-z 0-9 - _`, no
 //! padding), 43 chars for 32 bytes: inside the RFC 7636 alphabet and
 //! length range.
 
@@ -43,15 +45,16 @@ pub fn challenge_matches(verifier: &str, challenge: &str) -> bool {
     base64url_no_pad(Sha256::digest(verifier.as_bytes()).as_slice()) == challenge
 }
 
-/// Fill `buf` with random bytes.
+/// Fill `buf` with random bytes from the OS CSPRNG (`getrandom` — the
+/// `getrandom(2)` syscall on Linux, `BCryptGenRandom`/`SecRandomCopyBytes`
+/// on Windows/macOS: a real CSPRNG contract on every target, unlike the
+/// old hand-rolled fallback whose hash-stretched seed was locally
+/// guessable). The hash-stretch remains only as a never-expected
+/// last resort if the syscall itself fails.
 fn random_bytes(len: usize) -> Vec<u8> {
-    // bounded read: /dev/urandom never EOFs, `fs::read` would hang
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        use std::io::Read as _;
-        let mut buf = vec![0u8; len];
-        if f.read_exact(&mut buf).is_ok() {
-            return buf;
-        }
+    let mut buf = vec![0u8; len];
+    if getrandom::fill(&mut buf).is_ok() {
+        return buf;
     }
     fallback_bytes(len)
 }
@@ -148,6 +151,24 @@ mod tests {
         let b = Pkce::generate();
         assert_ne!(a.verifier, b.verifier);
         assert_ne!(a.state, b.state);
+    }
+
+    #[test]
+    fn os_csprng_yields_distinct_material_across_calls() {
+        // the OS CSPRNG (getrandom) must never repeat material across a
+        // burst of back-to-back generations — this pins the fix away
+        // from the old hash-stretch fallback whose seed was locally
+        // guessable (nanos+pid+counter+stack address)
+        let mut verifiers = Vec::new();
+        for _ in 0..64 {
+            let pkce = Pkce::generate();
+            assert_eq!(pkce.verifier.len(), 43, "length stays RFC 7636");
+            assert!(!verifiers.contains(&pkce.verifier), "no verifier reuse");
+            verifiers.push(pkce.verifier);
+        }
+        let raw = random_bytes(32);
+        let again = random_bytes(32);
+        assert_ne!(raw, again, "raw random_bytes never repeats");
     }
 
     #[test]

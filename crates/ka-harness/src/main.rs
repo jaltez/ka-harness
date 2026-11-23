@@ -5,7 +5,7 @@
 
 use clap::{CommandFactory, Parser, Subcommand};
 use ka_dialect::Catalog;
-use ka_engine::config::Config;
+use ka_engine::config::{Config, ShellEnvMode};
 use ka_engine::spawn_full;
 use ka_protocol::{Command, Event, Stop, to_line};
 use std::path::{Path, PathBuf};
@@ -1238,6 +1238,19 @@ are file-edited only"
             }
             cfg.sandbox.mode = Some(value.to_string());
         }
+        "shell.env" => {
+            let mode = match value {
+                "all" => ShellEnvMode::All,
+                "core" => ShellEnvMode::Core,
+                "none" => ShellEnvMode::None,
+                other => {
+                    return Err(format!(
+                        "-- shell.env: expected all|core|none, got {other:?}"
+                    ));
+                }
+            };
+            cfg.shell.env = Some(mode);
+        }
         "lsp.enable" => cfg.lsp.enable = Some(parse_bool(key, value)?),
         "lsp.write_through" => cfg.lsp.write_through = Some(parse_bool(key, value)?),
         "debug.enable" => cfg.debug.enable = Some(parse_bool(key, value)?),
@@ -1268,6 +1281,7 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "mode",
     "roles.default",
     "roles.fast",
+    "shell.env",
     "tui.header_glyph",
     "tui.bell",
     "tui.notify",
@@ -1401,6 +1415,11 @@ fn config_get(cfg: &Config, key: &str) -> Result<String, String> {
             ka_engine::config::UpdateCheck::Off => "off".into(),
         }),
         "sandbox.mode" => Ok(s(&cfg.sandbox.mode)),
+        "shell.env" => Ok(match cfg.shell.env {
+            Some(ShellEnvMode::All) | None => "all".into(),
+            Some(ShellEnvMode::Core) => "core".into(),
+            Some(ShellEnvMode::None) => "none".into(),
+        }),
         "lsp.enable" => Ok(cfg.lsp.enable.unwrap_or(false).to_string()),
         "lsp.write_through" => Ok(cfg.lsp.write_through.unwrap_or(false).to_string()),
         "debug.enable" => Ok(cfg.debug.enable.unwrap_or(false).to_string()),

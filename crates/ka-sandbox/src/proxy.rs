@@ -527,13 +527,37 @@ fn serve_connect(mut client: TcpStream, filter: &DomainFilter, target: &str) {
     };
     // the remainder of the CONNECT head (optional headers + blank line)
     // is consumed and discarded: nothing past the request line may leak
-    // into the tunnel
+    // into the tunnel. A head that never terminates inside the line
+    // budget is malformed — reject instead of tunnelling unread bytes
+    // (they would be indistinguishable from TLS records downstream).
+    let mut head_consumed = false;
     for _ in 0..64 {
         match read_line(&mut client, MAX_LINE) {
-            Ok(line) if line == "\r\n" || line == "\n" => break,
+            Ok(line) if line == "\r\n" || line == "\n" => {
+                head_consumed = true;
+                break;
+            }
             Ok(_) => continue,
             Err(_) => return,
         }
+    }
+    if !head_consumed {
+        // drain what is already in flight (bounded) so the close is a
+        // FIN, not an RST: unread receive data makes the kernel reset
+        // the connection and destroys the in-flight 400 response
+        for _ in 0..256 {
+            match read_line(&mut client, MAX_LINE) {
+                Ok(line) if line == "\r\n" || line == "\n" => break,
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+        respond(
+            &mut client,
+            "400 Bad Request",
+            "sandbox proxy: CONNECT head too large",
+        );
+        return;
     }
     if !filter.permits(&host) {
         respond(
@@ -924,6 +948,22 @@ pub(crate) mod tests {
         let resp = roundtrip(proxy.addr(), "CONNECT denied.example:443 HTTP/1.1\r\n\r\n");
         assert!(resp.contains("403"), "deny answers with 403: {resp}");
         assert!(!resp.contains("200"), "{resp}");
+    }
+
+    #[test]
+    fn connect_oversized_head_answers_400_without_tunnel() {
+        // a head that never reaches the blank line inside the 64-line
+        // budget must be refused, not tunnelled: the unread bytes would
+        // otherwise surface as fake "TLS" records downstream
+        let proxy = NetProxy::spawn(filter(&["example.com"], &[])).unwrap();
+        let mut request = String::from("CONNECT example.com:443 HTTP/1.1\r\n");
+        for i in 0..80 {
+            request.push_str(&format!("X-Fill-{i}: padding\r\n"));
+        }
+        request.push_str("\r\n");
+        let resp = roundtrip(proxy.addr(), &request);
+        assert!(resp.contains("400"), "oversized head rejected: {resp}");
+        assert!(!resp.contains("200"), "no tunnel established: {resp}");
     }
 
     #[test]

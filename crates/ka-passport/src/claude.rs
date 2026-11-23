@@ -150,7 +150,7 @@ impl ClaudePlanSource {
         eprintln!("ka passport: open this URL to authorize Claude Pro/Max access:\n{url}");
         open_browser_best_effort(&url);
         let code = self.wait_for_code(&listener, &pkce.state).await?;
-        let tokens = self.exchange(&code, &pkce.verifier).await?;
+        let tokens = self.exchange(&code, &pkce.verifier, &redirect_uri).await?;
         self.save(&tokens)?;
         Ok(tokens)
     }
@@ -228,16 +228,23 @@ impl ClaudePlanSource {
     }
 
     /// Exchange an authorization code for tokens (PKCE verifier proves
-    /// the binding; no client secret exists).
-    pub async fn exchange(&self, code: &str, verifier: &str) -> Result<Tokens, AuthError> {
+    /// the binding; no client secret exists). `redirect_uri` must be
+    /// byte-identical to the one sent on the authorize hop (RFC 6749
+    /// §4.1.3 — the provider compares exact strings).
+    pub async fn exchange(
+        &self,
+        code: &str,
+        verifier: &str,
+        redirect_uri: &str,
+    ) -> Result<Tokens, AuthError> {
         let form = [
             ("grant_type", "authorization_code"),
             ("code", code),
             ("client_id", CLIENT_ID),
             ("code_verifier", verifier),
-            ("redirect_uri", ""),
+            ("redirect_uri", redirect_uri),
         ];
-        self.token_request(&form, VENDOR).await
+        self.token_request(&form, VENDOR, None).await
     }
 
     /// Rotate a token pair via the refresh grant.
@@ -247,15 +254,21 @@ impl ClaudePlanSource {
             ("refresh_token", refresh_token),
             ("client_id", CLIENT_ID),
         ];
-        self.token_request(&form, VENDOR).await
+        self.token_request(&form, VENDOR, Some(refresh_token)).await
     }
 
     /// Shared POST to the token endpoint; the OAuth beta header rides
     /// the exchange/refresh per Anthropic's OAuth contract.
+    /// `previous_refresh` is the refresh token already held: a response
+    /// without a new one conserves the old (RFC 6749 §6 — the refresh
+    /// token MAY be rotated, absence never means revocation). Storing
+    /// `""` there would permanently log the user out on the next
+    /// refresh.
     async fn token_request(
         &self,
         form: &[(&str, &str)],
         vendor: &str,
+        previous_refresh: Option<&str>,
     ) -> Result<Tokens, AuthError> {
         let resp = self
             .http
@@ -290,9 +303,14 @@ impl ClaudePlanSource {
         }
         let now = unix_now();
         let expires_at = now.saturating_add(parsed.expires_in.unwrap_or(3600).max(1));
+        let refresh_token = if parsed.refresh_token.trim().is_empty() {
+            previous_refresh.unwrap_or("").to_string()
+        } else {
+            parsed.refresh_token.trim().to_string()
+        };
         Ok(Tokens {
             access_token: access,
-            refresh_token: parsed.refresh_token.trim().to_string(),
+            refresh_token,
             expires_at,
         })
     }
@@ -705,7 +723,10 @@ mod tests {
         )
         .await;
         let src = test_source(store.clone(), &url);
-        let tokens = src.exchange("the-code", "the-verifier").await.unwrap();
+        let tokens = src
+            .exchange("the-code", "the-verifier", "http://127.0.0.1:5173/callback")
+            .await
+            .unwrap();
         assert_eq!(tokens.access_token, "at-1");
         assert_eq!(tokens.refresh_token, "rt-1");
         let raw = captured.lock()[0].clone();
@@ -716,6 +737,17 @@ mod tests {
             "body: {raw}"
         );
         assert!(raw.contains("code_verifier=the-verifier"), "body: {raw}");
+        // RFC 6749 §4.1.3: the exchange redirect_uri must be byte-
+        // identical to the authorize hop's — the full loopback URL rides
+        // the form, not an empty placeholder
+        assert!(
+            raw.contains("redirect_uri=http%3A%2F%2F127.0.0.1%3A5173%2Fcallback"),
+            "exchange carries the authorize redirect_uri: {raw}"
+        );
+        assert!(
+            !raw.contains("redirect_uri=&"),
+            "no empty redirect_uri: {raw}"
+        );
         assert!(
             raw.contains(&format!(
                 "anthropic-beta: {}",
@@ -728,6 +760,36 @@ mod tests {
         let st = src.status();
         assert!(st.logged_in);
         assert!(st.expires_at.unwrap() > unix_now() + 3_600);
+    }
+
+    #[tokio::test]
+    async fn refresh_without_rotation_conserves_previous_refresh_token() {
+        // RFC 6749 §6: a refresh response may omit refresh_token — that
+        // is "keep the old one", never revocation. Storing "" would
+        // permanently log the user out on the next refresh.
+        let store = Arc::new(MemoryStore::default());
+        let captured = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let url = serve_token_json(
+            r#"{"access_token":"at-3","expires_in":7200}"#,
+            captured.clone(),
+        )
+        .await;
+        let src = test_source(store.clone(), &url);
+        let tokens = src.refresh("rt-old").await.unwrap();
+        assert_eq!(tokens.access_token, "at-3");
+        assert_eq!(
+            tokens.refresh_token, "rt-old",
+            "rotation-less response conserves the old refresh token"
+        );
+        // an explicitly empty refresh_token is conserved too
+        let url = serve_token_json(
+            r#"{"access_token":"at-4","refresh_token":"  ","expires_in":7200}"#,
+            captured.clone(),
+        )
+        .await;
+        let src = test_source(store.clone(), &url);
+        let tokens = src.refresh("rt-old").await.unwrap();
+        assert_eq!(tokens.refresh_token, "rt-old");
     }
 
     #[tokio::test]

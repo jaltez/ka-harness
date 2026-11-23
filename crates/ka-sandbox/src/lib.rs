@@ -919,12 +919,13 @@ fn seatbelt_quote(p: &Path) -> String {
 pub fn seatbelt_profile(policy: &Policy) -> String {
     // Off policies are never wrapped; if one reaches here the profile is
     // inert (allow everything, deny nothing)
-    let (allow_write, allow_net) = match policy {
+    let (allow_write, allow_net, net) = match policy {
         Policy::Fs {
             allow_write,
             allow_net,
+            net,
             ..
-        } => (allow_write.clone(), *allow_net),
+        } => (allow_write.clone(), *allow_net, net.clone()),
         Policy::Off => return "(version 1)\n(allow default)\n".to_string(),
     };
     let mut profile = String::from(
@@ -952,17 +953,37 @@ pub fn seatbelt_profile(policy: &Policy) -> String {
             ));
         }
         profile.push_str(")\n");
-        profile.push_str("(deny file-write*");
-        for dir in &writes {
+        // SBPL combines sibling `(require-not …)` filters as OR (any
+        // match satisfies the filter), which would deny ALL writes once
+        // more than one carve-out exists. `require-all` is the real AND:
+        // the deny only fires when the path matches none of the
+        // allowlist subpaths. A single entry keeps the bare form.
+        if writes.len() == 1 {
             profile.push_str(&format!(
-                " (require-not (subpath \"{}\"))",
-                seatbelt_quote(Path::new(dir))
+                "(deny file-write* (require-not (subpath \"{}\")))\n",
+                seatbelt_quote(Path::new(&writes[0]))
             ));
+        } else {
+            profile.push_str("(deny file-write* (require-all");
+            for dir in &writes {
+                profile.push_str(&format!(
+                    " (require-not (subpath \"{}\"))",
+                    seatbelt_quote(Path::new(dir))
+                ));
+            }
+            profile.push_str("))\n");
         }
-        profile.push_str(")\n");
     }
     if allow_net {
         profile.push_str("(allow network*)\n");
+    } else if net.is_restricted() {
+        // PERM-03: with a domain policy the loopback proxy is the only
+        // network path — the blanket deny would black out even the
+        // CONNECT to the proxy itself. The specific loopback allow is
+        // emitted BEFORE the deny so it wins; everything else stays
+        // denied (proxy-side filtering is the enforcement).
+        profile.push_str("(allow network-outbound (remote ip \"127.0.0.1\"))\n");
+        profile.push_str("(deny network*)\n");
     } else {
         profile.push_str("(deny network*)\n");
     }
@@ -1433,10 +1454,30 @@ mod tests {
         );
         assert!(
             profile.contains(
-                "(deny file-write* (require-not (subpath \"/work/proj\")) \
+                "(deny file-write* (require-all (require-not (subpath \"/work/proj\")) \
                  (require-not (subpath \"/tmp/x\"))"
             ),
-            "deny wins in SBPL: the scoped deny is the enforcement: {profile}"
+            "deny wins in SBPL; require-all is the real AND — sibling \
+             require-nots are OR in SBPL and would deny every write: {profile}"
+        );
+        // the empty-allowlist policy (dev nodes only) keeps the AND
+        // combinator too — it is still multi-clause
+        let profile = seatbelt_profile(&Policy::fs(Vec::new()));
+        assert!(
+            profile
+                .contains("(deny file-write* (require-all (require-not (subpath \"/dev/null\"))"),
+            "empty operator list still needs the AND combinator: {profile}"
+        );
+        // a bare one-entry deny (dev nodes suppressed for shape check)
+        // uses the single-clause form without require-all
+        let single = seatbelt_profile(&Policy::fs(vec![PathBuf::from("/only")]))
+            .lines()
+            .find(|l| l.starts_with("(deny file-write*"))
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            single.contains("(require-all") || single.matches("(require-not").count() == 1,
+            "one-clause deny uses the bare form, multi-clause uses require-all: {single}"
         );
         assert!(profile.contains("(deny network*)"), "{profile}");
         // a full-network grant drops the network deny
@@ -1458,7 +1499,8 @@ mod tests {
             "no blanket deny line: {profile}"
         );
         assert!(
-            profile.contains("(deny file-write* (require-not (subpath \"/dev/null\"))"),
+            profile
+                .contains("(deny file-write* (require-all (require-not (subpath \"/dev/null\"))"),
             "all non-/dev writes denied via the scoped deny: {profile}"
         );
         assert!(
@@ -1471,6 +1513,59 @@ mod tests {
         assert!(
             profile.contains("(subpath \"/dev/null\")"),
             "shell redirections need the enumerated dev nodes: {profile}"
+        );
+    }
+
+    #[test]
+    fn seatbelt_profile_proxy_loopback_allow_precedes_deny() {
+        // PERM-03: a domain-restricted policy without a network grant
+        // must still let the child reach the loopback proxy — the deny
+        // alone would black out even the CONNECT to 127.0.0.1
+        let restricted = Policy::Fs {
+            allow_write: vec![PathBuf::from("/tmp")],
+            allow_net: false,
+            pass_env: Vec::new(),
+            net: NetDomains {
+                allow: vec!["api.example.com".to_string()],
+                deny: Vec::new(),
+            },
+        };
+        let profile = seatbelt_profile(&restricted);
+        let loopback = profile.find("(allow network-outbound (remote ip \"127.0.0.1\"))");
+        let deny = profile.find("(deny network*)");
+        assert!(
+            loopback.is_some(),
+            "proxy CONNECT stays reachable: {profile}"
+        );
+        assert!(deny.is_some(), "everything else stays denied: {profile}");
+        assert!(
+            loopback.unwrap() < deny.unwrap(),
+            "the specific loopback allow precedes the deny: {profile}"
+        );
+        // deny-only policy (proxy active, no allows): same shape
+        let deny_only = Policy::Fs {
+            allow_write: Vec::new(),
+            allow_net: false,
+            pass_env: Vec::new(),
+            net: NetDomains {
+                allow: Vec::new(),
+                deny: vec!["evil.example".to_string()],
+            },
+        };
+        let profile = seatbelt_profile(&deny_only);
+        assert!(
+            profile.contains("(allow network-outbound (remote ip \"127.0.0.1\"))")
+                && profile.contains("(deny network*)"),
+            "deny-only restriction keeps the proxy reachable: {profile}"
+        );
+        // unrestricted policy with no grant: the plain blanket deny, no
+        // loopback carve-out (no proxy is running)
+        let plain = Policy::fs(vec![PathBuf::from("/tmp")]);
+        let profile = seatbelt_profile(&plain);
+        assert!(profile.contains("(deny network*)"), "{profile}");
+        assert!(
+            !profile.contains("network-outbound"),
+            "no proxy to reach: {profile}"
         );
     }
 

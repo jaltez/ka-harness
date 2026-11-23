@@ -82,6 +82,11 @@ jobs:
           ./ka --version
 
       - name: Run ka (read-only) on the issue/PR body
+        env:
+          # bash children get the core shell vars only — KA_* API keys
+          # stay in ka's own process (model calls) and never reach a
+          # tool subprocess, so a prompt cannot coax them out.
+          KA_SHELL__ENV: core
         run: |
           set -euo pipefail
           if [ -z "${KA_PROMPT:-}" ]; then

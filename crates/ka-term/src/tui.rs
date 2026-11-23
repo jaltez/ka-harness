@@ -21524,7 +21524,7 @@ mod tests {
         // argument-syntax ghost takes over
         let g = ghost_suggestion("/goal", 5, &mut cache).expect("syntax ghost");
         assert!(matches!(g, crate::ghost::Ghost::Syntax { .. }));
-        assert_eq!(g.suffix("/goal"), " <condición>");
+        assert_eq!(g.suffix("/goal"), " <condition>");
         // typed argument: no ghost, not even the mention walk
         assert!(ghost_suggestion("/goal status", 12, &mut cache).is_none());
     }

@@ -331,7 +331,7 @@ fn sandbox_check(cfg: &Config) -> Check {
         name: "sandbox",
         ok,
         detail: if fs_configured && engine == "none" {
-            "mode \"fs\" configured but no engine (bwrap, firejail, landlock) — bash will refuse"
+            "mode \"fs\" configured but no engine (bwrap, firejail, landlock, seatbelt) — bash will refuse"
                 .to_string()
         } else if fs_configured {
             format!("mode \"fs\" via {engine}")

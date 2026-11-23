@@ -22,7 +22,7 @@ pub enum Ghost {
     /// An @-mention file: the walk-relative path the token completes
     /// to, plus whether it is a directory (dirs get no trailing space).
     Mention { rel: String, is_dir: bool },
-    /// An argument-syntax template (` <condición>`): what the command
+    /// An argument-syntax template (` <condition>`): what the command
     /// still expects once the bare name is typed and the slash ghost
     /// has nothing left to suggest.
     Syntax { rest: String },
@@ -76,7 +76,7 @@ pub fn syntax_ghost(input: &str) -> Option<Ghost> {
         None => (input, None),
     };
     let template = match name {
-        "/goal" => "<condición>",
+        "/goal" => "<condition>",
         "/loop" => "[--every <secs>] <task>",
         "/pr" => "<n|url|branch> [fix]",
         _ => return None,
@@ -243,14 +243,14 @@ mod tests {
     fn syntax_ghost_shows_the_argument_shape_at_the_prefix() {
         // bare name: the template rides a separating space
         let g = syntax_ghost("/goal").expect("prefix matches");
-        assert_eq!(g.suffix("/goal"), " <condición>");
+        assert_eq!(g.suffix("/goal"), " <condition>");
         let g = syntax_ghost("/loop").expect("prefix matches");
         assert_eq!(g.suffix("/loop"), " [--every <secs>] <task>");
         let g = syntax_ghost("/pr").expect("prefix matches");
         assert_eq!(g.suffix("/pr"), " <n|url|branch> [fix]");
         // trailing space: the template continues right at the caret
         let g = syntax_ghost("/goal ").expect("prefix matches");
-        assert_eq!(g.suffix("/goal "), "<condición>");
+        assert_eq!(g.suffix("/goal "), "<condition>");
     }
 
     #[test]

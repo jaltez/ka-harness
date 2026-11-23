@@ -1258,12 +1258,12 @@ fn goal_and_loop_ghost_their_argument_syntax() {
     use ka_term::tui::InputBuffer;
 
     let g = ghost::syntax_ghost("/goal").expect("bare /goal ghosts");
-    assert_eq!(g.suffix("/goal"), " <condición>");
+    assert_eq!(g.suffix("/goal"), " <condition>");
     let g = ghost::syntax_ghost("/loop").expect("bare /loop ghosts");
     assert_eq!(g.suffix("/loop"), " [--every <secs>] <task>");
     // trailing space: the template continues at the caret
     let g = ghost::syntax_ghost("/goal ").expect("prefix + space ghosts");
-    assert_eq!(g.suffix("/goal "), "<condición>");
+    assert_eq!(g.suffix("/goal "), "<condition>");
     // typed arguments own their syntax — no template parked after them
     assert!(ghost::syntax_ghost("/goal status").is_none());
     assert!(ghost::syntax_ghost("/goal tests stay green").is_none());
