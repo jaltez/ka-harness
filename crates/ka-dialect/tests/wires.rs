@@ -209,6 +209,7 @@ fn request(dialect: Dialect, system: &str) -> SpeakRequest {
         session_id: None,
         schema: None,
         native_search: false,
+        service_tier: None,
     }
 }
 
@@ -1454,5 +1455,123 @@ async fn tool_use_input_at_start_used_when_no_deltas() {
     assert_eq!(
         call.arguments.get("path").and_then(|v| v.as_str()),
         Some("src/a.rs")
+    );
+}
+
+// ------------------------------------------------- lote 11 fixtures
+
+const ANY_SSE: &str = r#"
+data: {"choices":[{"delta":{"content":"ok"}}]}
+
+data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+"#;
+
+const ANTHROPIC_ANY_SSE: &str = r#"
+event: message_start
+data: {"type":"message_start","message":{"usage":{"input_tokens":3}}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+"#;
+
+/// MODEL-01: `auth = "passport"` + a token rides `Authorization: Bearer`
+/// plus the OAuth beta header on the anthropic wire — never `x-api-key`
+/// (an OAuth access token sent as x-api-key is rejected by the endpoint).
+#[tokio::test]
+async fn anthropic_passport_auth_sends_bearer_and_oauth_beta_header() {
+    let (addr, captured) = serve_sse(ANTHROPIC_ANY_SSE).await;
+    let dialect = dialect_for("anthropic_messages", addr, "auth = \"passport\"\n");
+    let req = request(dialect, "");
+    collect(&AnthropicMessages::new(), req).await;
+    let raw = captured.lock().clone().expect("request captured");
+    assert!(
+        raw.contains("authorization: Bearer k-test-token"),
+        "OAuth bearer header required: {raw}"
+    );
+    assert!(
+        raw.contains("anthropic-beta: oauth-2025-04-20"),
+        "OAuth beta header required: {raw}"
+    );
+    assert!(
+        !raw.contains("x-api-key"),
+        "no env-key header on passport rows: {raw}"
+    );
+}
+
+/// The same wire WITHOUT `auth = "passport"` keeps the classic
+/// `x-api-key` shape and no beta header.
+#[tokio::test]
+async fn anthropic_env_key_auth_stays_x_api_key() {
+    let (addr, captured) = serve_sse(ANTHROPIC_ANY_SSE).await;
+    let dialect = dialect_for("anthropic_messages", addr, "");
+    collect(&AnthropicMessages::new(), request(dialect, "")).await;
+    let raw = captured.lock().clone().expect("request captured");
+    assert!(
+        raw.contains("x-api-key: k-test-token"),
+        "env-key shape: {raw}"
+    );
+    assert!(
+        !raw.contains("anthropic-beta"),
+        "no OAuth beta on env-key rows: {raw}"
+    );
+}
+
+/// MODEL-03: `service_tier` rides the request body only when the
+/// request carries it — on all three wires.
+#[tokio::test]
+async fn service_tier_rides_chat_body_when_set() {
+    let (addr, captured) = serve_sse(ANY_SSE).await;
+    let dialect = dialect_for("openai_chat", addr, "");
+    let mut req = request(dialect, "");
+    req.service_tier = Some("flex".to_string());
+    collect(&OpenaiChat::new(), req).await;
+    let raw = captured.lock().clone().expect("request captured");
+    assert!(
+        raw.contains("\"service_tier\":\"flex\""),
+        "tier in body: {raw}"
+    );
+}
+
+#[tokio::test]
+async fn service_tier_absent_from_chat_body_when_unset() {
+    let (addr, captured) = serve_sse(ANY_SSE).await;
+    let dialect = dialect_for("openai_chat", addr, "");
+    collect(&OpenaiChat::new(), request(dialect, "")).await;
+    let raw = captured.lock().clone().expect("request captured");
+    assert!(
+        !raw.contains("service_tier"),
+        "unset tier must not appear: {raw}"
+    );
+}
+
+#[tokio::test]
+async fn service_tier_rides_anthropic_body_when_set() {
+    let (addr, captured) = serve_sse(ANTHROPIC_ANY_SSE).await;
+    let dialect = dialect_for("anthropic_messages", addr, "");
+    let mut req = request(dialect, "");
+    req.service_tier = Some("standard".to_string());
+    collect(&AnthropicMessages::new(), req).await;
+    let raw = captured.lock().clone().expect("request captured");
+    assert!(
+        raw.contains("\"service_tier\":\"standard\""),
+        "tier in body: {raw}"
+    );
+}
+
+#[tokio::test]
+async fn service_tier_rides_responses_body_when_set() {
+    let (addr, captured) = serve_sse(RESPONSES_BASIC).await;
+    let dialect = dialect_for("openai_responses", addr, "");
+    let mut req = request(dialect, "");
+    req.service_tier = Some("flex".to_string());
+    collect(&OpenaiResponses::new(), req).await;
+    let raw = captured.lock().clone().expect("request captured");
+    assert!(
+        raw.contains("\"service_tier\":\"flex\""),
+        "tier in body: {raw}"
     );
 }

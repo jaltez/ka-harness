@@ -14,6 +14,91 @@ pub const EMBEDDED: &str = include_str!("../dialects.toml");
 /// Curated rows in `dialects.toml` win for the same selector.
 pub const MODELS_DEV: &str = include_str!("../models-dev.toml");
 
+/// Version marker of the EMBEDDED catalog. Neither `dialects.toml` nor
+/// `models-dev.toml` carry an in-file version — the shipping crate
+/// version stands in: a runtime catalog file only overrides the
+/// embedded rows when its own `"version"` field is strictly greater
+/// (semver, numeric component compare; anything unparseable, equal, or
+/// older is ignored, so a stale download never clobbers curated rows).
+pub const CATALOG_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// models.dev api.json endpoint the runtime catalog refreshes from.
+const MODELS_DEV_API: &str = "https://models.dev/api.json";
+
+/// Catalog file name inside the ka data dir.
+const RUNTIME_CATALOG_FILE: &str = "catalog.json";
+
+/// True when `candidate` is a strictly greater semver than the embedded
+/// [`CATALOG_VERSION`] (numeric component compare, shorter version
+/// sorts lower: `0.7.3` > `0.7.2`, `0.8` > `0.7.9`).
+pub fn catalog_version_is_newer(candidate: &str) -> bool {
+    fn parse(v: &str) -> Vec<u64> {
+        v.trim()
+            .trim_start_matches('v')
+            .split('.')
+            .map(|p| p.trim().parse::<u64>().unwrap_or(0))
+            .collect()
+    }
+    let (mut a, mut b) = (parse(candidate), parse(CATALOG_VERSION));
+    a.resize(b.len().max(a.len()), 0);
+    b.resize(a.len(), 0);
+    a > b
+}
+
+/// Read the runtime catalog from `<data_root>/catalog.json`, if it
+/// exists and is fresh: the file must parse as JSON, carry a `"version"`
+/// string strictly greater than the embedded [`CATALOG_VERSION`], and
+/// hold a `dialects` object (`{"version": "0.7.3", "dialects": {
+/// "vendor/model": { ...dialect fields... } }}`). Anything else —
+/// missing file, stale version, malformed JSON — is `None` and the
+/// embedded catalog stands alone.
+pub fn load_runtime_catalog(data_root: &std::path::Path) -> Option<serde_json::Value> {
+    let text = std::fs::read_to_string(data_root.join(RUNTIME_CATALOG_FILE)).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let version = json.get("version")?.as_str()?;
+    if !catalog_version_is_newer(version) {
+        return None;
+    }
+    if !json
+        .get("dialects")
+        .is_some_and(serde_json::Value::is_object)
+    {
+        return None;
+    }
+    Some(json)
+}
+
+/// Persist a runtime catalog to `<data_root>/catalog.json` (creating the
+/// data dir). Writes exactly the given JSON — callers shape it (see
+/// [`load_runtime_catalog`] for the expected form); the fetch path is
+/// `fetch_models_dev()` plus a convert step, so a failed conversion
+/// never poisons the live catalog.
+pub fn store_runtime_catalog(
+    data_root: &std::path::Path,
+    json: &serde_json::Value,
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(data_root)?;
+    let text = serde_json::to_string_pretty(json)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    std::fs::write(data_root.join(RUNTIME_CATALOG_FILE), text)
+}
+
+/// Fetch the models.dev api.json (network; no tests exercise this).
+/// The raw provider-shaped JSON converts to catalog rows before
+/// [`store_runtime_catalog`] — the wire shape here is models.dev's, not
+/// the catalog's.
+pub async fn fetch_models_dev() -> Result<serde_json::Value, String> {
+    let resp = reqwest::get(MODELS_DEV_API)
+        .await
+        .map_err(|e| format!("models.dev fetch failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("models.dev fetch returned {}", resp.status()));
+    }
+    resp.json::<serde_json::Value>()
+        .await
+        .map_err(|e| format!("models.dev response is not JSON: {e}"))
+}
+
 /// Which wire protocol a model speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -118,6 +203,13 @@ pub struct Dialect {
     /// Environment variable holding the API token (None = keyless local).
     #[serde(default)]
     pub api_key_env: Option<String>,
+    /// Authentication tier override: `"passport"` = the bearer token
+    /// comes from a registered `TokenSource` (ka-passport), never an env
+    /// var — the row then carries no `api_key_env`. `None`/any other
+    /// value = the standard env/dotenv/registry/keyring ladder over
+    /// `api_key_env` (ratified catalog key, sdk.md §6).
+    #[serde(default)]
+    pub auth: Option<String>,
     /// Vendor docs URL (pricing/console) surfaced by the key prompt.
     #[serde(default)]
     pub doc_url: Option<String>,
@@ -219,6 +311,21 @@ impl Catalog {
     pub fn merged_embedded_with_overlays<'a>(
         overlay_texts: impl IntoIterator<Item = &'a str>,
     ) -> Result<Self, String> {
+        Self::merged_embedded_with_runtime(None, overlay_texts)
+    }
+
+    /// The runtime-catalog-aware merge. Layer order, most general
+    /// first: embedded (models.dev + curated `dialects.toml`) < runtime
+    /// catalog file (`load_runtime_catalog`, leaf-merged BEFORE user
+    /// overlays so a hand-written `--dialects` overlay always wins) <
+    /// user overlay TOMLs in order. The runtime value is the JSON
+    /// document [`load_runtime_catalog`] returns; its `dialects` object
+    /// merges leaf-wise exactly like an overlay. `None` (no fresh
+    /// runtime catalog) skips the layer.
+    pub fn merged_embedded_with_runtime<'a>(
+        runtime: Option<&serde_json::Value>,
+        overlay_texts: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Self, String> {
         fn parse_table(text: &str, what: &str) -> Result<toml::Table, String> {
             toml::from_str(text).map_err(|e| format!("{what} is invalid: {e}"))
         }
@@ -230,6 +337,19 @@ impl Catalog {
                 for (k, v) in cd {
                     bd.insert(k.clone(), v.clone());
                 }
+            }
+        }
+        // runtime catalog: embedded < catalog.json < --dialects
+        if let Some(json) = runtime {
+            let rows = json
+                .get("dialects")
+                .and_then(serde_json::Value::as_object)
+                .ok_or_else(|| {
+                    "runtime catalog is invalid: missing a `dialects` object".to_string()
+                })?;
+            let as_toml = json_to_toml(&serde_json::Value::Object(rows.clone()));
+            if let Some(bd) = base.get_mut("dialects") {
+                merge_tables(bd, &as_toml);
             }
         }
         for overlay_text in overlay_texts {
@@ -291,6 +411,39 @@ fn merge_tables(dst: &mut toml::Value, src: &toml::Value) {
                     d.insert(k.clone(), v.clone());
                 }
             }
+        }
+    }
+}
+
+/// Convert a JSON value into a TOML value for the runtime-catalog merge.
+/// JSON `null`s have no TOML representation — they drop out of tables
+/// (a null leaf means "unset", never an explicit empty string).
+fn json_to_toml(v: &serde_json::Value) -> toml::Value {
+    match v {
+        serde_json::Value::Null => toml::Value::String(String::new()),
+        serde_json::Value::Bool(b) => toml::Value::Boolean(*b),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                toml::Value::Integer(i)
+            } else if let Some(u) = n.as_u64() {
+                toml::Value::Integer(u as i64)
+            } else {
+                toml::Value::Float(n.as_f64().unwrap_or(0.0))
+            }
+        }
+        serde_json::Value::String(s) => toml::Value::String(s.clone()),
+        serde_json::Value::Array(items) => {
+            toml::Value::Array(items.iter().map(json_to_toml).collect())
+        }
+        serde_json::Value::Object(map) => {
+            let mut table = toml::Table::new();
+            for (k, item) in map {
+                if item.is_null() {
+                    continue;
+                }
+                table.insert(k.clone(), json_to_toml(item));
+            }
+            toml::Value::Table(table)
         }
     }
 }
@@ -357,6 +510,175 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    // ── MODEL-06 · runtime catalog ──────────────────────────────────
+
+    /// Unique temp dir per call (no tempfile dependency in this crate).
+    fn temp_data_root(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ka-dialect-catalog-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn runtime_json(version: &str, model: &str, context: u32) -> serde_json::Value {
+        serde_json::json!({
+            "version": version,
+            "dialects": {
+                model: { "context": context }
+            }
+        })
+    }
+
+    #[test]
+    fn version_marker_compares_semver_numerically() {
+        assert!(catalog_version_is_newer("99.0.0"));
+        let bumped = format!(
+            "{}.999",
+            CATALOG_VERSION
+                .rsplit_once('.')
+                .map(|(a, _)| a.to_string())
+                .unwrap_or_else(|| CATALOG_VERSION.to_string())
+        );
+        assert!(
+            catalog_version_is_newer(&bumped),
+            "same-minor higher patch counts as newer: {bumped}"
+        );
+        assert!(
+            !catalog_version_is_newer(CATALOG_VERSION),
+            "equal is not newer"
+        );
+        assert!(!catalog_version_is_newer("0.0.1"));
+        assert!(!catalog_version_is_newer("not-a-version"));
+        assert!(!catalog_version_is_newer(""));
+    }
+
+    #[test]
+    fn runtime_catalog_roundtrips_through_disk() {
+        let root = temp_data_root("roundtrip");
+        assert!(
+            load_runtime_catalog(&root).is_none(),
+            "missing file is None"
+        );
+        store_runtime_catalog(&root, &runtime_json("99.0.0", "vendor/model", 123_456)).unwrap();
+        let loaded = load_runtime_catalog(&root).expect("fresh file loads");
+        assert_eq!(loaded["dialects"]["vendor/model"]["context"], 123_456);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stale_or_malformed_runtime_catalog_is_ignored() {
+        let root = temp_data_root("stale");
+        // stale version: embedded wins, the file is not an error
+        store_runtime_catalog(&root, &runtime_json("0.0.1", "vendor/model", 1)).unwrap();
+        assert!(load_runtime_catalog(&root).is_none());
+        // same version is not newer either
+        store_runtime_catalog(&root, &runtime_json(CATALOG_VERSION, "vendor/model", 1)).unwrap();
+        assert!(load_runtime_catalog(&root).is_none());
+        // malformed JSON
+        std::fs::write(root.join("catalog.json"), "{not json").unwrap();
+        assert!(load_runtime_catalog(&root).is_none());
+        // fresh version but no `dialects` object: invalid shape
+        store_runtime_catalog(&root, &serde_json::json!({"version": "99.0.0"})).unwrap();
+        assert!(load_runtime_catalog(&root).is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn runtime_merge_sits_between_embedded_and_user_overlays() {
+        let root = temp_data_root("merge");
+        // the runtime file enriches an EMBEDDED row leaf-wise and adds a
+        // brand-new selector
+        store_runtime_catalog(
+            &root,
+            &runtime_json("99.0.0", "anthropic/claude-sonnet-5", 777_777),
+        )
+        .unwrap();
+        let runtime = load_runtime_catalog(&root);
+        let with_runtime = Catalog::merged_embedded_with_runtime(runtime.as_ref(), []).unwrap();
+        let runtime_row = with_runtime.get("anthropic/claude-sonnet-5").unwrap();
+        assert_eq!(runtime_row.context, 777_777, "runtime leaf won");
+        // wire/base_url survive: the runtime layer is a leaf merge, not
+        // a whole-row replacement
+        assert_eq!(runtime_row.wire, Wire::AnthropicMessages);
+        assert_eq!(
+            runtime_row.base_url.as_deref(),
+            Some("https://api.anthropic.com")
+        );
+        assert!(
+            with_runtime.get("runtime-only/new-model").is_none(),
+            "runtime layer only carried the one selector"
+        );
+
+        // user overlay wins OVER the runtime file: same leaf, later layer
+        let overlay = "[dialects.\"anthropic/claude-sonnet-5\"]\ncontext = 1\n\n\
+                       [dialects.\"runtime-only/new-model\"]\nwire = \"openai_chat\"\n";
+        let merged = Catalog::merged_embedded_with_runtime(runtime.as_ref(), [overlay]).unwrap();
+        assert_eq!(
+            merged.get("anthropic/claude-sonnet-5").unwrap().context,
+            1,
+            "--dialects overlay beats the runtime file"
+        );
+        let synth = merged.get("runtime-only/new-model").unwrap();
+        assert_eq!(
+            synth.wire,
+            Wire::OpenaiChat,
+            "overlay's new selector landed"
+        );
+        assert_eq!(
+            synth.base_url, None,
+            "overlay row keeps only what it sets (embedded has no such row)"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn runtime_merge_rejects_unknown_row_keys_strictly() {
+        let root = temp_data_root("strict");
+        store_runtime_catalog(
+            &root,
+            &serde_json::json!({
+                "version": "99.0.0",
+                "dialects": { "vendor/typo": { "cotnext": 1 } }
+            }),
+        )
+        .unwrap();
+        let runtime = load_runtime_catalog(&root);
+        let err = Catalog::merged_embedded_with_runtime(runtime.as_ref(), []).unwrap_err();
+        assert!(
+            err.contains("cotnext"),
+            "unknown runtime keys name the key like overlays do: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn embedded_catalog_carries_the_claude_plan_rows() {
+        let c = Catalog::embedded();
+        for id in ["claude-plan/claude-sonnet-5", "claude-plan/claude-opus-4"] {
+            let d = c
+                .get(id)
+                .unwrap_or_else(|| panic!("missing curated row {id}"));
+            assert_eq!(d.wire, Wire::AnthropicMessages, "{id}");
+            assert_eq!(
+                d.base_url.as_deref(),
+                Some("https://api.anthropic.com"),
+                "{id}"
+            );
+            assert_eq!(d.auth.as_deref(), Some("passport"), "{id}");
+            assert_eq!(
+                d.api_key_env, None,
+                "{id}: subscription rows carry no env key"
+            );
+            assert!(!d.priced, "{id}: never fabricate subscription costs");
+        }
+    }
 
     #[test]
     fn seeded_rows_never_fabricate_pricing() {

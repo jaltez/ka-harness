@@ -1055,6 +1055,7 @@ dependencies = [
  "ka-dialect",
  "ka-engine",
  "ka-index",
+ "ka-passport",
  "ka-protocol",
  "ka-sandbox",
  "ka-strand",
@@ -1075,6 +1076,20 @@ dependencies = [
  "ka-strand",
  "rusqlite",
  "serde_json",
+]
+
+[[package]]
+name = "ka-passport"
+version = "0.7.2"
+dependencies = [
+ "ka-dialect",
+ "keyring",
+ "parking_lot",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
 ]
 
 [[package]]

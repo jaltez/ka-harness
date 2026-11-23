@@ -21,6 +21,11 @@ reqwest = { workspace = true }
 ka-index = { workspace = true, optional = true }
 ka-engine = { workspace = true }
 ka-dialect = { workspace = true }
+# Passport tier (opt-in, MODEL-01): subscription OAuth behind the
+# `passport` feature. Not in [workspace.dependencies] on purpose —
+# default builds never see it (keys-only core, ratified 2026-09-29);
+# `passport` also flips ka-dialect's registry consult on.
+ka-passport = { path = "../ka-passport", version = "0.7.2", optional = true }
 ka-strand = { workspace = true }
 ka-term = { workspace = true }
 ka-protocol = { workspace = true }
@@ -38,3 +43,6 @@ workspace = true
 [features]
 default = []
 index = ["dep:ka-index"]
+# MODEL-01: subscription OAuth (Claude Pro/Max). Links ka-passport and
+# activates ka-dialect's TokenSource registry consult; default OFF.
+passport = ["dep:ka-passport", "ka-dialect/passport"]

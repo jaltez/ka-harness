@@ -13,14 +13,23 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 tokio = { workspace = true }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 keyring = { workspace = true }
 
 [dev-dependencies]
-keyring = { workspace = true }
-
 parking_lot = { workspace = true }
+
+[features]
+default = []
+# Passport tier: the global TokenSource registry + its consult inside the
+# auth ladder. Default OFF (keys-only core, ratified 2026-09-29) — only
+# builds that link ka-passport (ka-harness `passport` feature) flip it on;
+# the registry stays empty otherwise, so the consult is a no-op branch.
+passport = []
+# Contract-test enablement: the registry-order tests need the passport
+# tier compiled in without pulling ka-passport into the dev graph.
+test-util = ["passport"]
 
 [lints]
 workspace = true

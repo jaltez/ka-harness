@@ -185,6 +185,11 @@ pub struct SpeakRequest {
     /// word is enabled (the wire injects the provider's server tool
     /// only then — the feature toggle stays fail-closed).
     pub native_search: bool,
+    /// Top-level `service_tier` config hint (MODEL-03), passed through
+    /// verbatim to wires that carry the field (anthropic_messages,
+    /// openai_chat, openai_responses). `None`/unset = the field is
+    /// absent from the request body entirely; ka fixes no values.
+    pub service_tier: Option<String>,
 }
 
 /// Normalized streaming events emitted by any wire.

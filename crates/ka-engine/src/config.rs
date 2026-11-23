@@ -896,7 +896,18 @@ pub struct Context {
     /// before the first turn. `None`/false = off; `--prewalk` wins
     /// over the file value (the integrator overlays it).
     pub prewalk: Option<bool>,
+    /// MODEL-05: cache warming in the idle tick. `"off"` (default)
+    /// never touches the provider cache; `"idle"` re-sends the current
+    /// history with `max_tokens = 1` while the surface is quiet — new
+    /// turns since the last warm and a last-turn cost ≥ $0.05 gate it —
+    /// refreshing the provider cache TTL without emitting any turn
+    /// events. Only fires when the active dialect's `cache` is not
+    /// `off`.
+    pub cache_warming: Option<String>,
 }
+
+/// The cache-warming modes [`Context::cache_warming`] accepts.
+pub const CACHE_WARMING_MODES: [&str; 2] = ["off", "idle"];
 
 /// Fallback model chain ([fallback]). When a turn fails on the active
 /// model with a provider/auth error after retries are exhausted, the
@@ -938,6 +949,11 @@ pub struct Config {
     pub model: Option<String>,
     /// Default reasoning effort.
     pub effort: Option<Effort>,
+    /// MODEL-03: `service_tier` hint passed through verbatim to
+    /// providers that carry the field (anthropic_messages,
+    /// openai_chat, openai_responses requests include it only when
+    /// set; ka fixes no values). `None` = the field stays absent.
+    pub service_tier: Option<String>,
     /// Permission mode: `ask` | `accept_edits` | `allow` | `readonly` |
     /// `dont_ask` (defaults to allow when absent everywhere; the
     /// pre-v0.5 names `guarded`/`free`/`plan` still parse as aliases).
@@ -1177,6 +1193,17 @@ impl Config {
                 }
             }
         }
+        // [context] cache_warming (MODEL-05): the mode is a closed set
+        // ("off" default | "idle") — a typo'd mode must not silently
+        // disable warming
+        if let Some(mode) = &self.context.cache_warming {
+            if !crate::config::CACHE_WARMING_MODES.contains(&mode.as_str()) {
+                return Err(format!(
+                    "[context] cache_warming: unknown mode {mode:?} (expected one of: {})",
+                    crate::config::CACHE_WARMING_MODES.join(", ")
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -1188,8 +1215,14 @@ impl Config {
         if other.effort.is_some() {
             self.effort = other.effort;
         }
+        if other.service_tier.is_some() {
+            self.service_tier = other.service_tier;
+        }
         if other.mode.is_some() {
             self.mode = other.mode;
+        }
+        if other.context.cache_warming.is_some() {
+            self.context.cache_warming = other.context.cache_warming;
         }
         if other.roles.default.is_some() {
             self.roles.default = other.roles.default;
@@ -1524,6 +1557,12 @@ impl Config {
     /// Whether overflow promotion is enabled (default true).
     pub fn effective_context_promote(&self) -> bool {
         self.context.promote.unwrap_or(true)
+    }
+
+    /// MODEL-05: the cache-warming mode, "off" unless set to "idle"
+    /// (validated parse-side; unknown modes never parse).
+    pub fn effective_cache_warming(&self) -> &str {
+        self.context.cache_warming.as_deref().unwrap_or("off")
     }
 
     /// Effective read-hand image cap in MB (default 5, 0 = unlimited).
@@ -1899,9 +1938,71 @@ mod tests {
         assert_eq!(defaults.context.idle_minutes, None);
         assert_eq!(defaults.context.recap_minutes, None);
         assert_eq!(defaults.context.idle_compact_pct, None);
+        // MODEL-05/03: warming off by default, service tier unset
+        assert_eq!(defaults.context.cache_warming, None);
+        assert_eq!(
+            defaults.effective_cache_warming(),
+            "off",
+            "warming default is off"
+        );
+        assert_eq!(defaults.service_tier, None);
 
         // out-of-band keys stay a parse error (deny_unknown_fields)
         assert!(Config::parse_layer("[context]\nnonsense = 1\n", "x").is_err());
+    }
+
+    /// MODEL-05: `[context] cache_warming` is a closed mode set, and
+    /// the overlay layers compose.
+    #[test]
+    fn cache_warming_modes_parse_overlay_and_validate() {
+        let cfg = Config::parse_layer(
+            "[context]\nidle_minutes = 5\ncache_warming = \"idle\"\n",
+            "user",
+        )
+        .unwrap();
+        assert_eq!(cfg.effective_cache_warming(), "idle");
+        // "off" parses explicitly
+        let off = Config::parse_layer("[context]\ncache_warming = \"off\"\n", "u").unwrap();
+        assert_eq!(off.effective_cache_warming(), "off");
+        // layered overlay: a later layer turns it back off
+        let mut merged = cfg;
+        merged.overlay(
+            Config::parse_layer("[context]\ncache_warming = \"off\"\n", "project").unwrap(),
+        );
+        assert_eq!(merged.effective_cache_warming(), "off");
+        // an unknown mode is a hard config error naming the value
+        let err = Config::parse_layer("[context]\ncache_warming = \"eager\"\n", "u")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("eager"), "error names the bad mode: {err}");
+    }
+
+    /// MODEL-03: top-level `service_tier` parses, overlays and stays a
+    /// literal pass-through (ka fixes no values).
+    #[test]
+    fn service_tier_parses_and_overlays() {
+        let base = Config::parse_layer("service_tier = \"flex\"\n", "user").unwrap();
+        assert_eq!(base.service_tier.as_deref(), Some("flex"));
+        // an arbitrary provider-specific value passes through unchanged
+        let base = Config::parse_layer("service_tier = \"priority\"\n", "user").unwrap();
+        assert_eq!(base.service_tier.as_deref(), Some("priority"));
+        // layered: a later layer overrides, an unset layer keeps
+        let mut merged = base;
+        merged.overlay(Config::parse_layer("service_tier = \"standard\"\n", "p").unwrap());
+        assert_eq!(merged.service_tier.as_deref(), Some("standard"));
+        merged.overlay(Config::parse_layer("model = \"x/y\"\n", "p2").unwrap());
+        assert_eq!(
+            merged.service_tier.as_deref(),
+            Some("standard"),
+            "unset upper layer keeps the lower value"
+        );
+    }
+
+    #[test]
+    fn schema_carries_lote11_keys() {
+        let schema = Config::schema_json().unwrap();
+        assert!(schema.contains("service_tier"), "got: {schema}");
+        assert!(schema.contains("cache_warming"), "got: {schema}");
     }
 
     #[test]

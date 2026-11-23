@@ -94,8 +94,24 @@ async fn speak_anthropic(
         ("content-type".into(), "application/json".into()),
         ("anthropic-version".into(), "2023-06-01".into()),
     ];
-    if let Some(token) = req.token.clone() {
-        headers.push(("x-api-key".into(), token));
+    // Auth mode (MODEL-01): the DIALECT carries the tier, not the token —
+    // `auth = "passport"` rows ride OAuth. Their tokens are OAuth access
+    // tokens: `Authorization: Bearer` + the OAuth beta header (an
+    // x-api-key of an OAuth token is rejected by the endpoint), and no
+    // env-var key ever rides a passport row.
+    let passport_auth = dialect.auth.as_deref() == Some("passport");
+    match (passport_auth, req.token.clone()) {
+        (true, Some(token)) => {
+            headers.push(("authorization".into(), format!("Bearer {token}")));
+            headers.push((
+                "anthropic-beta".into(),
+                crate::auth::ANTHROPIC_OAUTH_BETA.into(),
+            ));
+        }
+        (_, Some(token)) => {
+            headers.push(("x-api-key".into(), token));
+        }
+        (_, None) => {}
     }
 
     let wire_model = dialect.wire_model.clone().unwrap_or_else(|| {
@@ -110,6 +126,10 @@ async fn speak_anthropic(
         "max_tokens": dialect.max_output,
         "stream": true,
     });
+    // MODEL-03: pass-through `service_tier` hint, only when configured
+    if let Some(tier) = req.service_tier.as_deref().filter(|t| !t.is_empty()) {
+        body["service_tier"] = json!(tier);
+    }
     if !req.system.is_empty() {
         // cache_control on the stable system prefix when the dialect asks
         if dialect.cache == crate::dialects::Cache::Control {

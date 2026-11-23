@@ -105,6 +105,10 @@ async fn speak_openai(
         "stream": true,
         "stream_options": { "include_usage": true },
     });
+    // MODEL-03: pass-through `service_tier` hint, only when configured
+    if let Some(tier) = req.service_tier.as_deref().filter(|t| !t.is_empty()) {
+        body["service_tier"] = json!(tier);
+    }
     if !req.tools.is_empty() {
         let tools: Vec<Value> = req
             .tools

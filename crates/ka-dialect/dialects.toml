@@ -178,3 +178,46 @@ input_per_mtok = 0.075
 output_per_mtok = 0.25
 [dialects."openrouter/z-ai/glm-5.3-flash".flags]
 reasoning_field = "reasoning_effort"
+
+# ── Claude plans (MODEL-01): subscription auth via ka-passport ──────
+# `auth = "passport"`: the bearer token comes from the registered
+# TokenSource (Claude Pro/Max OAuth), never an env var; rows carry no
+# api_key_env and stay unpriced (subscription — costs are never
+# fabricated). The anthropic_messages wire rides `Authorization: Bearer`
+# plus the OAuth beta header for these rows.
+[dialects."claude-plan/claude-sonnet-5"]
+wire = "anthropic_messages"
+base_url = "https://api.anthropic.com"
+auth = "passport"
+context = 200_000
+max_output = 64_000
+efforts = ["low", "medium", "high", "max"]
+input = ["text", "image"]
+cache = "control"
+ratio = 3.6
+priced = false
+[dialects."claude-plan/claude-sonnet-5".flags]
+reasoning_field = "thinking"
+[dialects."claude-plan/claude-sonnet-5".effort_budgets]
+low = 2048
+medium = 8192
+high = 16_384
+max = 32_768
+
+[dialects."claude-plan/claude-opus-4"]
+wire = "anthropic_messages"
+base_url = "https://api.anthropic.com"
+auth = "passport"
+context = 200_000
+max_output = 32_000
+efforts = ["low", "medium", "high"]
+input = ["text", "image"]
+cache = "control"
+ratio = 3.6
+priced = false
+[dialects."claude-plan/claude-opus-4".flags]
+reasoning_field = "thinking"
+[dialects."claude-plan/claude-opus-4".effort_budgets]
+low = 2048
+medium = 8192
+high = 16_384

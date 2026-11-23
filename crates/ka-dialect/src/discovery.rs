@@ -289,6 +289,7 @@ impl Dialect {
             base_url: None,
             doc_url: None,
             api_key_env: None,
+            auth: None,
             wire_model: None,
             discovery: None,
             context: 0,

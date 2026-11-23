@@ -42,3 +42,6 @@
 
 ### Batch 10b — MCP protocol & roles
 - OAuth for HTTP MCP servers (dynamic client registration RFC 7591, CIMD, local callback, token cache with refresh in the data dir, `bearer_token_env` / `headers_helper` per server) · MCP elicitation routed to ka asks, sampling via the default model, `roots`, and server-initiated notifications applied live (tools/list_changed refreshes catalogs) · `[roles.<name>]` arbitrary roles addressable as `@name` · `[virtual_models.<name>]` round-robin/failover routers · `ka mcp-serve` read-only MCP stdio server (read/glob/grep/sessions_search/session_info; bash deliberately excluded).
+
+### Batch 11 — models
+- ka-passport (new opt-in crate + `passport` cargo feature): TokenSource trait per the ratified design stub, Claude Pro/Max OAuth (PKCE, loopback callback, keyring service `ka-passport`, proactive refresh) exposed as a claude-plan vendor (anthropic wire + oauth beta header) · Curated community providers: perplexity, nebius, sambanova, upstage · `[model] service_tier` passthrough on all three wires · Idle cache warming (`[context] cache_warming = "idle"`, ≥$0.05 turns) · `ka models --update` runtime catalog overlay from models.dev.

@@ -99,6 +99,25 @@ pub(crate) const SHAKE_ARG_CAP: usize = 240;
 /// prompt (SES-03).
 const BRANCH_SIDE_CAP: usize = 1_200;
 
+/// Resolve the request token for one dialect (MODEL-01): `auth =
+/// "passport"` rows consult the registered `TokenSource` for the
+/// selector's vendor (ka-passport; no env var ever serves these rows);
+/// every other row walks the standard env/dotenv/registry/keyring
+/// ladder over `api_key_env`.
+pub(crate) fn resolve_request_token(
+    dialect: &ka_dialect::Dialect,
+    model_id: &str,
+) -> Option<String> {
+    if dialect.auth.as_deref() == Some("passport") {
+        let vendor = model_id.split('/').next().unwrap_or(model_id);
+        return ka_dialect::auth::resolve_passport_token(vendor);
+    }
+    dialect
+        .api_key_env
+        .as_deref()
+        .and_then(ka_dialect::auth::resolve_token)
+}
+
 /// Human-readable byte size (`12.3 kB`, `1.2 MB`) for notes and hints.
 pub(crate) fn fmt_bytes(bytes: u64) -> String {
     let b = bytes as f64;
@@ -239,6 +258,13 @@ pub struct Voice {
     /// Reasoning-effort level name from the engine's live settings
     /// (`SetEffort`); a selector `@effort` suffix still wins per model.
     effort: Option<String>,
+    /// MODEL-03: top-level `service_tier` hint, attached to every
+    /// request the voice builds (wires include the field only when
+    /// set).
+    service_tier: Option<String>,
+    /// MODEL-05: the system prompt of the most recent turn — the cache
+    /// warm touch replays it so the provider cache prefix matches.
+    last_system: Option<String>,
     /// Active strand id — every request carries it for gateways that
     /// route by conversation (the wire maps the vendor to a header via
     /// `providers::session_header`; opencode-go needs
@@ -410,6 +436,8 @@ impl Voice {
             history: Vec::new(),
             model_selector: None,
             effort: None,
+            service_tier: None,
+            last_system: None,
             session_id: None,
             ratio: 4.0,
             digest: None,
@@ -641,6 +669,8 @@ impl Voice {
             history: Vec::new(),
             model_selector: None,
             effort: None,
+            service_tier: None,
+            last_system: None,
             session_id: None,
             ratio: 4.0,
             digest: None,
@@ -697,6 +727,13 @@ impl Voice {
     /// selector `@effort` suffix still overrides per model.
     pub fn set_effort(&mut self, level: Option<String>) {
         self.effort = level;
+    }
+
+    /// MODEL-03: the top-level `service_tier` hint (`None` = the field
+    /// stays absent from request bodies). Set once at engine bootstrap
+    /// from the config layer chain.
+    pub fn set_service_tier(&mut self, tier: Option<String>) {
+        self.service_tier = tier;
     }
 
     /// Record the active strand id (attach/transfer); every request
@@ -856,10 +893,7 @@ impl Voice {
         let Some(dialect) = self.catalog.get(&model_id).cloned() else {
             return false;
         };
-        let token = dialect
-            .api_key_env
-            .as_deref()
-            .and_then(ka_dialect::auth::resolve_token);
+        let token = resolve_request_token(&dialect, &model_id);
         let system = DIGEST_SYSTEM.to_string();
         let mut messages = Vec::new();
         if let Some(d) = &self.digest {
@@ -1818,10 +1852,7 @@ impl Voice {
     ) -> Option<String> {
         let model_id = self.model_selector.clone()?;
         let dialect = self.catalog.get(&model_id).cloned()?;
-        let token = dialect
-            .api_key_env
-            .as_deref()
-            .and_then(ka_dialect::auth::resolve_token);
+        let token = resolve_request_token(&dialect, &model_id);
         let ratio = if dialect.ratio > 0.0 {
             dialect.ratio as f64
         } else {
@@ -1883,6 +1914,9 @@ impl Voice {
             session_id,
             schema: None,
             native_search: false,
+            // auxiliary calls (digests/titles) ride the endpoint
+            // default tier — ka-internal work, no user hint attached
+            service_tier: None,
         };
         let (tx, mut rx) = mpsc::channel::<StreamEvent>(256);
         {
@@ -1957,6 +1991,79 @@ impl Voice {
             Self::ROLE_MAX_OUTPUT,
         )?;
         aux.complete(system, prompt, deadline).await
+    }
+
+    /// MODEL-05: one silent cache-TTL touch. Re-sends the last turn's
+    /// exact prefix — same system prompt, same history shape, the
+    /// wire-level `max_tokens` floored to 1 — through the active
+    /// model's speaker, so the provider's prompt cache (key-based or
+    /// cache_control breakpoint) refreshes while the surface is quiet.
+    /// Silent by construction: no events emitted, nothing appended to
+    /// history. Guards: a dialect that caches at all (`cache != off`),
+    /// a completed turn to replay (`last_system`), history present.
+    /// Returns true when the touch round-tripped (Finished), false on
+    /// any guard miss, transport failure, or timeout — callers stay
+    /// quiet either way beyond their own note.
+    pub async fn cache_warm_touch(&mut self, deadline: std::time::Duration) -> bool {
+        let Some(model_id) = self.model_selector.clone() else {
+            return false;
+        };
+        let Some(mut dialect) = self.catalog.get(&model_id).cloned() else {
+            return false;
+        };
+        if dialect.cache == ka_dialect::dialects::Cache::Off {
+            return false; // provider does no prompt caching — nothing to warm
+        }
+        let Some(system) = self.last_system.clone() else {
+            return false; // no completed turn yet — no prefix to warm
+        };
+        if self.history.is_empty() {
+            return false;
+        }
+        // the touch is a max_tokens=1 request: one token out, the whole
+        // prefix re-read (cache-hit) provider-side
+        let token = resolve_request_token(&dialect, &model_id);
+        dialect.max_output = 1;
+        let speaker = self.speaker(dialect.wire);
+        let req = SpeakRequest {
+            model_id: model_id.clone(),
+            dialect,
+            effort: None,
+            system,
+            messages: self.speak_messages(),
+            tools: Vec::new(),
+            token,
+            cache_key: None,
+            session_id: self.session_id.clone(),
+            schema: None,
+            native_search: false,
+            // ka-internal touch: endpoint-default tier
+            service_tier: None,
+        };
+        let (tx, mut rx) = mpsc::channel::<StreamEvent>(16);
+        {
+            let speaker = speaker.clone();
+            tokio::spawn(async move {
+                speaker.speak(req, tx).await;
+            });
+        }
+        let mut finished = false;
+        let _ = tokio::time::timeout(deadline, async {
+            while let Some(evt) = rx.recv().await {
+                match evt {
+                    StreamEvent::Finished { .. } => {
+                        finished = true;
+                        break;
+                    }
+                    // a Failed stream just means the cache stayed cold;
+                    // never surface, never retry here
+                    StreamEvent::Failed { .. } => break,
+                    _ => {}
+                }
+            }
+        })
+        .await;
+        finished
     }
 
     /// EXT-05b: complete an MCP `sampling/createMessage` request with
@@ -2390,10 +2497,7 @@ impl Voice {
         } else {
             4.0
         };
-        let mut token = dialect
-            .api_key_env
-            .as_deref()
-            .and_then(ka_dialect::auth::resolve_token);
+        let mut token = resolve_request_token(&dialect, &model_id);
         let mut window = dialect.context as u64;
         let mut fallback_cursor: usize = 0;
         let mut fallback_hops: usize = 0;
@@ -2580,6 +2684,10 @@ impl Voice {
                 "\n\nEarlier-conversation summary (this is your memory of prior turns — treat it as accurate ground truth):\n{d}"
             ));
         }
+        // MODEL-05: the exact prefix the last request warmed — the idle
+        // cache-warm touch replays it verbatim so the provider cache
+        // (key or cache_control breakpoint) actually hits
+        self.last_system = Some(system.clone());
 
         self.model_selector = Some(model_selector.to_string());
         self.ratio = if dialect.ratio > 0.0 {
@@ -2617,6 +2725,7 @@ impl Voice {
                 session_id: self.session_id.clone(),
                 schema: schema.clone(),
                 native_search,
+                service_tier: self.service_tier.clone(),
             };
             let speaker = self.speaker(dialect.wire);
             let (tx, mut rx) = mpsc::channel::<StreamEvent>(256);
@@ -2843,10 +2952,7 @@ impl Voice {
                                     } else {
                                         4.0
                                     };
-                                    token = dialect
-                                        .api_key_env
-                                        .as_deref()
-                                        .and_then(ka_dialect::auth::resolve_token);
+                                    token = resolve_request_token(&dialect, &target);
                                     window = dialect.context as u64;
                                     retry_attempt = 0;
                                     self.model_selector = Some(target);
@@ -2937,10 +3043,7 @@ impl Voice {
                         } else {
                             4.0
                         };
-                        token = dialect
-                            .api_key_env
-                            .as_deref()
-                            .and_then(ka_dialect::auth::resolve_token);
+                        token = resolve_request_token(&dialect, &sel);
                         window = dialect.context as u64;
                         retry_attempt = 0;
                         self.model_selector = Some(sel);
@@ -5064,10 +5167,7 @@ impl AuxRole {
         if dialect.max_output == 0 || dialect.max_output > max_output {
             dialect.max_output = max_output;
         }
-        let token = dialect
-            .api_key_env
-            .as_deref()
-            .and_then(ka_dialect::auth::resolve_token);
+        let token = resolve_request_token(&dialect, &model_id);
         Some(Self {
             model_id,
             dialect,
@@ -5096,6 +5196,8 @@ impl AuxRole {
             session_id: self.session_id.clone(),
             schema: None,
             native_search: false,
+            // auxiliary role call: endpoint-default tier
+            service_tier: None,
         };
         let (tx, mut rx) = mpsc::channel::<StreamEvent>(256);
         {

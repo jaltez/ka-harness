@@ -306,6 +306,16 @@ enum CliCommand {
         /// Fuzzy filter: case-insensitive substring on the model id
         #[arg(value_name = "QUERY")]
         query: Option<String>,
+        /// Refresh the runtime catalog from models.dev and store it in
+        /// the data dir (loaded before embedded + user overlays)
+        #[arg(long)]
+        update: bool,
+    },
+    /// Manage passport subscription auth (Claude Pro/Max; `passport`
+    /// cargo feature)
+    Passport {
+        #[command(subcommand)]
+        cmd: PassportCmd,
     },
     /// Rewind the newest strand N user turns (default 1)
     Rewind {
@@ -511,6 +521,18 @@ enum ConfigCommand {
     },
     /// Print the config layer paths ka reads
     Path,
+}
+
+/// `ka passport …`: subscription auth lifecycle (claude-plan vendor).
+#[derive(Subcommand, Clone)]
+enum PassportCmd {
+    /// Run the Claude OAuth flow (browser + loopback callback) and
+    /// store the tokens in the OS keyring under `ka-passport`
+    Login,
+    /// Clear the stored credentials
+    Logout,
+    /// Print the stored-credential status
+    Status,
 }
 
 /// `ka rules …`: dry-run access to the permission gate.
@@ -1644,7 +1666,21 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             no_discovery,
             dialects,
             query,
+            update,
         }) => {
+            if update {
+                let json = ka_dialect::dialects::fetch_models_dev()
+                    .await
+                    .map_err(|e| format!("models.dev fetch: {e}"))?;
+                let root = ka_strand::data_dir();
+                ka_dialect::dialects::store_runtime_catalog(&root, &json)
+                    .map_err(|e| format!("store catalog: {e}"))?;
+                println!(
+                    "runtime catalog stored at {} (loads before embedded + user overlays)",
+                    root.join("catalog.json").display()
+                );
+                return Ok(ExitCode::SUCCESS);
+            }
             let mut catalog = load_catalog(&dialects)?;
             if !no_discovery {
                 ka_dialect::discovery::overlay_discovered(&mut catalog).await;
@@ -1810,6 +1846,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             }
             Ok(ExitCode::SUCCESS)
         }
+        Some(CliCommand::Passport { cmd }) => run_passport(cmd).await,
         Some(CliCommand::Attach {
             session,
             addr,
@@ -3177,6 +3214,50 @@ fn truncate_str(s: &str, max: usize) -> String {
         line = line.chars().take(max).collect::<String>() + "…";
     }
     line
+}
+
+/// `ka passport login|logout|status` — claude-plan subscription auth
+/// lifecycle over the passport crate (feature `passport`).
+#[cfg(feature = "passport")]
+async fn run_passport(cmd: PassportCmd) -> Result<ExitCode, String> {
+    use ka_passport::TokenSource;
+    use ka_passport::claude::{ClaudePlanSource, VENDOR};
+    let source = ClaudePlanSource::new();
+    match cmd {
+        PassportCmd::Login => {
+            let tokens = source.login().await.map_err(|e| format!("login: {e}"))?;
+            println!("logged in as {VENDOR} (expires unix {})", tokens.expires_at);
+            let handle = ka_passport::claude::install();
+            println!(
+                "passport registered for vendors {:?} — claude-plan rows are live",
+                handle.vendors()
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        PassportCmd::Logout => {
+            source.logout().map_err(|e| format!("logout: {e}"))?;
+            println!("logged out of {VENDOR}");
+            Ok(ExitCode::SUCCESS)
+        }
+        PassportCmd::Status => {
+            let st = source.status();
+            if st.logged_in {
+                println!(
+                    "{VENDOR}: logged in (expires unix {}, {})",
+                    st.expires_at.map(|e| e.to_string()).unwrap_or_default(),
+                    if st.stale { "stale" } else { "fresh" }
+                );
+            } else {
+                println!("{VENDOR}: not logged in");
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+    }
+}
+
+#[cfg(not(feature = "passport"))]
+async fn run_passport(_cmd: PassportCmd) -> Result<ExitCode, String> {
+    Err("passport auth is not compiled in — rebuild with --features passport".to_string())
 }
 
 /// `ka session …` — rename / delete (cascade) / archive / unarchive,

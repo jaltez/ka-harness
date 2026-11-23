@@ -157,6 +157,10 @@ async fn speak_responses(
         "stream": true,
         "store": false,
     });
+    // MODEL-03: pass-through `service_tier` hint, only when configured
+    if let Some(tier) = req.service_tier.as_deref().filter(|t| !t.is_empty()) {
+        body["service_tier"] = json!(tier);
+    }
     if !req.system.is_empty() {
         body["instructions"] = json!(req.system);
     }

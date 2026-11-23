@@ -657,6 +657,9 @@ fn config_schema_carries_every_documented_key() {
         "strategy",
         "round_robin",
         "failover",
+        // Lote 11: service tier (MODEL-03) + cache warming (MODEL-05)
+        "service_tier",
+        "cache_warming",
     ] {
         assert!(
             schema.contains(&format!("\"{key}\"")),

@@ -485,6 +485,14 @@ struct EngineState {
     /// `turns_seen` value at the last idle recap; the recap fires only
     /// when `turns_seen` has moved past it.
     last_recap_turns: u64,
+    /// MODEL-05: `[context] cache_warming = "idle"` armed (default off).
+    cache_warming: bool,
+    /// MODEL-05: cost of the most recent completed turn (USD); the
+    /// warming gate compares it against the $0.05 threshold.
+    last_turn_cost: f64,
+    /// MODEL-05: `turns_seen` value at the last cache warm; the warm
+    /// fires only when new turns happened since.
+    last_warm_turns: u64,
     /// CTX-05: the active goal, when one is set (the fast role judges
     /// each settle whether the condition holds; the auto-poke prefix
     /// keeps the model working toward it).
@@ -530,6 +538,7 @@ struct LoopRuntime {
 impl From<Config> for EngineState {
     fn from(c: Config) -> Self {
         let mode = c.effective_mode();
+        let warming = c.effective_cache_warming() == "idle";
         Self {
             model: c.model,
             effort: c.effort,
@@ -556,6 +565,9 @@ impl From<Config> for EngineState {
             last_activity: std::time::Instant::now(),
             turns_seen: 0,
             last_recap_turns: 0,
+            cache_warming: warming,
+            last_turn_cost: 0.0,
+            last_warm_turns: 0,
             goal: None,
             loop_mode: None,
             prewalk: c.context.prewalk.unwrap_or(false),
@@ -670,6 +682,39 @@ async fn run(
     // roles resolve once at engine start, through the same catalog the
     // main model uses (discovery overlays already applied by the caller)
     let roles = resolve_roles(&catalog, &config.roles, config.model.as_deref());
+    // passport tier bootstrap (MODEL-01, ratified rule): every selector
+    // this session can speak with an `auth = "passport"` dialect must
+    // find a registered TokenSource NOW — an unregistered row is an
+    // instructive error, never a mid-turn surprise. Safe mode keeps
+    // passport auth available (it is auth, not a customization).
+    for selector in [
+        config.roles.default.as_deref(),
+        config.roles.fast.as_deref(),
+        config.model.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .chain(config.roles.extra.values().map(String::as_str))
+    {
+        let parsed = match ka_dialect::parse_selector(selector) {
+            Ok(p) => p,
+            Err(_) => continue, // the turn machine reports bad selectors
+        };
+        let Some(dialect) = catalog.get(&parsed.model_id()) else {
+            continue; // synthetic dialects resolve the same tier below
+        };
+        if dialect.auth.as_deref() == Some("passport")
+            && !ka_dialect::auth::passport_serves(&parsed.vendor)
+        {
+            return Err(format!(
+                "model {} uses auth = \"passport\" but no passport source is registered — \
+                 build with `--features passport` and run `ka login claude`, or pick a \
+                 non-plan model",
+                parsed.model_id()
+            )
+            .into());
+        }
+    }
     // the full table rides the ctx so `SetModel "@<role>"` resolves
     // the same way (EXT-11)
     let roles_table = config.roles.clone();
@@ -725,6 +770,9 @@ async fn run(
     voice.set_routers(&config.virtual_models);
     voice.set_max_image_mb(config.effective_max_image_mb());
     voice.set_context_promote(config.effective_context_promote());
+    // MODEL-03: the pass-through service_tier hint rides every
+    // main-line request from here on
+    voice.set_service_tier(config.service_tier.clone());
     voice.set_shell_env(config.effective_shell_env());
     let sandbox_policy = ka_sandbox::policy_from_config(&config.sandbox.to_policy_config(), &cwd)?;
     voice.set_sandbox(sandbox_policy);
@@ -3750,6 +3798,12 @@ async fn session_tick(
     Ok(())
 }
 
+/// Minimum last-turn cost before idle cache warming is worth a wire
+/// call (MODEL-05, ratified $0.05).
+const CACHE_WARM_MIN_COST_USD: f64 = 0.05;
+/// The warm touch's round-trip budget (a max_tokens=1 stream).
+const CACHE_WARM_TIMEOUT_SECS: u64 = 60;
+
 /// The idle tick (CTX-07): runs only between commands (the turn runs
 /// inside the command arm, so ticks never race live work). When
 /// `[context] idle_minutes` is configured and the surface has been
@@ -3759,7 +3813,13 @@ async fn session_tick(
 ///     the tip) and surface as a note; only when turns happened since
 ///     the last recap;
 /// (b) compaction — when `[context] idle_compact_pct` is set and the
-///     meter reached it, the standard digest runs.
+///     meter reached it, the standard digest runs;
+/// (c) cache warming (MODEL-05) — when `[context] cache_warming =
+///     "idle"`, new turns happened since the last warm, the last turn
+///     cost ≥ $0.05, and the active dialect does prompt caching at
+///     all, the current prefix is re-sent with max_tokens = 1 (a
+///     silent cache-TTL touch; no turn events) and surfaces only as a
+///     `cache warmed (saved est. $X)` note.
 /// Either action resets the activity baseline: one idle action per
 /// quiet span, retried only after another `idle_minutes` pass.
 async fn idle_tick_work(ctx: &mut Ctx) {
@@ -3776,6 +3836,29 @@ async fn idle_tick_work(ctx: &mut Ctx) {
     {
         ctx.state.last_recap_turns = ctx.state.turns_seen;
         idle_recap(&mut ctx.voice, &ctx.state, &mut ctx.strand, &ctx.events).await;
+    }
+    // (c) MODEL-05 cache warming: silent touch, new turns only, worth
+    // it only above the cost floor; the `cache != off` guard lives in
+    // Voice::cache_warm_touch (a no-caching provider has no TTL to
+    // extend)
+    if ctx.state.cache_warming
+        && ctx.state.turns_seen > ctx.state.last_warm_turns
+        && ctx.state.last_turn_cost >= CACHE_WARM_MIN_COST_USD
+    {
+        let saved = ctx.state.last_turn_cost;
+        if ctx
+            .voice
+            .cache_warm_touch(Duration::from_secs(CACHE_WARM_TIMEOUT_SECS))
+            .await
+        {
+            ctx.state.last_warm_turns = ctx.state.turns_seen;
+            ctx.events
+                .send(Event::Note {
+                    message: format!("cache warmed (saved est. ${saved:.2})"),
+                })
+                .await
+                .ok();
+        }
     }
     // (b) compaction: the standard digest, threshold-gated
     if compact_due(
@@ -4797,6 +4880,8 @@ async fn dispatch_turn(
     // session spend accounting + the persisted Usage record feed the
     // spend guard and `ka sessions` stats
     state.guards.session_spend += usage.cost;
+    // MODEL-05: the cache-warm gate reads the latest turn's cost
+    state.last_turn_cost = usage.cost;
     let _ = strand.append(ka_strand::Record::Usage {
         id: ka_strand::new_record_id(),
         cost: usage.cost,
@@ -7722,7 +7807,9 @@ mod tests {
         // phase ends at the digest's own events.
         let mut idle_events = Vec::new();
         loop {
-            let evt = tokio::time::timeout(Duration::from_secs(10), h.events.recv())
+            // 30s per event: under loaded CI the SSE fixture turn can
+            // overshoot shorter windows (same tolerance as cron tests)
+            let evt = tokio::time::timeout(Duration::from_secs(30), h.events.recv())
                 .await
                 .unwrap()
                 .unwrap();
@@ -7773,6 +7860,154 @@ mod tests {
             captured.lock().len(),
             requests_after_first_span,
             "no extra wire calls in the second quiet span"
+        );
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// MODEL-05 · idle cache warming: a quiet span after a costly turn
+    /// on a caching dialect fires exactly ONE silent max_tokens=1 touch
+    /// (no turn events, only the note); a second quiet span without new
+    /// turns stays silent.
+    #[tokio::test]
+    async fn idle_cache_warming_touches_once_per_new_turns() {
+        use crate::engine::{StrandChoice, spawn_full};
+        let _guard = IdleFactors::shrink();
+        let captured = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        // call order: the turn → the warm touch (no fast role → no
+        // title/recap wire calls; no compaction)
+        const WARM_SSE: &str = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\".\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":1}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let addr = serve_sse(vec![TURN_BIG_SSE, WARM_SSE], captured.clone());
+        let work = title_workdir("warm");
+        // priced caching dialect: the turn costs 5000/1M×$15 = $0.075 —
+        // over the $0.05 warm gate
+        let catalog = ka_dialect::Catalog::parse(&format!(
+            "[dialects.\"test/main\"]\nwire = \"openai_chat\"\nbase_url = \
+             \"http://{addr}/v1\"\ncontext = 100000\npriced = true\ncache = \"control\"\n\
+             [dialects.\"test/main\".price]\ninput_per_mtok = 15\noutput_per_mtok = 30\n"
+        ))
+        .unwrap();
+        let cfg = Config {
+            model: Some("test/main".into()),
+            roles: crate::config::Roles {
+                default: None,
+                fast: None,
+                extra: Default::default(),
+            },
+            cwd: Some(work.display().to_string()),
+            context: crate::config::Context {
+                idle_minutes: Some(1),
+                cache_warming: Some("idle".to_string()),
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        let mut h = spawn_full(cfg, catalog, StrandChoice::New);
+        h.commands
+            .send(Command::Prompt {
+                allowed_tools: None,
+                model: None,
+                text: "fix the parser".into(),
+                schema: None,
+                images: Vec::new(),
+                skills: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let first = drain_to_idle(&mut h).await;
+        assert!(
+            notes_of(&first).iter().all(|n| !n.contains("cache warmed")),
+            "no warm before the idle span: {:?}",
+            notes_of(&first)
+        );
+        // the quiet span: the warm note ends the phase; everything in
+        // between is notes — a warm NEVER emits turn events
+        let mut warm_events = Vec::new();
+        loop {
+            let evt = tokio::time::timeout(Duration::from_secs(10), h.events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let done =
+                matches!(&evt, Event::Note { message } if message.starts_with("cache warmed"));
+            warm_events.push(evt);
+            if done {
+                break;
+            }
+        }
+        assert!(
+            warm_events.iter().all(|e| matches!(e, Event::Note { .. })),
+            "warming stays silent (no TurnStarted/Delta/TurnFinished): {warm_events:?}"
+        );
+        // exactly one wire call beyond the turn, with max_tokens = 1
+        {
+            let reqs = captured.lock();
+            assert_eq!(reqs.len(), 2, "turn + one warm touch: {reqs:?}");
+            assert!(
+                reqs[1].contains("\"max_tokens\":1"),
+                "warm touch caps output at 1: {}",
+                reqs[1]
+            );
+        }
+        // one warm per new-turn batch: a second quiet span stays quiet
+        let after = captured.lock().len();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(captured.lock().len(), after, "no warm without new turns");
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// MODEL-05 off-switch: `cache_warming = "off"` (default) never
+    /// warms, even over an idle span with an expensive last turn.
+    #[tokio::test]
+    async fn cache_warming_off_stays_cold() {
+        use crate::engine::{StrandChoice, spawn_full};
+        let _guard = IdleFactors::shrink();
+        let captured = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let addr = serve_sse(vec![TURN_BIG_SSE], captured.clone());
+        let work = title_workdir("warmoff");
+        let catalog = ka_dialect::Catalog::parse(&format!(
+            "[dialects.\"test/main\"]\nwire = \"openai_chat\"\nbase_url = \
+             \"http://{addr}/v1\"\ncontext = 100000\npriced = true\ncache = \"control\"\n\
+             [dialects.\"test/main\".price]\ninput_per_mtok = 15\noutput_per_mtok = 30\n"
+        ))
+        .unwrap();
+        let cfg = Config {
+            model: Some("test/main".into()),
+            roles: crate::config::Roles {
+                default: None,
+                fast: None,
+                extra: Default::default(),
+            },
+            cwd: Some(work.display().to_string()),
+            context: crate::config::Context {
+                idle_minutes: Some(1),
+                cache_warming: Some("off".to_string()),
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        let mut h = spawn_full(cfg, catalog, StrandChoice::New);
+        h.commands
+            .send(Command::Prompt {
+                allowed_tools: None,
+                model: None,
+                text: "fix the parser".into(),
+                schema: None,
+                images: Vec::new(),
+                skills: Vec::new(),
+            })
+            .await
+            .unwrap();
+        drain_to_idle(&mut h).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(
+            captured.lock().len(),
+            1,
+            "warming off: only the turn's own wire call"
         );
         let _ = std::fs::remove_dir_all(&work);
     }

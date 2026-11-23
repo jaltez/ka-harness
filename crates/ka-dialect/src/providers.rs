@@ -8,12 +8,12 @@
 //! until a catalog row confirms them; the context window is unknown (0).
 //!
 //! Curation (v2): official providers first and FEW — Anthropic, OpenAI,
-//! Google, z.ai (API), z.ai (Coding Readonly) — then community/alternative
-//! vendors, then local runtimes last. The z.ai family is merged: legacy
-//! `zhipu`/`zhipuai` selectors resolve to the z.ai provider (see
-//! [`find`]). The final display order for both providers and catalog
-//! models is defined by [`vendor_rank`]; surfaces sort by it and inherit
-//! the order with no per-surface policy.
+//! Google, z.ai (API), z.ai (Coding Readonly), Claude plans — then
+//! community/alternative vendors, then local runtimes last. The z.ai
+//! family is merged: legacy `zhipu`/`zhipuai` selectors resolve to the
+//! z.ai provider (see [`find`]). The final display order for both
+//! providers and catalog models is defined by [`vendor_rank`]; surfaces
+//! sort by it and inherit the order with no per-surface policy.
 //!
 //! Excluded entirely: Azure/Bedrock/Vertex (sigv4/Entra machinery),
 //! JWT-only flows, and mirrors/duplicates of the official five.
@@ -29,8 +29,14 @@ pub struct Provider {
     pub wire: Wire,
     /// Base URL (OpenAI-compatible path included).
     pub base_url: &'static str,
-    /// Env var holding the API key (None = keyless local).
+    /// Env var holding the API key (None = keyless local or passport
+    /// auth — see [`Provider::auth`]).
     pub key_env: Option<&'static str>,
+    /// Authentication tier for synthetic dialects: `Some("passport")` =
+    /// the bearer token comes from a registered `TokenSource`
+    /// (ka-passport), never an env var. `None` = the standard
+    /// env/dotenv/registry/keyring ladder over [`Provider::key_env`].
+    pub auth: Option<&'static str>,
     /// One-line note for listings.
     pub note: &'static str,
 }
@@ -44,6 +50,7 @@ pub const PROVIDERS: &[Provider] = &[
         wire: Wire::AnthropicMessages,
         base_url: "https://api.anthropic.com",
         key_env: Some("ANTHROPIC_API_KEY"),
+        auth: None,
         note: "Claude models",
     },
     Provider {
@@ -51,6 +58,7 @@ pub const PROVIDERS: &[Provider] = &[
         wire: Wire::OpenaiChat,
         base_url: "https://api.openai.com/v1",
         key_env: Some("OPENAI_API_KEY"),
+        auth: None,
         note: "GPT models",
     },
     Provider {
@@ -58,6 +66,7 @@ pub const PROVIDERS: &[Provider] = &[
         wire: Wire::OpenaiChat,
         base_url: "https://generativelanguage.googleapis.com/v1beta/openai",
         key_env: Some("GEMINI_API_KEY"),
+        auth: None,
         note: "Gemini via OpenAI-compatible bridge",
     },
     Provider {
@@ -65,6 +74,7 @@ pub const PROVIDERS: &[Provider] = &[
         wire: Wire::OpenaiChat,
         base_url: "https://api.z.ai/api/paas/v4",
         key_env: Some("ZHIPU_API_KEY"),
+        auth: None,
         note: "z.ai API — GLM models (absorbs the legacy zhipu entry)",
     },
     Provider {
@@ -72,7 +82,16 @@ pub const PROVIDERS: &[Provider] = &[
         wire: Wire::OpenaiChat,
         base_url: "https://api.z.ai/api/coding/paas/v4",
         key_env: Some("ZHIPU_API_KEY"),
+        auth: None,
         note: "z.ai Coding Readonly subscription endpoint",
+    },
+    Provider {
+        name: "claude-plan",
+        wire: Wire::AnthropicMessages,
+        base_url: "https://api.anthropic.com",
+        key_env: None,
+        auth: Some("passport"),
+        note: "Claude Pro/Max subscription (OAuth via ka-passport)",
     },
     // ── community / alternative ─────────────────────────────────
     Provider {
@@ -80,6 +99,7 @@ pub const PROVIDERS: &[Provider] = &[
         wire: Wire::OpenaiChat,
         base_url: "https://api.deepseek.com",
         key_env: Some("DEEPSEEK_API_KEY"),
+        auth: None,
         note: "DeepSeek models",
     },
     Provider {
@@ -87,6 +107,7 @@ pub const PROVIDERS: &[Provider] = &[
         wire: Wire::OpenaiChat,
         base_url: "https://api.mistral.ai/v1",
         key_env: Some("MISTRAL_API_KEY"),
+        auth: None,
         note: "Mistral models",
     },
     Provider {
@@ -94,6 +115,7 @@ pub const PROVIDERS: &[Provider] = &[
         wire: Wire::OpenaiChat,
         base_url: "https://api.groq.com/openai/v1",
         key_env: Some("GROQ_API_KEY"),
+        auth: None,
         note: "ultra-fast open-model inference",
     },
     Provider {
@@ -101,6 +123,7 @@ pub const PROVIDERS: &[Provider] = &[
         wire: Wire::OpenaiChat,
         base_url: "https://api.cerebras.ai/v1",
         key_env: Some("CEREBRAS_API_KEY"),
+        auth: None,
         note: "very fast Llama/Qwen inference",
     },
     Provider {
@@ -108,6 +131,7 @@ pub const PROVIDERS: &[Provider] = &[
         wire: Wire::OpenaiChat,
         base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1",
         key_env: Some("DASHSCOPE_API_KEY"),
+        auth: None,
         note: "Alibaba Qwen (DashScope)",
     },
     Provider {
@@ -115,13 +139,47 @@ pub const PROVIDERS: &[Provider] = &[
         wire: Wire::OpenaiChat,
         base_url: "https://api.moonshot.cn/v1",
         key_env: Some("MOONSHOT_API_KEY"),
+        auth: None,
         note: "Kimi models",
+    },
+    Provider {
+        name: "perplexity",
+        wire: Wire::OpenaiChat,
+        base_url: "https://api.perplexity.ai",
+        key_env: Some("PERPLEXITY_API_KEY"),
+        auth: None,
+        note: "Perplexity Sonar models (online search)",
+    },
+    Provider {
+        name: "nebius",
+        wire: Wire::OpenaiChat,
+        base_url: "https://api.tokenfactory.nebius.com/v1",
+        key_env: Some("NEBIUS_API_KEY"),
+        auth: None,
+        note: "Nebius Token Factory — hosted open models",
+    },
+    Provider {
+        name: "sambanova",
+        wire: Wire::OpenaiChat,
+        base_url: "https://api.sambanova.ai/v1",
+        key_env: Some("SAMBANOVA_API_KEY"),
+        auth: None,
+        note: "SambaNova fast inference",
+    },
+    Provider {
+        name: "upstage",
+        wire: Wire::OpenaiChat,
+        base_url: "https://api.upstage.ai/v1/solar",
+        key_env: Some("UPSTAGE_API_KEY"),
+        auth: None,
+        note: "Upstage Solar models",
     },
     Provider {
         name: "xai",
         wire: Wire::OpenaiChat,
         base_url: "https://api.x.ai/v1",
         key_env: Some("XAI_API_KEY"),
+        auth: None,
         note: "Grok models",
     },
     Provider {
@@ -129,6 +187,7 @@ pub const PROVIDERS: &[Provider] = &[
         wire: Wire::OpenaiChat,
         base_url: "https://integrate.api.nvidia.com/v1",
         key_env: Some("NVIDIA_API_KEY"),
+        auth: None,
         note: "NVIDIA AI Foundation models",
     },
     Provider {
@@ -136,6 +195,7 @@ pub const PROVIDERS: &[Provider] = &[
         wire: Wire::OpenaiChat,
         base_url: "https://opencode.ai/inference/go/openai/v1",
         key_env: Some("OPENCODE_API_KEY"),
+        auth: None,
         note: "OpenCode Go subscription gateway — open coding models",
     },
     Provider {
@@ -143,6 +203,7 @@ pub const PROVIDERS: &[Provider] = &[
         wire: Wire::OpenaiChat,
         base_url: "https://openrouter.ai/api/v1",
         key_env: Some("OPENROUTER_API_KEY"),
+        auth: None,
         note: "gateway to 100+ models",
     },
     Provider {
@@ -150,6 +211,7 @@ pub const PROVIDERS: &[Provider] = &[
         wire: Wire::OpenaiChat,
         base_url: "https://api.together.xyz/v1",
         key_env: Some("TOGETHER_API_KEY"),
+        auth: None,
         note: "hosted open models",
     },
     Provider {
@@ -157,6 +219,7 @@ pub const PROVIDERS: &[Provider] = &[
         wire: Wire::OpenaiChat,
         base_url: "https://api.fireworks.ai/inference/v1",
         key_env: Some("FIREWORKS_API_KEY"),
+        auth: None,
         note: "fast open-model inference",
     },
     // ── local runtimes (always last) ────────────────────────────
@@ -165,6 +228,7 @@ pub const PROVIDERS: &[Provider] = &[
         wire: Wire::OpenaiChat,
         base_url: "http://127.0.0.1:11434/v1",
         key_env: None,
+        auth: None,
         note: "local runtime",
     },
     Provider {
@@ -172,6 +236,7 @@ pub const PROVIDERS: &[Provider] = &[
         wire: Wire::OpenaiChat,
         base_url: "http://127.0.0.1:1234/v1",
         key_env: None,
+        auth: None,
         note: "local server",
     },
     Provider {
@@ -179,6 +244,7 @@ pub const PROVIDERS: &[Provider] = &[
         wire: Wire::OpenaiChat,
         base_url: "http://127.0.0.1:8080/v1",
         key_env: None,
+        auth: None,
         note: "llama.cpp server",
     },
     Provider {
@@ -186,6 +252,7 @@ pub const PROVIDERS: &[Provider] = &[
         wire: Wire::OpenaiChat,
         base_url: "http://127.0.0.1:8000/v1",
         key_env: None,
+        auth: None,
         note: "vLLM server (key optional at the endpoint)",
     },
 ];
@@ -195,7 +262,7 @@ pub const PROVIDERS: &[Provider] = &[
 /// the model id). Final order:
 ///
 /// 1. official block — `anthropic` (0), `openai` (1), `google` (2),
-///    `zai` (3), `zai-plan`/`zai-coding-plan` (4)
+///    `zai` (3), `zai-plan`/`zai-coding-plan` (4), `claude-plan` (5)
 /// 2. community / alternative vendors (500)
 /// 3. local runtimes + discovered endpoints — `ollama`, `lmstudio`,
 ///    `llamacpp`, `vllm` (900)
@@ -206,6 +273,7 @@ pub fn vendor_rank(vendor: &str) -> u32 {
         "google" => 2,
         "zai" => 3,
         "zai-plan" | "zai-coding-plan" => 4,
+        "claude-plan" => 5,
         "ollama" | "lmstudio" | "llamacpp" | "vllm" => 900,
         _ => 500,
     }
@@ -243,6 +311,7 @@ pub fn synthetic_dialect(provider: &Provider, model: &str) -> Dialect {
         base_url: Some(provider.base_url.to_string()),
         doc_url: None,
         api_key_env: provider.key_env.map(str::to_string),
+        auth: provider.auth.map(str::to_string),
         wire_model: Some(model.to_string()),
         discovery: None,
         context: 0,
@@ -370,6 +439,63 @@ mod tests {
         for name in ["anthropic", "openai", "google", "zai", "zai-plan"] {
             assert!(vendor_rank(name) < 500, "{name} must be official-tier");
         }
+    }
+
+    #[test]
+    fn community_vendors_lote11_carry_endpoint_and_key() {
+        let cases = [
+            (
+                "perplexity",
+                "https://api.perplexity.ai",
+                "PERPLEXITY_API_KEY",
+            ),
+            (
+                "nebius",
+                "https://api.tokenfactory.nebius.com/v1",
+                "NEBIUS_API_KEY",
+            ),
+            (
+                "sambanova",
+                "https://api.sambanova.ai/v1",
+                "SAMBANOVA_API_KEY",
+            ),
+            (
+                "upstage",
+                "https://api.upstage.ai/v1/solar",
+                "UPSTAGE_API_KEY",
+            ),
+        ];
+        for (name, base, key) in cases {
+            let p = find(name).unwrap_or_else(|| panic!("missing provider {name}"));
+            assert_eq!(p.base_url, base, "{name} base_url");
+            assert_eq!(p.key_env, Some(key), "{name} key env");
+            assert_eq!(p.wire, Wire::OpenaiChat, "{name} speaks openai_chat");
+            assert_eq!(p.auth, None, "{name} uses the env-key ladder");
+            assert_eq!(vendor_rank(name), 500, "{name} is community-tier");
+            // synthetic dialects for the vendor keep the same shape
+            let d = synthetic_dialect(p, "any-model");
+            assert_eq!(d.base_url.as_deref(), Some(base));
+            assert_eq!(d.api_key_env.as_deref(), Some(key));
+            assert_eq!(d.auth, None);
+        }
+    }
+
+    #[test]
+    fn claude_plan_is_a_passport_vendor() {
+        let p = find("claude-plan").expect("claude-plan registered");
+        assert_eq!(p.wire, Wire::AnthropicMessages);
+        assert_eq!(p.base_url, "https://api.anthropic.com");
+        assert_eq!(p.key_env, None, "subscription rows carry no env key");
+        assert_eq!(p.auth, Some("passport"), "token comes from ka-passport");
+        // official tier (anthropic's plan vendor), after the z.ai family
+        assert_eq!(vendor_rank("claude-plan"), 5);
+        // the synthetic dialect mirrors the catalog row: passport auth,
+        // no env key, subscription (unpriced) conservativeness
+        let d = synthetic_dialect(p, "claude-sonnet-9");
+        assert_eq!(d.auth.as_deref(), Some("passport"));
+        assert_eq!(d.api_key_env, None);
+        assert_eq!(d.wire, Wire::AnthropicMessages);
+        assert!(!d.priced, "subscription: no per-token cost display");
     }
 
     #[test]
