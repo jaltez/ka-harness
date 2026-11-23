@@ -4,6 +4,7 @@
 
 ### TUI
 - Click a past user prompt (capture mouse mode) → rewind popup: `⏎/r` rewind there · `e` rewind & edit · `f` fork from there (same actions as the double-esc menu and `/tree`; `/focus` digest rows answer the same way).
+- Fixed: the 10 s background-task poll printed `▸ background tasks` + its rows into the transcript on every tick (twice at startup on a clean session, then every 10 s) — a roster snapshot now only feeds the job pill and an open `/tasks`.
 - Fixed: transcript click/hover mapping with several prompts — the `/focus` row mapping was applied with `/focus` off, shifting or deadening rows (tool cards in earlier turns answered the wrong click).
 - Fixed: `/update` in-session resume re-exec failed with ENOENT after the binary swap.
 

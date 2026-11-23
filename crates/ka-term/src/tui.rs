@@ -9928,13 +9928,6 @@ fn apply_event(
                 "» {command} — output joins your next prompt"
             )));
         }
-        Event::Tasks { rows } => {
-            // /tasks dashboard snapshot rendered as report rows
-            transcript.push_separated(Line::Info("▸ background tasks".into()));
-            for row in rows {
-                transcript.push_separated(Line::Report(row.clone()));
-            }
-        }
         Event::TurnFinished { stop, usage } => {
             let elapsed = busy_since.map_or(0.0, |t| t.elapsed().as_secs_f64());
             flush_live_text(transcript, current_thought, current_assistant);
@@ -10206,11 +10199,13 @@ fn apply_event(
             transcript.push_separated(Line::Info("⋯ digesting context…".to_string()))
         }
         Event::DigestFinished { .. } => {}
-        // the run loop opens the /context modal from this event
+        // the run loop opens the /context modal from this event, and
+        // owns the /tasks roster and the /debug overlay (a flagged
+        // /tasks opens its modal; the 10 s ambient poll only refreshes
+        // the job pill). A roster snapshot is never a transcript row —
+        // the poll used to print "▸ background tasks" on every tick.
         Event::ContextBreakdown { .. } => {}
-        // the run loop opens the /tasks pager and /debug overlay from
-        // these events (transcript fallback included)
-        Event::TaskDetail { .. } | Event::DebugRoster { .. } => {}
+        Event::Tasks { .. } | Event::TaskDetail { .. } | Event::DebugRoster { .. } => {}
         // serve-side observer presence: the in-process writer TUI never
         // receives it (the server emits it to SSE subscribers only)
         Event::Presence { .. } => {}
@@ -19808,6 +19803,55 @@ mod tests {
         assert!(
             matches!(last, Line::Info(m) if m.contains("rewound 2 turn(s)")),
             "{last:?}"
+        );
+    }
+
+    /// Regression: a roster snapshot is never a transcript row. The
+    /// 10 s ambient /tasks poll used to print "▸ background tasks" plus
+    /// its rows on every tick — two lines per tick on a clean session,
+    /// and a "session saved" resume hint for a session that never ran.
+    #[test]
+    fn roster_snapshots_never_become_transcript_rows() {
+        let mut lines = Transcript::default();
+        let (mut busy, mut busy_since) = (false, None);
+        let mut meters = Meters::default();
+        let mut pending = None;
+        let mut orphaned: Vec<(String, usize)> = Vec::new();
+        let mut usage = None;
+        let (mut a, mut t, mut tool) = (String::new(), String::new(), String::new());
+        let mut live_tool: Option<LiveTool> = None;
+        let mut last_user: Option<String> = None;
+        let mut last_error: Option<String> = None;
+        let mut spills: Vec<String> = Vec::new();
+        let mut sidebar = SidebarState::default();
+        // the idle answer, then a live roster — neither belongs in the chat
+        for rows in [
+            vec!["no background tasks or jobs".to_string()],
+            vec!["t-1  running  delegate  $0.01".to_string()],
+        ] {
+            let _ = apply_event(
+                &Event::Tasks { rows },
+                &mut lines,
+                &mut busy,
+                &mut busy_since,
+                &mut meters,
+                &mut pending,
+                &mut orphaned,
+                &mut usage,
+                &mut a,
+                &mut t,
+                &mut tool,
+                &mut live_tool,
+                &mut last_user,
+                &mut last_error,
+                &mut spills,
+                &mut sidebar,
+            );
+        }
+        assert!(
+            lines.entries().is_empty(),
+            "a clean session stays clean: {:?}",
+            lines.entries()
         );
     }
 
