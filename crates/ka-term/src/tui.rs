@@ -3124,6 +3124,40 @@ enum EscAction {
     None,
 }
 
+/// What a pressed Ctrl+C does, in the key loop's precedence order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CtrlCAction {
+    /// Abort the running turn. Like the idle arming press, it arms the
+    /// quit, so the next press within the window quits.
+    Abort,
+    /// Leave the reverse search.
+    CancelSearch,
+    /// Clear the draft.
+    ClearDraft,
+    /// Arm the quit with its toast.
+    Arm,
+    /// Second press within the window.
+    Quit,
+}
+
+fn ctrl_c_action(busy: bool, searching: bool, draft: bool, armed: bool) -> CtrlCAction {
+    if busy {
+        if armed {
+            CtrlCAction::Quit
+        } else {
+            CtrlCAction::Abort
+        }
+    } else if searching {
+        CtrlCAction::CancelSearch
+    } else if draft {
+        CtrlCAction::ClearDraft
+    } else if armed {
+        CtrlCAction::Quit
+    } else {
+        CtrlCAction::Arm
+    }
+}
+
 fn esc_action(
     focus_on: bool,
     scrolled: bool,
@@ -5777,22 +5811,30 @@ async fn app(
                         == (KeyCode::Char('c'), KeyModifiers::CONTROL)
                         || bindings.matches_custom(&key, "session.quit");
                     if quit_chord {
-                        if busy {
-                            let _ = commands.send(Command::Abort).await;
-                            quit_armed = None;
-                        } else if input.searching() {
-                            input.search_cancel();
-                            quit_armed = None;
-                        } else if !input.text.is_empty() {
-                            input.clear_draft();
-                            slash_popup = update_suggestions(&input.text);
-                            quit_armed = None;
-                        } else if quit_armed
-                            .is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(3))
-                        {
-                            exit = Some(Exit::Quit);
-                        } else {
-                            quit_armed = Some(Instant::now());
+                        let action = ctrl_c_action(
+                            busy,
+                            input.searching(),
+                            !input.text.is_empty(),
+                            quit_armed
+                                .is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(3)),
+                        );
+                        match action {
+                            CtrlCAction::Quit => exit = Some(Exit::Quit),
+                            CtrlCAction::Abort => {
+                                let _ = commands.send(Command::Abort).await;
+                            }
+                            CtrlCAction::CancelSearch => input.search_cancel(),
+                            CtrlCAction::ClearDraft => {
+                                input.clear_draft();
+                                slash_popup = update_suggestions(&input.text);
+                            }
+                            CtrlCAction::Arm => {}
+                        }
+                        // the aborting press arms the quit like an idle
+                        // one does; every other press breaks the arm
+                        quit_armed = matches!(action, CtrlCAction::Abort | CtrlCAction::Arm)
+                            .then(Instant::now);
+                        if quit_armed.is_some() {
                             pop_toast(&mut toast, "press ctrl+c again to exit");
                         }
                         continue;
@@ -19355,6 +19397,25 @@ mod tests {
         ] {
             assert!(own.iter().all(|(_, v)| *v != "clear"));
         }
+    }
+
+    #[test]
+    fn a_second_ctrl_c_during_a_turn_quits() {
+        // from a busy turn: the first press aborts, the next one within
+        // the window quits — the same two presses it takes from idle
+        assert_eq!(ctrl_c_action(true, false, false, false), CtrlCAction::Abort);
+        assert_eq!(ctrl_c_action(true, false, false, true), CtrlCAction::Quit);
+        assert_eq!(ctrl_c_action(false, false, false, false), CtrlCAction::Arm);
+        assert_eq!(ctrl_c_action(false, false, false, true), CtrlCAction::Quit);
+        // a draft and an open search still come first, and break the arm
+        assert_eq!(
+            ctrl_c_action(false, false, true, true),
+            CtrlCAction::ClearDraft
+        );
+        assert_eq!(
+            ctrl_c_action(false, true, false, true),
+            CtrlCAction::CancelSearch
+        );
     }
 
     #[test]
