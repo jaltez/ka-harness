@@ -15684,8 +15684,9 @@ fn render(
                 let height = ((rows.len() + 5 + note) as u16).min(20).min(fh);
                 let width = 68.min(fw);
                 let cap = (height as usize).saturating_sub(5);
+                let offset = window_of(picker.selected, rows.len(), cap);
                 let mut text = vec![filter_row(&picker.filter)];
-                for (i, (p, detail)) in rows.iter().take(cap).enumerate() {
+                for (i, (p, detail)) in rows.iter().enumerate().skip(offset).take(cap) {
                     let name: String = p.name.chars().take(16).collect();
                     let detail: String = detail.chars().take(44).collect();
                     if i == picker.selected {
@@ -15886,15 +15887,37 @@ fn render(
                     .saturating_sub(5)
                     .saturating_sub(extra)
                     .max(1);
-                let offset = window_of(*selected, entries.len(), cap);
                 let inner_w = inner(width);
-                for (i, (id, row)) in entries.iter().enumerate().skip(offset).take(cap) {
+                // TUI-15: the paged result's last line rides under its
+                // row, dimmed. A row and its preview are one pair: the
+                // list is windowed over the lines the pairs take, the
+                // window opens on a row (never inside a pair), and the
+                // selected row rides in whole
+                let preview_of = |id: &Option<u64>| {
+                    id.and_then(|id| previews.iter().find(|(pid, _)| *pid == id))
+                        .map(|(_, preview)| preview)
+                };
+                let lines_of = |i: usize| 1 + usize::from(preview_of(&entries[i].0).is_some());
+                let mut first_line = Vec::with_capacity(entries.len());
+                let mut lines = 0usize;
+                for i in 0..entries.len() {
+                    first_line.push(lines);
+                    lines += lines_of(i);
+                }
+                let picked_last = first_line
+                    .get(*selected)
+                    .map_or(0, |first| first + lines_of(*selected) - 1);
+                let start = window_of(picked_last, lines, cap);
+                for (i, (id, row)) in entries
+                    .iter()
+                    .enumerate()
+                    .skip_while(|(i, _)| first_line[*i] < start)
+                {
+                    if first_line[i] + lines_of(i) > start + cap {
+                        break;
+                    }
                     text.push(list_row(row.clone(), i == *selected, inner_w, Style::new()));
-                    // TUI-15: the paged result's last line rides under the
-                    // row, dimmed, when the row has a preview at all
-                    if let Some((_, preview)) =
-                        id.and_then(|id| previews.iter().find(|(pid, _)| *pid == id))
-                    {
+                    if let Some(preview) = preview_of(id) {
                         text.push(TuiLine::styled(
                             format!("    └ {}", trunc_cols(preview, inner_w.saturating_sub(6))),
                             meta,
@@ -15968,7 +15991,7 @@ fn render(
                                 meta,
                             ));
                         } else {
-                            let cap = (height as usize).saturating_sub(6).max(1);
+                            let cap = (height as usize).saturating_sub(5);
                             let offset = window_of(*selected, files.len(), cap);
                             for (i, file) in files.iter().enumerate().skip(offset).take(cap) {
                                 text.push(list_row(
@@ -16108,14 +16131,15 @@ fn render(
                 (width, height, title, body)
             }
             Modal::Rewind { items, selected } => {
-                let height = (items.len() as u16 + 5).clamp(6, 22).min(fh);
+                // the hint row costs as many rows as it wraps to
+                let hint = "pick a message — ⏎/r rewind here · e edit & resend · s summarize & rewind · esc close";
+                let hint_rows = wrap_rows(hint, inner(76.min(fw))).len();
+                let height = ((items.len() + hint_rows + 4) as u16).clamp(6, 22).min(fh);
                 let width = 76.min(fw);
-                let mut text = vec![TuiLine::styled(
-                    "pick a message — ⏎/r rewind here · e edit & resend · s summarize & rewind · esc close",
-                    meta,
-                )];
-                let cap = (height as usize).saturating_sub(5);
-                for (i, (turns, prompt)) in items.iter().enumerate().take(cap.max(1)) {
+                let mut text = vec![TuiLine::styled(hint, meta)];
+                let cap = (height as usize).saturating_sub(4 + hint_rows).max(1);
+                let offset = window_of(*selected, items.len(), cap);
+                for (i, (turns, prompt)) in items.iter().enumerate().skip(offset).take(cap) {
                     text.push(list_row(
                         format!("[−{turns}] {prompt}"),
                         i == *selected,
@@ -16165,36 +16189,48 @@ fn render(
                 inbox,
                 selected,
             } => {
-                let extra = if inbox.is_empty() { 0 } else { inbox.len() + 2 };
-                let height = (rows.len() as u16 + extra as u16 + 4).clamp(6, 24).min(fh);
+                // the memory files, a blank row, the staged-inbox header,
+                // then the notes — one body, windowed on the selected note
+                let inbox_head = if inbox.is_empty() { 0 } else { 2 };
+                let total = rows.len() + inbox_head + inbox.len();
+                let height = ((total + 4) as u16).clamp(6, 24).min(fh);
                 let width = 80.min(fw);
+                let cap = (height as usize).saturating_sub(4);
+                let notes_at = rows.len() + inbox_head;
+                let picked = (notes_at + *selected).min(total.saturating_sub(1));
+                let offset = if inbox.is_empty() {
+                    0
+                } else {
+                    window_of(picked, total, cap)
+                };
+                let (from, to) = (offset, (offset + cap).min(total));
                 let mut text = Vec::new();
-                let mut budget = (height as usize).saturating_sub(4);
-                for row in rows.iter() {
-                    if budget == 0 {
-                        break;
-                    }
-                    budget -= 1;
+                for row in rows
+                    .iter()
+                    .skip(from)
+                    .take(to.min(rows.len()).saturating_sub(from))
+                {
                     if row.starts_with('▸') {
                         text.push(TuiLine::styled(row.clone(), crate::palette::ACCENT_BOLD));
                     } else {
                         text.push(TuiLine::raw(row.clone()));
                     }
                 }
-                if !inbox.is_empty() && budget >= 2 {
-                    budget -= 2;
+                if !inbox.is_empty() && from <= rows.len() {
                     text.push(TuiLine::default());
                     text.push(TuiLine::styled(
                         "staged memories — ⏎ accept→MEMORY.md · u→user · d discard",
                         meta,
                     ));
-                    for (i, line) in inbox.iter().enumerate() {
-                        if budget == 0 {
-                            break;
-                        }
-                        budget -= 1;
-                        text.push(list_row(line.clone(), i == *selected, inner(width), meta));
-                    }
+                }
+                let first_note = from.saturating_sub(notes_at);
+                for (i, line) in inbox
+                    .iter()
+                    .enumerate()
+                    .skip(first_note)
+                    .take(to.saturating_sub(notes_at).saturating_sub(first_note))
+                {
+                    text.push(list_row(line.clone(), i == *selected, inner(width), meta));
                 }
                 (width, height, modal_title("memory"), text)
             }
@@ -16205,7 +16241,7 @@ fn render(
                 let width = 76.min(fw);
                 let cap = (height as usize).saturating_sub(4);
                 // keep the selection inside the window
-                let first = (*selected + 1).saturating_sub(cap);
+                let first = window_of(*selected, entries.len(), cap);
                 let mut text = Vec::new();
                 for (i, row) in entries.iter().enumerate().skip(first).take(cap) {
                     if row.header {
