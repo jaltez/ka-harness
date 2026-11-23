@@ -5261,6 +5261,30 @@ fn mouse_mode_text(captured: bool) -> String {
 /// chord: it is already part of the character it produced (`A`, `?`),
 /// and terminals report it on Enter and the arrows too, so ⇧⏎ still
 /// submits and ⇧↓ still moves.
+/// What a key does in the click-a-prompt popup: Enter runs the row the
+/// pointer is on, the letters jump straight to their action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptAction {
+    Rewind,
+    Edit,
+    Fork,
+}
+
+fn prompt_action_for(code: crossterm::event::KeyCode, selected: usize) -> Option<PromptAction> {
+    use crossterm::event::KeyCode;
+    match code {
+        KeyCode::Enter => match selected {
+            1 => Some(PromptAction::Edit),
+            2 => Some(PromptAction::Fork),
+            _ => Some(PromptAction::Rewind),
+        },
+        KeyCode::Char('r') => Some(PromptAction::Rewind),
+        KeyCode::Char('e') => Some(PromptAction::Edit),
+        KeyCode::Char('f') => Some(PromptAction::Fork),
+        _ => None,
+    }
+}
+
 /// Whether a modal holds typed work a stray click outside would cost:
 /// an api-key value, a settings edit, or a save path. Filters are cheap
 /// to retype and do not count.
@@ -6589,7 +6613,15 @@ async fn app(
                                             *selected += 1;
                                         }
                                     }
-                                    KeyCode::Enter | KeyCode::Char('r') | KeyCode::Char('e') => {
+                                    KeyCode::Enter
+                                    | KeyCode::Char('r')
+                                    | KeyCode::Char('e')
+                                    | KeyCode::Char('f') => {
+                                        // Enter runs the row the pointer is
+                                        // on; the letters jump straight to
+                                        // their action
+                                        let action = prompt_action_for(key.code, *selected)
+                                            .unwrap_or(PromptAction::Rewind);
                                         // mid-turn the command drain swallows
                                         // Rewind/ForkStrand — act only from
                                         // idle, like the /tree fork
@@ -6599,47 +6631,44 @@ async fn app(
                                             ));
                                             continue;
                                         }
-                                        let edit = key.code == KeyCode::Char('e');
                                         let (turns, prompt) = (*turns, prompt.clone());
                                         modal = None;
-                                        apply_rewind(
-                                            commands,
-                                            &mut transcript,
-                                            &mut input,
-                                            turns,
-                                            &prompt,
-                                            edit,
-                                        )
-                                        .await;
-                                    }
-                                    KeyCode::Char('f') => {
-                                        if busy {
-                                            transcript.push_separated(Line::Warn(
-                                                "⏳ turn running — esc to abort first".into(),
-                                            ));
-                                            continue;
+                                        match action {
+                                            PromptAction::Rewind | PromptAction::Edit => {
+                                                apply_rewind(
+                                                    commands,
+                                                    &mut transcript,
+                                                    &mut input,
+                                                    turns,
+                                                    &prompt,
+                                                    matches!(action, PromptAction::Edit),
+                                                )
+                                                .await;
+                                            }
+                                            PromptAction::Fork => {
+                                                // branch point: the current strand
+                                                // stays intact, the fork child
+                                                // continues from before the picked
+                                                // input (same as /tree)
+                                                let _ = commands
+                                                    .send(Command::ForkStrand {
+                                                        turns: turns as u32,
+                                                    })
+                                                    .await;
+                                                busy = true;
+                                                // going back lands the picked prompt
+                                                // in the composer; an existing draft
+                                                // is parked in the kill ring (Ctrl+Y)
+                                                if !input.text.is_empty() {
+                                                    input.clear_draft();
+                                                }
+                                                input.text = prompt.clone();
+                                                input.cursor = input.text.chars().count();
+                                                transcript.push_separated(Line::Info(format!(
+                                                    "⑂ forked {turns} turn(s) back — prompt in the box; original intact in /tree"
+                                                )));
+                                            }
                                         }
-                                        // branch point: the current strand
-                                        // stays intact, the fork child
-                                        // continues from before the picked
-                                        // input (same as /tree)
-                                        let (turns, prompt) = (*turns, prompt.clone());
-                                        let _ = commands
-                                            .send(Command::ForkStrand { turns: turns as u32 })
-                                            .await;
-                                        busy = true;
-                                        modal = None;
-                                        // going back lands the picked prompt
-                                        // in the composer; an existing draft
-                                        // is parked in the kill ring (Ctrl+Y)
-                                        if !input.text.is_empty() {
-                                            input.clear_draft();
-                                        }
-                                        input.text = prompt.clone();
-                                        input.cursor = input.text.chars().count();
-                                        transcript.push_separated(Line::Info(format!(
-                                            "⑂ forked {turns} turn(s) back — prompt in the box; original intact in /tree"
-                                        )));
                                     }
                                     _ => {}
                                 }
@@ -13767,7 +13796,8 @@ fn modal_hints(open: &Modal) -> &'static [(&'static str, &'static str)] {
         ],
         Modal::PromptActions { .. } => &[
             ("↑↓", "choose"),
-            ("⏎/r", "rewind"),
+            ("⏎", "run selected"),
+            ("r", "rewind"),
             ("e", "edit & resend"),
             ("f", "fork"),
             ("esc", "close"),
@@ -16289,14 +16319,14 @@ fn render(
                 let height = 9.min(fh);
                 let width = 76.min(fw);
                 let mut text = vec![TuiLine::styled(
-                    "⏎/r rewind · e edit & resend · f fork · esc close",
+                    "⏎ run the selected row · r rewind · e edit & resend · f fork",
                     meta,
                 )];
                 // echo the picked prompt (dimmed): the backdrop dims the
                 // transcript row the click landed on
                 text.push(list_row(format!("“{prompt}”"), false, inner(width), meta));
                 text.push(list_row(
-                    format!("⏪ rewind here — cut −{turns} turn(s) (⏎/r)"),
+                    format!("⏪ rewind here — cut −{turns} turn(s) (r)"),
                     *selected == 0,
                     inner(width),
                     meta,
@@ -18765,6 +18795,39 @@ mod tests {
         let wide = vec![Span::raw("a".repeat(40))];
         let empty = fit_status_left(wide, 10, 20);
         assert!(empty.is_empty(), "{empty:?}");
+    }
+
+    /// In the click-a-prompt popup Enter runs the row the pointer is on,
+    /// so moving to "fork" and pressing Enter forks; the letters jump.
+    #[test]
+    fn prompt_popup_enter_runs_the_selected_row() {
+        use crossterm::event::KeyCode;
+        assert_eq!(
+            prompt_action_for(KeyCode::Enter, 0),
+            Some(PromptAction::Rewind)
+        );
+        assert_eq!(
+            prompt_action_for(KeyCode::Enter, 1),
+            Some(PromptAction::Edit)
+        );
+        assert_eq!(
+            prompt_action_for(KeyCode::Enter, 2),
+            Some(PromptAction::Fork)
+        );
+        assert_eq!(
+            prompt_action_for(KeyCode::Char('r'), 2),
+            Some(PromptAction::Rewind)
+        );
+        assert_eq!(
+            prompt_action_for(KeyCode::Char('e'), 0),
+            Some(PromptAction::Edit)
+        );
+        assert_eq!(
+            prompt_action_for(KeyCode::Char('f'), 0),
+            Some(PromptAction::Fork)
+        );
+        assert_eq!(prompt_action_for(KeyCode::Char('x'), 0), None);
+        assert_eq!(prompt_action_for(KeyCode::Esc, 0), None);
     }
 
     /// The rules that guard typed work and empty filters, pinned where a
