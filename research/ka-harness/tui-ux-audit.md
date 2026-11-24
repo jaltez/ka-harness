@@ -20,7 +20,7 @@ Two traps in the method were found and fixed during the run, both worth remember
 Each landed as its own commit with its test or its harness scene.
 
 **Traps (a key did something other than the screen promised)**
-- Unknown slash commands, and Enter on a partial one, no longer reach the model: the draft is refused with the nearest command, and Enter with the popup open runs the highlighted one (`/hel` used to send `/hel` while the box read `/help`).
+- Unknown slash commands, and Enter on a partial one, no longer reach the model: the draft is refused with the nearest command, and Enter with the popup open runs the highlighted one (`/hel` used to send `/hel` while the box read `/help`). The distance behind that suggestion was wrong in v0.10.0 and named far-off commands. It is fixed in the review after release, which also found that this refusal broke thirteen commands the TUI runs itself.
 - Escape clears a draft; previously it closed the popup, kept the text, and did nothing after that.
 - Reverse search takes typed characters instead of typing them into the draft.
 - Modified keys never act as their bare letter inside a modal (Ctrl+R no longer rewinds from the rewind menu; Ctrl+A no longer runs `git add -A`).
@@ -33,7 +33,7 @@ Each landed as its own commit with its test or its harness scene.
 **Sizing and layout**
 - Modals size against the area they are drawn in. Before, rows were built for the whole frame and then clamped into a smaller box, which wrapped every 80-column dialog two columns too wide.
 - Every list keeps its selection on screen (model, provider, session, tasks, rewind, memory), windows over rendered rows, and keeps a selected task's preview with it.
-- Doc pagers (changelog, hooks, permissions, doctor, debug, task detail) open at the top, page from there to the last page, scroll by line and page, close only on Esc, and keep their `… ↑ / … ↓` markers inside the box.
+- Doc pagers (changelog, hooks, permissions, doctor, debug, task detail) open at the top, page from there to the last page, scroll by line and page, close only on Esc, and keep their `… ↑ / … ↓` markers inside the box. v0.10.0 fell short of the last page whenever a row wrapped. It is fixed in the review after release.
 - The permission ask shows the changed lines of the diff (never the file headers), and always its options: at 80x24, `1 allow`, `2 always` and `3 deny` are on screen even with a tall question and a long diff.
 - The status line never cuts a segment; whole spans drop from the end of the left cluster, so the cost and the mode chip always survive.
 - Plain mode clears its pane before painting a modal (a screen reader used to hear fragments of both), wraps rows, and says a verdict once.
@@ -60,9 +60,20 @@ An independent reviewer, given the range and the user's requests and none of thi
 - **Left as is.** With a draft present, the `commands` hint types `/` into the draft, because that is what the key does.
 - **Left as is.** The dim ghost after `@` is prefix-only; the list is where fuzzy matches show.
 
+## Review after release (2026-11-24)
+
+A second independent reviewer got the same range (v0.9.0..v0.10.0) and one instruction: review it and fix what needs fixing. Verdict: release with fixes. Its toolset was read-only, so every fix was applied here after checking the finding against the code and the real binary.
+
+- **Fixed.** The distance behind "did you mean" seeded its table with the wrong row and undercounted every path through the first typed character, so `/x` was blamed on `/sandbox`. Two tests pin it: the rolling rows against the full Damerau-Levenshtein table for every pair of strings up to four characters, and `/x` naming `/pr`, its true neighbor two edits away.
+- **Fixed.** Doc pagers bounded their scroll by source lines while the body pages over wrapped rows, so the tail of every wrapped row sat under a `… ↓` marker no key could clear. At 80 columns the changelog stopped 164 rows short of its end. The keys now page by the width the frame published and by the wrapped row count. A test opens `/changelog`, presses End through the real key function, and checks that the file's last words are on screen at four terminal sizes.
+- **Fixed. Found while proving the one above on the real binary.** Thirteen commands the TUI runs itself were refused as unknown when typed: `/image <path>` could not attach, and `/theme`, `/features`, `/changelog`, `/copy`, `/find`, `/search`, `/style`, `/sandbox`, `/queue`, `/retry`, `/focus` and `/clip` did nothing. The refusal of unknown slash commands ran ahead of their handlers, and knew only what the engine-side parser knows. Neither review caught it. The first drove the changelog through Alt+C, and the second did the same. Both refusals now read one list of the composer's own commands, and a test reads the handlers out of the source, so the next one cannot ship broken the same way.
+- **Corrections to the reviewer's proposed tests, which were never run.** `/x` to `/sandbox` is distance 6, not 7, because the closing `x` matches. And `/x` does name a command, `/pr`, so its "names nothing" assertion would have failed on correct code.
+
+**Evidence that did not survive.** The machine was restarted after the release and `/tmp` was cleared. The frames and the detailed findings tables that this document points to under `/tmp` are gone (`ka-ux-vis-*`, `ka-ux-beh-*`, `ka-review`, `ka-ux-pty`, `ka-ux-visual`), and so is the first reviewer's full report. What remains is this account and `.audit/tui-ux-findings.tsv`, which holds only the 22 operator rows. The finding ids quoted under Open findings can no longer be looked up. The frames for this second review are under `/tmp/ka-fix-shots` and will not survive a restart either.
+
 ## Open findings
 
-Every row has frames and a `file:line` at `/tmp/ka-ux-vis-*/findings.tsv`, `/tmp/ka-ux-beh-*/findings.tsv` and `.audit/tui-ux-findings.tsv` (all on the run's worktree). Grouped by what they need.
+Every row had frames and a `file:line` at `/tmp/ka-ux-vis-*/findings.tsv`, `/tmp/ka-ux-beh-*/findings.tsv` and `.audit/tui-ux-findings.tsv` (all on the run's worktree). The two `/tmp` tables did not survive the restart after the release, so only the ids and this summary remain. Grouped by what they need.
 
 **Needs a decision (engine or persistence, deliberately untouched)**
 - Settings and api-key saves rewrite the real `~/.config/ka/ka.toml`, `ka.schema.json` and `.env` under `--ignore-user-config --ephemeral` (M01). Ready patch: a `set_user_config_override`, mirroring `ka_strand::set_data_dir_override`, set by `--ephemeral` and `--ignore-user-config` in `crates/ka-harness/src/main.rs`.
