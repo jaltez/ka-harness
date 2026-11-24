@@ -504,6 +504,49 @@ pub(crate) fn gc_spills(root: &Path) {
     gc_spills_with_now(root, SystemTime::now(), SPILL_RETENTION);
 }
 
+/// How often a machine scans its spill directory for expired files.
+pub(crate) const SPILL_GC_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(24 * 60 * 60);
+
+/// The opportunistic spill GC, once per process, however many engines
+/// start in it: a machine scans its spill directory at most once per
+/// [`SPILL_GC_INTERVAL`], and never on the thread an engine starts on.
+/// A directory with a week of job output holds thousands of files, and
+/// statting each of them is not work a first turn or a first frame
+/// should wait for.
+pub(crate) fn gc_spills_at_startup() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        gc_spills_later(&spills_root(), SystemTime::now());
+    });
+}
+
+/// Scan `root` on a background thread when the last scan is older than
+/// [`SPILL_GC_INTERVAL`]; the stamp file beside the directory carries
+/// the last scan's time, and no stamp means never scanned. Returns the
+/// thread when one was started.
+pub(crate) fn gc_spills_later(root: &Path, now: SystemTime) -> Option<std::thread::JoinHandle<()>> {
+    let stamp = root.with_file_name("spills.gc");
+    let last = std::fs::metadata(&stamp).and_then(|m| m.modified()).ok();
+    let due = last.is_none_or(|last| {
+        now.duration_since(last)
+            .is_ok_and(|age| age > SPILL_GC_INTERVAL)
+    });
+    if !due {
+        return None;
+    }
+    let root = root.to_path_buf();
+    std::thread::Builder::new()
+        .name("spill-gc".into())
+        .spawn(move || {
+            gc_spills(&root);
+            // best effort: a stamp that fails to write only means the
+            // next machine start scans again
+            let _ = std::fs::write(&stamp, b"");
+        })
+        .ok()
+}
+
 /// The full registry wired for Phase 2: an internally-owned todo slot.
 pub fn registry() -> Vec<std::sync::Arc<dyn Hand>> {
     registry_with_pathfinder(
@@ -820,6 +863,36 @@ mod tests {
         gc_spills_with_now(&dir, mtime, SPILL_RETENTION);
         assert!(old.exists(), "just-written spill must survive");
         assert!(dir.join("old-spill.done").exists(), "fresh .done survives");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The startup GC runs off the starting thread and at most once per
+    /// interval: a machine with no scan on record gets one (and the
+    /// stamp that dates it), a start soon after gets none, and a start
+    /// after the interval gets one again.
+    #[test]
+    fn startup_spill_gc_runs_elsewhere_at_most_once_per_interval() {
+        let dir = std::env::temp_dir().join(format!("ka-gcspills-startup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let root = dir.join("spills");
+        std::fs::create_dir_all(&root).unwrap();
+        let stamp = dir.join("spills.gc");
+        let now = SystemTime::now();
+
+        // never scanned: a thread other than this one scans, and dates itself
+        let scan = gc_spills_later(&root, now).expect("no scan on record: one starts");
+        assert_eq!(scan.thread().name(), Some("spill-gc"));
+        scan.join().expect("the scan thread ends cleanly");
+        assert!(stamp.exists(), "the scan leaves a stamp beside the spills");
+
+        // scanned moments ago: nothing starts
+        let soon = now + std::time::Duration::from_secs(60);
+        assert!(gc_spills_later(&root, soon).is_none(), "scanned just now");
+
+        // the interval has passed: one starts again
+        let later = now + SPILL_GC_INTERVAL + std::time::Duration::from_secs(60);
+        let again = gc_spills_later(&root, later).expect("the interval has passed");
+        again.join().expect("the second scan thread ends cleanly");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1258,8 +1258,9 @@ async fn run(
         }
     }
     // opportunistic spill-dir GC: detached-job spill files older than
-    // the retention window are deleted once per engine start
-    crate::hands::gc_spills(&crate::hands::spills_root());
+    // the retention window are deleted in the background, at most once
+    // a day per machine — no startup path waits on the scan
+    crate::hands::gc_spills_at_startup();
     // CTX-07: the idle task polls at a fixed 30s cadence between
     // commands. `interval_at` (not `interval`) skips the immediate
     // first tick, and `Delay` collapses any tick bursts the turn
