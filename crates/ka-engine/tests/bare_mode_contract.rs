@@ -190,12 +190,14 @@ async fn safe_mode_pins_feature_toggles_off() {
 /// (an unattended repeat executor is a customization-tier risk the
 /// bare surface pins off, like the loop) and the engine's tick path is
 /// guarded separately, so even a hypothetical entry could not fire.
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn safe_mode_never_arms_cron() {
-    {
-        let _guard = FLAG_LOCK.lock();
-        conventions::set_bare_mode(true);
-    }
+    // the guard spans the whole test, as in its siblings: the flag is
+    // flipped again at the end, and a scoped guard let that happen with
+    // no lock held, under whichever test held it
+    let _guard = FLAG_LOCK.lock();
+    conventions::set_bare_mode(true);
     let dir = std::env::temp_dir().join(format!("ka-bare-cron-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
