@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Performance
+- Starting `ka` no longer waits on the spill directory. The cleanup of old job output ran on the engine's starting thread and statted every file, so a start cost one call per spill file ever kept, about 1,800 a day on a busy machine. It now runs in the background, at most once a day per machine. With 9,000 spill files a headless turn takes 22.9 ms of CPU instead of 48.0 ms.
+- A turn's records reach the session file in one write and one sync instead of one sync per record. A headless turn with four tool calls takes 33.5 ms instead of 64.5 ms, and a 200 KB write tool call 40.9 ms instead of 68.4 ms.
+- The model catalog is built from the parsed table instead of being printed back to TOML and parsed again. The TUI's first frame comes 10 ms sooner, a headless turn takes 8 ms less CPU, and the binary is 4 KB smaller.
+- The side question asks git for the branch alone instead of also running a status walk it throws away.
+
+### Fixed
+- `--offline` switches off local endpoint discovery in the TUI, as its help text says. The TUI used to probe the local model ports before its first frame anyway.
+
 ## 0.10.1 — 2026-11-24
 
 ### Fixed
