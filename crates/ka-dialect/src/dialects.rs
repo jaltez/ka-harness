@@ -280,7 +280,14 @@ pub struct Catalog {
 impl Catalog {
     /// Parse a catalog from TOML text (strict: unknown keys error).
     pub fn parse(text: &str) -> Result<Self, toml::de::Error> {
-        toml::from_str(text)
+        Self::from_table(toml::from_str(text)?)
+    }
+
+    /// Build the typed catalog from an already-parsed table: the one
+    /// typed step every catalog goes through, so the text reader and
+    /// the overlay merge share it instead of each carrying a copy.
+    fn from_table(table: toml::Table) -> Result<Self, toml::de::Error> {
+        toml::Value::Table(table).try_into()
     }
 
     /// The embedded catalog: the generated models.dev table first, then
@@ -381,9 +388,9 @@ impl Catalog {
                 merge_tables(bd, &toml::Value::Table(od.clone()));
             }
         }
-        let text = toml::to_string(&base)
-            .map_err(|e| format!("re-serializing merged catalog failed: {e}"))?;
-        Self::parse(&text).map_err(|e| e.to_string())
+        // straight from the merged table: printing it back to TOML and
+        // parsing that again would re-read the 200 KB table for nothing
+        Self::from_table(base).map_err(|e| e.to_string())
     }
 
     /// Overlay another catalog on top (user wins per key).
