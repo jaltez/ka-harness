@@ -662,40 +662,73 @@ impl StrandFile {
     /// Append a record (writes through to disk; memory-only when
     /// persistence is off, skipped past the `max_bytes` ceiling).
     pub fn append(&mut self, record: Record) -> std::io::Result<()> {
-        self.settings.apply(&record);
-        if matches!(
-            record,
-            Record::Message {
-                role: Role::User,
-                ..
+        self.append_all([record])
+    }
+
+    /// Append several records under one open and one sync. Each record
+    /// is treated exactly as [`append`] treats it (replayed settings,
+    /// the byte ceiling, memory-only mode); only the visits to the file
+    /// are shared. A turn's records are persisted together, so a turn
+    /// syncs once instead of once per record.
+    pub fn append_all(&mut self, records: impl IntoIterator<Item = Record>) -> std::io::Result<()> {
+        // in arrival order, each with whether it goes to disk
+        let mut batch: Vec<(Record, bool)> = Vec::new();
+        let mut lines: Vec<Vec<u8>> = Vec::new();
+        // the ceiling is checked record by record, against the size
+        // the file has reached once the records before it are written
+        let mut size: Option<u64> = None;
+        for record in records {
+            self.settings.apply(&record);
+            if matches!(
+                record,
+                Record::Message {
+                    role: Role::User,
+                    ..
+                }
+            ) {
+                self.settings.dangling = true;
+            } else if matches!(record, Record::Message { .. }) {
+                self.settings.dangling = false;
             }
-        ) {
-            self.settings.dangling = true;
-        } else if matches!(record, Record::Message { .. }) {
-            self.settings.dangling = false;
-        }
-        if !self.persist {
-            self.records.push(record);
-            return Ok(());
-        }
-        if let Some(max) = self.max_bytes {
-            let size = self
-                .path
-                .as_deref()
-                .and_then(|p| std::fs::metadata(p).ok())
-                .map(|m| m.len())
-                .unwrap_or(0);
-            if size >= max {
-                // the ceiling is a policy, not an error: the session
-                // continues, further records stay in memory
-                self.records.push(record);
-                return Ok(());
+            if !self.persist {
+                batch.push((record, false));
+                continue;
+            }
+            let mut line = serde_json::to_vec(&record)
+                .map_err(|e| std::io::Error::other(format!("record serialize: {e}")))?;
+            line.push(b'\n');
+            let past_ceiling = match self.max_bytes {
+                None => false,
+                Some(max) => {
+                    let reached = size.get_or_insert_with(|| {
+                        self.path
+                            .as_deref()
+                            .and_then(|p| std::fs::metadata(p).ok())
+                            .map(|m| m.len())
+                            .unwrap_or(0)
+                    });
+                    if *reached >= max {
+                        true
+                    } else {
+                        *reached += line.len() as u64;
+                        false
+                    }
+                }
+            };
+            // the ceiling is a policy, not an error: the session
+            // continues, records past it stay in memory
+            batch.push((record, !past_ceiling));
+            if !past_ceiling {
+                lines.push(line);
             }
         }
-        let path = self.materialize()?;
-        let mut writer = StrandWriter::open(&path)?;
-        writer.append(&record)?;
-        self.records.push(record);
+        if !lines.is_empty() {
+            let path = self.materialize()?;
+            let mut writer = StrandWriter::open(&path)?;
+            writer.append_lines(&lines)?;
+        }
+        self.records
+            .extend(batch.into_iter().map(|(record, _)| record));
         Ok(())
     }
 
@@ -780,14 +813,25 @@ impl StrandWriter {
         Ok(Self { file })
     }
 
-    /// Append one record, fsync its bytes (records are turn-scale, so
-    /// this is ~1 fsync per record), and flush. Appends are the only
-    /// writes strands get.
+    /// Append one record, fsync its bytes, and flush.
     pub fn append(&mut self, record: &Record) -> std::io::Result<()> {
         let mut line = serde_json::to_string(record)
             .map_err(|e| std::io::Error::other(format!("record serialize: {e}")))?;
         line.push('\n');
-        self.file.write_all(line.as_bytes())?;
+        self.append_lines(&[line.into_bytes()])
+    }
+
+    /// Append record lines (each newline-terminated) as one write and
+    /// fsync once: the batch is on disk when this returns. A crash
+    /// mid-write can leave a torn last line, which the next open heals,
+    /// so every record before it stays resumable. Appends are the only
+    /// writes strands get.
+    pub fn append_lines(&mut self, lines: &[Vec<u8>]) -> std::io::Result<()> {
+        let mut bytes = Vec::new();
+        for line in lines {
+            bytes.extend_from_slice(line);
+        }
+        self.file.write_all(&bytes)?;
         self.file.sync_data()?;
         self.file.flush()
     }
@@ -2253,6 +2297,76 @@ mod tests {
         let records = read(&path).unwrap();
         assert!(matches!(records[0], Record::Header { .. }));
         assert_eq!(records.len(), 2, "header + first message");
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// A batch is one visit to the file: its records land as
+    /// consecutive lines in arrival order and read back whole, and the
+    /// byte ceiling still stops it record by record, keeping the
+    /// records past the ceiling in memory, in order.
+    #[test]
+    fn appended_batch_lands_in_order_and_meets_the_ceiling_per_record() {
+        let data = temp_data("batch");
+        let cwd = PathBuf::from("/tmp/proj-batch");
+        let message = |content: &str| Record::Message {
+            images: Vec::new(),
+            id: new_record_id(),
+            role: Role::User,
+            content: content.into(),
+            calls: Vec::new(),
+            results: Vec::new(),
+            thinking: None,
+        };
+        fn contents(records: &[Record]) -> Vec<&str> {
+            records
+                .iter()
+                .filter_map(|r| match r {
+                    Record::Message { content, .. } => Some(content.as_str()),
+                    _ => None,
+                })
+                .collect()
+        }
+        let mut strand = StrandFile::create(&cwd, None).unwrap();
+        strand
+            .append_all([message("one"), message("two"), message("three")])
+            .unwrap();
+        let path = strand.path().expect("materialized").to_path_buf();
+        let on_disk = read(&path).unwrap();
+        assert_eq!(contents(&on_disk), ["one", "two", "three"]);
+        assert_eq!(contents(strand.records()), ["one", "two", "three"]);
+
+        // a ceiling the file has reached: the next batch stays in memory
+        let size = std::fs::metadata(&path).unwrap().len();
+        strand.set_max_bytes(Some(size));
+        strand
+            .append_all([message("four"), message("five")])
+            .unwrap();
+        assert_eq!(
+            read(&path).unwrap().len(),
+            4,
+            "nothing past the ceiling is written"
+        );
+        assert_eq!(
+            contents(strand.records()),
+            ["one", "two", "three", "four", "five"],
+            "every record is kept, in arrival order"
+        );
+
+        // a ceiling the batch crosses: the record under it is written, the rest stay in memory
+        strand.set_max_bytes(Some(size + 10));
+        strand
+            .append_all([message("six"), message("seven")])
+            .unwrap();
+        assert_eq!(
+            read(&path).unwrap().len(),
+            5,
+            "only the record under the ceiling lands"
+        );
+        assert_eq!(
+            contents(strand.records()),
+            ["one", "two", "three", "four", "five", "six", "seven"],
+            "still in arrival order"
+        );
         let _ = std::fs::remove_dir_all(&data);
     }
 

@@ -5018,7 +5018,7 @@ async fn run_digest(
     if focus.is_none() {
         if let Some(summary) = voice.take_speculative().await {
             let _ = voice.apply_digest(summary, ratio);
-            persist_delta(voice, state, strand);
+            persist_delta(voice, state, strand, None);
             reinject_after_digest(voice, events).await;
             voice
                 .lifecycle_hook(
@@ -5048,7 +5048,7 @@ async fn run_digest(
         Some(summary) => {
             let kept = voice.apply_digest(summary, ratio);
             let _ = kept;
-            persist_delta(voice, state, strand);
+            persist_delta(voice, state, strand, None);
             reinject_after_digest(voice, events).await;
             voice
                 .lifecycle_hook(
@@ -5082,7 +5082,7 @@ async fn run_digest(
 unavailable). The most recent exchange follows; re-read files you need."
                 .to_string();
             voice.apply_digest(summary, ratio);
-            persist_delta(voice, state, strand);
+            persist_delta(voice, state, strand, None);
             reinject_after_digest(voice, events).await;
             voice
                 .lifecycle_hook(
@@ -5195,15 +5195,15 @@ async fn dispatch_turn(
     state.guards.session_spend += usage.cost;
     // MODEL-05: the cache-warm gate reads the latest turn's cost
     state.last_turn_cost = usage.cost;
-    let _ = strand.append(ka_strand::Record::Usage {
+    let usage_record = ka_strand::Record::Usage {
         id: ka_strand::new_record_id(),
         cost: usage.cost,
         input: usage.input,
         output: usage.output,
         cache_read: usage.cache_read,
         cache_write: usage.cache_write,
-    });
-    persist_delta(voice, state, strand);
+    };
+    persist_delta(voice, state, strand, Some(usage_record));
     if voice.hooks_enabled() {
         match crate::fshooks::run(HookPoint::PostTurn, cwd, None).await {
             Ok(steer) => apply_steering(steer, events, state, voice, strand).await,
@@ -5564,30 +5564,51 @@ async fn reinject_after_digest(voice: &mut Voice, events: &mpsc::Sender<Event>) 
     }
 }
 
-/// Persist any pending digest (as a Digest record) and the history delta.
-fn persist_delta(voice: &mut Voice, state: &mut EngineState, strand: &mut ka_strand::StrandFile) {
-    if let Some((summary, kept, _rev)) = voice.take_pending_digest() {
+/// Persist `first` (the turn's Usage record), any pending digest (as
+/// a Digest record) and the history delta, in that order and in one
+/// visit to the strand file.
+fn persist_delta(
+    voice: &mut Voice,
+    state: &mut EngineState,
+    strand: &mut ka_strand::StrandFile,
+    first: Option<ka_strand::Record>,
+) {
+    let digest = voice.take_pending_digest().map(|(summary, kept, _rev)| {
         let kept_from = state
             .record_ids
             .get(kept)
             .cloned()
             .unwrap_or_else(ka_strand::new_record_id);
-        let _ = strand.append(ka_strand::Record::Digest {
-            id: ka_strand::new_record_id(),
-            summary,
-            kept_from,
-        });
-        state.record_ids = state.record_ids.get(kept..).unwrap_or(&[]).to_vec();
-    }
-    while state.record_ids.len() < voice.history.len() {
-        let record = record_from_message(&voice.history[state.record_ids.len()]);
-        let _ = strand.append(record.clone());
-        if let Some(id) = record.id() {
-            state.record_ids.push(id.clone());
-        } else {
+        (
+            ka_strand::Record::Digest {
+                id: ka_strand::new_record_id(),
+                summary,
+                kept_from,
+            },
+            kept,
+        )
+    });
+    // the history up to the first message without a record id
+    let mut delta = Vec::new();
+    while state.record_ids.len() + delta.len() < voice.history.len() {
+        let record = record_from_message(&voice.history[state.record_ids.len() + delta.len()]);
+        if record.id().is_none() {
             break;
         }
+        delta.push(record);
     }
+    let records: Vec<ka_strand::Record> = first
+        .into_iter()
+        .chain(digest.iter().map(|(record, _)| record.clone()))
+        .chain(delta.iter().cloned())
+        .collect();
+    let _ = strand.append_all(records);
+    if let Some((_, kept)) = digest {
+        state.record_ids = state.record_ids.get(kept..).unwrap_or(&[]).to_vec();
+    }
+    state
+        .record_ids
+        .extend(delta.iter().filter_map(|record| record.id().cloned()));
 }
 
 /// The strand's own id from its header record.
