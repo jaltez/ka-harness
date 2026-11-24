@@ -2095,6 +2095,18 @@ fn doc_window(total: usize, visible: usize, scroll: Option<usize>) -> (usize, bo
     (start, visible > 0 && start >= max_start && total > visible)
 }
 
+/// The rows a doc pager pages over: every source row wrapped to the
+/// box's inner text width.
+fn doc_flat_rows<S: AsRef<str>>(rows: &[S], inner_w: usize) -> Vec<String> {
+    rows.iter()
+        .flat_map(|row| {
+            wrap_rows(row.as_ref(), inner_w)
+                .into_iter()
+                .map(|vr| vr.text)
+        })
+        .collect()
+}
+
 /// The body of a doc pager: windowed over RENDERED rows (pager text wraps,
 /// and a window counted in source lines pushes its markers out of the box),
 /// with a `… ↑` marker on the first row and a `… ↓` marker on the last when
@@ -2108,14 +2120,7 @@ fn doc_body<S: AsRef<str>>(
     style_of: impl Fn(&str) -> ratatui::style::Style,
 ) -> Vec<ratatui::text::Line<'static>> {
     use ratatui::text::Line as TuiLine;
-    let flat: Vec<String> = rows
-        .iter()
-        .flat_map(|row| {
-            wrap_rows(row.as_ref(), inner_w)
-                .into_iter()
-                .map(|vr| vr.text)
-        })
-        .collect();
+    let flat = doc_flat_rows(rows, inner_w);
     let (start, _) = doc_window(flat.len(), visible, scroll);
     let end = (start + visible).min(flat.len());
     let mut body: Vec<TuiLine<'static>> = flat[start..end]
@@ -2134,17 +2139,28 @@ fn doc_body<S: AsRef<str>>(
     body
 }
 
+/// Text width inside a doc pager's box: its nominal width clamped to
+/// the modal area, less the box's borders and padding — the width
+/// `doc_body` wraps at.
+fn doc_pager_inner_w(fw: u16, nominal: u16) -> usize {
+    nominal.min(fw).saturating_sub(4) as usize
+}
+
 /// Keys for a doc pager (`None` = top): line and page keys move the
 /// window, Home/End jump to the ends. Only Esc closes, so a stray letter
-/// never dismisses a panel.
-fn doc_pager_keys(
+/// never dismisses a panel. The window is bounded by the WRAPPED row
+/// count, the rows the body shows: bounded by source lines instead, the
+/// tail of every wrapped row would sit past the last page under a `… ↓`
+/// marker no key could clear.
+fn doc_pager_keys<S: AsRef<str>>(
     code: crossterm::event::KeyCode,
-    total: usize,
+    rows: &[S],
+    inner_w: usize,
     scroll: &mut Option<usize>,
     visible: usize,
 ) -> bool {
     use crossterm::event::KeyCode;
-    let max_start = total.saturating_sub(visible);
+    let max_start = doc_flat_rows(rows, inner_w).len().saturating_sub(visible);
     let cur = scroll.unwrap_or(0).min(max_start);
     let page = visible.saturating_sub(1).max(1);
     match code {
@@ -2516,8 +2532,13 @@ fn queue_refusal(draft: &str) -> Option<String> {
     if let Some(head) = unknown_slash(item) {
         return Some(format!("{head}: unknown command — nothing queued"));
     }
-    let cmd = slash_command(item)?;
+    // the composer's own commands need its surface, live: they refuse
+    // like the picker-openers, with their true reason
     let head = item.split(' ').next().unwrap_or_default();
+    if LOCAL_COMMANDS.contains(&head) {
+        return Some(format!("{head} runs in the composer — press enter"));
+    }
+    let cmd = slash_command(item)?;
     if cmd.quit {
         Some(format!("{head} runs immediately — press enter"))
     } else if cmd.modal.is_some() {
@@ -2531,14 +2552,43 @@ fn queue_refusal(draft: &str) -> Option<String> {
     }
 }
 
+/// The commands the composer runs itself, ahead of the slash dispatcher:
+/// panels, transcript tools, toggles — and `/image`, which stages an
+/// attachment. None of them produce an engine event, so the parser
+/// answers `None` for them (`slash_command`), and every "is this a
+/// command?" gate has to know them by name: the Enter refusal and the
+/// queue refusal both read this list.
+/// `local_commands_cover_every_local_handler` pins it against the
+/// handlers themselves. (v0.10.0 shipped without it and refused all
+/// thirteen as unknown commands.)
+const LOCAL_COMMANDS: &[&str] = &[
+    "/changelog",
+    "/clip",
+    "/copy",
+    "/features",
+    "/find",
+    "/focus",
+    "/image",
+    "/queue",
+    "/retry",
+    "/sandbox",
+    "/search",
+    "/style",
+    "/theme",
+];
+
 /// The one rule behind every refusal of a `/`-led line: it names no
-/// built-in or custom command. For a slash line, returns its typed head
-/// (`/hlep`) when nothing answers to it. Skill lines answer to the live
-/// inventory, not the command table.
+/// built-in, custom, or composer-local command. For a slash line,
+/// returns its typed head (`/hlep`) when nothing answers to it. Skill
+/// lines answer to the live inventory, not the command table.
 fn unknown_slash(item: &str) -> Option<&str> {
     let skill_line = item.starts_with("/skill:") || item == "/skill" || item.starts_with("/skill ");
-    (item.starts_with('/') && !skill_line && slash_command(item).is_none())
-        .then(|| item.split(' ').next().unwrap_or_default())
+    let head = item.split(' ').next().unwrap_or_default();
+    (item.starts_with('/')
+        && !skill_line
+        && slash_command(item).is_none()
+        && !LOCAL_COMMANDS.contains(&head))
+    .then_some(head)
 }
 
 /// The note Enter leaves for an unknown slash line, naming the nearest
@@ -2580,9 +2630,11 @@ fn nearest_command(head: &str) -> Option<String> {
 fn edit_distance(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();
-    // three rolling rows of the distance table: i-2, i-1, and i
-    let mut older: Vec<usize> = (0..=b.len()).collect();
-    let mut prev = vec![0; b.len() + 1];
+    // three rolling rows of the distance table: D[i-2], D[i-1] and D[i].
+    // D[0][j] is j (an empty `a` takes j insertions), so `prev` opens
+    // as that row; `older` is first read at i = 2
+    let mut older = vec![0; b.len() + 1];
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
     let mut row = prev.clone();
     for (i, &ca) in a.iter().enumerate() {
         row[0] = i + 1;
@@ -5307,6 +5359,12 @@ enum PendingModal {
 /// matches what is on screen.
 const PAGER_VISIBLE: usize = 25;
 
+/// Nominal box width of the doc pager panels, and of the changelog
+/// (two columns narrower). The frame clamps it to the modal area; the
+/// keys page by the width that clamp gives, so both name it here.
+const DOC_PANEL_W: u16 = 90;
+const CHANGELOG_PANEL_W: u16 = 88;
+
 /// The pager's window height for a transcript pane `view_rows` tall —
 /// the same number the renderer derives from its clamped box height,
 /// so page keys never step past what is actually shown.
@@ -7134,7 +7192,9 @@ async fn app(
                             },
                             Modal::TaskDetail { text, scroll, .. } => {
                                 let visible = pager_visible(view_rows);
-                                if doc_pager_keys(key.code, text.lines().count(), scroll, visible) {
+                                let lines: Vec<&str> = text.lines().collect();
+                                let inner_w = doc_pager_inner_w(tx_width.get(), DOC_PANEL_W);
+                                if doc_pager_keys(key.code, &lines, inner_w, scroll, visible) {
                                     modal = None;
                                 }
                             }
@@ -7310,13 +7370,15 @@ async fn app(
                             | Modal::Permissions { rows, scroll }
                             | Modal::Doctor { rows, scroll } => {
                                 let visible = pager_visible(view_rows);
-                                if doc_pager_keys(key.code, rows.len(), scroll, visible) {
+                                let inner_w = doc_pager_inner_w(tx_width.get(), DOC_PANEL_W);
+                                if doc_pager_keys(key.code, rows, inner_w, scroll, visible) {
                                     modal = None;
                                 }
                             }
                             Modal::Debug { rows, scroll } => {
                                 let visible = pager_visible(view_rows);
-                                if doc_pager_keys(key.code, rows.len(), scroll, visible) {
+                                let inner_w = doc_pager_inner_w(tx_width.get(), DOC_PANEL_W);
+                                if doc_pager_keys(key.code, rows, inner_w, scroll, visible) {
                                     modal = None;
                                 }
                             }
@@ -7567,7 +7629,8 @@ async fn app(
                             },
                             Modal::Changelog { rows, scroll } => {
                                 let visible = pager_visible(view_rows);
-                                if doc_pager_keys(key.code, rows.len(), scroll, visible) {
+                                let inner_w = doc_pager_inner_w(tx_width.get(), CHANGELOG_PANEL_W);
+                                if doc_pager_keys(key.code, rows, inner_w, scroll, visible) {
                                     modal = None;
                                 }
                             }
@@ -15467,6 +15530,10 @@ fn render(
     // modals center within the transcript pane, one col clear of its
     // edges: they never touch the composer or the status line
     let modal_area = tx_area.inner(ratatui::layout::Margin::new(1, 0));
+    // the same two columns the transcript's inner width gives up, so the
+    // width published above (`tx_width`) is the modal area's width too:
+    // the pager keys page by it between frames
+    debug_assert_eq!(modal_area.width, tx_inner);
     // an overlay owns keyboard focus (the composer border steps back)
     let overlay = modal.is_some() || popup.is_some() || path.is_some() || picker.is_some();
 
@@ -16688,7 +16755,7 @@ fn render(
             // TUI-18: read-only panels — same pager shape as Debug
             Modal::Hooks { rows, scroll } => {
                 let height = (rows.len() as u16 + 5).clamp(7, 30).min(fh);
-                let width = 90.min(fw);
+                let width = DOC_PANEL_W.min(fw);
                 let visible = (height as usize).saturating_sub(5);
                 let body = doc_body(rows, inner(width), visible, *scroll, |_| Style::new());
                 let title = format!("{} hooks", crate::icons::tool_icon("hooks"));
@@ -16696,7 +16763,7 @@ fn render(
             }
             Modal::Permissions { rows, scroll } => {
                 let height = (rows.len() as u16 + 5).clamp(7, 30).min(fh);
-                let width = 90.min(fw);
+                let width = DOC_PANEL_W.min(fw);
                 let visible = (height as usize).saturating_sub(5);
                 let body = doc_body(rows, inner(width), visible, *scroll, |_| Style::new());
                 let title = format!("{} permissions", crate::icons::tool_icon("permissions"));
@@ -16704,7 +16771,7 @@ fn render(
             }
             Modal::Doctor { rows, scroll } => {
                 let height = (rows.len() as u16 + 5).clamp(7, 30).min(fh);
-                let width = 90.min(fw);
+                let width = DOC_PANEL_W.min(fw);
                 let visible = (height as usize).saturating_sub(5);
                 let body = doc_body(rows, inner(width), visible, *scroll, |_| Style::new());
                 let title = format!("{} doctor", crate::icons::tool_icon("doctor"));
@@ -16715,7 +16782,7 @@ fn render(
                 // clamp to the transcript pane: a taller box would bleed
                 // over the composer / status line
                 let height = (lines.len() as u16 + 5).clamp(7, 30).min(fh);
-                let width = 90.min(fw);
+                let width = DOC_PANEL_W.min(fw);
                 let visible = (height as usize).saturating_sub(5);
                 let body = doc_body(&lines, inner(width), visible, *scroll, |_| Style::new());
                 let title = format!("{} task t-{id}", crate::icons::tool_icon("tasks"));
@@ -16725,7 +16792,7 @@ fn render(
                 // clamp to the transcript pane: a taller box would bleed
                 // over the composer / status line
                 let height = (rows.len() as u16 + 5).clamp(7, 30).min(fh);
-                let width = 90.min(fw);
+                let width = DOC_PANEL_W.min(fw);
                 let visible = (height as usize).saturating_sub(5);
                 let body = doc_body(rows, inner(width), visible, *scroll, |_| meta);
                 let title = format!("{} debug sessions", crate::icons::tool_icon("debug"));
@@ -17045,7 +17112,7 @@ fn render(
             }
             Modal::Changelog { rows, scroll } => {
                 let height = 34u16.min(fh);
-                let width = 88.min(fw);
+                let width = CHANGELOG_PANEL_W.min(fw);
                 let visible = (height as usize).saturating_sub(4);
                 let text = doc_body(rows, inner(width), visible, *scroll, |row| {
                     if row.starts_with("## ") || row.starts_with("# ") {
@@ -19487,21 +19554,21 @@ mod tests {
         use crossterm::event::KeyCode;
         assert_eq!(doc_window(100, 20, None), (0, false));
         assert_eq!(doc_window(100, 20, Some(95)), (80, true));
+        let rows: Vec<String> = (0..100).map(|i| format!("r{i}")).collect();
         let mut s = None;
-        assert!(!doc_pager_keys(KeyCode::PageDown, 100, &mut s, 20));
+        assert!(!doc_pager_keys(KeyCode::PageDown, &rows, 20, &mut s, 20));
         assert_eq!(s, Some(19));
-        assert!(!doc_pager_keys(KeyCode::End, 100, &mut s, 20));
+        assert!(!doc_pager_keys(KeyCode::End, &rows, 20, &mut s, 20));
         assert_eq!(s, Some(80));
-        assert!(!doc_pager_keys(KeyCode::Home, 100, &mut s, 20));
+        assert!(!doc_pager_keys(KeyCode::Home, &rows, 20, &mut s, 20));
         assert_eq!(s, Some(0));
-        assert!(!doc_pager_keys(KeyCode::Down, 100, &mut s, 20));
+        assert!(!doc_pager_keys(KeyCode::Down, &rows, 20, &mut s, 20));
         assert_eq!(s, Some(1));
         // a stray letter keeps the panel open; only Esc closes
-        assert!(!doc_pager_keys(KeyCode::Char('x'), 100, &mut s, 20));
-        assert!(!doc_pager_keys(KeyCode::Enter, 100, &mut s, 20));
-        assert!(doc_pager_keys(KeyCode::Esc, 100, &mut s, 20));
+        assert!(!doc_pager_keys(KeyCode::Char('x'), &rows, 20, &mut s, 20));
+        assert!(!doc_pager_keys(KeyCode::Enter, &rows, 20, &mut s, 20));
+        assert!(doc_pager_keys(KeyCode::Esc, &rows, 20, &mut s, 20));
         // markers replace rows: the body never grows past the window
-        let rows: Vec<String> = (0..100).map(|i| format!("r{i}")).collect();
         let text = |l: &ratatui::text::Line| {
             l.spans
                 .iter()
@@ -19515,6 +19582,142 @@ mod tests {
         let top = doc_body(&rows, 20, 20, None, |_| ratatui::style::Style::new());
         assert_eq!(text(&top[0]), "r0");
         assert_eq!(text(&top[19]), "… ↓ 80 more");
+    }
+
+    /// A wrapped row is as long as it renders: End lands on the last
+    /// wrapped row, and a panel with fewer source rows than its window
+    /// still pages once its rows wrap.
+    #[test]
+    fn doc_pager_end_reaches_the_last_wrapped_row() {
+        use crossterm::event::KeyCode;
+        // one row wrapping to three, then a short one: four rendered rows
+        let rows = ["x".repeat(50), "tail".to_string()];
+        assert_eq!(doc_flat_rows(&rows, 20).len(), 4);
+        let text = |l: &ratatui::text::Line| {
+            l.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        };
+        let mut s = None;
+        assert!(!doc_pager_keys(KeyCode::End, &rows, 20, &mut s, 3));
+        assert_eq!(s, Some(1));
+        let body = doc_body(&rows, 20, 3, s, |_| ratatui::style::Style::new());
+        assert_eq!(text(&body[0]), "… ↑ 1 above");
+        assert_eq!(text(&body[2]), "tail");
+        // two source rows, a two-row window: the wrapped tail sits under
+        // a marker at the top, and End reaches it
+        s = None;
+        let top = doc_body(&rows, 20, 2, s, |_| ratatui::style::Style::new());
+        assert_eq!(text(&top[1]), "… ↓ 2 more");
+        assert!(!doc_pager_keys(KeyCode::End, &rows, 20, &mut s, 2));
+        assert_eq!(s, Some(2));
+        let last = doc_body(&rows, 20, 2, s, |_| ratatui::style::Style::new());
+        assert_eq!(text(&last[0]), "… ↑ 2 above");
+        assert_eq!(text(&last[1]), "tail");
+        // the keys' width is the width the box draws its body at
+        assert_eq!(doc_pager_inner_w(120, DOC_PANEL_W), 86);
+        assert_eq!(doc_pager_inner_w(76, DOC_PANEL_W), 72);
+        assert_eq!(doc_pager_inner_w(76, CHANGELOG_PANEL_W), 72);
+    }
+
+    /// End in `/changelog` lands on the oldest entry at every terminal
+    /// size: the keys page by the width the frame just published and by
+    /// the rows the body wraps the text into, so no page sits out of
+    /// reach. (v0.10.0 bounded the scroll by source lines, and at 80
+    /// columns the last 164 rows of the shipped changelog were.)
+    #[test]
+    fn changelog_end_reaches_the_oldest_entry() {
+        use crossterm::event::KeyCode;
+        use ratatui::backend::TestBackend;
+        let rows = changelog_rows();
+        for (w, h) in [(80u16, 24u16), (120, 40), (200, 50), (64, 18)] {
+            let mut terminal = ratatui::Terminal::new(TestBackend::new(w, h)).unwrap();
+            let tx_width = std::cell::Cell::new(0u16);
+            let mut t = Transcript::default();
+            // the frame the modal opens on: it publishes the width the
+            // pager's body is drawn at
+            let mut draw = |scroll: Option<usize>| {
+                terminal
+                    .draw(|f| {
+                        super::render(
+                            f,
+                            &mut t,
+                            None,
+                            "",
+                            0,
+                            false,
+                            None,
+                            Instant::now(),
+                            0,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            Some(&Modal::Changelog {
+                                rows: changelog_rows(),
+                                scroll,
+                            }),
+                            None,
+                            &Meters::default(),
+                            &SidebarState::default(),
+                            false,
+                            true,
+                            "◆",
+                            &std::cell::Cell::new(None::<StripZones>),
+                            None,
+                            &std::cell::Cell::new(None::<TitleArrows>),
+                            &std::cell::Cell::new(None::<ratatui::layout::Rect>),
+                            &std::cell::Cell::new(None::<ratatui::layout::Rect>),
+                            &std::cell::Cell::new(None::<(ratatui::layout::Rect, usize)>),
+                            &std::cell::Cell::new(
+                                None::<(ratatui::layout::Rect, usize, usize, usize, usize)>,
+                            ),
+                            &tx_width,
+                            None,
+                            None,
+                            None,
+                            false,
+                            None,
+                            None,
+                        )
+                    })
+                    .unwrap();
+                let buf = terminal.backend().buffer();
+                (0..buf.area.height)
+                    .map(|y| {
+                        (0..buf.area.width)
+                            .map(|x| buf[(x, y)].symbol())
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            let top = draw(None);
+            assert!(
+                top.contains("# Changelog") && top.contains("… ↓ "),
+                "{w}x{h}: the panel does not open at the top"
+            );
+            // the key loop's own numbers at this size, for an empty
+            // draft's composer (borders included, as the loop passes it)
+            let visible = pager_visible(visible_rows(h, input_height(1)));
+            let mut scroll = None;
+            assert!(!doc_pager_keys(
+                KeyCode::End,
+                &rows,
+                doc_pager_inner_w(tx_width.get(), CHANGELOG_PANEL_W),
+                &mut scroll,
+                visible,
+            ));
+            let end = draw(scroll);
+            // the file's last words sit on its last wrapped row, and no
+            // row is left below the window
+            assert!(
+                end.contains("platform-named error.") && !end.contains("… ↓ "),
+                "{w}x{h}: the oldest entry is not on the last page\n{end}"
+            );
+        }
     }
     #[test]
     fn user_entry_rows_tracks_user_message_positions() {
@@ -20195,6 +20398,172 @@ mod tests {
                 .unwrap_or_default()
                 .contains("immediately")
         );
+    }
+
+    /// The distance behind "did you mean" is the real one: the first
+    /// typed character costs like any other, so a miss names its true
+    /// neighbor. (v0.10.0 seeded its table with the wrong row and
+    /// suggested `/sandbox` for `/x`, seven edits away.)
+    #[test]
+    fn nearest_command_never_names_a_far_miss() {
+        // a swap, an insertion, an empty side, nothing in common
+        assert_eq!(edit_distance("hlep", "help"), 1);
+        assert_eq!(edit_distance("k", "ka"), 1);
+        assert_eq!(edit_distance("", "ka"), 2);
+        assert_eq!(edit_distance("ka", ""), 2);
+        assert_eq!(edit_distance("a", "xy"), 2);
+        // the closing x matches: six insertions, no substitution
+        assert_eq!(edit_distance("/x", "/sandbox"), 6);
+        // `/x` names `/pr`, one substitution and one insertion away
+        assert_eq!(nearest_command("/x").as_deref(), Some("/pr"));
+        assert_eq!(
+            slash_enter(None, "/x").unwrap_err(),
+            "unknown command /x. did you mean /pr?"
+        );
+        // a longer miss with nothing in common names nothing
+        assert_eq!(nearest_command("/qqqqqq"), None);
+        assert_eq!(
+            slash_enter(None, "/qqqqqq").unwrap_err(),
+            "unknown command /qqqqqq."
+        );
+    }
+
+    /// The composer's own commands run when typed and entered, and the
+    /// queue refuses them with their true reason. (v0.10.0 refused all
+    /// thirteen as unknown commands: `/image <path>` could not attach,
+    /// `/theme` would not open.)
+    #[test]
+    fn local_commands_are_never_refused_as_unknown() {
+        for name in LOCAL_COMMANDS {
+            assert_eq!(
+                slash_enter(None, name).unwrap_or_default(),
+                *name,
+                "{name} is refused as an unknown command"
+            );
+            let reason = queue_refusal(name).unwrap_or_default();
+            assert!(reason.contains("runs in the composer"), "{name}: {reason}");
+            // the list is only for what the parser cannot answer
+            assert!(
+                slash_command(name).is_none(),
+                "{name} is parsed: drop it from the list"
+            );
+        }
+        // with an argument, as their handlers take them
+        for line in [
+            "/image photo.png",
+            "/find seed",
+            "/search seed",
+            "/style dark",
+            "/sandbox fs",
+        ] {
+            assert_eq!(slash_enter(None, line).unwrap_or_default(), line, "{line}");
+            assert!(queue_refusal(line).is_some(), "{line} must not queue");
+        }
+        // a highlighted local row still stands in for a partial draft
+        // (completed with its argument slot, as Tab completes it)
+        let theme = update_suggestions("/them");
+        assert_eq!(
+            slash_enter(theme.as_ref(), "/them")
+                .unwrap_or_default()
+                .trim(),
+            "/theme"
+        );
+        // a true miss is still refused
+        assert!(unknown_slash("/definitely-not-a-command").is_some());
+    }
+
+    /// Every command the composer handles by itself is known to the
+    /// refusals: a local handler that is neither parsed nor on
+    /// `LOCAL_COMMANDS` is refused as unknown the moment it ships, as
+    /// thirteen were in v0.10.0. The handlers are read from this file's
+    /// own source, by the idiom its dispatch chain is written in.
+    #[test]
+    fn local_commands_cover_every_local_handler() {
+        let source = include_str!("tui.rs");
+        let mut heads: Vec<&str> = Vec::new();
+        for marker in [
+            "text.trim() == ",
+            "text.trim().starts_with(",
+            "text == ",
+            "text.starts_with(",
+        ] {
+            for line in source.lines() {
+                let mut rest = line;
+                while let Some(at) = rest.find(marker) {
+                    rest = &rest[at + marker.len()..];
+                    let Some(quoted) = rest.strip_prefix('"') else {
+                        continue;
+                    };
+                    if quoted.starts_with('/') {
+                        let end = quoted.find(['"', ' ', ':']).unwrap_or(quoted.len());
+                        heads.push(&quoted[..end]);
+                    }
+                }
+            }
+        }
+        assert!(
+            !heads.is_empty(),
+            "the dispatch chain is written in a new idiom: update this scan"
+        );
+        heads.sort_unstable();
+        heads.dedup();
+        for head in heads {
+            assert!(
+                unknown_slash(head).is_none(),
+                "{head} is handled in the composer but the refusals call it unknown: add it to LOCAL_COMMANDS"
+            );
+        }
+    }
+
+    /// `edit_distance` is the full Damerau-Levenshtein table, for every
+    /// pair of strings up to four characters over a three-letter
+    /// alphabet: the rolling rows lose nothing against the textbook
+    /// matrix. (v0.10.0 seeded its rows the wrong way round and
+    /// undercounted every path through the first character.)
+    #[test]
+    fn edit_distance_matches_the_full_table_for_short_strings() {
+        fn table(a: &[char], b: &[char]) -> usize {
+            let (n, m) = (a.len(), b.len());
+            let mut d = vec![vec![0usize; m + 1]; n + 1];
+            for (i, row) in d.iter_mut().enumerate() {
+                row[0] = i;
+            }
+            for (j, cell) in d[0].iter_mut().enumerate() {
+                *cell = j;
+            }
+            for i in 1..=n {
+                for j in 1..=m {
+                    let cost = usize::from(a[i - 1] != b[j - 1]);
+                    d[i][j] = (d[i - 1][j] + 1)
+                        .min(d[i][j - 1] + 1)
+                        .min(d[i - 1][j - 1] + cost);
+                    if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                        d[i][j] = d[i][j].min(d[i - 2][j - 2] + 1);
+                    }
+                }
+            }
+            d[n][m]
+        }
+        let alphabet = ['a', 'b', '/'];
+        let mut words: Vec<String> = vec![String::new()];
+        for _ in 0..4 {
+            let longer: Vec<String> = words
+                .iter()
+                .flat_map(|w| alphabet.iter().map(move |c| format!("{w}{c}")))
+                .collect();
+            words.extend(longer);
+        }
+        let words: Vec<Vec<char>> = words.iter().map(|w| w.chars().collect()).collect();
+        for a in &words {
+            for b in &words {
+                let (sa, sb): (String, String) = (a.iter().collect(), b.iter().collect());
+                assert_eq!(
+                    edit_distance(&sa, &sb),
+                    table(a, b),
+                    "distance({sa:?}, {sb:?})"
+                );
+            }
+        }
     }
 
     #[test]
