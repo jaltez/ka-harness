@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.10.2 — 2026-11-24
 
 ### Performance
 - Starting `ka` no longer waits on the spill directory. The cleanup of old job output ran on the engine's starting thread and statted every file, so a start cost one call per spill file ever kept, about 1,800 a day on a busy machine. It now runs in the background, at most once a day per machine. With 9,000 spill files a headless turn takes 22.9 ms of CPU instead of 48.0 ms.
