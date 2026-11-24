@@ -15,10 +15,7 @@ pub struct RepoSnapshot {
 impl RepoSnapshot {
     /// Capture the snapshot for `cwd`. Non-repo → default (empty).
     pub fn capture(cwd: &std::path::Path) -> Self {
-        let branch = git_output(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_default();
+        let branch = Self::branch(cwd);
         let dirty = git_output(cwd, &["status", "--porcelain"])
             .map(|s| {
                 s.lines()
@@ -31,6 +28,15 @@ impl RepoSnapshot {
             })
             .unwrap_or_default();
         Self { branch, dirty }
+    }
+
+    /// The current branch name (`HEAD` when detached, empty when not a
+    /// repo). No status walk, for callers that need the branch alone.
+    pub fn branch(cwd: &std::path::Path) -> String {
+        git_output(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_default()
     }
 
     /// One-line summary for the system prompt.
@@ -101,6 +107,7 @@ mod tests {
         let snap = RepoSnapshot::capture(&dir);
         assert_eq!(snap.dirty, vec!["new.txt".to_string()]);
         assert!(snap.summary().contains("branch main"));
+        assert_eq!(RepoSnapshot::branch(&dir), "main", "the branch alone");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

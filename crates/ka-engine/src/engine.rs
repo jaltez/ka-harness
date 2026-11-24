@@ -4332,7 +4332,7 @@ async fn side_question(
     text: String,
 ) -> Option<String> {
     let fast = state.roles.fast.clone()?;
-    let branch = crate::hands::git::RepoSnapshot::capture(cwd).branch;
+    let branch = crate::hands::git::RepoSnapshot::branch(cwd);
     let branch = if branch.is_empty() {
         "none"
     } else {
