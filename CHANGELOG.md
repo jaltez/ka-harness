@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.10.1 — 2026-11-24
 
 ### Fixed
 - Thirteen commands the TUI runs itself were refused as unknown when typed, so `/image <path>` could not attach an image and `/theme`, `/features`, `/changelog`, `/copy`, `/find`, `/search`, `/style`, `/sandbox`, `/queue`, `/retry`, `/focus` and `/clip` did nothing. The new refusal of unknown slash commands ran ahead of their handlers.
