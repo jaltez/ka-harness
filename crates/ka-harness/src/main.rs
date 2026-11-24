@@ -2867,7 +2867,10 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
         .map(PathBuf::from)
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| PathBuf::from("."));
-    let catalog = build_catalog(&cli.dialects, !cli.no_discovery).await?;
+    // --offline promises no local discovery on this path too, as on the
+    // headless one: the probe is an HTTP request before the first frame
+    // whenever a local model server is listening
+    let catalog = build_catalog(&cli.dialects, !cli.no_discovery && !cli.offline).await?;
     let model_label = cfg.model.clone().unwrap_or_else(|| "(canned)".to_string());
     let mut providers: Vec<ka_term::tui::ProviderInfo> = ka_dialect::providers::PROVIDERS
         .iter()
