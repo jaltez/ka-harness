@@ -71,6 +71,14 @@ The catalog change grew the binary by 48 KB in its first version: a second typed
 - **The `@` mention walk ignores `.gitignore`.** `walk_files` collects every entry, sorts the list and keeps the first 500. In this repository it visits 27,220 entries. The 500th kept entry is `research/repos/aider/aider/website/assets/audio/.../07-43.mp3`, so an ignored vendored tree uses up the list and the design notes under `research/ka-harness/` cannot be mentioned. The list also includes the private signing key in the repository root. Which files should be mentionable is a product decision: honouring `.gitignore` (the `ignore` crate is already in the binary) or taking the 500 breadth-first would each fix both the speed and the reach.
 - **The CI quick gate has almost no margin.** It takes the median of five `ka --version` runs against a baseline from v0.6.0. Three runs of one commit measured 2.6, 3.0 and 3.2 ms against a 3.08 ms limit. This round makes that path no slower. Refreshing the baseline is the release machine's call.
 
+## Released as v0.10.2
+
+Release commit `82da3f7`, annotated tag, `main` and the tag pushed. It is published as the latest release with its tarball, checksum and signature. Downloaded again, the tarball matches the published checksum and its signature verifies against the tracked public key. On that binary `/x` suggests `/pr`, `/image` attaches a real file, and End in the changelog lands on the file's last row. The two published artifacts through the startup bench, 15 interleaved runs each and no errors: a headless turn takes 85.1 ms instead of 123.1 ms wall and 12.4 ms instead of 40.5 ms CPU, the first frame 13.1 ms instead of 30.9 ms, a headless turn makes 0 `lstat` calls instead of 10,286, and the binary is 4,096 bytes smaller.
+
+**The release went out with its test job red.** Both CI runs of the release commit failed `safe_mode_keeps_llm_guards_dark_and_gate_posture_on`, and the test's own log showed the reviewer deciding in a test that forbids it. The product was not at fault. The six tests of `bare_mode_contract.rs` share one process-wide safe-mode flag and serialise on a lock. The cron test took that lock inside an inner block, released it after two statements, and then flipped the flag with no lock held, so whichever sibling held the lock at that moment lost safe mode mid-test. Whether it bites depends on which of two tests reaches the lock first when the six start together, which is why it passes most of the time. Reproduced here once the test binary ran unpinned: 6 failures in 40 runs, five of them the guards test. With the guard spanning the whole test (`589b1ac`), 120 of 120 pass, and CI is green on that commit at the first attempt. This is a cause for the safe-mode half of the races reported in earlier sessions. The other three real-clock engine tests are separate and unchanged.
+
+The binary installed on this machine was left alone. Its read-only update check reports v0.10.2.
+
 ## Best ideas if pushed further
 
 1. **Tool schemas as data.** Each hand derives its JSON schema at runtime. Static schema text would drop `schemars` and its generated code. Size, unmeasured.
@@ -84,6 +92,8 @@ The catalog change grew the binary by 48 KB in its first version: a second typed
 - A diagnostic syscall count ran from the repository's directory instead of the harness's empty one, so git did real work and the two sides were not comparable.
 - An estimate of 20 ms for a change measured 0.8 ms. The estimate counted a code path that needs a fast model role and never runs in the harness.
 - Re-adding a dependency feature after a trim let cargo resolve a Windows dependency to a different version. The committed lockfile was restored by hand.
+- The changelog heading for v0.10.2 was dated the day after, on the assumption that the release would land after midnight. The tag was created before midnight and showed the error, and the unpushed commit was amended before anything was pushed.
+- The release was pushed after the release gates passed here, and CI's test job then failed on it twice. The cause took longer to find than it should have, because the first reproduction attempt pinned the test binary to one core, which serialised its threads and hid the race.
 
 ## Running it again
 
