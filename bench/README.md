@@ -65,3 +65,28 @@ on WSL2 x64: ready 7.7 ms · `-p` with 4 tool calls 14.5 ms · 5-prompt
 session 91.5 ms CPU / 9.1 MB peak · per-prompt CPU at p75 20.5 ms ·
 own memory 8.8 MB · 200 KB tool write 20 ms · 60k-char stream 24.8 ms
 CPU · idle 0.0% · 64 tty writes per turn.
+
+## Startup bench
+
+`startup_bench.py` measures what a user waits for before any work
+happens. It takes two builds at once and interleaves their runs, so a
+keep-or-revert call never rests on one machine's drift:
+
+```sh
+python3 bench/startup_bench.py --side before=target/release/ka --side after=/path/to/ka
+```
+
+It prints one JSON line: `ka --version`, a headless turn with the
+offline canned speaker (wall and CPU), the time to the TUI's first
+frame, the syscall counts behind them, and each binary's size. Every
+side runs in its own hermetic home. Its state directory holds 9,000 job
+spill files unless `--spills 0` says otherwise, because a machine with
+a week of history is the case a start has to survive. `--repo` puts
+each side inside a small git repository (`--repo-files N` sets its
+size), and `--tui-discovery` starts the TUI the way a user passing
+only `--offline` gets it. A run whose output lacks what the path must
+print counts as an error, never as a fast run.
+
+The headless turn carries 60 ms of pacing by the canned speaker, a
+constant across builds. Compare builds with it, and never read it as
+the cost of a real turn.
