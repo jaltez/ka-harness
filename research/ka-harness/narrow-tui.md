@@ -64,3 +64,7 @@ python3 bench/pty_shot.py --bin target/debug/ka --cols 46 --rows 14 --out shots 
     wait:ka sleep:1 shot:start "type:hello" key:Enter sleep:3 shot:done "type:/help" key:Enter sleep:1 shot:help
 # and the depths: --term xterm-256color --colorterm none, or --term xterm
 ```
+
+## Released
+
+v0.11.0, 2026-11-25. The tag run's five jobs were green (test, check, musl, release, bench); the artifact is 7.87 MB against the 10 MB contract, its checksum and ed25519 signature verified, and the installed 0.10.1 updated itself to it through `ka update` — the signature check that the update path performs. The published binary, driven on a pty, shows 11 of 14 rows for the transcript at 46x14 and zero 24-bit codes at 256 and at sixteen colours.
