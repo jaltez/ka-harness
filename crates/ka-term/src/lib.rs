@@ -6,6 +6,7 @@ use std::io;
 
 use crossterm::event::{Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
+pub mod color_depth;
 pub mod emoji;
 pub mod fx;
 pub mod ghost;

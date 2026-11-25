@@ -5569,8 +5569,10 @@ type TuiTerminal = ratatui::Terminal<ThemeBackend>;
 /// Delegates to the crossterm backend and remaps every cell's
 /// fg/bg/underline color through the active theme's default→override
 /// map (Nocturne RGB values are the keys — anything else, content
-/// colors included, passes through untouched). Modifiers and symbols
-/// are the cell's own.
+/// colors included, passes through untouched), then, on a terminal
+/// without 24-bit color, through [`crate::color_depth`], so no color
+/// leaves that the terminal can only approximate. Modifiers and
+/// symbols are the cell's own.
 struct ThemeBackend {
     inner: ratatui::backend::CrosstermBackend<std::io::BufWriter<std::io::Stdout>>,
 }
@@ -5580,8 +5582,17 @@ impl ratatui::backend::Backend for ThemeBackend {
     where
         I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
     {
-        let Some(map) = crate::theme::tint() else {
+        let tint = crate::theme::tint();
+        let depth = crate::color_depth::terminal_depth();
+        if tint.is_none() && depth == crate::color_depth::Depth::TrueColor {
             return self.inner.draw(content);
+        }
+        let fit = |color: ratatui::style::Color| {
+            depth.fit(
+                tint.as_ref()
+                    .and_then(|map| map.get(&color).copied())
+                    .unwrap_or(color),
+            )
         };
         let tinted: Vec<(u16, u16, ratatui::buffer::Cell)> = content
             .map(|(x, y, cell)| {
@@ -5591,11 +5602,9 @@ impl ratatui::backend::Backend for ThemeBackend {
                 } else {
                     let mut owned = cell.clone();
                     owned.set_style(ratatui::style::Style {
-                        fg: style.fg.map(|c| map.get(&c).copied().unwrap_or(c)),
-                        bg: style.bg.map(|c| map.get(&c).copied().unwrap_or(c)),
-                        underline_color: style
-                            .underline_color
-                            .map(|c| map.get(&c).copied().unwrap_or(c)),
+                        fg: style.fg.map(fit),
+                        bg: style.bg.map(fit),
+                        underline_color: style.underline_color.map(fit),
                         ..style
                     });
                     (x, y, owned)
