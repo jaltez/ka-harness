@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### TUI
+- A compact layout for small terminals, so `ka` works from a phone through a remote client. Below 18 rows the two rows of air go and the composer is a bare input line instead of a box; below 56 columns the transcript loses its side air, its text inset and its scrollbar column, the composer's placeholder loses its preamble, and overlays span the frame. At 46x14 the transcript goes from 5 to 7 of 14 rows to 11, and a popup gives nine command rows above the input line instead of a second box touching the composer. Frames at 80 columns by 24 rows and up are unchanged.
+- Colour follows the terminal: 24-bit where it announces it, xterm's 256 where the terminal names 256 colours, the sixteen ANSI colours otherwise, with every colour fitted to the nearest one the terminal shows (judged in OKLab). At sixteen colours anything darker than mid-gray becomes the terminal's black, so tinted surfaces never land on a primary. Text contrast at 256 colours stays within a few percent of 24-bit.
+- Help descriptions wrap under their key column instead of being cut at 44 characters, and its more-below marker takes the window's last row, so a short box cannot drop it. The mode picker drops its descriptions whole on a narrow frame.
+
 ## 0.10.2 — 2026-11-24
 
 ### Performance
