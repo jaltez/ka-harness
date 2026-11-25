@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.11.0 — 2026-11-25
 
 ### TUI
 - A compact layout for small terminals, so `ka` works from a phone through a remote client. Below 18 rows the two rows of air go and the composer is a bare input line instead of a box; below 56 columns the transcript loses its side air, its text inset and its scrollbar column, the composer's placeholder loses its preamble, and overlays span the frame. At 46x14 the transcript goes from 5 to 7 of 14 rows to 11, and a popup gives nine command rows above the input line instead of a second box touching the composer. Frames at 80 columns by 24 rows and up are unchanged.
