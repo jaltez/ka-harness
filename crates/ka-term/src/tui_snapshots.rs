@@ -140,7 +140,7 @@ fn draw(state: &mut RenderInput, (term_w, term_h): (u16, u16)) -> Buffer {
     let rsearch = state.input.search_title();
     let last_w = tx_width.get();
     let md_width = assistant_md_width(if last_w == 0 {
-        transcript_width(term_w)
+        transcript_width(term_w, FrameMode::of(term_w, term_h))
     } else {
         last_w
     });
@@ -1512,7 +1512,7 @@ fn vim(text: &str, mode: crate::vim::Mode) -> InputBuffer {
 /// the viewport — the anchor a Ctrl+↑ jump leaves behind.
 fn showing(w: u16, lines: Vec<Line>, pick: fn(&Line) -> bool) -> RenderInput {
     let mut t = transcript(lines);
-    t.set_width(transcript_width(w));
+    t.set_width(transcript_width(w, FrameMode::FULL));
     let top = entry(&t, pick);
     let scroll = t.entry_row_span(top).map_or(0, |(first, _)| first);
     RenderInput {
@@ -1578,7 +1578,7 @@ fn hovered(w: u16, pick: fn(&Line) -> bool) -> RenderInput {
 /// The long session with its viewport anchored at transcript row `row`.
 fn scrolled(w: u16, row: usize) -> RenderInput {
     let mut t = long_session();
-    t.set_width(transcript_width(w));
+    t.set_width(transcript_width(w, FrameMode::FULL));
     RenderInput {
         scroll: Some(row),
         transcript: t,
@@ -1588,7 +1588,7 @@ fn scrolled(w: u16, row: usize) -> RenderInput {
 
 fn selection(w: u16) -> RenderInput {
     let mut t = session();
-    t.set_width(transcript_width(w));
+    t.set_width(transcript_width(w, FrameMode::FULL));
     let (first, _) = t.entry_row_span(5).expect("the last user turn");
     RenderInput {
         sel: Some(((first.saturating_sub(4), 4), (first.saturating_sub(1), 40))),
@@ -1810,7 +1810,7 @@ fn chrome_scenes() -> Vec<Scene> {
             ["%", "below · esc"],
             |(w, _)| {
                 let mut t = long_session();
-                t.set_width(transcript_width(w));
+                t.set_width(transcript_width(w, FrameMode::FULL));
                 scrolled(w, t.total_rows() / 2)
             },
         ),
@@ -3651,7 +3651,7 @@ fn transcript_scenes() -> Vec<Scene> {
             ["· "],
             |(w, _)| {
                 let mut t = long_session();
-                t.set_width(transcript_width(w));
+                t.set_width(transcript_width(w, FrameMode::FULL));
                 t.set_focus(true);
                 RenderInput {
                     transcript: t,

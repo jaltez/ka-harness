@@ -2212,21 +2212,70 @@ fn rail_drag_anchor(
     Some(anchor.min(max_anchor)).filter(|a| *a < max_anchor)
 }
 
-/// Visible transcript rows for a terminal height: the header bar, the
-/// row of air under it, the composer, the row of air under it, and the
-/// status line are the rows carved out of the viewport (the transcript
-/// has no border row).
-fn visible_rows(term_h: u16, input_h: u16) -> usize {
-    term_h.saturating_sub(input_h + 4) as usize
+/// What the frame can afford, decided once per frame from its size.
+///
+/// `short`: fewer than [`SHORT_ROWS`] rows, where the fixed chrome
+/// would take more than 40 percent of the frame. The two rows of air
+/// go, the composer is a bare line instead of a box, and the pinned
+/// todo panel shrinks. `narrow`: fewer than [`NARROW_COLS`] columns.
+/// The transcript's side air, inset and scrollbar rail go, the
+/// composer's placeholder loses its preamble, and overlays span the
+/// frame. A portrait phone without its keyboard is narrow with rows
+/// to spare; a laptop with a short window is short with columns to
+/// spare; so the two do not depend on each other.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct FrameMode {
+    short: bool,
+    narrow: bool,
+}
+
+const SHORT_ROWS: u16 = 18;
+const NARROW_COLS: u16 = 56;
+
+impl FrameMode {
+    fn of(width: u16, height: u16) -> Self {
+        Self {
+            short: height < SHORT_ROWS,
+            narrow: width < NARROW_COLS,
+        }
+    }
+    /// A frame with room for everything.
+    #[cfg(test)]
+    const FULL: Self = Self {
+        short: false,
+        narrow: false,
+    };
+    /// A phone with its keyboard up: short and narrow at once.
+    #[cfg(test)]
+    const PHONE: Self = Self {
+        short: true,
+        narrow: true,
+    };
+}
+
+/// Rows the frame carves out around the transcript and the composer:
+/// the header bar and the status line always, and a row of air under
+/// each when the frame is not short.
+fn chrome_rows(mode: FrameMode) -> u16 {
+    if mode.short { 2 } else { 4 }
+}
+
+/// Visible transcript rows for a terminal height: the chrome rows
+/// ([`chrome_rows`]) and the composer are carved out of the viewport
+/// (the transcript has no border row).
+fn visible_rows(term_h: u16, mode: FrameMode, input_h: u16) -> usize {
+    term_h.saturating_sub(input_h + chrome_rows(mode)) as usize
 }
 
 /// Rows of the pinned todo panel: while a turn runs and the todo hand has
 /// a list, the list stays in view beside the streaming text — a title row
 /// plus up to four items. Idle, or with no todos, it takes no room (the
 /// strip button still opens the full list).
-fn pinned_todos_h(busy: bool, todos: &[ka_protocol::TodoItem]) -> usize {
+fn pinned_todos_h(busy: bool, todos: &[ka_protocol::TodoItem], mode: FrameMode) -> usize {
+    // a short frame keeps its rows for the answer: two items at most
+    let items = if mode.short { 2 } else { 4 };
     if busy && !todos.is_empty() {
-        1 + todos.len().min(4)
+        1 + todos.len().min(items)
     } else {
         0
     }
@@ -2239,10 +2288,11 @@ fn cursor_row_col(text: &str, cursor_chars: usize) -> (usize, usize) {
     (row, col)
 }
 
-/// Input box height: borders + one row, growing one row per extra line
-/// up to a five-row cap (longer drafts clip).
-fn input_height(row_count: usize) -> u16 {
-    3 + row_count.saturating_sub(1).min(5) as u16
+/// Composer height: a box is its borders plus one row per draft row,
+/// a bare line ([`FrameMode::short`]) just the rows. Both grow one row
+/// per extra line up to a five-row cap (longer drafts clip).
+fn input_height(row_count: usize, mode: FrameMode) -> u16 {
+    row_count.saturating_sub(1).min(5) as u16 + if mode.short { 1 } else { 3 }
 }
 
 /// Rows the input area needs: an open picker (mode tiers or thinking
@@ -2327,12 +2377,46 @@ fn visual_cursor_row(rows: &[VisualRow], cursor: usize) -> usize {
     rows.iter().rposition(|r| r.start <= cursor).unwrap_or(0)
 }
 
-/// Draft text width of the composer at terminal width `term_w`:
-/// 2 outer margin cols + 2 borders + 2 horizontal padding + the 2-col
-/// `❯ ` lead ([`COMPOSER_LEAD`]). The draft wraps at exactly this width
+/// Draft text width of the composer at terminal width `term_w`: the
+/// outer margin cols, the box's borders and horizontal padding (none
+/// of either when the frame is narrow or short), and the 2-col `❯ `
+/// lead ([`COMPOSER_LEAD`]). The draft wraps at exactly this width
 /// and the cursor math adds the lead back.
-fn input_inner_w(term_w: u16) -> usize {
-    term_w.saturating_sub(6 + COMPOSER_LEAD) as usize
+fn input_inner_w(term_w: u16, mode: FrameMode) -> usize {
+    let air = u16::from(!mode.narrow) * 2;
+    let box_cols = u16::from(!mode.short) * 4;
+    term_w.saturating_sub(air + box_cols + COMPOSER_LEAD) as usize
+}
+
+/// The frame's rows, top to bottom: the header bar, a row of air, the
+/// transcript, the composer, a row of air, the status line. The header
+/// and the status line run the full frame width. The air rows are
+/// empty on a short frame ([`FrameMode::short`]). `composer_rows` is
+/// what the composer has to show ([`input_area_rows`]). Both
+/// renderers split the frame with this, so their viewport arithmetic
+/// agrees.
+fn frame_chunks(
+    full: ratatui::layout::Rect,
+    mode: FrameMode,
+    composer_rows: usize,
+) -> std::rc::Rc<[ratatui::layout::Rect]> {
+    use ratatui::layout::Constraint::{Length, Min};
+    let air = Length(u16::from(!mode.short));
+    ratatui::layout::Layout::vertical([
+        Length(1),
+        air,
+        Min(0),
+        Length(input_height(composer_rows, mode)),
+        air,
+        Length(1),
+    ])
+    .split(full)
+}
+
+/// A pane's own area inside its chunk: one column of air at each side,
+/// which a narrow frame ([`FrameMode::narrow`]) cannot spare.
+fn pane(chunk: ratatui::layout::Rect, mode: FrameMode) -> ratatui::layout::Rect {
+    chunk.inner(ratatui::layout::Margin::new(u16::from(!mode.narrow), 0))
 }
 
 /// Body rows of the permission-ask modal, `width` cols wide: the
@@ -3336,12 +3420,17 @@ impl TitleArrows {
     }
 }
 
-/// Inner text width of the transcript column: the terminal narrows by
-/// one margin column on each side and the paragraph's side padding.
-/// Both the cache (`Transcript::set_width`) and the live surface derive
-/// from this so they always agree.
-fn transcript_width(term_w: u16) -> u16 {
-    term_w.saturating_sub(4) // 2 margin cols + the paragraph's side padding
+/// Inner text width of the transcript column: unless the frame is
+/// narrow, the terminal narrows by one margin column on each side and
+/// the paragraph's side padding. Both the cache
+/// (`Transcript::set_width`) and the live surface derive from this so
+/// they always agree.
+fn transcript_width(term_w: u16, mode: FrameMode) -> u16 {
+    if mode.narrow {
+        term_w
+    } else {
+        term_w.saturating_sub(4) // 2 margin cols + the paragraph's side padding
+    }
 }
 
 /// Truncate a string to `max_cols` display columns (unicode-width aware),
@@ -6127,21 +6216,21 @@ async fn app(
                 Ok(s) => (s.width, s.height),
                 Err(_) => (80, 24),
             };
+            let mode = FrameMode::of(term_w, term_h);
             // the markdown cache keys on the width render actually used,
             // folded exactly like a cached assistant block (W minus its
             // indent), so the flush never reflows; one tick of staleness
             // after a resize is fine
             let last_w = tx_width.get();
             let md_width = assistant_md_width(if last_w == 0 {
-                transcript_width(term_w)
+                transcript_width(term_w, mode)
             } else {
                 last_w
             });
-            let input_h = input_height(input_area_rows(
-                picker.as_ref(),
-                &input.text,
-                input_inner_w(term_w),
-            ));
+            let input_h = input_height(
+                input_area_rows(picker.as_ref(), &input.text, input_inner_w(term_w, mode)),
+                mode,
+            );
             let live = if busy_now {
                 let now = Instant::now();
                 let stale = live_cache
@@ -6170,8 +6259,11 @@ async fn app(
                 live_cache = None;
                 None
             };
-            view_rows = visible_rows(term_h, input_h)
-                .saturating_sub(pinned_todos_h(busy_now, &sidebar.todos));
+            view_rows = visible_rows(term_h, mode, input_h).saturating_sub(pinned_todos_h(
+                busy_now,
+                &sidebar.todos,
+                mode,
+            ));
             turn_ended = false;
             let cursor = input.cursor;
             terminal.draw(|frame| {
@@ -15129,10 +15221,15 @@ fn dim_backdrop(buf: &mut ratatui::buffer::Buffer, area: ratatui::layout::Rect) 
     }
 }
 
-/// Composer placeholder for an empty idle draft.
+/// Composer placeholder for an empty idle draft, and the shorter one
+/// for a narrow frame: the `❯ ` lead already says "type here", so the
+/// preamble is the first hint to go.
 const COMPOSER_PLACEHOLDER: &str = "Ask anything  ·  / commands  ·  @ files  ·  ! shell";
-/// Composer placeholder for an empty draft while a turn runs.
+const COMPOSER_PLACEHOLDER_NARROW: &str = "/ commands  ·  @ files  ·  ! shell";
+/// Composer placeholder for an empty draft while a turn runs, and its
+/// shorter form.
 const COMPOSER_PLACEHOLDER_BUSY: &str = "Steer the turn  ·  + to queue  ·  esc to abort";
+const COMPOSER_PLACEHOLDER_BUSY_NARROW: &str = "steer  ·  + queue  ·  esc abort";
 /// Columns the composer's `❯ ` lead (and the continuation indent)
 /// takes before the draft text.
 const COMPOSER_LEAD: u16 = 2;
@@ -15168,30 +15265,22 @@ fn render_plain(
     header_glyph: &str,
     _status_order: Option<&[String]>,
 ) {
-    use ratatui::layout::Constraint::{Length, Min};
     use ratatui::widgets::Paragraph;
-    // same 6-chunk skeleton as the decorated view: the viewport math
-    // (visible_rows, pager heights) must agree across renderers
+    // the same six-chunk skeleton as the decorated view, from
+    // `frame_chunks`: the viewport math must agree across renderers
     let full = frame.area();
+    let mode = FrameMode::of(full.width, full.height);
     frame.render_widget(
         ratatui::widgets::Block::new().style(crate::palette::CANVAS),
         full,
     );
-    let chunks = ratatui::layout::Layout::vertical([
-        Length(1),
-        Length(1),
-        Min(0),
-        Length(input_height(input_area_rows(
-            picker,
-            input,
-            input_inner_w(full.width),
-        ))),
-        Length(1),
-        Length(1),
-    ])
-    .split(full);
-    let tx_area = chunks[2].inner(ratatui::layout::Margin::new(1, 0));
-    let composer = chunks[3].inner(ratatui::layout::Margin::new(1, 0));
+    let chunks = frame_chunks(
+        full,
+        mode,
+        input_area_rows(picker, input, input_inner_w(full.width, mode)),
+    );
+    let tx_area = pane(chunks[2], mode);
+    let composer = pane(chunks[3], mode);
     let status = chunks[5];
     let width = tx_area.width as usize;
 
@@ -15493,52 +15582,50 @@ fn render(
     let full = frame.area();
     frame.render_widget(Block::new().style(crate::palette::CANVAS), full);
     // ── layout: header bar · air · transcript · composer · air · status
-    // line. The header and status line run the full frame width;
-    // transcript and composer keep one column of air on each side.
+    // line, split by [`frame_chunks`] like the plain view. The header
+    // and status line run the full frame width; transcript and composer
+    // keep one column of air on each side unless the frame is narrow.
     // Every width below derives from these chunks, never from the raw
     // frame area.
-    let chunks = ratatui::layout::Layout::vertical([
-        Length(1),
-        Length(1),
-        Min(0),
-        Length(input_height(input_area_rows(
-            picker,
-            input,
-            input_inner_w(full.width),
-        ))),
-        Length(1),
-        Length(1),
-    ])
-    .split(full);
+    let mode = FrameMode::of(full.width, full.height);
+    let chunks = frame_chunks(
+        full,
+        mode,
+        input_area_rows(picker, input, input_inner_w(full.width, mode)),
+    );
     let header = chunks[0];
     // the transcript chunk gives its bottom rows to the pinned todo panel
-    let todos_h = pinned_todos_h(busy, &sidebar.todos) as u16;
+    let todos_h = pinned_todos_h(busy, &sidebar.todos, mode) as u16;
     let (tx_chunk, todos_area) = if todos_h > 0 {
         let [above, panel] =
             ratatui::layout::Layout::vertical([Min(0), Length(todos_h)]).areas(chunks[2]);
-        // the transcript keeps a column of air at each side: so does the panel
+        // the transcript starts one column in: so does the panel
+        let inset = u16::from(!mode.narrow);
         (
             above,
             Rect {
-                x: panel.x + 1,
-                width: panel.width.saturating_sub(1),
+                x: panel.x + inset,
+                width: panel.width.saturating_sub(inset),
                 ..panel
             },
         )
     } else {
         (chunks[2], Rect::default())
     };
-    let tx_area = tx_chunk.inner(ratatui::layout::Margin::new(1, 0));
-    let composer = chunks[3].inner(ratatui::layout::Margin::new(1, 0));
+    let tx_area = pane(tx_chunk, mode);
+    let composer = pane(chunks[3], mode);
     let status = chunks[5];
-    let tx_inner = tx_area.width.saturating_sub(2);
+    // the transcript's text sits one column in from each side of its
+    // pane, which a narrow frame cannot spare
+    let inset = u16::from(!mode.narrow);
+    let tx_inner = tx_area.width.saturating_sub(inset * 2);
     // single width authority: the frame's own layout decides the cache
     // width — never a tick-side terminal.size() guess
     tx_width.set(tx_inner);
     transcript.set_width(tx_inner);
     // modals center within the transcript pane, one col clear of its
     // edges: they never touch the composer or the status line
-    let modal_area = tx_area.inner(ratatui::layout::Margin::new(1, 0));
+    let modal_area = tx_area.inner(ratatui::layout::Margin::new(inset, 0));
     // the same two columns the transcript's inner width gives up, so the
     // width published above (`tx_width`) is the modal area's width too:
     // the pager keys page by it between frames
@@ -15556,7 +15643,7 @@ fn render(
     let visible = tx_area.height as usize;
     debug_assert_eq!(
         visible,
-        visible_rows(full.height, composer.height).saturating_sub(todos_h as usize),
+        visible_rows(full.height, mode, composer.height).saturating_sub(todos_h as usize),
         "viewport arithmetic must agree with the layout"
     );
     let (start, pinned) = window_range(total, visible, scroll);
@@ -15574,7 +15661,7 @@ fn render(
     // content rows fill the pane one column in from its left edge; the
     // right column is the scrollbar rail
     let content_rect = Rect {
-        x: tx_area.x + 1,
+        x: tx_area.x + inset,
         y: tx_area.y,
         width: tx_inner,
         height: tx_area.height,
@@ -15741,7 +15828,9 @@ fn render(
 
     // ── scrollbar rail: the pane's rightmost column, so no width math
     // ever learns about it ──
-    if total > visible {
+    // a narrow frame gives the rail's column to the text: the header's
+    // scroll percent and the jump pill still say where the view is
+    if total > visible && !mode.narrow {
         let (thumb_pos, thumb_len) = rail_thumb(visible, total, visible, start);
         // span-level styling: Paragraph paints span styles, not line styles
         let rail: Vec<TuiLine> = (0..visible)
@@ -15820,8 +15909,9 @@ fn render(
                 .or_else(|| busy_input_title(queued).map(padded_title)),
         },
     };
-    // picker rows: borders + horizontal padding
-    let picker_w = composer.width.saturating_sub(4) as usize;
+    // picker rows: the width the box leaves them (none of the box on a
+    // short frame)
+    let picker_w = composer.width.saturating_sub(u16::from(!mode.short) * 4) as usize;
     // the draft's cursor as (visible row, display col) past the lead
     let mut cursor_at: Option<(u16, u16)> = None;
     let body: Vec<TuiLine> = match picker {
@@ -15830,15 +15920,21 @@ fn render(
         Some(InputPicker::Mode(pk)) => MODE_CHOICES
             .iter()
             .enumerate()
-            .map(|(i, (mode, label, desc))| {
-                let icon = crate::icons::mode_icon(*mode);
+            .map(|(i, (kind, label, desc))| {
+                let icon = crate::icons::mode_icon(*kind);
+                // a narrow frame drops the descriptions whole rather
+                // than letting the box cut them: the labels say what
+                // each mode is
+                let text = if mode.narrow {
+                    format!("{icon} {label}")
+                } else {
+                    format!("{icon} {label:<15} {desc}")
+                };
                 if i == pk.selected {
-                    list_row(
-                        format!("{icon} {label:<15} {desc}"),
-                        true,
-                        picker_w,
-                        Style::new(),
-                    )
+                    return list_row(text, true, picker_w, Style::new());
+                }
+                if mode.narrow {
+                    TuiLine::from(vec![Span::raw("  "), Span::raw(text)])
                 } else {
                     TuiLine::from(vec![
                         Span::raw("  "),
@@ -15869,7 +15965,7 @@ fn render(
         // window ends at the cursor's visual row and the terminal cursor
         // rides its offset inside that window
         None => {
-            let draft_w = input_inner_w(full.width);
+            let draft_w = input_inner_w(full.width, mode);
             let rows = wrap_rows(input, draft_w);
             let cur_row = visual_cursor_row(&rows, cursor);
             let vis = rows.len().min(6);
@@ -15902,10 +15998,11 @@ fn render(
                 && rsearch.is_none()
                 && let Some(row) = out.first_mut()
             {
-                let hint = if busy {
-                    COMPOSER_PLACEHOLDER_BUSY
-                } else {
-                    COMPOSER_PLACEHOLDER
+                let hint = match (busy, mode.narrow) {
+                    (true, false) => COMPOSER_PLACEHOLDER_BUSY,
+                    (true, true) => COMPOSER_PLACEHOLDER_BUSY_NARROW,
+                    (false, false) => COMPOSER_PLACEHOLDER,
+                    (false, true) => COMPOSER_PLACEHOLDER_NARROW,
                 };
                 row.spans.push(Span::styled(
                     trunc_cols(hint, draft_w),
@@ -15929,20 +16026,34 @@ fn render(
             out
         }
     };
-    let mut block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(border_fg))
-        .padding(ratatui::widgets::Padding::horizontal(1))
-        .style(
-            Style::new()
-                .fg(crate::palette::FG)
-                .bg(crate::palette::BG_PANEL),
+    if mode.short {
+        // a bare line on the panel ground: the frame has no rows for a
+        // box, the title that rides its top border, or the hints in its
+        // bottom one
+        frame.render_widget(
+            Paragraph::new(body).style(
+                Style::new()
+                    .fg(crate::palette::FG)
+                    .bg(crate::palette::BG_PANEL),
+            ),
+            composer,
         );
-    if let Some(t) = title {
-        block = block.title(t);
+    } else {
+        let mut block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::new().fg(border_fg))
+            .padding(ratatui::widgets::Padding::horizontal(1))
+            .style(
+                Style::new()
+                    .fg(crate::palette::FG)
+                    .bg(crate::palette::BG_PANEL),
+            );
+        if let Some(t) = title {
+            block = block.title(t);
+        }
+        frame.render_widget(Paragraph::new(body).block(block), composer);
     }
-    frame.render_widget(Paragraph::new(body).block(block), composer);
     // a picker borrows the composer: that chunk is its popup rect
     // (click-outside closes it without submitting)
     if picker.is_some() {
@@ -15950,20 +16061,22 @@ fn render(
     }
     // the hardware cursor only rides the draft when it can actually
     // follow keystrokes (an open ask captures input into its dialog);
-    // x = border + padding + the ❯ lead + the display column
+    // x = the box's border and padding (none on a short frame) + the ❯
+    // lead + the display column
     if ask.is_none()
         && let Some((row_off, col)) = cursor_at
     {
+        let (cols, rows) = if mode.short { (0, 0) } else { (2, 1) };
         frame.set_cursor_position((
-            (composer.x + 2 + COMPOSER_LEAD + col).min(composer.right().saturating_sub(2)),
-            composer.y + 1 + row_off.min(composer.height.saturating_sub(2)),
+            (composer.x + cols + COMPOSER_LEAD + col).min(composer.right().saturating_sub(cols)),
+            composer.y + rows + row_off.min(composer.height.saturating_sub(1 + rows)),
         ));
     }
     {
         let buf = frame.buffer_mut();
         // busy comet: a brand-colored light band sweeping the top border
         // (title text keeps its own color — only border glyphs light up)
-        if busy && ask.is_none() && !overlay {
+        if busy && ask.is_none() && !overlay && !mode.short {
             let ms = busy_since.map_or(0, |t| now.saturating_duration_since(t).as_millis());
             let len = composer.width as usize;
             let span = len.saturating_sub(1).max(1) as f32;
@@ -15981,7 +16094,7 @@ fn render(
         // native mode uses the printed shortcuts), contextual hints right
         // — unless a modal, the ask, or a popup holds focus, whose own
         // bottom border carries them
-        if composer.height >= 2 && composer.width >= 4 {
+        if !mode.short && composer.height >= 2 && composer.width >= 4 {
             let y = composer.bottom() - 1;
             let limit = composer.right() - 2;
             let (mut zones, strip_end) = paint_strip(buf, composer.x + 2, limit, y);
@@ -16333,7 +16446,14 @@ fn render(
                     all.into_iter().skip(offset).take(cap).collect::<Vec<_>>();
                 let more = total.saturating_sub(offset + cap);
                 if more > 0 {
-                    rows.push(TuiLine::styled(format!("… ↓ +{more} more"), meta));
+                    // the marker takes the window's last row: a box
+                    // clamped to a phone's rows would drop one pushed
+                    // after it, and the page below would go unsignposted
+                    let marker = TuiLine::styled(format!("… ↓ +{more} more"), meta);
+                    match rows.last_mut() {
+                        Some(last) => *last = marker,
+                        None => rows.push(marker),
+                    }
                 }
                 (width, height, modal_title("help"), rows)
             }
@@ -17786,14 +17906,24 @@ pub(crate) fn help_modal_rows(width: usize) -> Vec<ratatui::text::Line<'static>>
         text: &mut Vec<TuiLine<'static>>,
         pairs: &[(&str, &str)],
         key_style: ratatui::style::Style,
+        width: usize,
     ) {
         let col = pairs.iter().map(|(k, _)| k.width()).max().unwrap_or(0) + 2;
+        // the description wraps under its own column: a narrow terminal
+        // must not cut it mid-word
+        let desc_w = width.saturating_sub(col).max(8);
         for (k, v) in pairs {
-            let desc: String = v.chars().take(44).collect();
-            text.push(TuiLine::from(vec![
-                Span::styled(format!("{k}{}", " ".repeat(col - k.width())), key_style),
-                Span::styled(desc, crate::palette::META_STYLE),
-            ]));
+            for (i, part) in wrap_rows(v, desc_w).iter().enumerate() {
+                let lead = if i == 0 {
+                    Span::styled(format!("{k}{}", " ".repeat(col - k.width())), key_style)
+                } else {
+                    Span::raw(" ".repeat(col))
+                };
+                text.push(TuiLine::from(vec![
+                    lead,
+                    Span::styled(part.text.clone(), crate::palette::META_STYLE),
+                ]));
+            }
         }
     }
     section(&mut text, "keys");
@@ -17849,7 +17979,7 @@ pub(crate) fn help_modal_rows(width: usize) -> Vec<ratatui::text::Line<'static>>
         ),
     ]);
     let key_pairs: Vec<(&str, &str)> = keys.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-    rows(&mut text, &key_pairs, key_style);
+    rows(&mut text, &key_pairs, key_style, width);
     text.push(TuiLine::default());
     section(&mut text, "session");
     rows(
@@ -17876,6 +18006,7 @@ pub(crate) fn help_modal_rows(width: usize) -> Vec<ratatui::text::Line<'static>>
             ("/retry", "resend the last prompt"),
         ],
         key_style,
+        width,
     );
     text.push(TuiLine::default());
     section(&mut text, "model & providers");
@@ -17895,6 +18026,7 @@ pub(crate) fn help_modal_rows(width: usize) -> Vec<ratatui::text::Line<'static>>
             ("/settings", "settings & provider status"),
         ],
         key_style,
+        width,
     );
     text.push(TuiLine::default());
     section(&mut text, "tools & context");
@@ -17923,6 +18055,7 @@ pub(crate) fn help_modal_rows(width: usize) -> Vec<ratatui::text::Line<'static>>
             ("/image", "attach an image [path]"),
         ],
         key_style,
+        width,
     );
     text.push(TuiLine::default());
     section(&mut text, "panels");
@@ -17934,6 +18067,7 @@ pub(crate) fn help_modal_rows(width: usize) -> Vec<ratatui::text::Line<'static>>
             ("/doctor", "live surface state (CLI owns network checks)"),
         ],
         key_style,
+        width,
     );
     text.push(TuiLine::default());
     section(&mut text, "appearance & notifications");
@@ -17957,6 +18091,7 @@ pub(crate) fn help_modal_rows(width: usize) -> Vec<ratatui::text::Line<'static>>
             ("title", "[tui] terminal title (default on)"),
         ],
         key_style,
+        width,
     );
     text.push(TuiLine::default());
     section(&mut text, "composer vim (/vim)");
@@ -17975,6 +18110,7 @@ pub(crate) fn help_modal_rows(width: usize) -> Vec<ratatui::text::Line<'static>>
             ("esc", "insert → normal · normal → insert"),
         ],
         key_style,
+        width,
     );
     text.push(TuiLine::default());
     section(&mut text, "safety & plans");
@@ -17997,6 +18133,7 @@ pub(crate) fn help_modal_rows(width: usize) -> Vec<ratatui::text::Line<'static>>
             ),
         ],
         key_style,
+        width,
     );
     text.push(TuiLine::default());
     section(&mut text, "meta");
@@ -18010,6 +18147,7 @@ pub(crate) fn help_modal_rows(width: usize) -> Vec<ratatui::text::Line<'static>>
             ("/update", "update ka, then resume here (idle)"),
         ],
         key_style,
+        width,
     );
     text.push(TuiLine::default());
     text.push(TuiLine::from(Span::styled(
@@ -19375,11 +19513,33 @@ mod tests {
             confidence: None,
         };
         let two = [todo("a"), todo("b")];
-        assert_eq!(pinned_todos_h(false, &two), 0, "idle: no panel");
-        assert_eq!(pinned_todos_h(true, &[]), 0, "busy without todos: no panel");
-        assert_eq!(pinned_todos_h(true, &two), 3, "title + two items");
+        assert_eq!(
+            pinned_todos_h(false, &two, FrameMode::FULL),
+            0,
+            "idle: no panel"
+        );
+        assert_eq!(
+            pinned_todos_h(true, &[], FrameMode::FULL),
+            0,
+            "busy without todos: no panel"
+        );
+        assert_eq!(
+            pinned_todos_h(true, &two, FrameMode::FULL),
+            3,
+            "title + two items"
+        );
         let six: Vec<_> = (0..6).map(|i| todo(&i.to_string())).collect();
-        assert_eq!(pinned_todos_h(true, &six), 5, "capped at four items");
+        assert_eq!(
+            pinned_todos_h(true, &six, FrameMode::FULL),
+            5,
+            "capped at four items"
+        );
+        // a short frame keeps its rows for the answer: two items at most
+        assert_eq!(
+            pinned_todos_h(true, &six, FrameMode::PHONE),
+            3,
+            "capped at two items"
+        );
     }
 
     /// A composer popup lists as many rows as the room above the composer
@@ -19710,7 +19870,11 @@ mod tests {
             );
             // the key loop's own numbers at this size, for an empty
             // draft's composer (borders included, as the loop passes it)
-            let visible = pager_visible(visible_rows(h, input_height(1)));
+            let visible = pager_visible(visible_rows(
+                h,
+                FrameMode::FULL,
+                input_height(1, FrameMode::FULL),
+            ));
             let mut scroll = None;
             assert!(!doc_pager_keys(
                 KeyCode::End,
@@ -19864,11 +20028,30 @@ mod tests {
     #[test]
     fn visible_rows_carves_out_chrome() {
         // header bar + its row of air + composer + a row of air + status
-        assert_eq!(visible_rows(24, 3), 17);
-        assert_eq!(visible_rows(5, 3), 0, "never underflows");
-        assert_eq!(visible_rows(0, 0), 0);
+        assert_eq!(visible_rows(24, FrameMode::FULL, 3), 17);
+        assert_eq!(visible_rows(5, FrameMode::FULL, 3), 0, "never underflows");
+        assert_eq!(visible_rows(0, FrameMode::FULL, 0), 0);
         // growth of the composer eats the viewport one row at a time
-        assert_eq!(visible_rows(24, 8), 12);
+        assert_eq!(visible_rows(24, FrameMode::FULL, 8), 12);
+        // a short frame keeps only the header bar and the status line,
+        // and the composer is its rows alone: 11 of 14 rows and 9 of 12
+        // are the transcript's. The line is drawn just under 18 rows,
+        // where the full chrome first takes less than 40 percent of the
+        // frame, and from there down to 12 rows the transcript keeps
+        // three quarters of the frame at least.
+        assert_eq!(
+            visible_rows(18, FrameMode::FULL, input_height(1, FrameMode::FULL)),
+            11,
+            "18 rows still carry the box"
+        );
+        for h in [17u16, 16, 15, 14, 13, 12] {
+            let mode = FrameMode::of(46, h);
+            let visible = visible_rows(h, mode, input_height(1, mode));
+            assert!(
+                visible * 4 >= (h as usize) * 3,
+                "{h} rows leave {visible} for the transcript"
+            );
+        }
     }
 
     #[test]
@@ -19908,8 +20091,8 @@ mod tests {
         // the transcript content starts right under it: no border row
         let (area, start) = f.tx.expect("content rect published");
         assert_eq!((area.y, start), (2, 0));
-        assert_eq!(area.height as usize, visible_rows(40, 3));
-        assert_eq!(area.width, transcript_width(120));
+        assert_eq!(area.height as usize, visible_rows(40, FrameMode::FULL, 3));
+        assert_eq!(area.width, transcript_width(120, FrameMode::FULL));
         // the composer closes with rounded corners (rows 35..=37)
         assert_eq!(buf[(1, 35)].symbol(), "╭");
         assert_eq!(buf[(118, 35)].symbol(), "╮");
@@ -20120,7 +20303,10 @@ mod tests {
         let pos = f.terminal.get_cursor_position().unwrap();
         assert_eq!((pos.x, pos.y), (5 + 2, 20));
         // the wrap width is the box minus borders, padding, and lead
-        assert_eq!(input_inner_w(80), 72);
+        assert_eq!(input_inner_w(80, FrameMode::FULL), 72);
+        // a bare line on the full frame width leaves only the lead
+        assert_eq!(input_inner_w(46, FrameMode::PHONE), 44);
+        assert_eq!(input_inner_w(40, FrameMode::PHONE), 38);
         // an empty draft shows the placeholder after the lead
         let f = plain_frame(
             &mut Transcript::default(),
@@ -25979,9 +26165,15 @@ mod tests {
     fn transcript_width_is_full_width_minus_chrome() {
         // margin cols on each side + the paragraph's side padding; no
         // sidebar column anywhere in the layout anymore
-        assert_eq!(transcript_width(120), 116);
-        assert_eq!(transcript_width(100), 96);
-        assert_eq!(transcript_width(60), 56, "never underflows");
+        assert_eq!(transcript_width(120, FrameMode::FULL), 116);
+        assert_eq!(transcript_width(100, FrameMode::FULL), 96);
+        assert_eq!(
+            transcript_width(60, FrameMode::FULL),
+            56,
+            "never underflows"
+        );
+        // a narrow frame has no columns to spare: the text runs edge to edge
+        assert_eq!(transcript_width(46, FrameMode::PHONE), 46);
     }
 
     #[test]
@@ -27222,7 +27414,11 @@ mod tests {
                     )
                 })
                 .unwrap();
-            assert_eq!(tx_width.get(), transcript_width(width), "w{width}");
+            assert_eq!(
+                tx_width.get(),
+                transcript_width(width, FrameMode::FULL),
+                "w{width}"
+            );
             let buf = terminal.backend().buffer();
             let area = buf.area;
             // header (row 0) + composer (3 rows) + status line (last row)
