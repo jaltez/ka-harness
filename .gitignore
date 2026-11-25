@@ -19,3 +19,4 @@ ka-*.tar.gz.*
 .voyager/
 .codex/
 .claude/
+__pycache__/

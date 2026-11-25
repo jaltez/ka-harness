@@ -19800,7 +19800,14 @@ mod tests {
         use crossterm::event::KeyCode;
         use ratatui::backend::TestBackend;
         let rows = changelog_rows();
-        for (w, h) in [(80u16, 24u16), (120, 40), (200, 50), (64, 18)] {
+        for (w, h) in [
+            (80u16, 24u16),
+            (120, 40),
+            (200, 50),
+            (64, 18),
+            (46, 14),
+            (40, 12),
+        ] {
             let mut terminal = ratatui::Terminal::new(TestBackend::new(w, h)).unwrap();
             let tx_width = std::cell::Cell::new(0u16);
             let mut t = Transcript::default();
@@ -19868,13 +19875,9 @@ mod tests {
                 top.contains("# Changelog") && top.contains("… ↓ "),
                 "{w}x{h}: the panel does not open at the top"
             );
-            // the key loop's own numbers at this size, for an empty
-            // draft's composer (borders included, as the loop passes it)
-            let visible = pager_visible(visible_rows(
-                h,
-                FrameMode::FULL,
-                input_height(1, FrameMode::FULL),
-            ));
+            // the key loop's own numbers at this size, in this size's mode
+            let mode = FrameMode::of(w, h);
+            let visible = pager_visible(visible_rows(h, mode, input_height(1, mode)));
             let mut scroll = None;
             assert!(!doc_pager_keys(
                 KeyCode::End,
@@ -19884,14 +19887,147 @@ mod tests {
                 visible,
             ));
             let end = draw(scroll);
-            // the file's last words sit on its last wrapped row, and no
-            // row is left below the window
+            // the file's last words sit on its last wrapped row (a
+            // narrow frame wraps them across two rows), and no row is
+            // left below the window
             assert!(
-                end.contains("platform-named error.") && !end.contains("… ↓ "),
+                end.contains("platform-named") && end.contains("error.") && !end.contains("… ↓ "),
                 "{w}x{h}: the oldest entry is not on the last page\n{end}"
             );
         }
     }
+    /// The compact layout's bar, on the real renderer: at a phone size
+    /// the input is a bare line, nothing is boxed while it is quiet, a
+    /// popup is one box sitting on the input line with its list intact,
+    /// and a paged overlay says there is more below. A desktop frame
+    /// keeps its box and its row of air.
+    #[test]
+    fn compact_frames_keep_the_transcript_and_its_input() {
+        use ratatui::backend::TestBackend;
+
+        fn frame(
+            (w, h): (u16, u16),
+            popup: Option<&SlashPopup>,
+            modal: Option<&Modal>,
+        ) -> Vec<String> {
+            let mut terminal = ratatui::Terminal::new(TestBackend::new(w, h)).unwrap();
+            let tx_width = std::cell::Cell::new(0u16);
+            let mut t = Transcript::default();
+            terminal
+                .draw(|f| {
+                    super::render(
+                        f,
+                        &mut t,
+                        None,
+                        "",
+                        0,
+                        false,
+                        None,
+                        Instant::now(),
+                        0,
+                        None,
+                        None,
+                        popup,
+                        None,
+                        None,
+                        modal,
+                        None,
+                        &Meters::default(),
+                        &SidebarState::default(),
+                        true,
+                        true,
+                        "◆",
+                        &std::cell::Cell::new(None::<StripZones>),
+                        None,
+                        &std::cell::Cell::new(None::<TitleArrows>),
+                        &std::cell::Cell::new(None::<ratatui::layout::Rect>),
+                        &std::cell::Cell::new(None::<ratatui::layout::Rect>),
+                        &std::cell::Cell::new(None::<(ratatui::layout::Rect, usize)>),
+                        &std::cell::Cell::new(
+                            None::<(ratatui::layout::Rect, usize, usize, usize, usize)>,
+                        ),
+                        &tx_width,
+                        None,
+                        None,
+                        None,
+                        false,
+                        None,
+                        None,
+                    )
+                })
+                .unwrap();
+            let buf = terminal.backend().buffer();
+            (0..buf.area.height)
+                .map(|y| {
+                    (0..buf.area.width)
+                        .map(|x| buf[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect()
+        }
+
+        let box_tops = |lines: &[String]| {
+            lines
+                .iter()
+                .enumerate()
+                .filter(|(_, line)| line.contains('╭'))
+                .map(|(y, _)| y)
+                .collect::<Vec<_>>()
+        };
+        for size in [(46u16, 14u16), (40, 12)] {
+            let h = usize::from(size.1);
+            let quiet = frame(size, None, None);
+            assert_eq!(quiet.len(), h, "{size:?}");
+            // the header on top, the bare input line over the status
+            // line, and no box anywhere while nothing is open
+            assert!(quiet[0].contains("ka"), "{size:?}: {quiet:?}");
+            assert!(quiet[h - 2].contains('❯'), "{size:?}: no input line");
+            assert!(!quiet[h - 2].contains('╭'), "{size:?}: the input is boxed");
+            assert!(
+                box_tops(&quiet).is_empty(),
+                "{size:?}: a box on a quiet phone frame: {quiet:?}"
+            );
+
+            // a popup is one box sitting on the input line, five rows of
+            // list at least
+            let popup = SlashPopup {
+                items: (0..8)
+                    .map(|i| (format!("/cmd{i}"), format!("what cmd{i} does")))
+                    .collect(),
+                selected: 0,
+            };
+            let open = frame(size, Some(&popup), None);
+            let tops = box_tops(&open);
+            assert_eq!(tops.len(), 1, "{size:?}: one box: {open:?}");
+            let top = tops[0];
+            let bottom = (top..h)
+                .find(|&y| open[y].contains('╰'))
+                .expect("the box closes");
+            assert_eq!(
+                bottom + 1,
+                h - 2,
+                "{size:?}: the box must sit on the input line: {open:?}"
+            );
+            let list = open[top + 1..bottom]
+                .iter()
+                .filter(|line| line.contains("/cmd"))
+                .count();
+            assert!(list >= 5, "{size:?}: {list} list rows: {open:?}");
+
+            // a paged overlay says there is more below
+            let help = frame(size, None, Some(&Modal::Help { scroll: None }));
+            assert!(
+                help.iter().any(|line| line.contains("… ↓")),
+                "{size:?}: the help page hides that it continues: {help:?}"
+            );
+        }
+
+        // a desktop frame keeps the box and its row of air
+        let desk = frame((80, 24), None, None);
+        assert!(desk[1].trim().is_empty(), "the air row under the header");
+        assert_eq!(box_tops(&desk).len(), 1, "the composer box");
+    }
+
     #[test]
     fn user_entry_rows_tracks_user_message_positions() {
         let mut t = Transcript::default();
