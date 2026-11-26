@@ -133,7 +133,8 @@ impl ClaudePlanSource {
     /// URL, best-effort open a browser, wait at an ephemeral loopback
     /// callback for the code, exchange it, persist. Returns the tokens.
     pub async fn login(&self) -> Result<Tokens, AuthError> {
-        let pkce = crate::pkce::Pkce::generate();
+        let pkce =
+            crate::pkce::Pkce::generate().map_err(|message| AuthError::Protocol { message })?;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .map_err(|e| AuthError::Protocol {
@@ -155,70 +156,127 @@ impl ClaudePlanSource {
         Ok(tokens)
     }
 
-    /// Wait at the loopback listener for `?code=…&state=…` (one hit).
-    /// The state must match — a mismatch or missing code is a protocol
-    /// error, never a best-effort fallback.
+    /// Wait at the loopback listener for `GET /callback?code=…&state=…`.
+    /// Non-GET or non-`/callback` probes (e.g. `/favicon.ico`) are answered
+    /// and ignored until the deadline. The state is verified before
+    /// answering `200 OK` — a mismatch returns `400 Bad Request` and a
+    /// protocol error.
     pub async fn wait_for_code(
         &self,
         listener: &tokio::net::TcpListener,
         expected_state: &str,
     ) -> Result<String, AuthError> {
-        use tokio::io::AsyncReadExt as _;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        /// Cap the HTTP request head at 16 KiB to prevent OOM DoS.
+        const MAX_CALLBACK_HEAD: usize = 16 * 1024;
+        /// Per-connection read bound so a hanging probe cannot stall login.
+        const CONN_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
         let wait = async {
-            let (mut sock, _) = listener.accept().await.map_err(|e| AuthError::Protocol {
-                message: format!("callback accept failed: {e}"),
-            })?;
-            let mut buf = Vec::new();
-            let mut tmp = [0u8; 2048];
-            // read until the request head is complete (the browser sends
-            // exactly one GET; the body is empty)
             loop {
-                let n = sock.read(&mut tmp).await.map_err(|e| AuthError::Protocol {
-                    message: format!("callback read failed: {e}"),
+                let (mut sock, _) = listener.accept().await.map_err(|e| AuthError::Protocol {
+                    message: format!("callback accept failed: {e}"),
                 })?;
-                if n == 0 {
-                    break;
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 2048];
+                let conn_deadline = tokio::time::Instant::now() + CONN_READ_TIMEOUT;
+                let mut oversized = false;
+                let mut read_failed = false;
+                loop {
+                    match tokio::time::timeout_at(conn_deadline, sock.read(&mut tmp)).await {
+                        Ok(Ok(0)) => break,
+                        Ok(Ok(n)) => {
+                            if buf.len().saturating_add(n) > MAX_CALLBACK_HEAD {
+                                oversized = true;
+                                break;
+                            }
+                            buf.extend_from_slice(&tmp[..n]);
+                            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        Ok(Err(_)) | Err(_) => {
+                            read_failed = true;
+                            break;
+                        }
+                    }
                 }
-                buf.extend_from_slice(&tmp[..n]);
-                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                    break;
+                if oversized {
+                    let resp = "HTTP/1.1 431 Request Header Fields Too Large\r\n\
+                                content-type: text/plain\r\nconnection: close\r\n\r\n\
+                                Request too large.";
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                    continue;
                 }
+                if read_failed || buf.is_empty() {
+                    let _ = sock.shutdown().await;
+                    continue;
+                }
+                let text = String::from_utf8_lossy(&buf);
+                let request_line = text.lines().next().unwrap_or("");
+                let mut parts = request_line.split_whitespace();
+                let method = parts.next().unwrap_or("");
+                let target = parts.next().unwrap_or("");
+                if method != "GET" {
+                    let resp = "HTTP/1.1 405 Method Not Allowed\r\n\
+                                content-type: text/plain\r\nconnection: close\r\n\r\n\
+                                Method not allowed.";
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                    continue;
+                }
+                let (path, query) = target.split_once('?').unwrap_or((target, ""));
+                if path != CALLBACK_PATH {
+                    let resp = "HTTP/1.1 404 Not Found\r\n\
+                                content-type: text/plain\r\nconnection: close\r\n\r\n\
+                                Not found.";
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                    continue;
+                }
+                let mut code = None;
+                let mut state = None;
+                for pair in query.split('&') {
+                    if pair.is_empty() {
+                        continue;
+                    }
+                    let (raw_k, raw_v) = pair.split_once('=').unwrap_or((pair, ""));
+                    let k = urldecode(raw_k);
+                    let v = urldecode(raw_v);
+                    if k == "code" && !v.is_empty() {
+                        code = Some(v);
+                    } else if k == "state" {
+                        state = Some(v);
+                    }
+                }
+                if state.as_deref() != Some(expected_state) {
+                    let resp = "HTTP/1.1 400 Bad Request\r\n\
+                                content-type: text/plain\r\nconnection: close\r\n\r\n\
+                                Invalid OAuth state.";
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                    return Err(AuthError::Protocol {
+                        message: "callback state mismatch (possible CSRF)".to_string(),
+                    });
+                }
+                let Some(code) = code else {
+                    let resp = "HTTP/1.1 400 Bad Request\r\n\
+                                content-type: text/plain\r\nconnection: close\r\n\r\n\
+                                Missing authorization code.";
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                    return Err(AuthError::Protocol {
+                        message: "callback carried no code (denied or malformed)".to_string(),
+                    });
+                };
+                // Verified state + code: answer the tab so the user can close it.
+                let page = "HTTP/1.1 200 OK\r\ncontent-type: text/html\r\nconnection: close\r\n\r\n\
+                            <h1>ka passport</h1><p>Login received — you can close this tab.</p>";
+                let _ = sock.write_all(page.as_bytes()).await;
+                let _ = sock.shutdown().await;
+                return Ok(code);
             }
-            let text = String::from_utf8_lossy(&buf);
-            // answer the tab so the user can close it
-            let page = "HTTP/1.1 200 OK\r\ncontent-type: text/html\r\nconnection: close\r\n\r\n\
-                        <h1>ka passport</h1><p>Login received — you can close this tab.</p>";
-            use tokio::io::AsyncWriteExt as _;
-            let _ = sock.write_all(page.as_bytes()).await;
-            let _ = sock.shutdown().await;
-            // `GET /callback?code=…&state=… HTTP/1.1`
-            let target = text
-                .split_whitespace()
-                .nth(1)
-                .ok_or_else(|| AuthError::Protocol {
-                    message: "callback request had no path".to_string(),
-                })?;
-            let query = target.split_once('?').map(|(_, q)| q).unwrap_or("");
-            let mut code = None;
-            let mut state = None;
-            for pair in query.split('&') {
-                let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-                if k == "code" && !v.is_empty() {
-                    code = Some(v.to_string());
-                }
-                if k == "state" {
-                    state = Some(v.to_string());
-                }
-            }
-            let code = code.ok_or_else(|| AuthError::Protocol {
-                message: "callback carried no code (denied or malformed)".to_string(),
-            })?;
-            if state.as_deref() != Some(expected_state) {
-                return Err(AuthError::Protocol {
-                    message: "callback state mismatch (possible CSRF)".to_string(),
-                });
-            }
-            Ok(code)
         };
         tokio::time::timeout(std::time::Duration::from_secs(LOGIN_TIMEOUT_SECS), wait)
             .await
@@ -492,14 +550,57 @@ fn urlencode(s: &str) -> String {
     out
 }
 
-/// Best-effort `xdg-open`/`open`/`start` on the authorize URL. The URL
-/// is always printed first, so a headless or odd-desktop environment
-/// still completes the flow by hand; a failure here is silent.
+/// Percent-decode an `application/x-www-form-urlencoded` query component
+/// (`+` → space, `%XX` → byte, invalid sequences preserved verbatim).
+fn urldecode(s: &str) -> String {
+    fn hex_val(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                    out.push((hi << 4) | lo);
+                    i += 3;
+                } else {
+                    out.push(b'%');
+                    i += 1;
+                }
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Best-effort `xdg-open`/`open`/`rundll32.exe` on the authorize URL.
+/// Only `https://` URLs are passed to the OS opener (never `cmd /c start`,
+/// which splits on `&` in OAuth query strings). The URL is always printed
+/// first, so a headless or odd-desktop environment still completes the
+/// flow by hand; a failure here is silent.
 fn open_browser_best_effort(url: &str) {
+    if !url.starts_with("https://") {
+        return;
+    }
     let (program, args): (&str, Vec<&str>) = if cfg!(target_os = "macos") {
         ("open", vec![url])
     } else if cfg!(target_os = "windows") {
-        ("cmd", vec!["/c", "start", "", url])
+        ("rundll32.exe", vec!["url.dll,FileProtocolHandler", url])
     } else {
         ("xdg-open", vec![url])
     };
@@ -524,7 +625,9 @@ mod tests {
     #[test]
     fn authorize_url_carries_pkce_and_state() {
         let src = ClaudePlanSource::with_store(Arc::new(MemoryStore::default()));
-        let pkce = crate::pkce::Pkce::generate();
+        let Ok(pkce) = crate::pkce::Pkce::generate() else {
+            panic!("Pkce::generate failed");
+        };
         let url = src.authorize_url(&pkce, "http://127.0.0.1:5173/callback");
         assert!(url.starts_with(AUTHORIZE_URL), "authorize endpoint: {url}");
         for piece in [

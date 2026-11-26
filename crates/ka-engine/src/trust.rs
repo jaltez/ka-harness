@@ -10,22 +10,35 @@
 
 use std::path::{Path, PathBuf};
 
-/// The trust store file, derived from the environment.
-pub fn trust_file() -> PathBuf {
+/// Resolve the trust store file from the environment, returning `None`
+/// (fail closed) when neither `XDG_STATE_HOME` nor `HOME` is set —
+/// never falling back to a world-writable temp directory.
+fn resolve_trust_file() -> Option<PathBuf> {
     // gated like [`test_support`] itself, not `cfg(test)`: integration
     // suites link the lib WITHOUT `cfg(test)`, so a plain test gate
     // would leave their `with_trust_file` redirection inert and point
     // them at the real store
     #[cfg(any(test, feature = "test-util"))]
     if let Some(file) = test_support::current_file() {
-        return file;
+        return Some(file);
     }
-    trust_file_under(
-        std::env::var("XDG_STATE_HOME")
-            .map(PathBuf::from)
-            .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".local/state")))
-            .unwrap_or_else(|_| std::env::temp_dir()),
-    )
+    let state_home = std::env::var("XDG_STATE_HOME")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .map(|h| PathBuf::from(h).join(".local/state"))
+        })?;
+    Some(trust_file_under(state_home))
+}
+
+/// The trust store file, derived from the environment. Returns an empty
+/// path when no state home can be resolved (never `/tmp`).
+pub fn trust_file() -> PathBuf {
+    resolve_trust_file().unwrap_or_default()
 }
 
 /// Trust store path beneath an explicit state home.
@@ -33,9 +46,11 @@ fn trust_file_under(state_home: PathBuf) -> PathBuf {
     state_home.join("ka/trust.json")
 }
 
-/// Read the trust store; missing or malformed file = empty store.
+/// Read the trust store; missing, unresolvable, or malformed file = empty store.
 pub fn load_trust() -> Vec<PathBuf> {
-    load_trust_at(&trust_file())
+    resolve_trust_file()
+        .map(|file| load_trust_at(&file))
+        .unwrap_or_default()
 }
 
 pub fn load_trust_at(file: &Path) -> Vec<PathBuf> {
@@ -46,16 +61,47 @@ pub fn load_trust_at(file: &Path) -> Vec<PathBuf> {
 }
 
 /// Persist the trust store (creating parent directories; best-effort).
+/// Fails closed if no user state home is resolvable.
 pub fn save_trust(dirs: &[PathBuf]) {
-    save_trust_at(&trust_file(), dirs);
+    if let Some(file) = resolve_trust_file() {
+        save_trust_at(&file, dirs);
+    }
 }
 
 pub fn save_trust_at(file: &Path, dirs: &[PathBuf]) {
-    if let Some(parent) = file.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    let Some(parent) = file.parent() else {
+        return;
+    };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
     }
-    if let Ok(json) = serde_json::to_string_pretty(dirs) {
-        let _ = std::fs::write(file, json);
+    let Ok(json) = serde_json::to_string_pretty(dirs) else {
+        return;
+    };
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = parent.join(format!(".trust.json.tmp.{}.{nanos}", std::process::id()));
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let Ok(mut f) = opts.open(&tmp) else {
+        return;
+    };
+    use std::io::Write;
+    if f.write_all(json.as_bytes()).is_ok() && f.sync_all().is_ok() {
+        drop(f);
+        if std::fs::rename(&tmp, file).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    } else {
+        drop(f);
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 

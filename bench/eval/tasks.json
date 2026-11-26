@@ -1,0 +1,195 @@
+{
+  "schema_version": 1,
+  "tasks": [
+    {
+      "id": "py-csv-dialect",
+      "title": "Fix RFC 4180 CSV parser",
+      "category": "bugfix",
+      "language": "python",
+      "timeout_s": 120,
+      "prompt": "Fix `parse_csv` in `csv_parser.py` so it properly implements RFC 4180 CSV parsing: quoted fields containing commas, escaped double quotes (`\"\"`), embedded newlines inside quoted fields, and CRLF (`\\r\\n`) line endings. Run `python3 -m unittest test_csv.py` to verify.",
+      "setup_files": {
+        "csv_parser.py": "def parse_csv(text: str) -> list[list[str]]:\n    \"\"\"BUGGY: naive split breaks on quoted commas, escaped quotes, and embedded newlines.\"\"\"\n    rows = []\n    for line in text.splitlines():\n        if not line:\n            continue\n        rows.append([cell.strip('\"') for cell in line.split(',')])\n    return rows\n",
+        "test_csv.py": "import unittest\nfrom csv_parser import parse_csv\n\n\nclass TestCsvParser(unittest.TestCase):\n    def test_simple(self):\n        self.assertEqual(parse_csv('a,b,c\\n1,2,3\\n'), [['a', 'b', 'c'], ['1', '2', '3']])\n\n    def test_quoted_commas_and_escaped_quotes(self):\n        src = 'name,note\\n\"Ada, Lovelace\",\"She said \"\"hello\"\"\"\\n'\n        self.assertEqual(parse_csv(src), [['name', 'note'], ['Ada, Lovelace', 'She said \"hello\"']])\n\n    def test_embedded_newlines_and_crlf(self):\n        src = 'id,bio\\r\\n1,\"line1\\nline2\\r\\nline3\"\\r\\n2,\"ok\"\\r\\n'\n        self.assertEqual(parse_csv(src), [['id', 'bio'], ['1', 'line1\\nline2\\r\\nline3'], ['2', 'ok']])\n\n    def test_empty_fields(self):\n        self.assertEqual(parse_csv(',a,\"\",\\n'), [['', 'a', '', '']])\n\n\nif __name__ == '__main__':\n    unittest.main()\n"
+      },
+      "verify_cmd": "python3 -m unittest test_csv.py"
+    },
+    {
+      "id": "py-lru-ttl",
+      "title": "Fix LRU cache with TTL expiry",
+      "category": "edge-case",
+      "language": "python",
+      "timeout_s": 120,
+      "prompt": "Fix `LruTtlCache` in `cache.py`. It must: (1) use the injected `clock` callable for timestamps, (2) treat entries with `now >= expires_at` as expired and remove them on `get`/`put`/`__len__`, (3) refresh recency on `get` and on `put` updates, and (4) purge expired entries before evicting the least-recently-used live entry when at capacity. Run `python3 -m unittest test_cache.py` to verify.",
+      "setup_files": {
+        "cache.py": "import time\n\n\nclass LruTtlCache:\n    \"\"\"BUGGY: does not refresh recency on get/put and evicts live items before expired ones.\"\"\"\n\n    def __init__(self, capacity: int, clock=time.monotonic):\n        self.capacity = capacity\n        self.clock = clock\n        self._store: dict = {}\n\n    def get(self, key):\n        item = self._store.get(key)\n        if item is None:\n            return None\n        val, exp = item\n        if self.clock() >= exp:\n            del self._store[key]\n            return None\n        return val\n\n    def put(self, key, value, ttl: float) -> None:\n        if len(self._store) >= self.capacity and key not in self._store:\n            oldest = next(iter(self._store))\n            del self._store[oldest]\n        self._store[key] = (value, self.clock() + ttl)\n\n    def __len__(self) -> int:\n        return len(self._store)\n",
+        "test_cache.py": "import unittest\nfrom cache import LruTtlCache\n\n\nclass FakeClock:\n    def __init__(self):\n        self.t = 100.0\n\n    def __call__(self):\n        return self.t\n\n    def advance(self, dt):\n        self.t += dt\n\n\nclass TestLruTtlCache(unittest.TestCase):\n    def test_recency_refresh_on_get(self):\n        clk = FakeClock()\n        c = LruTtlCache(2, clock=clk)\n        c.put('a', 1, ttl=10)\n        c.put('b', 2, ttl=10)\n        self.assertEqual(c.get('a'), 1)\n        c.put('c', 3, ttl=10)\n        self.assertEqual(c.get('a'), 1)\n        self.assertIsNone(c.get('b'))\n        self.assertEqual(c.get('c'), 3)\n\n    def test_expired_purged_before_live_eviction(self):\n        clk = FakeClock()\n        c = LruTtlCache(2, clock=clk)\n        c.put('live', 1, ttl=50)\n        c.put('short', 2, ttl=5)\n        clk.advance(6)\n        c.put('new', 3, ttl=50)\n        self.assertEqual(c.get('live'), 1)\n        self.assertEqual(c.get('new'), 3)\n        self.assertIsNone(c.get('short'))\n\n    def test_len_excludes_expired(self):\n        clk = FakeClock()\n        c = LruTtlCache(3, clock=clk)\n        c.put('a', 1, ttl=2)\n        c.put('b', 2, ttl=10)\n        clk.advance(3)\n        self.assertEqual(len(c), 1)\n\n    def test_update_refreshes_recency(self):\n        clk = FakeClock()\n        c = LruTtlCache(2, clock=clk)\n        c.put('a', 1, ttl=10)\n        c.put('b', 2, ttl=10)\n        c.put('a', 10, ttl=10)\n        c.put('c', 3, ttl=10)\n        self.assertEqual(c.get('a'), 10)\n        self.assertIsNone(c.get('b'))\n\n\nif __name__ == '__main__':\n    unittest.main()\n"
+      },
+      "verify_cmd": "python3 -m unittest test_cache.py"
+    },
+    {
+      "id": "py-semver-sort",
+      "title": "Fix SemVer 2.0 precedence sorting",
+      "category": "edge-case",
+      "language": "python",
+      "timeout_s": 120,
+      "prompt": "Fix `compare_semver` and `sort_versions` in `semver.py` to follow SemVer 2.0.0 precedence rules: numeric prerelease identifiers compare numerically (e.g., `alpha.2 < alpha.10`), numeric identifiers always have lower precedence than non-numeric identifiers, a larger set of prerelease fields has higher precedence if all preceding identifiers are equal, a normal version has higher precedence than a prerelease version, and build metadata (`+...`) is ignored for precedence. Run `python3 -m unittest test_semver.py` to verify.",
+      "setup_files": {
+        "semver.py": "def compare_semver(a: str, b: str) -> int:\n    \"\"\"BUGGY: compares prerelease lexically and fails to ignore build metadata.\"\"\"\n    def key(v: str):\n        main, *rest = v.split('-', 1)\n        nums = tuple(int(x) for x in main.split('.'))\n        pre = rest[0] if rest else ''\n        return (nums, pre)\n    ka, kb = key(a), key(b)\n    return (ka > kb) - (ka < kb)\n\n\ndef sort_versions(versions: list[str]) -> list[str]:\n    from functools import cmp_to_key\n    return sorted(versions, key=cmp_to_key(compare_semver))\n",
+        "test_semver.py": "import unittest\nfrom semver import compare_semver, sort_versions\n\n\nclass TestSemver(unittest.TestCase):\n    def test_spec_ordering(self):\n        ordered = [\n            '1.0.0-alpha',\n            '1.0.0-alpha.1',\n            '1.0.0-alpha.2',\n            '1.0.0-alpha.10',\n            '1.0.0-alpha.beta',\n            '1.0.0-beta',\n            '1.0.0-beta.2',\n            '1.0.0-beta.11',\n            '1.0.0-rc.1',\n            '1.0.0',\n            '1.0.1',\n            '1.1.0',\n            '2.0.0',\n        ]\n        shuffled = list(reversed(ordered))\n        self.assertEqual(sort_versions(shuffled), ordered)\n\n    def test_build_metadata_ignored(self):\n        self.assertEqual(compare_semver('1.0.0+20130313', '1.0.0+exp.sha.5114f85'), 0)\n        self.assertEqual(compare_semver('1.0.0-beta+exp', '1.0.0-beta+2013'), 0)\n        self.assertLess(compare_semver('1.0.0-alpha+001', '1.0.0+001'), 0)\n\n    def test_numeric_vs_alphanumeric_prerelease(self):\n        self.assertLess(compare_semver('1.0.0-1', '1.0.0-alpha'), 0)\n        self.assertLess(compare_semver('1.0.0-2', '1.0.0-10'), 0)\n\n\nif __name__ == '__main__':\n    unittest.main()\n"
+      },
+      "verify_cmd": "python3 -m unittest test_semver.py"
+    },
+    {
+      "id": "py-async-rate-limiter",
+      "title": "Fix token-bucket concurrency race",
+      "category": "concurrency",
+      "language": "python",
+      "timeout_s": 120,
+      "prompt": "Fix the race condition in `TokenBucket.acquire` in `limiter.py` so concurrent threads can never acquire more tokens than available, refills are monotonic and capped at `capacity`, and `acquire(cost)` rejects invalid/negative costs or costs exceeding capacity. Run `python3 -m unittest test_limiter.py` to verify.",
+      "setup_files": {
+        "limiter.py": "import time\n\n\nclass TokenBucket:\n    \"\"\"BUGGY: unsynchronized check-then-act allows oversubscription across threads.\"\"\"\n\n    def __init__(self, capacity: float, refill_per_sec: float, clock=time.monotonic):\n        self.capacity = float(capacity)\n        self.refill_per_sec = float(refill_per_sec)\n        self.clock = clock\n        self.tokens = float(capacity)\n        self.last = self.clock()\n\n    def acquire(self, cost: float = 1.0) -> bool:\n        now = self.clock()\n        elapsed = max(0.0, now - self.last)\n        if elapsed > 0:\n            self.tokens = min(self.capacity, self.tokens + elapsed * self.refill_per_sec)\n            self.last = now\n        if self.tokens >= cost:\n            # Simulate scheduling interleaving\n            time.sleep(0.0005)\n            self.tokens -= cost\n            return True\n        return False\n",
+        "test_limiter.py": "import threading\nimport unittest\nfrom limiter import TokenBucket\n\n\nclass TestTokenBucket(unittest.TestCase):\n    def test_no_oversubscription_under_contention(self):\n        now = [100.0]\n        bucket = TokenBucket(capacity=10, refill_per_sec=0.0, clock=lambda: now[0])\n        granted = []\n        lock = threading.Lock()\n        barrier = threading.Barrier(30)\n\n        def worker():\n            barrier.wait()\n            if bucket.acquire(1.0):\n                with lock:\n                    granted.append(1)\n\n        threads = [threading.Thread(target=worker) for _ in range(30)]\n        for t in threads:\n            t.start()\n        for t in threads:\n            t.join()\n        self.assertEqual(len(granted), 10)\n\n    def test_refill_and_cap(self):\n        now = [0.0]\n        bucket = TokenBucket(capacity=5, refill_per_sec=2.0, clock=lambda: now[0])\n        self.assertTrue(bucket.acquire(5.0))\n        self.assertFalse(bucket.acquire(1.0))\n        now[0] += 1.0\n        self.assertTrue(bucket.acquire(2.0))\n        self.assertFalse(bucket.acquire(1.0))\n        now[0] += 100.0\n        self.assertTrue(bucket.acquire(5.0))\n        self.assertFalse(bucket.acquire(0.1))\n\n    def test_invalid_cost(self):\n        bucket = TokenBucket(capacity=5, refill_per_sec=1.0)\n        with self.assertRaises(ValueError):\n            bucket.acquire(-1.0)\n        self.assertFalse(bucket.acquire(6.0))\n\n\nif __name__ == '__main__':\n    unittest.main()\n"
+      },
+      "verify_cmd": "python3 -m unittest test_limiter.py"
+    },
+    {
+      "id": "py-ini-refactor",
+      "title": "Extract shared INI parser with interpolation",
+      "category": "multi-file-refactor",
+      "language": "python",
+      "timeout_s": 150,
+      "fixture_dir": "py-ini-refactor",
+      "prompt": "`loader_a.py` and `loader_b.py` duplicate broken INI parsing logic. Extract a shared `ini_core.py` exposing `parse_ini(text: str) -> dict[str, dict[str, str]]`, update both `loader_a.py` and `loader_b.py` to delegate to it, and support `#` and `;` full-line and inline comments (ignoring comment markers inside double-quoted values, and unquoting double-quoted values), `${key}` / `${section.key}` interpolation, cycle detection (`ValueError`), and missing-reference errors (`KeyError`). Run `python3 -m unittest test_ini.py` to verify.",
+      "verify_cmd": "python3 -m unittest test_ini.py"
+    },
+    {
+      "id": "py-json-patch",
+      "title": "Fix RFC 6902 JSON Patch engine",
+      "category": "bugfix",
+      "language": "python",
+      "timeout_s": 120,
+      "prompt": "Fix `apply_patch` in `json_patch.py` to conform to RFC 6902: unescape JSON Pointer tokens (`~1` -> `/`, `~0` -> `~` in the right order), support `-` for array append on `add`, reject `move` into a descendant of `from`, and enforce strict type equality on `test` (`1 != True` and `0 != False`). Do not mutate the caller's input document on error. Run `python3 -m unittest test_patch.py` to verify.",
+      "setup_files": {
+        "json_patch.py": "import copy\n\n\ndef _resolve_parent(doc, path: str):\n    parts = path.lstrip('/').split('/')\n    cur = doc\n    for p in parts[:-1]:\n        cur = cur[int(p)] if isinstance(cur, list) else cur[p]\n    return cur, parts[-1]\n\n\ndef apply_patch(doc, ops: list[dict]):\n    \"\"\"BUGGY: no ~0/~1 unescaping, no '-' append, no strict bool/int test, no move cycle check.\"\"\"\n    out = copy.deepcopy(doc)\n    for op in ops:\n        kind = op['op']\n        parent, key = _resolve_parent(out, op['path'])\n        if kind == 'add':\n            if isinstance(parent, list):\n                parent.insert(int(key), op['value'])\n            else:\n                parent[key] = op['value']\n        elif kind == 'remove':\n            if isinstance(parent, list):\n                parent.pop(int(key))\n            else:\n                del parent[key]\n        elif kind == 'replace':\n            if isinstance(parent, list):\n                parent[int(key)] = op['value']\n            else:\n                parent[key] = op['value']\n        elif kind == 'test':\n            actual = parent[int(key)] if isinstance(parent, list) else parent[key]\n            if actual != op['value']:\n                raise ValueError('test failed')\n        else:\n            raise ValueError(f'unsupported op: {kind}')\n    return out\n",
+        "test_patch.py": "import unittest\nfrom json_patch import apply_patch\n\n\nclass TestJsonPatch(unittest.TestCase):\n    def test_pointer_escaping(self):\n        doc = {'a/b': {'c~d': 1}}\n        res = apply_patch(doc, [{'op': 'replace', 'path': '/a~1b/c~0d', 'value': 2}])\n        self.assertEqual(res, {'a/b': {'c~d': 2}})\n\n    def test_array_append_dash(self):\n        doc = {'items': [1, 2]}\n        res = apply_patch(doc, [{'op': 'add', 'path': '/items/-', 'value': 3}])\n        self.assertEqual(res['items'], [1, 2, 3])\n\n    def test_move_and_copy(self):\n        doc = {'a': {'x': 10}, 'b': {}}\n        res = apply_patch(doc, [\n            {'op': 'copy', 'from': '/a/x', 'path': '/b/y'},\n            {'op': 'move', 'from': '/a/x', 'path': '/b/z'},\n        ])\n        self.assertEqual(res, {'a': {}, 'b': {'y': 10, 'z': 10}})\n\n    def test_move_into_descendant_rejected(self):\n        doc = {'a': {'b': {'c': 1}}}\n        with self.assertRaises(ValueError):\n            apply_patch(doc, [{'op': 'move', 'from': '/a/b', 'path': '/a/b/c/d'}])\n\n    def test_strict_bool_vs_int(self):\n        doc = {'flag': True, 'num': 1}\n        with self.assertRaises(ValueError):\n            apply_patch(doc, [{'op': 'test', 'path': '/flag', 'value': 1}])\n        with self.assertRaises(ValueError):\n            apply_patch(doc, [{'op': 'test', 'path': '/num', 'value': True}])\n        res = apply_patch(doc, [{'op': 'test', 'path': '/flag', 'value': True}])\n        self.assertEqual(res, doc)\n\n\nif __name__ == '__main__':\n    unittest.main()\n"
+      },
+      "verify_cmd": "python3 -m unittest test_patch.py"
+    },
+    {
+      "id": "py-log-perf",
+      "title": "Optimize O(N^2) log aggregator",
+      "category": "performance",
+      "language": "python",
+      "timeout_s": 120,
+      "prompt": "`summarize_logs` in `log_agg.py` has O(N^2) complexity and fails the latency budget in `test_perf.py`. Optimize it to linear time while preserving exact output semantics (top-k endpoints by count, ties broken alphabetically, plus unique user count per endpoint). Run `python3 -m unittest test_perf.py` to verify.",
+      "setup_files": {
+        "log_agg.py": "def summarize_logs(records: list[tuple[str, str]], top_k: int = 5) -> list[dict]:\n    \"\"\"BUGGY (O(N^2)): linear scan for unique users and repeated sorts.\"\"\"\n    endpoints = []\n    for ep, _ in records:\n        if ep not in endpoints:\n            endpoints.append(ep)\n    summary = []\n    for ep in endpoints:\n        count = 0\n        users = []\n        for r_ep, user in records:\n            if r_ep == ep:\n                count += 1\n                if user not in users:\n                    users.append(user)\n        summary.append({'endpoint': ep, 'count': count, 'unique_users': len(users)})\n    summary.sort(key=lambda d: (-d['count'], d['endpoint']))\n    return summary[:top_k]\n",
+        "test_perf.py": "import time\nimport unittest\nfrom log_agg import summarize_logs\n\n\nclass TestLogPerf(unittest.TestCase):\n    def test_correctness(self):\n        recs = [\n            ('/b', 'u1'), ('/a', 'u1'), ('/a', 'u2'),\n            ('/b', 'u1'), ('/c', 'u3'),\n        ]\n        self.assertEqual(\n            summarize_logs(recs, top_k=2),\n            [\n                {'endpoint': '/a', 'count': 2, 'unique_users': 2},\n                {'endpoint': '/b', 'count': 2, 'unique_users': 1},\n            ],\n        )\n\n    def test_large_scale_under_budget(self):\n        records = [(f'/api/v1/item/{i % 1000}', f'user_{i % 2000}') for i in range(60_000)]\n        t0 = time.perf_counter()\n        out = summarize_logs(records, top_k=5)\n        dt = time.perf_counter() - t0\n        self.assertEqual(len(out), 5)\n        self.assertEqual(out[0]['count'], 60)\n        self.assertEqual(out[0]['unique_users'], 2)\n        self.assertLess(dt, 0.25, f'too slow: {dt:.3f}s (must be < 0.25s)')\n\n\nif __name__ == '__main__':\n    unittest.main()\n"
+      },
+      "verify_cmd": "python3 -m unittest test_perf.py"
+    },
+    {
+      "id": "rs-ring-buffer",
+      "title": "Fix fixed-capacity Rust ring buffer",
+      "category": "bugfix",
+      "language": "rust",
+      "timeout_s": 150,
+      "prompt": "Fix `RingBuffer<T>` in `src/lib.rs` so `push_overwrite`, `pop`, `len`, and `iter()` work correctly across wraparound boundaries, including overwriting when full and iterating oldest-to-newest. Run `cargo test` to verify.",
+      "setup_files": {
+        "Cargo.toml": "[package]\nname = \"ring_buffer\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        "src/lib.rs": "pub struct RingBuffer<T> {\n    buf: Vec<Option<T>>,\n    head: usize,\n    len: usize,\n}\n\nimpl<T> RingBuffer<T> {\n    pub fn new(cap: usize) -> Self {\n        assert!(cap > 0, \"capacity must be > 0\");\n        let mut buf = Vec::with_capacity(cap);\n        buf.resize_with(cap, || None);\n        Self { buf, head: 0, len: 0 }\n    }\n\n    pub fn len(&self) -> usize { self.len }\n    pub fn is_empty(&self) -> bool { self.len == 0 }\n    pub fn capacity(&self) -> usize { self.buf.len() }\n\n    /// BUGGY: fails to advance head on overwrite and drops wrong slot.\n    pub fn push_overwrite(&mut self, val: T) -> Option<T> {\n        let cap = self.buf.len();\n        let tail = (self.head + self.len) % cap;\n        let prev = self.buf[tail].replace(val);\n        if self.len < cap {\n            self.len += 1;\n        }\n        prev\n    }\n\n    pub fn pop(&mut self) -> Option<T> {\n        if self.len == 0 { return None; }\n        let val = self.buf[self.head].take();\n        self.head = (self.head + 1) % self.buf.len();\n        self.len -= 1;\n        val\n    }\n\n    /// BUGGY: ignores head offset and yields in raw storage order.\n    pub fn iter(&self) -> Vec<&T> {\n        self.buf.iter().filter_map(|x| x.as_ref()).collect()\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn overwrite_and_order() {\n        let mut rb = RingBuffer::new(3);\n        assert_eq!(rb.push_overwrite(1), None);\n        assert_eq!(rb.push_overwrite(2), None);\n        assert_eq!(rb.push_overwrite(3), None);\n        assert_eq!(rb.push_overwrite(4), Some(1));\n        assert_eq!(rb.push_overwrite(5), Some(2));\n        assert_eq!(rb.len(), 3);\n        assert_eq!(rb.iter(), vec![&3, &4, &5]);\n        assert_eq!(rb.pop(), Some(3));\n        assert_eq!(rb.pop(), Some(4));\n        assert_eq!(rb.pop(), Some(5));\n        assert_eq!(rb.pop(), None);\n    }\n\n    #[test]\n    fn wraparound_after_pops() {\n        let mut rb = RingBuffer::new(3);\n        rb.push_overwrite(10);\n        rb.push_overwrite(20);\n        assert_eq!(rb.pop(), Some(10));\n        rb.push_overwrite(30);\n        rb.push_overwrite(40);\n        assert_eq!(rb.iter(), vec![&20, &30, &40]);\n        assert_eq!(rb.push_overwrite(50), Some(20));\n        assert_eq!(rb.iter(), vec![&30, &40, &50]);\n    }\n}\n"
+      },
+      "verify_cmd": "cargo test"
+    },
+    {
+      "id": "rs-glob-match",
+      "title": "Fix Rust path glob matcher",
+      "category": "parser-fix",
+      "language": "rust",
+      "timeout_s": 150,
+      "prompt": "Fix `glob_match(pattern: &str, text: &str) -> bool` in `src/lib.rs` so it properly handles `*` (any characters except `/`), `**` (zero or more path segments including `/`), `?` (single non-`/` character), and character classes `[abc]`, `[a-z]`, `[!0-9]`. Run `cargo test` to verify.",
+      "setup_files": {
+        "Cargo.toml": "[package]\nname = \"glob_match\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        "src/lib.rs": "/// BUGGY: treats `*` as crossing `/`, ignores `**` and `[...]` classes.\npub fn glob_match(pattern: &str, text: &str) -> bool {\n    if pattern == \"*\" {\n        return true;\n    }\n    pattern == text\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn star_does_not_cross_slash() {\n        assert!(glob_match(\"src/*.rs\", \"src/main.rs\"));\n        assert!(!glob_match(\"src/*.rs\", \"src/a/main.rs\"));\n    }\n\n    #[test]\n    fn globstar_matches_zero_or_more_dirs() {\n        assert!(glob_match(\"src/**/*.rs\", \"src/main.rs\"));\n        assert!(glob_match(\"src/**/*.rs\", \"src/a/b/c.rs\"));\n        assert!(glob_match(\"**/Cargo.toml\", \"Cargo.toml\"));\n        assert!(glob_match(\"**/Cargo.toml\", \"crates/foo/Cargo.toml\"));\n        assert!(!glob_match(\"src/**/*.rs\", \"tests/main.rs\"));\n    }\n\n    #[test]\n    fn question_and_char_classes() {\n        assert!(glob_match(\"file?.txt\", \"file1.txt\"));\n        assert!(!glob_match(\"file?.txt\", \"file/.txt\"));\n        assert!(glob_match(\"log-[0-9].txt\", \"log-7.txt\"));\n        assert!(!glob_match(\"log-[0-9].txt\", \"log-a.txt\"));\n        assert!(glob_match(\"log-[!0-9].txt\", \"log-a.txt\"));\n        assert!(!glob_match(\"log-[!0-9].txt\", \"log-5.txt\"));\n    }\n}\n"
+      },
+      "verify_cmd": "cargo test"
+    },
+    {
+      "id": "rs-kv-wal",
+      "title": "Fix WAL truncated-tail recovery",
+      "category": "bugfix",
+      "language": "rust",
+      "timeout_s": 150,
+      "prompt": "Fix `Wal::recover` in `src/lib.rs`. Each WAL record on disk is `[len: u32 LE][checksum: u32 LE][payload: len bytes]` where `checksum` is `fnv1a32(payload)`. `recover` must replay all valid records in order, stop cleanly at a torn/truncated tail or checksum-corrupted tail record, truncate the underlying file back to the last valid record boundary, and allow subsequent appends to succeed. Run `cargo test` to verify.",
+      "setup_files": {
+        "Cargo.toml": "[package]\nname = \"kv_wal\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        "src/lib.rs": "use std::collections::BTreeMap;\nuse std::fs::{File, OpenOptions};\nuse std::io::{Read, Write};\nuse std::path::{Path, PathBuf};\n\npub fn fnv1a32(bytes: &[u8]) -> u32 {\n    let mut h: u32 = 0x811c_9dc5;\n    for &b in bytes {\n        h ^= b as u32;\n        h = h.wrapping_mul(0x0100_0193);\n    }\n    h\n}\n\npub struct Wal {\n    path: PathBuf,\n    pub map: BTreeMap<String, String>,\n}\n\nimpl Wal {\n    /// BUGGY: fails with Err on torn tail instead of recovering & truncating.\n    pub fn recover(path: &Path) -> std::io::Result<Self> {\n        let mut map = BTreeMap::new();\n        if path.exists() {\n            let mut data = Vec::new();\n            File::open(path)?.read_to_end(&mut data)?;\n            let mut off = 0;\n            while off < data.len() {\n                let len = u32::from_le_bytes(data[off..off + 4].try_into().unwrap()) as usize;\n                let _crc = u32::from_le_bytes(data[off + 4..off + 8].try_into().unwrap());\n                let payload = &data[off + 8..off + 8 + len];\n                let line = std::str::from_utf8(payload).unwrap();\n                if let Some((k, v)) = line.split_once('=') {\n                    map.insert(k.to_string(), v.to_string());\n                }\n                off += 8 + len;\n            }\n        }\n        Ok(Self { path: path.to_path_buf(), map })\n    }\n\n    pub fn put(&mut self, key: &str, val: &str) -> std::io::Result<()> {\n        let payload = format!(\"{key}={val}\");\n        let bytes = payload.as_bytes();\n        let len = bytes.len() as u32;\n        let crc = fnv1a32(bytes);\n        let mut f = OpenOptions::new().create(true).append(true).open(&self.path)?;\n        f.write_all(&len.to_le_bytes())?;\n        f.write_all(&crc.to_le_bytes())?;\n        f.write_all(bytes)?;\n        f.flush()?;\n        self.map.insert(key.to_string(), val.to_string());\n        Ok(())\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    use std::fs;\n\n    #[test]\n    fn recovers_from_torn_tail_and_appends() {\n        let path = std::env::temp_dir().join(format!(\"kv_wal_test_{}.wal\", std::process::id()));\n        let _ = fs::remove_file(&path);\n        {\n            let mut w = Wal::recover(&path).unwrap();\n            w.put(\"k1\", \"v1\").unwrap();\n            w.put(\"k2\", \"v2\").unwrap();\n        }\n        // Append a torn tail (header claims 100 bytes, only 3 bytes present)\n        {\n            let mut f = OpenOptions::new().append(true).open(&path).unwrap();\n            f.write_all(&100u32.to_le_bytes()).unwrap();\n            f.write_all(&0u32.to_le_bytes()).unwrap();\n            f.write_all(b\"abc\").unwrap();\n        }\n        let mut w2 = Wal::recover(&path).unwrap();\n        assert_eq!(w2.map.get(\"k1\").map(String::as_str), Some(\"v1\"));\n        assert_eq!(w2.map.get(\"k2\").map(String::as_str), Some(\"v2\"));\n        assert_eq!(w2.map.len(), 2);\n        // Appending after recovery must produce a clean WAL\n        w2.put(\"k3\", \"v3\").unwrap();\n        let w3 = Wal::recover(&path).unwrap();\n        assert_eq!(w3.map.get(\"k3\").map(String::as_str), Some(\"v3\"));\n        let _ = fs::remove_file(&path);\n    }\n\n    #[test]\n    fn rejects_bad_checksum_tail() {\n        let path = std::env::temp_dir().join(format!(\"kv_wal_crc_{}.wal\", std::process::id()));\n        let _ = fs::remove_file(&path);\n        {\n            let mut w = Wal::recover(&path).unwrap();\n            w.put(\"good\", \"yes\").unwrap();\n        }\n        {\n            let mut f = OpenOptions::new().append(true).open(&path).unwrap();\n            let bad = b\"bad=no\";\n            f.write_all(&(bad.len() as u32).to_le_bytes()).unwrap();\n            f.write_all(&0xdead_beefu32.to_le_bytes()).unwrap();\n            f.write_all(bad).unwrap();\n        }\n        let w = Wal::recover(&path).unwrap();\n        assert_eq!(w.map.get(\"good\").map(String::as_str), Some(\"yes\"));\n        assert!(!w.map.contains_key(\"bad\"));\n        let _ = fs::remove_file(&path);\n    }\n}\n"
+      },
+      "verify_cmd": "cargo test"
+    },
+    {
+      "id": "rs-cli-flags",
+      "title": "Fix multi-file Rust CLI flag parser",
+      "category": "failing-test-repair",
+      "language": "rust",
+      "timeout_s": 150,
+      "fixture_dir": "rs-cli-flags",
+      "prompt": "Fix the failing tests in `tests/cli_tests.rs` by updating `src/parser.rs` (and `src/spec.rs` if needed) to support `--key=val`, combined short flags (`-vaf`, `-oresult.bin`, `-vo file.txt`), `--` end-of-options separator, and bare `-` as a positional argument. Run `cargo test` to verify.",
+      "verify_cmd": "cargo test"
+    },
+    {
+      "id": "rs-parallel-merge",
+      "title": "Fix Rust worker-pool deadlock & ordering",
+      "category": "concurrency",
+      "language": "rust",
+      "timeout_s": 150,
+      "prompt": "Fix `parallel_map_sum` in `src/lib.rs`: it currently deadlocks because the result channel sender is never dropped before draining, and it panics when `workers == 0` or `items.is_empty()`. Make it return results in the original input order without deadlocking for any `workers >= 1` (treating `0` as `1`). Run `cargo test` to verify.",
+      "setup_files": {
+        "Cargo.toml": "[package]\nname = \"parallel_merge\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        "src/lib.rs": "use std::sync::{mpsc, Arc, Mutex};\nuse std::thread;\n\n/// BUGGY: deadlocks because `res_tx` is never dropped, and output order is nondeterministic.\npub fn parallel_map<F>(items: Vec<i64>, workers: usize, f: F) -> Vec<i64>\nwhere\n    F: Fn(i64) -> i64 + Send + Sync + 'static,\n{\n    let (work_tx, work_rx) = mpsc::channel::<i64>();\n    let work_rx = Arc::new(Mutex::new(work_rx));\n    let (res_tx, res_rx) = mpsc::channel::<i64>();\n    let f = Arc::new(f);\n\n    for item in items {\n        work_tx.send(item).unwrap();\n    }\n    // BUG: work_tx and res_tx are never dropped!\n    let mut handles = Vec::new();\n    for _ in 0..workers {\n        let rx = Arc::clone(&work_rx);\n        let tx = res_tx.clone();\n        let f = Arc::clone(&f);\n        handles.push(thread::spawn(move || {\n            while let Ok(v) = rx.lock().unwrap().recv() {\n                tx.send(f(v)).unwrap();\n            }\n        }));\n    }\n    let mut out = Vec::new();\n    for r in res_rx {\n        out.push(r);\n    }\n    for h in handles {\n        h.join().unwrap();\n    }\n    out\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    use std::time::Duration;\n\n    #[test]\n    fn preserves_order_and_terminates() {\n        let (done_tx, done_rx) = mpsc::channel();\n        thread::spawn(move || {\n            let res = parallel_map((1..=20).collect(), 4, |x| x * x);\n            let _ = done_tx.send(res);\n        });\n        let res = done_rx\n            .recv_timeout(Duration::from_secs(3))\n            .expect(\"parallel_map deadlocked!\");\n        let expected: Vec<i64> = (1..=20).map(|x| x * x).collect();\n        assert_eq!(res, expected);\n    }\n\n    #[test]\n    fn handles_empty_and_zero_workers() {\n        let (tx, rx) = mpsc::channel();\n        thread::spawn(move || {\n            let a = parallel_map(vec![], 4, |x| x + 1);\n            let b = parallel_map(vec![3, 4], 0, |x| x * 2);\n            let _ = tx.send((a, b));\n        });\n        let (a, b) = rx\n            .recv_timeout(Duration::from_secs(2))\n            .expect(\"parallel_map deadlocked on empty/zero workers!\");\n        assert_eq!(a, Vec::<i64>::new());\n        assert_eq!(b, vec![6, 8]);\n    }\n}\n"
+      },
+      "verify_cmd": "cargo test"
+    },
+    {
+      "id": "sh-envsubst-safe",
+      "title": "Fix safe .env parser shell script",
+      "category": "edge-case",
+      "language": "shell",
+      "timeout_s": 120,
+      "prompt": "Fix `parse_env.sh` so that given a `.env` file path as `$1` and a key name as `$2`, it prints the parsed value of that key to stdout (and exits 1 if the key is missing). It must safely handle: blank lines and `#` comments, optional `export ` prefix, values containing `=`, spaces inside single/double quotes, `#` inside quotes (not a comment), inline `#` comments outside quotes, and NOT execute shell expansions like `$(...)` or `$VAR`. Run `bash test_env.sh` to verify.",
+      "setup_files": {
+        "parse_env.sh": "#!/usr/bin/env bash\n# BUGGY: sources the file (unsafe!) and fails on comments/missing keys.\nset -euo pipefail\nfile=\"$1\"\nkey=\"$2\"\ngrep \"^${key}=\" \"$file\" | cut -d= -f2\n",
+        "test_env.sh": "#!/usr/bin/env bash\nset -euo pipefail\n\ncat <<'EOF' > sample.env\n# leading comment\nSIMPLE=hello\nexport EXPORTED=world\nURL=https://example.com?a=1&b=2\nINLINE=value # trailing comment\nQUOTED_HASH=\"foo # bar\"\nSINGLE_LITERAL='price is $100 and $(echo nope)'\nSPACES=\"  keep me  \"\nEOF\n\nassert_eq() {\n  local key=\"$1\" want=\"$2\"\n  local got\n  got=\"$(bash parse_env.sh sample.env \"$key\")\"\n  if [[ \"$got\" != \"$want\" ]]; then\n    echo \"FAIL $key: got=[$got] want=[$want]\" >&2\n    exit 1\n  fi\n}\n\nassert_eq SIMPLE \"hello\"\nassert_eq EXPORTED \"world\"\nassert_eq URL \"https://example.com?a=1&b=2\"\nassert_eq INLINE \"value\"\nassert_eq QUOTED_HASH \"foo # bar\"\nassert_eq SINGLE_LITERAL 'price is $100 and $(echo nope)'\nassert_eq SPACES \"  keep me  \"\n\nif bash parse_env.sh sample.env MISSING >/dev/null 2>&1; then\n  echo \"FAIL: MISSING key should exit non-zero\" >&2\n  exit 1\nfi\necho \"ALL PASS\"\n"
+      },
+      "verify_cmd": "bash test_env.sh"
+    },
+    {
+      "id": "cli-json-diff",
+      "title": "Fix structural JSON diff CLI",
+      "category": "cli-tool",
+      "language": "python",
+      "timeout_s": 120,
+      "prompt": "Fix `jsondiff.py` CLI (`python3 jsondiff.py <a.json> <b.json> [--ignore <dot.path>]...`). It must recursively diff JSON objects/arrays/primitives, print a JSON array of diff objects `[{\"path\": \"a.b\", \"kind\": \"added\"|\"removed\"|\"changed\", \"old\": ..., \"new\": ...}]` sorted by `path`, ignore any dot-path passed via repeatable `--ignore`, and exit with code `0` when equal, `1` when differences exist, or `2` on invalid JSON/args. Run `python3 -m unittest test_jsondiff.py` to verify.",
+      "setup_files": {
+        "jsondiff.py": "#!/usr/bin/env python3\nimport json\nimport sys\n\n\ndef main():\n    \"\"\"BUGGY: only checks top-level equality, ignores --ignore, wrong output format.\"\"\"\n    a = json.load(open(sys.argv[1]))\n    b = json.load(open(sys.argv[2]))\n    if a == b:\n        print('[]')\n        return 0\n    print(json.dumps([{'path': '', 'kind': 'changed'}]))\n    return 1\n\n\nif __name__ == '__main__':\n    sys.exit(main())\n",
+        "test_jsondiff.py": "import json\nimport os\nimport subprocess\nimport sys\nimport tempfile\nimport unittest\n\n\nclass TestJsonDiffCli(unittest.TestCase):\n    def run_cli(self, a_obj, b_obj, extra=()):\n        with tempfile.TemporaryDirectory() as td:\n            pa = os.path.join(td, 'a.json')\n            pb = os.path.join(td, 'b.json')\n            with open(pa, 'w') as f:\n                json.dump(a_obj, f)\n            with open(pb, 'w') as f:\n                json.dump(b_obj, f)\n            p = subprocess.run([sys.executable, 'jsondiff.py', pa, pb, *extra], capture_output=True, text=True)\n            return p.returncode, p.stdout\n\n    def test_equal_exit_zero(self):\n        rc, out = self.run_cli({'a': 1, 'b': [2, 3]}, {'b': [2, 3], 'a': 1})\n        self.assertEqual(rc, 0)\n        self.assertEqual(json.loads(out), [])\n\n    def test_nested_diff_and_ignore(self):\n        a = {'meta': {'ts': 1, 'ver': 1}, 'items': [1, 2], 'gone': True}\n        b = {'meta': {'ts': 2, 'ver': 1}, 'items': [1, 3], 'added': 'x'}\n        rc, out = self.run_cli(a, b, ['--ignore', 'meta.ts'])\n        self.assertEqual(rc, 1)\n        diffs = json.loads(out)\n        paths = [d['path'] for d in diffs]\n        self.assertEqual(paths, ['added', 'gone', 'items.1'])\n        by_path = {d['path']: d for d in diffs}\n        self.assertEqual(by_path['added']['kind'], 'added')\n        self.assertEqual(by_path['gone']['kind'], 'removed')\n        self.assertEqual(by_path['items.1']['kind'], 'changed')\n        self.assertEqual(by_path['items.1']['old'], 2)\n        self.assertEqual(by_path['items.1']['new'], 3)\n\n    def test_equal_when_only_ignored_differs(self):\n        rc, out = self.run_cli({'meta': {'ts': 1}}, {'meta': {'ts': 9}}, ['--ignore', 'meta.ts'])\n        self.assertEqual(rc, 0)\n        self.assertEqual(json.loads(out), [])\n\n\nif __name__ == '__main__':\n    unittest.main()\n"
+      },
+      "verify_cmd": "python3 -m unittest test_jsondiff.py"
+    },
+    {
+      "id": "cli-toml-merge",
+      "title": "Deep-merge config CLI with array semantics",
+      "category": "multi-file-refactor",
+      "language": "python",
+      "timeout_s": 120,
+      "prompt": "Fix `cfg_merge.py` (`python3 cfg_merge.py <base.json> <override.json> [--concat-arrays]`) and `merger.py` so nested dicts are deep-merged (not shallow-replaced), scalar/type conflicts take the override value, arrays replace by default OR concatenate when `--concat-arrays` is passed, and `null` in override deletes the key from the result when `--delete-null` is passed. Run `python3 -m unittest test_merge.py` to verify.",
+      "setup_files": {
+        "merger.py": "def deep_merge(base: dict, override: dict, concat_arrays: bool = False, delete_null: bool = False) -> dict:\n    \"\"\"BUGGY: shallow merge only.\"\"\"\n    out = dict(base)\n    out.update(override)\n    return out\n",
+        "cfg_merge.py": "#!/usr/bin/env python3\nimport json\nimport sys\nfrom merger import deep_merge\n\n\ndef main():\n    base = json.load(open(sys.argv[1]))\n    override = json.load(open(sys.argv[2]))\n    print(json.dumps(deep_merge(base, override)))\n    return 0\n\n\nif __name__ == '__main__':\n    sys.exit(main())\n",
+        "test_merge.py": "import json\nimport os\nimport subprocess\nimport sys\nimport tempfile\nimport unittest\nfrom merger import deep_merge\n\n\nclass TestConfigMerge(unittest.TestCase):\n    def test_deep_merge_nested_dicts(self):\n        base = {'db': {'host': 'localhost', 'port': 5432}, 'tags': ['a']}\n        over = {'db': {'port': 5433, 'ssl': True}, 'tags': ['b']}\n        res = deep_merge(base, over)\n        self.assertEqual(res, {'db': {'host': 'localhost', 'port': 5433, 'ssl': True}, 'tags': ['b']})\n        # Must not mutate inputs\n        self.assertEqual(base['db']['port'], 5432)\n\n    def test_concat_arrays_and_delete_null_cli(self):\n        base = {'a': {'x': 1, 'y': 2}, 'list': [1, 2]}\n        over = {'a': {'y': None, 'z': 3}, 'list': [3]}\n        with tempfile.TemporaryDirectory() as td:\n            p1 = os.path.join(td, 'base.json')\n            p2 = os.path.join(td, 'over.json')\n            json.dump(base, open(p1, 'w'))\n            json.dump(over, open(p2, 'w'))\n            p = subprocess.run(\n                [sys.executable, 'cfg_merge.py', p1, p2, '--concat-arrays', '--delete-null'],\n                capture_output=True, text=True, check=True,\n            )\n            self.assertEqual(json.loads(p.stdout), {'a': {'x': 1, 'z': 3}, 'list': [1, 2, 3]})\n\n\nif __name__ == '__main__':\n    unittest.main()\n"
+      },
+      "verify_cmd": "python3 -m unittest test_merge.py"
+    }
+  ]
+}

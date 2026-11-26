@@ -89,8 +89,8 @@ Handy extras, all strict-TOML like everything else:
 - **Unbypassable hardstops** — root rm, fork bombs, fetch-and-execute: they ask even in allow mode; headless denies.
 - **Read ledger** — edits refuse files the model has not read, or that changed since.
 - **Secret redaction**, one-way, in every tool result.
-- **Optional fs sandbox** for bash children (bwrap / firejail / landlock / macOS seatbelt), fail-closed; the landlock backend exposes only an enumerated `/dev` surface (`null`, `zero`, `full`, `random`, `urandom`, `shm`) rather than the host `/dev`; Windows has no backend — `mode "fs"` fails closed with a platform-named error.
-- **Network domain allowlist** — `[sandbox] net_allow_domains` / `net_deny_domains` inject a loopback HTTP/CONNECT proxy into sandboxed bash children: domains resolve through the filter (wildcards, deny-first), every host is resolved once and pinned, and private/loopback targets are refused unless explicitly allowlisted (anti-DNS-rebinding). Enforcement covers proxy-honoring clients (curl/wget/git/pip…); landlock confines raw TCP to the proxy port.
+- **Optional fs sandbox** for bash children (bwrap / landlock / firejail / macOS seatbelt), fail-closed; the landlock backend exposes only an enumerated `/dev` surface (`null`, `zero`, `full`, `random`, `urandom`) rather than the host `/dev` (`/dev/shm` is excluded — add it to `[sandbox] allow_write` if a workload needs shared memory); Windows has no backend — `mode "fs"` fails closed with a platform-named error.
+- **Network domain allowlist** — `[sandbox] net_allow_domains` / `net_deny_domains` inject a loopback HTTP/CONNECT proxy into sandboxed bash children: domains resolve through the filter (wildcards, deny-first), every host is resolved once and pinned, and a private/loopback resolution is refused unless the allowlist names a literal IP or `localhost` (anti-DNS-rebinding: an allowlisted DNS name never unlocks local targets). Enforcement covers proxy-honoring clients (curl/wget/git/pip…); landlock confines raw TCP to the proxy port.
 - **`ka --safe-mode`** — the troubleshooting floor: every customization off, built-ins kept.
 - **`--tools read,edit`** — positive allowlist for the session; `--ignore-rules` runs without `[[rules]]` tables and rule files (hardstops always stay; they are not rules).
 - **Permission profiles** — `[permissions.profiles.<name>]` named rule bundles with one-level `extends`, activated by `[permissions] profile`; profile rules evaluate before `[[rules]]` (more specific first). `ka rules check <command>` dry-runs your rules against a command.
@@ -163,7 +163,7 @@ Dependencies flow one way: every crate may depend on `ka-protocol`; only the sur
 
 ## Footprint contract
 
-CI-gated on every push: **≤ 10 MB** stripped musl binary (currently 6.25 MB) · cold start **≤ 50 ms** · idle RSS **≤ 15 MB** · no steady-state network (one rate-limited update check at startup; `[update] check = "off"` disables it). ~790 tests, `clippy -D warnings` clean. Any new dependency must justify itself.
+CI-gated on every push: **≤ 10 MB** stripped musl binary (currently ~8.0 MiB) · cold start **≤ 50 ms** · idle RSS **≤ 15 MB** · no steady-state network (one rate-limited update check at startup; `[update] check = "off"` disables it). 1,500+ tests including red-team security suites, `clippy -D warnings` clean. Any new dependency must justify itself.
 
 ## Ka and the future Ka Agent
 

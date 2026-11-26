@@ -117,6 +117,12 @@ pub struct ClaudeEntry {
     pub sidechain: bool,
 }
 
+/// Maximum source transcript file size (64 MiB).
+const MAX_SESSION_IMPORT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Maximum recursion depth when unwrapping nested Codex `output` envelopes.
+const MAX_CODEX_OUTPUT_DEPTH: usize = 16;
+
 /// Import a foreign session transcript into a fresh ka strand for `cwd`.
 ///
 /// `format` is `"claude"` (Claude Code session JSONL) or `"codex"`
@@ -131,8 +137,7 @@ pub fn import_session(format: &str, source: &Path, cwd: &Path) -> Result<ImportR
             "unknown format {format:?}; supported formats: claude, codex"
         ));
     }
-    let text = std::fs::read_to_string(source)
-        .map_err(|e| format!("cannot read {}: {e}", source.display()))?;
+    let text = read_session_bounded(source)?;
     let outcome = match format {
         "claude" => parse_claude(&text)?,
         "codex" => parse_codex(&text)?,
@@ -162,12 +167,15 @@ fn write_strand(
         ka_strand::now_rfc3339(),
         outcome.mapped.len(),
     );
-    let mut records = 1usize;
-    append_message(&mut strand, MappedRecord::message(Role::User, context))?;
+    let mut all_records = Vec::with_capacity(1 + outcome.mapped.len());
+    all_records.push(to_record(MappedRecord::message(Role::User, context)));
     for mapped in outcome.mapped {
-        append_message(&mut strand, mapped)?;
-        records += 1;
+        all_records.push(to_record(mapped));
     }
+    let records = all_records.len();
+    strand
+        .append_all(all_records)
+        .map_err(|e| format!("cannot write strand: {e}"))?;
     let path = strand
         .path()
         .map(Path::to_path_buf)
@@ -181,19 +189,17 @@ fn write_strand(
     })
 }
 
-/// Append one mapped record as a strand message.
-fn append_message(strand: &mut ka_strand::StrandFile, mapped: MappedRecord) -> Result<(), String> {
-    strand
-        .append(ka_strand::Record::Message {
-            id: ka_strand::new_record_id(),
-            role: mapped.role,
-            content: mapped.content,
-            calls: mapped.calls,
-            results: mapped.results,
-            thinking: mapped.thinking,
-            images: Vec::new(),
-        })
-        .map_err(|e| format!("cannot write strand: {e}"))
+/// Convert one mapped record into a strand `Record::Message`.
+fn to_record(mapped: MappedRecord) -> ka_strand::Record {
+    ka_strand::Record::Message {
+        id: ka_strand::new_record_id(),
+        role: mapped.role,
+        content: mapped.content,
+        calls: mapped.calls,
+        results: mapped.results,
+        thinking: mapped.thinking,
+        images: Vec::new(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -676,19 +682,51 @@ fn block_content_text(block: &serde_json::Value) -> String {
 /// Extract text from a Codex `function_call_output` payload. `output` is
 /// either plain text or a JSON-encoded envelope
 /// (`{"output": "...", "metadata": …}`) — the inner `output` field wins
-/// when present; objects without it serialize compactly.
+/// when present; objects without it serialize compactly. Bounded to
+/// [`MAX_CODEX_OUTPUT_DEPTH`] levels to prevent stack overflow DoS.
 fn codex_output_text(output: Option<&serde_json::Value>) -> String {
+    codex_output_text_depth(output, 0)
+}
+
+/// Read a transcript fully, but never past the cap: `metadata().len()` is
+/// 0 for `/dev/zero` and FIFOs, so the bound must ride the read itself.
+fn read_session_bounded(path: &std::path::Path) -> Result<String, String> {
+    use std::io::Read as _;
+    let file =
+        std::fs::File::open(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_SESSION_IMPORT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    if bytes.len() as u64 > MAX_SESSION_IMPORT_BYTES {
+        return Err(format!(
+            "{}: file size exceeds {} byte session import cap",
+            path.display(),
+            MAX_SESSION_IMPORT_BYTES
+        ));
+    }
+    String::from_utf8(bytes).map_err(|e| format!("{}: not UTF-8: {e}", path.display()))
+}
+
+fn codex_output_text_depth(output: Option<&serde_json::Value>, depth: usize) -> String {
+    if depth >= MAX_CODEX_OUTPUT_DEPTH {
+        return match output {
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(value) => value.to_string(),
+            None => String::new(),
+        };
+    }
     match output {
         Some(serde_json::Value::String(s)) => match serde_json::from_str::<serde_json::Value>(s) {
             Ok(serde_json::Value::Object(inner)) => inner
                 .get("output")
-                .map(|v| codex_output_text(Some(v)))
+                .map(|v| codex_output_text_depth(Some(v), depth + 1))
                 .unwrap_or_else(|| s.clone()),
             _ => s.clone(),
         },
         Some(serde_json::Value::Object(inner)) => inner
             .get("output")
-            .map(|v| codex_output_text(Some(v)))
+            .map(|v| codex_output_text_depth(Some(v), depth + 1))
             .unwrap_or_else(|| serde_json::Value::Object(inner.clone()).to_string()),
         Some(v) => v.to_string(),
         None => String::new(),

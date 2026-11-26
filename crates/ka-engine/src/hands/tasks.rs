@@ -55,6 +55,13 @@ struct AgentTask {
     inbox: Vec<String>,
 }
 
+/// Maximum retained tasks in [`AgentTaskTable`] (oldest finished task
+/// evicted first when full).
+const MAX_AGENT_TASKS: usize = 64;
+
+/// Maximum recorded inbox messages per finished task.
+const MAX_TASK_INBOX: usize = 64;
+
 /// Shared registry of background delegate tasks (engine owns one,
 /// DelegateHand registers, TasksHand serves).
 pub struct AgentTaskTable {
@@ -83,7 +90,18 @@ impl AgentTaskTable {
         *next += 1;
         let id = *next;
         drop(next);
-        self.inner.lock().push(AgentTask {
+        let mut t = self.inner.lock();
+        if t.len() >= MAX_AGENT_TASKS {
+            if let Some(pos) = t.iter().position(|e| e.state != AgentTaskState::Running) {
+                t.remove(pos);
+            } else {
+                let oldest = t.remove(0);
+                if let Some(a) = oldest.abort {
+                    a.abort();
+                }
+            }
+        }
+        t.push(AgentTask {
             id,
             agent: agent.to_string(),
             task: task.to_string(),
@@ -170,6 +188,9 @@ impl AgentTaskTable {
             },
             other => {
                 let note = format!("[message for t-{id} while {}: {}]", other.label(), text);
+                if e.inbox.len() >= MAX_TASK_INBOX {
+                    e.inbox.remove(0);
+                }
                 e.inbox.push(note.clone());
                 Err(format!(
                     "t-{id} already {} — the message is recorded and surfaces via tasks read",
@@ -339,6 +360,9 @@ fn merge_branch(
     id: u64,
     branch: &str,
 ) -> Result<(String, Vec<String>), String> {
+    if branch.is_empty() || branch.starts_with('-') {
+        return Err(format!("refusing invalid branch name {branch:?}"));
+    }
     let git = |args: &[&str]| -> Result<std::process::Output, String> {
         std::process::Command::new("git")
             .args(args)
@@ -346,13 +370,14 @@ fn merge_branch(
             .output()
             .map_err(|e| format!("git: {e}"))
     };
-    let base = String::from_utf8_lossy(&git(&["merge-base", "HEAD", branch])?.stdout)
+    let base = String::from_utf8_lossy(&git(&["merge-base", "--", "HEAD", branch])?.stdout)
         .trim()
         .to_string();
     if base.is_empty() {
         return Err(format!("no merge base between HEAD and {branch}"));
     }
-    let diff = git(&["diff", &format!("{base}..{branch}")])?;
+    let range = format!("{base}..{branch}");
+    let diff = git(&["diff", &range, "--"])?;
     if !diff.status.success() {
         return Err(format!(
             "git diff failed: {}",
@@ -368,13 +393,11 @@ fn merge_branch(
     }
     // changed paths ride along for the caller's read-ledger conflict
     // check (repo-relative, one per line)
-    let changed = String::from_utf8_lossy(
-        &git(&["diff", "--name-only", &format!("{base}..{branch}")])?.stdout,
-    )
-    .lines()
-    .map(str::to_string)
-    .filter(|l| !l.is_empty())
-    .collect::<Vec<_>>();
+    let changed = String::from_utf8_lossy(&git(&["diff", "--name-only", &range, "--"])?.stdout)
+        .lines()
+        .map(str::to_string)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>();
     let feed = |check: bool| -> Result<std::process::Output, String> {
         let mut args = vec!["apply", "--whitespace=nowarn"];
         if check {
@@ -542,49 +565,57 @@ impl Hand for TasksHand {
                         return ToolOutput::err("tasks merge: missing required 'id'");
                     };
                     match self.table.branch(id) {
-                        Some(branch) => match merge_branch(&ctx.cwd, id, &branch) {
-                            Ok((msg, changed)) => {
-                                // cross-agent conflict note (the swarm
-                                // file-conflict pattern): a file this
-                                // voice READ just changed under it —
-                                // warn in the result the model reads,
-                                // before the ledger refuses a stale edit
-                                let conflicts: Vec<String> = {
-                                    let ledger = ctx.ledger.lock();
-                                    // `git diff --name-only` emits worktree-ROOT-relative
-                                    // paths — not cwd-relative when the session launched
-                                    // from a subdirectory — so probe the root-joined form
-                                    // alongside the cwd-joined one. Files the branch
-                                    // DELETED no longer exist post-apply: "re-read" is
-                                    // impossible guidance, skip them.
-                                    let root = crate::project_root(&ctx.cwd);
-                                    changed
-                                        .iter()
-                                        .filter(|rel| {
-                                            let exists = ctx.cwd.join(rel).exists()
-                                                || root.join(rel).exists();
-                                            exists
-                                                && (ledger.is_tracked(&root.join(rel))
-                                                    || ledger.is_tracked(&ctx.cwd.join(rel)))
-                                        })
-                                        .cloned()
-                                        .collect()
-                                };
-                                let mut out = format!("tasks: {msg}");
-                                if !conflicts.is_empty() {
-                                    out.push_str(
-                                        "\n⚠ read-file conflict: these files were read \
+                        Some(branch) => {
+                            let cwd = ctx.cwd.clone();
+                            let merged = tokio::task::spawn_blocking(move || {
+                                merge_branch(&cwd, id, &branch)
+                            })
+                            .await
+                            .unwrap_or_else(|e| Err(format!("git merge task failed: {e}")));
+                            match merged {
+                                Ok((msg, changed)) => {
+                                    // cross-agent conflict note (the swarm
+                                    // file-conflict pattern): a file this
+                                    // voice READ just changed under it —
+                                    // warn in the result the model reads,
+                                    // before the ledger refuses a stale edit
+                                    let conflicts: Vec<String> = {
+                                        let ledger = ctx.ledger.lock();
+                                        // `git diff --name-only` emits worktree-ROOT-relative
+                                        // paths — not cwd-relative when the session launched
+                                        // from a subdirectory — so probe the root-joined form
+                                        // alongside the cwd-joined one. Files the branch
+                                        // DELETED no longer exist post-apply: "re-read" is
+                                        // impossible guidance, skip them.
+                                        let root = crate::project_root(&ctx.cwd);
+                                        changed
+                                            .iter()
+                                            .filter(|rel| {
+                                                let exists = ctx.cwd.join(rel).exists()
+                                                    || root.join(rel).exists();
+                                                exists
+                                                    && (ledger.is_tracked(&root.join(rel))
+                                                        || ledger.is_tracked(&ctx.cwd.join(rel)))
+                                            })
+                                            .cloned()
+                                            .collect()
+                                    };
+                                    let mut out = format!("tasks: {msg}");
+                                    if !conflicts.is_empty() {
+                                        out.push_str(
+                                            "\n⚠ read-file conflict: these files were read \
                                          earlier this session and just changed — re-read \
                                          them before editing:",
-                                    );
-                                    for f in &conflicts {
-                                        out.push_str(&format!("\n- {f}"));
+                                        );
+                                        for f in &conflicts {
+                                            out.push_str(&format!("\n- {f}"));
+                                        }
                                     }
+                                    ToolOutput::ok(out)
                                 }
-                                ToolOutput::ok(out)
+                                Err(e) => ToolOutput::err(format!("tasks merge: {e}")),
                             }
-                            Err(e) => ToolOutput::err(format!("tasks merge: {e}")),
-                        },
+                        }
                         None => ToolOutput::err(format!(
                             "t-{id} has no isolated worktree branch — merge applies to \
                              isolate: true tasks only"

@@ -17,7 +17,6 @@
 //! (and pinned by known-answer tests), randomness comes from
 //! `/dev/urandom`.
 
-use std::hash::{DefaultHasher, Hasher};
 use std::path::PathBuf;
 
 use serde_json::json;
@@ -114,48 +113,57 @@ impl FlowHooks {
 }
 
 /// Where the token cache lives: `$XDG_DATA_HOME/ka/mcp-tokens/`
-/// (fallback `~/.local/share/ka/mcp-tokens/`, temp-dir last resort).
-fn tokens_dir() -> PathBuf {
+/// (fallback `~/.local/share/ka/mcp-tokens/`). Returns `None` (fails
+/// closed) when neither is set — never falls back to `/tmp`.
+fn tokens_dir() -> Option<PathBuf> {
     #[cfg(any(test, feature = "test-util"))]
     if let Some(dir) = test_support::current_dir() {
-        return dir;
+        return Some(dir);
     }
     let base = std::env::var_os("XDG_DATA_HOME")
+        .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .or_else(|| {
-            std::env::var_os("HOME").map(|h| {
+            std::env::var_os("HOME").filter(|v| !v.is_empty()).map(|h| {
                 let mut p = PathBuf::from(h);
                 p.push(".local/share");
                 p
             })
-        })
-        .unwrap_or_else(std::env::temp_dir);
-    base.join("ka").join("mcp-tokens")
+        })?;
+    Some(base.join("ka").join("mcp-tokens"))
 }
 
-/// Stable cache key for a server: a hash over the authorization
-/// identity (name + url), not the whole launch config — rotating
-/// headers must not orphan tokens.
+/// Stable cache key for a server: deterministic SHA-256 over the
+/// length-delimited authorization identity (name + url), not the whole
+/// launch config — rotating headers must not orphan tokens.
 pub fn server_key(cfg: &crate::mcp::McpServerConfig) -> String {
-    let mut h = DefaultHasher::new();
-    h.write(cfg.name.as_bytes());
-    h.write(cfg.url.as_deref().unwrap_or("").as_bytes());
-    format!("{:016x}", h.finish())
+    let url = cfg.url.as_deref().unwrap_or("");
+    let mut input = Vec::with_capacity(cfg.name.len() + url.len() + 16);
+    input.extend_from_slice(&(cfg.name.len() as u64).to_be_bytes());
+    input.extend_from_slice(cfg.name.as_bytes());
+    input.extend_from_slice(&(url.len() as u64).to_be_bytes());
+    input.extend_from_slice(url.as_bytes());
+    let digest = sha256(&input);
+    digest[..8].iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// The cached token set for `key`, when present and parseable.
 /// Corrupt files are misses (a bad token file must not wedge the
 /// connect path).
 pub fn load_tokens(key: &str) -> Option<TokenSet> {
-    let text = std::fs::read_to_string(tokens_dir().join(format!("{key}.json"))).ok()?;
+    let dir = tokens_dir()?;
+    let text = std::fs::read_to_string(dir.join(format!("{key}.json"))).ok()?;
     serde_json::from_str(&text).ok()
 }
 
-/// Persist `tokens` for `key` best-effort: 0600 file inside a 0700
-/// directory. A failed write costs a re-login next time, nothing more.
+/// Persist `tokens` for `key` atomically: temp file created with mode
+/// 0600 inside a 0700 directory, synced, then renamed into place. Fails
+/// closed if no user data dir is resolvable.
 pub fn store_tokens(key: &str, tokens: &TokenSet) {
-    let dir = tokens_dir();
-    if let Err(_e) = std::fs::create_dir_all(&dir) {
+    let Some(dir) = tokens_dir() else {
+        return;
+    };
+    if std::fs::create_dir_all(&dir).is_err() {
         return;
     }
     #[cfg(unix)]
@@ -167,21 +175,30 @@ pub fn store_tokens(key: &str, tokens: &TokenSet) {
         return;
     };
     let path = dir.join(format!("{key}.json"));
-    let Ok(mut f) = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&path)
-    else {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = dir.join(format!(".{key}.json.tmp.{}.{nanos}", std::process::id()));
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let Ok(mut f) = opts.open(&tmp) else {
         return;
     };
     use std::io::Write;
-    if f.write_all(text.as_bytes()).is_ok() {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
+    if f.write_all(text.as_bytes()).is_ok() && f.sync_all().is_ok() {
+        drop(f);
+        if std::fs::rename(&tmp, &path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
         }
+    } else {
+        drop(f);
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 
@@ -294,51 +311,90 @@ pub(crate) fn base64url(data: &[u8]) -> String {
     out
 }
 
-/// Random bytes from `/dev/urandom`, falling back to a
-/// time+pid-seeded xorshift (tests and locked-down containers).
-fn random_bytes(n: usize) -> Vec<u8> {
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        use std::io::Read;
-        let mut buf = vec![0u8; n];
-        if f.read_exact(&mut buf).is_ok() {
-            return buf;
-        }
+/// Cryptographically secure random bytes from the OS CSPRNG (getrandom:
+/// `getrandom(2)`/urandom on Linux, `BCryptGenRandom` on Windows);
+/// fails closed rather than falling back to a predictable PRNG.
+fn random_bytes(n: usize) -> Result<Vec<u8>, String> {
+    let mut buf = vec![0u8; n];
+    getrandom::fill(&mut buf).map_err(|e| format!("oauth: OS CSPRNG unavailable: {e}"))?;
+    Ok(buf)
+}
+
+/// Whether `parsed` points at the local machine (`localhost`,
+/// `127.0.0.0/8`, `[::1]`), any scheme: a user-configured loopback MCP
+/// server is trusted whether plain or TLS.
+fn is_loopback(parsed: &reqwest::Url) -> bool {
+    let Some(raw) = parsed.host_str() else {
+        return false;
+    };
+    let host = raw
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if host == "localhost" {
+        return true;
     }
-    let mut seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0x9E3779B97F4A7C15)
-        ^ ((std::process::id() as u64) << 32)
-        | 1;
-    let mut out = Vec::with_capacity(n);
-    for _ in 0..n {
-        seed ^= seed >> 12;
-        seed ^= seed << 25;
-        seed ^= seed >> 27;
-        out.push((seed.wrapping_mul(0x2545F4914F6CDD1D) >> 24) as u8);
+    host.parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Enforce `https://` for remote OAuth URLs (allowing `http://` only
+/// for loopback dev/test servers) and block SSRF/private targets.
+async fn validate_oauth_url(url: &str, label: &str) -> Result<reqwest::Url, String> {
+    let parsed =
+        reqwest::Url::parse(url).map_err(|e| format!("{label}: invalid URL {url}: {e}"))?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return Err(format!("{label}: OAuth URL must be http(s): {url}"));
     }
-    out
+    // a user-configured loopback server is trusted (plain or TLS);
+    // the SSRF guard applies to everything else, including every
+    // server-supplied endpoint
+    if is_loopback(&parsed) {
+        return Ok(parsed);
+    }
+    if parsed.scheme() != "https" {
+        return Err(format!(
+            "{label}: remote OAuth URL must use https:// (got {url})"
+        ));
+    }
+    crate::hands::web::check_url_not_private(url)
+        .await
+        .map_err(|e| format!("{label}: {e}"))?;
+    Ok(parsed)
+}
+
+/// Build an HTTP client with redirects disabled (OAuth endpoints must
+/// never silently follow redirects to private or attacker-controlled hosts).
+fn oauth_http_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("oauth http client: {e}"))
 }
 
 // ---------------------------------------------------------- flow steps
 
 /// Discover authorization-server metadata for the resource at `base`:
 /// `{origin}/.well-known/oauth-authorization-server` first, the
-/// RFC 8414 path-aware form second.
+/// RFC 8414 path-aware form (`{origin}/.well-known/oauth-authorization-server/{path}`) second.
 pub async fn discover_metadata(
-    client: &reqwest::Client,
+    _client: &reqwest::Client,
     base: &str,
 ) -> Result<AuthServerMetadata, String> {
+    let base_parsed = validate_oauth_url(base, "oauth discovery").await?;
+    let http = oauth_http_client()?;
     let (origin, path) = split_origin_path(base);
     let mut candidates = vec![format!("{origin}/.well-known/oauth-authorization-server")];
     if !path.is_empty() {
         candidates.push(format!(
-            "{origin}/.well-known/{path}/oauth-authorization-server"
+            "{origin}/.well-known/oauth-authorization-server/{path}"
         ));
     }
     let mut last = String::new();
     for url in candidates {
-        let resp = client
+        let resp = http
             .get(&url)
             .header("Accept", "application/json")
             .send()
@@ -352,8 +408,24 @@ pub async fn discover_metadata(
             .text()
             .await
             .map_err(|e| format!("oauth discovery: {e}"))?;
-        return serde_json::from_str(&body)
-            .map_err(|e| format!("oauth discovery: malformed metadata from {url}: {e}"));
+        let meta: AuthServerMetadata = serde_json::from_str(&body)
+            .map_err(|e| format!("oauth discovery: malformed metadata from {url}: {e}"))?;
+        // RFC 8414 §3.3: issuer origin must match the discovery origin.
+        let issuer_parsed = reqwest::Url::parse(&meta.issuer)
+            .map_err(|e| format!("oauth discovery: invalid issuer URL {}: {e}", meta.issuer))?;
+        if issuer_parsed.origin() != base_parsed.origin() {
+            return Err(format!(
+                "oauth discovery: issuer origin mismatch (expected {}, got {})",
+                base_parsed.origin().ascii_serialization(),
+                issuer_parsed.origin().ascii_serialization()
+            ));
+        }
+        validate_oauth_url(&meta.authorization_endpoint, "oauth authorization_endpoint").await?;
+        validate_oauth_url(&meta.token_endpoint, "oauth token_endpoint").await?;
+        if let Some(reg) = &meta.registration_endpoint {
+            validate_oauth_url(reg, "oauth registration_endpoint").await?;
+        }
+        return Ok(meta);
     }
     Err(last)
 }
@@ -376,11 +448,13 @@ fn split_origin_path(url: &str) -> (String, String) {
 /// RFC 7591 dynamic client registration: a public client (no secret)
 /// that authorizes via code + PKCE and refreshes.
 async fn register_client(
-    client: &reqwest::Client,
+    _client: &reqwest::Client,
     registration_endpoint: &str,
     redirect_uri: &str,
     scopes: &[String],
 ) -> Result<String, String> {
+    validate_oauth_url(registration_endpoint, "oauth registration").await?;
+    let http = oauth_http_client()?;
     let mut body = json!({
         "client_name": "ka",
         "redirect_uris": [redirect_uri],
@@ -391,7 +465,7 @@ async fn register_client(
     if !scopes.is_empty() {
         body["scope"] = json!(scopes.join(" "));
     }
-    let resp = client
+    let resp = http
         .post(registration_endpoint)
         .header("Accept", "application/json")
         .json(&body)
@@ -460,8 +534,11 @@ pub fn authorize_url(
     format!("{authorization_endpoint}{sep}{}", query.join("&"))
 }
 
-/// Read one HTTP request off the callback connection (headers + body);
-/// returns the request target.
+/// Cap on callback HTTP request headers (16 KiB).
+const CALLBACK_HEADER_CAP: usize = 16 * 1024;
+
+/// Read one HTTP request off the callback connection (headers capped at
+/// [`CALLBACK_HEADER_CAP`]); returns the request target.
 async fn read_callback_request(sock: &mut tokio::net::TcpStream) -> Result<String, String> {
     use tokio::io::AsyncReadExt;
     let mut buf: Vec<u8> = Vec::new();
@@ -475,22 +552,12 @@ async fn read_callback_request(sock: &mut tokio::net::TcpStream) -> Result<Strin
             break;
         }
         buf.extend_from_slice(&tmp[..n]);
-        let text = String::from_utf8_lossy(&buf);
-        if let Some(head_end) = text.find("\r\n\r\n") {
-            let cl = text
-                .lines()
-                .find_map(|l| {
-                    l.to_ascii_lowercase()
-                        .strip_prefix("content-length:")
-                        .and_then(|v| v.trim().parse::<usize>().ok())
-                })
-                .unwrap_or(0);
-            if buf.len() >= head_end + 4 + cl {
-                break;
-            }
-        }
-        if buf.len() > 64 * 1024 {
+        if buf.len() > CALLBACK_HEADER_CAP {
             return Err("oauth callback: oversized request".to_string());
+        }
+        let text = String::from_utf8_lossy(&buf);
+        if text.contains("\r\n\r\n") {
+            break;
         }
     }
     let text = String::from_utf8_lossy(&buf).into_owned();
@@ -502,6 +569,32 @@ async fn read_callback_request(sock: &mut tokio::net::TcpStream) -> Result<Strin
     Ok(target)
 }
 
+/// Full percent-decoding for OAuth query parameters (RFC 3986 `%XX` +
+/// `+` as space, UTF-8 lossy).
+fn pct_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        if bytes[i] == b'+' {
+            out.push(b' ');
+        } else {
+            out.push(bytes[i]);
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// Parse `?code=…&state=…` out of a callback target.
 fn parse_callback(target: &str) -> Result<(String, String), String> {
     let query = target.split_once('?').map(|(_, q)| q).unwrap_or(target);
@@ -509,12 +602,9 @@ fn parse_callback(target: &str) -> Result<(String, String), String> {
     let mut state = None;
     for pair in query.split('&') {
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-        let v = v
-            .replace("%3D", "=")
-            .replace("%2F", "/")
-            .replace("%2B", "+");
+        let v = pct_decode(v);
         match k {
-            "code" => code = Some(v.clone()),
+            "code" => code = Some(v),
             "state" => state = Some(v),
             _ => {}
         }
@@ -527,15 +617,17 @@ fn parse_callback(target: &str) -> Result<(String, String), String> {
 
 /// Token-endpoint POST shared by the code exchange and refresh grants.
 async fn token_request(
-    client: &reqwest::Client,
+    _client: &reqwest::Client,
     token_endpoint: &str,
     form: &[(&str, &str)],
 ) -> Result<TokenSet, String> {
+    validate_oauth_url(token_endpoint, "oauth token").await?;
+    let http = oauth_http_client()?;
     let form_pairs: Vec<(String, String)> = form
         .iter()
         .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
         .collect();
-    let resp = client
+    let resp = http
         .post(token_endpoint)
         .header("Accept", "application/json")
         .form(&form_pairs)
@@ -643,10 +735,10 @@ pub async fn authorize(
         }
     };
 
-    let verifier_bytes = random_bytes(32);
+    let verifier_bytes = random_bytes(32)?;
     let code_verifier = base64url(&verifier_bytes);
     let challenge = base64url(&sha256(code_verifier.as_bytes()));
-    let state = base64url(&random_bytes(16));
+    let state = base64url(&random_bytes(16)?);
     let url = authorize_url(
         &metadata.authorization_endpoint,
         &client_id,
@@ -660,21 +752,59 @@ pub async fn authorize(
     ));
 
     let code = tokio::time::timeout(hooks.authorize_timeout, async {
-        let (mut sock, _) = listener
-            .accept()
-            .await
-            .map_err(|e| format!("oauth callback accept: {e}"))?;
-        let target = read_callback_request(&mut sock).await?;
-        let _ = tokio::io::AsyncWriteExt::write_all(
-            &mut sock,
-            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 52\r\nConnection: close\r\n\r\nka: authorization received - you can close this tab.\n",
-        )
-        .await;
-        let (code, got_state) = parse_callback(&target)?;
-        if got_state != state {
-            return Err("oauth callback: state mismatch (possible CSRF) — aborting".to_string());
+        loop {
+            let (mut sock, _) = listener
+                .accept()
+                .await
+                .map_err(|e| format!("oauth callback accept: {e}"))?;
+            let target = match read_callback_request(&mut sock).await {
+                Ok(t) => t,
+                Err(_) => {
+                    let _ = tokio::io::AsyncWriteExt::write_all(
+                        &mut sock,
+                        b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+                    continue;
+                }
+            };
+            let path = target.split('?').next().unwrap_or("");
+            if path != "/callback" {
+                let _ = tokio::io::AsyncWriteExt::write_all(
+                    &mut sock,
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+                continue;
+            }
+            let (code, got_state) = match parse_callback(&target) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    let _ = tokio::io::AsyncWriteExt::write_all(
+                        &mut sock,
+                        b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: 26\r\nConnection: close\r\n\r\nka: invalid OAuth callback",
+                    )
+                    .await;
+                    return Err(e);
+                }
+            };
+            if got_state != state {
+                let _ = tokio::io::AsyncWriteExt::write_all(
+                    &mut sock,
+                    b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: 25\r\nConnection: close\r\n\r\nka: OAuth state mismatch\n",
+                )
+                .await;
+                return Err(
+                    "oauth callback: state mismatch (possible CSRF) — aborting".to_string(),
+                );
+            }
+            let _ = tokio::io::AsyncWriteExt::write_all(
+                &mut sock,
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 52\r\nConnection: close\r\n\r\nka: authorization received - you can close this tab.\n",
+            )
+            .await;
+            return Ok(code);
         }
-        Ok(code)
     })
     .await
     .map_err(|_| {
@@ -697,35 +827,92 @@ pub async fn authorize(
     Ok((tokens, client_id))
 }
 
+const HEADERS_HELPER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+const HEADERS_HELPER_STREAM_CAP: usize = 64 * 1024;
+
+/// Drain a pipe off-thread up to `cap` bytes, tracking total byte count
+/// so callers can detect oversized output without unbounded allocation.
+fn read_helper_pipe<R: std::io::Read + Send + 'static>(
+    pipe: Option<R>,
+    cap: usize,
+) -> std::thread::JoinHandle<(Vec<u8>, usize)> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let mut total = 0usize;
+        if let Some(mut pipe) = pipe {
+            let mut chunk = [0u8; 4096];
+            loop {
+                match pipe.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        total = total.saturating_add(n);
+                        if buf.len() < cap {
+                            let room = cap - buf.len();
+                            buf.extend_from_slice(&chunk[..n.min(room)]);
+                        }
+                    }
+                }
+            }
+        }
+        (buf, total)
+    })
+}
+
 /// EXT-03b: run a headers_helper command and parse its JSON-object
 /// stdout into headers. Blocking — callers wrap in spawn_blocking.
-/// Output past [`HEADERS_HELPER_CAP`] is an error (inline, with the
-/// captured stderr when the command itself failed).
+/// Enforces a 15s timeout and 64 KiB streaming pipe cap; stdout past
+/// [`HEADERS_HELPER_CAP`] is an error (never truncated).
 pub fn run_headers_helper(command: &str) -> Result<Vec<(String, String)>, String> {
     use std::process::{Command, Stdio};
-    let out = Command::new("sh")
-        .arg("-c")
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c")
         .arg(command)
         .stdin(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let mut child = cmd
+        .spawn()
         .map_err(|e| format!("headers_helper: spawn failed: {e}"))?;
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    if !out.status.success() {
+    let stdout_handle = read_helper_pipe(child.stdout.take(), HEADERS_HELPER_STREAM_CAP);
+    let stderr_handle = read_helper_pipe(child.stderr.take(), HEADERS_HELPER_STREAM_CAP);
+    let started = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if started.elapsed() >= HEADERS_HELPER_TIMEOUT {
+                    #[cfg(unix)]
+                    crate::hands::bash::kill_tree(child.id());
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("headers_helper: timed out after 15s".to_string());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(e) => return Err(format!("headers_helper: wait failed: {e}")),
+        }
+    };
+    let (stdout_bytes, stdout_total) = stdout_handle.join().unwrap_or_default();
+    let (stderr_bytes, _) = stderr_handle.join().unwrap_or_default();
+    let stderr = String::from_utf8_lossy(&stderr_bytes);
+    if !status.success() {
         return Err(format!(
             "headers_helper failed (exit {}): {}",
-            out.status.code().unwrap_or(-1),
+            status.code().unwrap_or(-1),
             stderr.trim()
         ));
     }
-    if out.stdout.len() > HEADERS_HELPER_CAP {
+    if stdout_total > HEADERS_HELPER_CAP {
         return Err(format!(
-            "headers_helper emitted {} bytes — over the {} cap",
-            out.stdout.len(),
-            HEADERS_HELPER_CAP
+            "headers_helper emitted {stdout_total} bytes — over the {HEADERS_HELPER_CAP} cap"
         ));
     }
-    let text = String::from_utf8_lossy(&out.stdout);
+    let text = String::from_utf8_lossy(&stdout_bytes);
     let v: serde_json::Value = serde_json::from_str(text.trim())
         .map_err(|e| format!("headers_helper: stdout is not a JSON object: {e}"))?;
     let map = v.as_object().ok_or_else(|| {
@@ -987,17 +1174,14 @@ mod tests {
         assert!(!back.expired());
         // 0600 on the file, 0700 on the dir
         use std::os::unix::fs::PermissionsExt;
-        let path = tokens_dir().join(format!("{key}.json"));
+        let dir = tokens_dir().unwrap();
+        let path = dir.join(format!("{key}.json"));
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
         assert_eq!(
-            std::fs::metadata(tokens_dir())
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
             0o700
         );
         // a header change does not orphan the tokens, a url change does
@@ -1170,7 +1354,7 @@ mod tests {
                             "application/json",
                             "",
                             &serde_json::json!({
-                                "issuer": "https://auth.test",
+                                "issuer": format!("http://{addr}"),
                                 "authorization_endpoint": auth_ep,
                                 "token_endpoint": token_ep,
                                 "registration_endpoint": register_ep,

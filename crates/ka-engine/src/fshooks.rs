@@ -181,7 +181,7 @@ pub async fn run_trusted(
     if !project_trusted {
         return Ok(None);
     }
-    let Some(script) = locate(event, cwd) else {
+    let Some(script) = locate(event, cwd)? else {
         return Ok(None);
     };
     let name = event.name();
@@ -202,13 +202,36 @@ pub async fn run_trusted(
 
 /// Find the hook script: `<project root>/.ka/hooks/<name>.sh` first,
 /// then `<name>` — root-anchored so a session launched from a
-/// subdirectory runs the same project hooks.
-fn locate(event: HookPoint, cwd: &Path) -> Option<PathBuf> {
+/// subdirectory runs the same project hooks. A symlink that escapes
+/// `.ka/hooks/` is an ERROR, not a silent skip: a pre-tool veto hook
+/// must fail closed, never stop enforcing behind the user's back.
+fn locate(event: HookPoint, cwd: &Path) -> Result<Option<PathBuf>, String> {
     let base = crate::project_root(cwd).join(".ka").join("hooks");
-    [format!("{}.sh", event.name()), event.name().to_string()]
-        .into_iter()
-        .map(|name| base.join(name))
-        .find(|path| path.is_file())
+    let Ok(canon_base) = std::fs::canonicalize(&base) else {
+        return Ok(None); // no hooks directory
+    };
+    for name in [format!("{}.sh", event.name()), event.name().to_string()] {
+        let path = base.join(name);
+        if !path.is_file() {
+            continue;
+        }
+        let Some(canon) = std::fs::canonicalize(&path).ok() else {
+            return Err(format!(
+                "{} hook: cannot resolve {}",
+                event.name(),
+                path.display()
+            ));
+        };
+        if !canon.starts_with(&canon_base) {
+            return Err(format!(
+                "{} hook: {} is a symlink escaping .ka/hooks — refusing (fix the link or remove it)",
+                event.name(),
+                path.display()
+            ));
+        }
+        return Ok(Some(canon));
+    }
+    Ok(None)
 }
 
 /// Execute one hook script synchronously (runs on the blocking pool).
@@ -224,10 +247,20 @@ fn execute(
         .current_dir(cwd)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .env("KA_HOOK", name);
+        .stderr(std::process::Stdio::piped());
+    let safe_env = crate::config::ShellEnvPolicy {
+        mode: crate::config::ShellEnvMode::Core,
+        ..Default::default()
+    };
+    safe_env.apply_to_std(&mut cmd);
+    cmd.env("KA_HOOK", name);
     if let Some(tool) = tool {
         cmd.env("KA_TOOL", tool);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
     }
     let mut child = match cmd.spawn() {
         Ok(child) => child,
@@ -243,6 +276,8 @@ fn execute(
             Ok(Some(status)) => break status,
             Ok(None) => {
                 if started.elapsed() >= HOOK_TIMEOUT {
+                    #[cfg(unix)]
+                    crate::hands::bash::kill_tree(child.id());
                     let _ = child.kill();
                     let _ = child.wait();
                     return Err(format!("{name} hook timed out after 10s"));

@@ -1801,20 +1801,21 @@ impl Config {
     }
 }
 
-/// First matching rule's verdict for a call — the exact matching the
-/// gate uses (shipped semantics): the FIRST rule naming the tool is
-/// decisive; when its pattern doesn't match the call's primary
-/// argument, NO rule applies (a pattern-less rule always matches).
+/// First matching rule's verdict for a call: iterates through `rules`
+/// and returns the verdict of the FIRST rule whose `tool` matches AND
+/// whose `pattern` matches `arg` (a pattern-less rule always matches).
 /// Web tools match the URL host with domain semantics. Public so
 /// `ka rules check <command>` can pre-flight a call against the same
 /// list the engine will evaluate.
 pub fn evaluate_rules(rules: &[Rule], tool: &str, arg: &str) -> Option<Verdict> {
     rules
         .iter()
-        .find(|r| r.tool == tool)
-        .filter(|r| match &r.pattern {
-            None => true,
-            Some(pat) => crate::voice::rule_pattern_matches(pat, tool, arg),
+        .find(|r| {
+            r.tool == tool
+                && match &r.pattern {
+                    None => true,
+                    Some(pat) => crate::voice::rule_pattern_matches(pat, tool, arg),
+                }
         })
         .map(|r| r.verdict)
 }
@@ -3358,10 +3359,9 @@ rules = [
         );
     }
 
-    /// PERM-06: `evaluate_rules` is the gate's matcher — shipped
-    /// semantics: the FIRST rule naming the tool is decisive, and when
-    /// its pattern doesn't match, no rule applies at all (a
-    /// pattern-less rule always matches). Web tools use host semantics.
+    /// PERM-06: `evaluate_rules` is the gate's matcher — first matching
+    /// rule wins (both tool and pattern must match; a pattern-less rule
+    /// always matches). Web tools use host semantics.
     #[test]
     fn evaluate_rules_matches_first_and_web_hosts() {
         let rules = vec![
@@ -3381,12 +3381,12 @@ rules = [
             Some(Verdict::Deny),
             "first match wins, subdomain covered"
         );
-        // first-rule-for-tool semantics: a non-matching pattern on the
-        // first web_fetch rule means NO rule applies (the gate ships
-        // this; `ka rules check` must pre-flight identically)
+        // first-matching-rule-wins: when the first web_fetch rule's
+        // pattern doesn't match, evaluation continues to the catch-all
+        // second rule
         assert_eq!(
             evaluate_rules(&rules, "web_fetch", "https://docs.rs/x"),
-            None
+            Some(Verdict::Ask)
         );
         assert_eq!(evaluate_rules(&rules, "bash", "git status"), None);
 

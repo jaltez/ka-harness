@@ -27,6 +27,7 @@ fn main() {
         "sign" => sign(&rest),
         "release" => release(),
         "bench" => bench(&rest),
+        "redteam" => redteam(),
         "live-smoke" => live_smoke(),
         "help" | "--help" | "-h" => {
             print_help();
@@ -73,6 +74,7 @@ fn print_help() {
             baselines on this machine (do it on the release machine)
   live-smoke  scripted one-turn conversations against real providers
             (ANTHROPIC_API_KEY / OPENAI_API_KEY / KA_LM_URL; never in CI)
+  redteam   run all red-team security regression test suites across crates
   help      this message"
     );
 }
@@ -125,13 +127,14 @@ fn install() -> i32 {
 /// crates.io rate limit resumes with the same command.
 /// `--dry-run` packages and verifies every crate without uploading.
 fn publish(args: &[String]) -> i32 {
-    const ORDER: [&str; 8] = [
+    const ORDER: [&str; 9] = [
         "ka-protocol",
         "ka-strand",
         "ka-dialect",
         "ka-sandbox",
         "ka-engine",
         "ka-index",
+        "ka-passport",
         "ka-term",
         "ka-harness",
     ];
@@ -269,6 +272,22 @@ fn ci() -> i32 {
     if clippy != 0 {
         return clippy;
     }
+    // the CI check job also compiles isolated optional features — run
+    // the same matrix here so a feature-only break fails locally too
+    let feature_checks: [&[&str]; 4] = [
+        &["check", "-p", "ka-harness", "--no-default-features"],
+        &["check", "-p", "ka-harness", "--features", "index"],
+        &["check", "-p", "ka-harness", "--features", "passport"],
+        &["check", "-p", "ka-engine", "--features", "code"],
+    ];
+    for args in feature_checks {
+        let mut cmd = Command::new("cargo");
+        cmd.args(args).current_dir(repo_root());
+        let code = run(&mut cmd);
+        if code != 0 {
+            return code;
+        }
+    }
     let graph_gate = deps();
     if graph_gate != 0 {
         return graph_gate;
@@ -276,6 +295,24 @@ fn ci() -> i32 {
     run(Command::new("cargo")
         .args(["test", "--workspace", "--all-features"])
         .current_dir(repo_root()))
+}
+
+/// Run the red-team security regression test suites across all crates.
+fn redteam() -> i32 {
+    let suites = [
+        ("ka-sandbox", "red_team_sandbox"),
+        ("ka-engine", "red_team_security"),
+        ("ka-harness", "red_team_surfaces"),
+    ];
+    for (pkg, test) in suites {
+        let code = run(Command::new("cargo")
+            .args(["test", "-p", pkg, "--all-features", "--test", test])
+            .current_dir(repo_root()));
+        if code != 0 {
+            return code;
+        }
+    }
+    0
 }
 
 /// Release binary size vs the footprint contract (`--bin <path>` gates any

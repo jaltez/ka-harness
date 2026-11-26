@@ -15,6 +15,14 @@ use super::{Clearance, Hand, HandContext, HandDef, ToolOutput};
 use crate::agents::AgentDef;
 use crate::voice::{GuardRuntime, Voice};
 
+/// Parent security posture propagated into delegated subagent voices.
+#[derive(Clone, Default)]
+pub(crate) struct DelegatePolicy {
+    pub sandbox: Option<ka_sandbox::Policy>,
+    pub rules: Vec<crate::config::Rule>,
+    pub shell_env: Option<crate::config::ShellEnvPolicy>,
+}
+
 /// The delegate tool: one hand over every discovered agent.
 pub struct DelegateHand {
     agents: Vec<AgentDef>,
@@ -26,6 +34,10 @@ pub struct DelegateHand {
     source: Arc<parking_lot::RwLock<super::pathfinder::PathfinderSource>>,
     /// The parent session's permission mode (gates isolated agents).
     parent_mode: ka_protocol::Mode,
+    /// Live parent mode slot (overrides `parent_mode` when wired by engine).
+    mode_slot: Option<crate::engine::ModeSlot>,
+    /// Parent sandbox/rules/shell-env policy propagated to subagent voices.
+    policy: DelegatePolicy,
     /// Background-task registry (`background: true` delegates).
     tasks: Arc<super::tasks::AgentTaskTable>,
     /// Event sink for completion notes.
@@ -50,6 +62,8 @@ impl DelegateHand {
             features,
             source,
             parent_mode,
+            mode_slot: None,
+            policy: DelegatePolicy::default(),
             tasks,
             events,
             hooks: std::sync::Arc::new(Vec::new()),
@@ -60,6 +74,27 @@ impl DelegateHand {
     pub fn with_hooks(mut self, hooks: std::sync::Arc<Vec<crate::config::Hook>>) -> Self {
         self.hooks = hooks;
         self
+    }
+
+    /// Wire the parent's live mode slot so mid-session `/mode` changes
+    /// govern isolated delegate permissions immediately.
+    pub(crate) fn with_mode_slot(mut self, slot: crate::engine::ModeSlot) -> Self {
+        self.mode_slot = Some(slot);
+        self
+    }
+
+    /// Propagate parent sandbox, permission rules, and shell-env policy
+    /// into delegated child voices.
+    pub(crate) fn with_policy(mut self, policy: DelegatePolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    fn effective_mode(&self) -> ka_protocol::Mode {
+        self.mode_slot
+            .as_ref()
+            .map(|s| *s.read())
+            .unwrap_or(self.parent_mode)
     }
 
     /// Agents visible to the model right now (`agent:<name>` toggles).
@@ -193,12 +228,13 @@ track it with the tasks tool.",
                 // bound ahead of the await: the read guard must not
                 // live across the spawn (it is not Send)
                 let source = self.source.read().clone();
-                let run = arm_background(
+                let run = arm_background_with_policy(
                     def.clone(),
                     task,
                     &ctx.cwd,
                     source,
-                    self.parent_mode,
+                    self.effective_mode(),
+                    self.policy.clone(),
                     self.tasks.clone(),
                     &self.events,
                     self.hooks.clone(),
@@ -240,7 +276,8 @@ track it with the tasks tool.",
                 task.to_string(),
                 ctx.cwd.clone(),
                 source,
-                self.parent_mode,
+                self.effective_mode(),
+                self.policy.clone(),
                 roster,
                 |_| {},
             )
@@ -319,6 +356,34 @@ pub(crate) async fn arm_background(
     hooks: Arc<Vec<crate::config::Hook>>,
     features: crate::features::FeatureSlot,
 ) -> BackgroundRun {
+    arm_background_with_policy(
+        def,
+        task,
+        cwd,
+        source,
+        parent_mode,
+        DelegatePolicy::default(),
+        tasks,
+        events,
+        hooks,
+        features,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn arm_background_with_policy(
+    def: AgentDef,
+    task: &str,
+    cwd: &std::path::Path,
+    source: super::pathfinder::PathfinderSource,
+    parent_mode: ka_protocol::Mode,
+    policy: DelegatePolicy,
+    tasks: Arc<super::tasks::AgentTaskTable>,
+    events: &mpsc::Sender<ka_protocol::Event>,
+    hooks: Arc<Vec<crate::config::Hook>>,
+    features: crate::features::FeatureSlot,
+) -> BackgroundRun {
     let id = tasks.register(&def.name, task);
     let roster = Some(tasks.rows_except(Some(id)));
     let mut prompt = format!("{}\n\nTask: {}", def.system, task);
@@ -357,6 +422,7 @@ pub(crate) async fn arm_background(
             cwd,
             source,
             parent_mode,
+            policy,
             roster,
             |tx| tasks_in.attach_cmds(id, tx),
         )
@@ -480,7 +546,8 @@ impl DelegateHand {
                         task: task.to_string(),
                         cwd: ctx.cwd.clone(),
                         source: self.source.read().clone(),
-                        parent_mode: self.parent_mode,
+                        parent_mode: self.effective_mode(),
+                        policy: self.policy.clone(),
                     }))
                 }
                 Some(_) => picked.push(Err(format!(
@@ -522,6 +589,7 @@ impl DelegateHand {
                             job.cwd.clone(),
                             job.source,
                             job.parent_mode,
+                            job.policy,
                             None,
                             |_| (),
                         )
@@ -599,6 +667,7 @@ struct FanoutJob {
     cwd: std::path::PathBuf,
     source: super::pathfinder::PathfinderSource,
     parent_mode: ka_protocol::Mode,
+    policy: DelegatePolicy,
 }
 
 /// Run one agent on one task: a nested voice turn (read-only, or
@@ -608,12 +677,14 @@ struct FanoutJob {
 /// `tasks send` can reach the live turn. An agent with an `output:`
 /// schema gets one instructive retry when an attempt fails. Returns the
 /// outcome plus the surviving worktree branch (isolated agents).
+#[allow(clippy::too_many_arguments)]
 async fn run_agent(
     def: AgentDef,
     task: String,
     cwd: std::path::PathBuf,
     source: super::pathfinder::PathfinderSource,
     parent_mode: ka_protocol::Mode,
+    policy: DelegatePolicy,
     roster: Option<Vec<String>>,
     mut on_channels: impl FnMut(mpsc::Sender<ka_protocol::Command>),
 ) -> (Result<String, String>, Option<String>, f64) {
@@ -641,6 +712,7 @@ async fn run_agent(
             &cwd,
             &source,
             parent_mode,
+            &policy,
             roster.clone(),
             &mut on_channels,
         )
@@ -654,13 +726,57 @@ async fn run_agent(
     (outcome.0, outcome.1, cost)
 }
 
+/// Validate a name segment used to construct a worktree directory and
+/// git branch: reject path separators, `..`, leading `-`, and
+/// non-ASCII-safe characters.
+fn valid_worktree_segment(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('-')
+        && !name.contains("..")
+        && !name.contains('/')
+        && !name.contains('\\')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Drop guard that ensures a created git worktree is always cleaned up
+/// on timeout, error, or future cancellation.
+struct WorktreeGuard {
+    cwd: std::path::PathBuf,
+    path: Option<std::path::PathBuf>,
+}
+
+impl WorktreeGuard {
+    fn new(cwd: &std::path::Path, path: Option<std::path::PathBuf>) -> Self {
+        Self {
+            cwd: cwd.to_path_buf(),
+            path,
+        }
+    }
+
+    fn take(&mut self) -> Option<std::path::PathBuf> {
+        self.path.take()
+    }
+}
+
+impl Drop for WorktreeGuard {
+    fn drop(&mut self) {
+        if let Some(p) = self.path.take() {
+            let _ = finish_worktree(&self.cwd, &p);
+        }
+    }
+}
+
 /// One attempt of [`run_agent`].
+#[allow(clippy::too_many_arguments)]
 async fn run_agent_once(
     def: &AgentDef,
     task: &str,
     cwd: &std::path::Path,
     source: &super::pathfinder::PathfinderSource,
     parent_mode: ka_protocol::Mode,
+    policy: &DelegatePolicy,
     roster: Option<Vec<String>>,
     on_channels: &mut impl FnMut(mpsc::Sender<ka_protocol::Command>),
 ) -> (Result<String, String>, Option<String>, ka_protocol::Usage) {
@@ -702,12 +818,22 @@ async fn run_agent_once(
                 ka_protocol::Usage::default(),
             );
         }
+        if !valid_worktree_segment(agent_name) {
+            return (
+                Err(format!(
+                    "delegate: invalid agent name '{agent_name}' for isolated worktree"
+                )),
+                None,
+                ka_protocol::Usage::default(),
+            );
+        }
         match create_worktree(cwd, &format!("ka-{agent_name}")) {
             Ok(path) => worktree = Some(path),
             Err(e) => return (Err(e), None, ka_protocol::Usage::default()),
         }
     }
     let agent_cwd = worktree.clone().unwrap_or_else(|| cwd.to_path_buf());
+    let mut worktree_guard = WorktreeGuard::new(cwd, worktree);
 
     let mut prompt = format!("{}\n\nTask: {}", def.system, task);
     if let Some(rows) = roster.filter(|r| !r.is_empty()) {
@@ -719,10 +845,11 @@ async fn run_agent_once(
     let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
     on_channels(cmd_tx.clone());
     let (evt_tx, mut evt_rx) = mpsc::channel(256);
-    let isolated = worktree.is_some();
+    let isolated = worktree_guard.path.is_some();
     let max_steps = def.max_steps;
     let schema = def.output.clone();
     let source = source.clone();
+    let policy = policy.clone();
     let (usage_tx, usage_rx) = tokio::sync::oneshot::channel();
     let handle = tokio::spawn(async move {
         let mut steers = Vec::new();
@@ -743,6 +870,15 @@ async fn run_agent_once(
                 max_steps,
             )
         };
+        if let Some(sandbox) = policy.sandbox {
+            voice.set_sandbox(sandbox);
+        }
+        if !policy.rules.is_empty() {
+            voice.set_rules(policy.rules);
+        }
+        if let Some(shell_env) = policy.shell_env {
+            voice.set_shell_env(shell_env);
+        }
         voice.set_model_selector(&model, 4.0);
         voice.set_session_id(source.session_id.clone());
         if let Some(tools) = &agent_tools {
@@ -778,6 +914,18 @@ async fn run_agent_once(
                     kind: ka_protocol::DeltaKind::Thought(t),
                 } => thought.push_str(&t),
                 ka_protocol::Event::Error { message, .. } => failed = Some(message),
+                ka_protocol::Event::Ask { id, questions } => {
+                    // nobody is there to answer a delegated child: answer the
+                    // deny option on its behalf — an unanswered ask would
+                    // otherwise block the child until the 10-minute cap
+                    let choice = super::teams::deny_choice(&questions);
+                    let _ = cmd_tx
+                        .send(ka_protocol::Command::Answer {
+                            question: id,
+                            choice,
+                        })
+                        .await;
+                }
                 ka_protocol::Event::TurnFinished { .. } => break,
                 _ => {}
             }
@@ -788,9 +936,10 @@ async fn run_agent_once(
     let _ = handle.await;
 
     if !matches!(deadline, Ok(())) {
+        drop(worktree_guard);
         return (
             Err("delegate: agent timed out (10m)".to_string()),
-            worktree.map(|_| String::new()),
+            None,
             usage_rx.await.unwrap_or_default(),
         );
     }
@@ -798,6 +947,7 @@ async fn run_agent_once(
         summary = thought; // thinking models: reason-only replies
     }
     if summary.trim().is_empty() {
+        drop(worktree_guard);
         return (
             Err(format!(
                 "agent {agent_name} failed: {}",
@@ -807,8 +957,8 @@ async fn run_agent_once(
             usage_rx.await.unwrap_or_default(),
         );
     }
-    if let Some(wt) = &worktree {
-        match finish_worktree(cwd, wt) {
+    if let Some(wt) = worktree_guard.take() {
+        match finish_worktree(cwd, &wt) {
             Ok(branch) => {
                 summary.push_str(&format!(
                     "\n\n(isolated worktree: changes live on branch `{branch}`)"
@@ -839,6 +989,9 @@ fn effort_label(e: &ka_protocol::Effort) -> &'static str {
 /// Create an isolated git worktree on its own branch under the state
 /// dir. `Err` when the cwd is not a git repository.
 fn create_worktree(cwd: &std::path::Path, name: &str) -> Result<std::path::PathBuf, String> {
+    if !valid_worktree_segment(name) {
+        return Err(format!("delegate: invalid worktree name '{name}'"));
+    }
     let git_ok = std::process::Command::new("git")
         .args(["rev-parse", "--is-inside-work-tree"])
         .current_dir(cwd)

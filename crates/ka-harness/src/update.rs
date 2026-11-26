@@ -37,14 +37,12 @@ pub struct UpdateOutcome {
 /// CLI entry: resolve defaults from env/config, then run.
 pub async fn run(channel: &str, check_only: bool, repo: &str) -> Result<String, String> {
     let api_base = std::env::var("KA_UPDATE_API_BASE").unwrap_or_else(|_| DEFAULT_API.to_string());
-    let state_dir = state_dir();
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     let outcome = check_and_install(
         &api_base,
         repo,
         channel,
         crate::PUBLIC_KEY,
-        &state_dir,
         &exe,
         check_only,
     )
@@ -83,13 +81,16 @@ fn version_triple(s: &str) -> Option<(u64, u64, u64)> {
     Some((major, minor, patch))
 }
 
-/// XDG state dir for downloads (`~/.local/state/ka/update` fallback).
-fn state_dir() -> PathBuf {
+/// XDG state dir for update check cache (`~/.local/state/ka/update`).
+/// Refuses to silently fall back to a world-writable temp directory.
+fn state_dir() -> Result<PathBuf, String> {
     std::env::var("XDG_STATE_HOME")
         .map(PathBuf::from)
         .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".local/state")))
-        .unwrap_or_else(|_| std::env::temp_dir())
-        .join("ka/update")
+        .map(|base| base.join("ka/update"))
+        .map_err(|_| {
+            "cannot determine update state dir: neither XDG_STATE_HOME nor HOME is set".to_string()
+        })
 }
 
 /// The release triple this binary updates for.
@@ -109,10 +110,72 @@ fn current_version() -> String {
         .ok()
         .and_then(|exe| {
             let out = Command::new(exe).arg("--version").output().ok()?;
-            String::from_utf8(out.stdout).ok()
+            if !out.status.success() {
+                return None;
+            }
+            let text = String::from_utf8(out.stdout).ok()?;
+            let trimmed = text.trim().to_string();
+            (!trimmed.is_empty()).then_some(trimmed)
         })
-        .map(|s| s.trim().to_string())
         .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string())
+}
+
+/// Maximum compressed artifact download size (32 MiB).
+const MAX_DOWNLOAD_BYTES: usize = 32 * 1024 * 1024;
+
+/// Maximum uncompressed tar size (64 MiB — gzip bomb guard).
+const MAX_UNCOMPRESSED_TAR: usize = 64 * 1024 * 1024;
+
+fn is_loopback_http(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    if parsed.scheme() != "http" {
+        return false;
+    }
+    // `http://127.0.0.1:80@evil.example/` parses as a userinfo URL, not
+    // a loopback one — reject anything carrying credentials
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return false;
+    }
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host == "127.0.0.1" || host == "::1"
+}
+
+/// Client with the update transport policy: every redirect hop must
+/// still pass [`validate_update_url`] (HTTPS, or loopback only when the
+/// fixture base is loopback), so an origin that 302s to plaintext
+/// cannot downgrade the transport.
+fn update_client(timeout: std::time::Duration, api_base: &str) -> Result<reqwest::Client, String> {
+    let base = api_base.to_string();
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+            if attempt.previous().len() > 5 {
+                return attempt.error("too many redirects");
+            }
+            match validate_update_url(attempt.url().as_str(), &base) {
+                Ok(()) => attempt.follow(),
+                Err(e) => attempt.error(e),
+            }
+        }))
+        .build()
+        .map_err(|e| format!("client: {e}"))
+}
+
+/// Enforce HTTPS on all update URLs, allowing loopback HTTP only when
+/// `api_base` itself is a loopback test fixture.
+fn validate_update_url(url: &str, api_base: &str) -> Result<(), String> {
+    if url.starts_with("https://") {
+        return Ok(());
+    }
+    if is_loopback_http(api_base) && is_loopback_http(url) {
+        return Ok(());
+    }
+    Err(format!("refusing non-HTTPS update URL: {url}"))
 }
 
 /// One network hit per 24 h — the check state file is the rate
@@ -162,10 +225,8 @@ fn newer_release(tag: &str, current: &str) -> bool {
 /// Latest `v*` (or legacy `ka-<channel>-*`) release tag. Short-capped
 /// client: a startup check must never linger on a slow network.
 async fn latest_release(api_base: &str, repo: &str, channel: &str) -> Result<String, String> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .map_err(|e| format!("client: {e}"))?;
+    validate_update_url(api_base, api_base)?;
+    let client = update_client(std::time::Duration::from_secs(5), api_base)?;
     let url = format!("{api_base}/repos/{repo}/releases");
     let releases: serde_json::Value = client
         .get(&url)
@@ -205,8 +266,11 @@ pub async fn startup_check(repo: &str, enabled: bool) -> Option<(String, String)
     if !enabled {
         return None;
     }
+    let Ok(dir) = state_dir() else {
+        return None;
+    };
     let api_base = std::env::var("KA_UPDATE_API_BASE").unwrap_or_else(|_| DEFAULT_API.to_string());
-    startup_check_in(&state_dir(), &api_base, repo, enabled, &current_version()).await
+    startup_check_in(&dir, &api_base, repo, enabled, &current_version()).await
 }
 
 /// Parameterized core (state dir + api base + version injectable for
@@ -245,17 +309,17 @@ pub async fn check_and_install(
     repo: &str,
     channel: &str,
     pubkey: Option<&str>,
-    state_dir: &Path,
     exe: &Path,
     check_only: bool,
 ) -> Result<UpdateOutcome, String> {
+    validate_update_url(api_base, api_base)?;
     let old_version = current_version();
     // unsigned builds (e.g. cargo install) verify the CI-published
     // sha256 instead of the ed25519 signature; `ka doctor` reports
     // which build identity is running
     let verifying = pubkey.map(verifying_key).transpose()?;
 
-    let client = reqwest::Client::new();
+    let client = update_client(std::time::Duration::from_secs(60), api_base)?;
     let url = format!("{api_base}/repos/{repo}/releases");
     let releases: serde_json::Value = client
         .get(&url)
@@ -287,17 +351,19 @@ pub async fn check_and_install(
         .ok_or_else(|| format!("no release tagged v* (or {legacy_prefix:?}) in {repo}"))?;
     let tag = release["tag_name"].as_str().unwrap_or_default().to_string();
 
-    // never reinstall the running version (or downgrade to a
-    // re-published older tag): compare triples before any download
-    if let (Some(new), Some(cur)) = (version_triple(&tag), version_triple(&old_version)) {
-        if new <= cur {
-            return Ok(UpdateOutcome {
-                old_version,
-                new_version: None,
-                latest_tag: tag,
-                up_to_date: true,
-            });
-        }
+    // Fail-closed downgrade protection: both the release tag and the
+    // running version must parse as version triples before any download.
+    let new_ver = version_triple(&tag)
+        .ok_or_else(|| format!("refusing update: unparseable release tag {tag:?}"))?;
+    let cur_ver = version_triple(&old_version)
+        .ok_or_else(|| format!("refusing update: unparseable current version {old_version:?}"))?;
+    if new_ver <= cur_ver {
+        return Ok(UpdateOutcome {
+            old_version,
+            new_version: None,
+            latest_tag: tag,
+            up_to_date: true,
+        });
     }
 
     let asset_name = format!("ka-{}.tar.gz", artifact_triple());
@@ -319,18 +385,34 @@ pub async fn check_and_install(
     let download = |url: String| {
         let client = &client;
         async move {
-            client
+            validate_update_url(&url, api_base)?;
+            let mut resp = client
                 .get(&url)
                 .header("User-Agent", "ka-update")
                 .send()
                 .await
                 .map_err(|e| format!("GET {url}: {e}"))?
                 .error_for_status()
-                .map_err(|e| format!("GET {url}: {e}"))?
-                .bytes()
-                .await
-                .map(Vec::from)
-                .map_err(|e| format!("GET {url}: {e}"))
+                .map_err(|e| format!("GET {url}: {e}"))?;
+            if let Some(cl) = resp.content_length() {
+                if cl > MAX_DOWNLOAD_BYTES as u64 {
+                    return Err(format!(
+                        "GET {url}: download size {cl} exceeds {} byte cap",
+                        MAX_DOWNLOAD_BYTES
+                    ));
+                }
+            }
+            let mut buf = Vec::new();
+            while let Some(chunk) = resp.chunk().await.map_err(|e| format!("GET {url}: {e}"))? {
+                if buf.len().saturating_add(chunk.len()) > MAX_DOWNLOAD_BYTES {
+                    return Err(format!(
+                        "GET {url}: download exceeds {} byte cap",
+                        MAX_DOWNLOAD_BYTES
+                    ));
+                }
+                buf.extend_from_slice(&chunk);
+            }
+            Ok(buf)
         }
     };
     let tarball = download(tar_url).await?;
@@ -356,47 +438,59 @@ pub async fn check_and_install(
         });
     }
 
-    // extract into the state dir, then atomically swap
-    let extract_dir = state_dir.join("extract");
-    let _ = std::fs::remove_dir_all(&extract_dir);
-    std::fs::create_dir_all(&extract_dir)
-        .map_err(|e| format!("mkdir {}: {e}", extract_dir.display()))?;
-    let tarball_path = state_dir.join(&asset_name);
-    std::fs::create_dir_all(state_dir)
-        .map_err(|e| format!("mkdir {}: {e}", state_dir.display()))?;
-    std::fs::write(&tarball_path, &tarball)
-        .map_err(|e| format!("write {}: {e}", tarball_path.display()))?;
-    let status = Command::new("tar")
-        .args([
-            "xzf",
-            tarball_path.to_string_lossy().as_ref(),
-            "-C",
-            extract_dir.to_string_lossy().as_ref(),
-        ])
-        .status()
-        .map_err(|e| format!("tar: {e}"))?;
-    if !status.success() {
-        return Err("tar extraction failed".to_string());
-    }
-    let new_bin = extract_dir.join("ka");
-    if !new_bin.exists() {
-        return Err("tarball: no 'ka' entry".to_string());
+    // Pure-Rust tar.gz inspection & extraction: rejects tar-slip (`..`),
+    // leading `/`, symlinks, hardlinks, devices, and gzip bombs without
+    // ever shelling out to `tar`.
+    let ka_bytes = extract_ka_from_tar_gz(&tarball)?;
+
+    // Stage in `exe.parent()` so rename is on the same filesystem (EXDEV-safe).
+    let stage_dir = exe.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(stage_dir)
+        .map_err(|e| format!("mkdir {}: {e}", stage_dir.display()))?;
+    let staged = stage_dir.join(format!(
+        ".ka.update.{}.{}.tmp",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    {
+        use std::io::Write as _;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.mode(0o700);
+        }
+        let mut file = opts
+            .open(&staged)
+            .map_err(|e| format!("stage {}: {e}", staged.display()))?;
+        if let Err(e) = file.write_all(&ka_bytes) {
+            let _ = std::fs::remove_file(&staged);
+            return Err(format!("stage {}: {e}", staged.display()));
+        }
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&new_bin, std::fs::Permissions::from_mode(0o755))
-            .map_err(|e| format!("chmod: {e}"))?;
+        if let Err(e) = std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755)) {
+            let _ = std::fs::remove_file(&staged);
+            return Err(format!("chmod: {e}"));
+        }
     }
 
     // atomic rename over the running binary; a busy executable (ETXTBSY)
     // lands the new binary next to the old one with instructions
-    match std::fs::rename(&new_bin, exe) {
+    match std::fs::rename(&staged, exe) {
         Ok(()) => {}
         Err(e) if e.raw_os_error() == Some(26) => {
             let beside = exe.with_file_name("ka.new");
-            std::fs::rename(&new_bin, &beside)
-                .map_err(|e| format!("stage {}: {e}", beside.display()))?;
+            if let Err(re) = std::fs::rename(&staged, &beside) {
+                let _ = std::fs::remove_file(&staged);
+                return Err(format!("stage {}: {re}", beside.display()));
+            }
             return Ok(UpdateOutcome {
                 old_version,
                 new_version: Some(format!(
@@ -409,14 +503,19 @@ pub async fn check_and_install(
                 up_to_date: false,
             });
         }
-        Err(e) => return Err(format!("install: {e}")),
+        Err(e) => {
+            let _ = std::fs::remove_file(&staged);
+            return Err(format!("install: {e}"));
+        }
     }
 
     let new_version = Command::new(exe)
         .arg("--version")
         .output()
         .ok()
+        .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
         .unwrap_or_else(|| tag.clone());
     Ok(UpdateOutcome {
         old_version,
@@ -424,6 +523,127 @@ pub async fn check_and_install(
         latest_tag: tag,
         up_to_date: false,
     })
+}
+
+/// Inspect every entry of a `.tar.gz` archive in pure Rust and return the
+/// bytes of the single regular `ka` binary entry. Rejects path traversal
+/// (`..`), absolute paths, symlinks, hardlinks, device nodes, and gzip
+/// bombs.
+fn extract_ka_from_tar_gz(tarball: &[u8]) -> Result<Vec<u8>, String> {
+    use std::io::Read as _;
+    let decoder = flate2::read::GzDecoder::new(tarball);
+    let mut raw = Vec::new();
+    decoder
+        .take((MAX_UNCOMPRESSED_TAR as u64) + 1)
+        .read_to_end(&mut raw)
+        .map_err(|e| format!("tarball gunzip failed: {e}"))?;
+    if raw.len() > MAX_UNCOMPRESSED_TAR {
+        return Err(format!(
+            "tarball exceeds {} byte uncompressed cap",
+            MAX_UNCOMPRESSED_TAR
+        ));
+    }
+
+    let mut offset = 0usize;
+    let mut ka_bytes: Option<Vec<u8>> = None;
+    while offset + 512 <= raw.len() {
+        let header = &raw[offset..offset + 512];
+        if header.iter().all(|&b| b == 0) {
+            break;
+        }
+        let typeflag = header[156];
+        let size = parse_tar_size(&header[124..136])?;
+        let data_start = offset + 512;
+        let data_end = data_start
+            .checked_add(size)
+            .ok_or_else(|| "tarball: entry size overflow".to_string())?;
+        if data_end > raw.len() {
+            return Err("tarball: truncated entry".to_string());
+        }
+        let padded = size
+            .checked_add(511)
+            .map(|n| (n / 512) * 512)
+            .ok_or_else(|| "tarball: entry size overflow".to_string())?;
+        let next_offset = data_start
+            .checked_add(padded)
+            .ok_or_else(|| "tarball: offset overflow".to_string())?;
+
+        // PAX extended headers (`x` / `g`) carry metadata only; skip them.
+        if typeflag == b'x' || typeflag == b'g' {
+            offset = next_offset;
+            continue;
+        }
+
+        // Only regular files (`0` / `\0`) and directories (`5`) are permitted.
+        if !matches!(typeflag, 0 | b'0' | b'5') {
+            return Err(format!(
+                "tarball: refusing non-regular entry type {:?}",
+                typeflag as char
+            ));
+        }
+
+        let name = tar_cstr(&header[0..100])?;
+        let prefix = if &header[257..262] == b"ustar" {
+            tar_cstr(&header[345..500])?
+        } else {
+            String::new()
+        };
+        let full_path = if prefix.is_empty() {
+            name
+        } else {
+            format!("{prefix}/{name}")
+        };
+        if full_path.is_empty()
+            || full_path.starts_with('/')
+            || full_path.starts_with('\\')
+            || full_path.contains('\0')
+            || full_path.split(['/', '\\']).any(|seg| seg == "..")
+        {
+            return Err(format!("tarball: refusing unsafe entry path {full_path:?}"));
+        }
+
+        let mut normalized = full_path.as_str();
+        while let Some(stripped) = normalized.strip_prefix("./") {
+            normalized = stripped;
+        }
+        if normalized == "ka" && matches!(typeflag, 0 | b'0') {
+            if ka_bytes.is_some() {
+                return Err("tarball: duplicate 'ka' entry".to_string());
+            }
+            ka_bytes = Some(raw[data_start..data_end].to_vec());
+        }
+
+        offset = next_offset;
+    }
+
+    ka_bytes.ok_or_else(|| "tarball: no 'ka' entry".to_string())
+}
+
+fn tar_cstr(field: &[u8]) -> Result<String, String> {
+    let end = field.iter().position(|&b| b == 0).unwrap_or(field.len());
+    std::str::from_utf8(&field[..end])
+        .map(str::to_string)
+        .map_err(|_| "tarball: non-UTF-8 entry name".to_string())
+}
+
+fn parse_tar_size(field: &[u8]) -> Result<usize, String> {
+    if field.first().copied() == Some(0x80) {
+        let mut val: u64 = 0;
+        for &b in &field[1..] {
+            val = val
+                .checked_shl(8)
+                .ok_or_else(|| "tarball: size overflow".to_string())?
+                | u64::from(b);
+        }
+        return usize::try_from(val).map_err(|_| "tarball: size overflow".to_string());
+    }
+    let s = std::str::from_utf8(field)
+        .map_err(|_| "tarball: invalid size header".to_string())?
+        .trim_matches(|c: char| c == '\0' || c.is_ascii_whitespace());
+    if s.is_empty() {
+        return Ok(0);
+    }
+    usize::from_str_radix(s, 8).map_err(|_| format!("tarball: invalid octal size {s:?}"))
 }
 
 /// Verify tarball bytes against a base64 ed25519 signature.
@@ -767,7 +987,6 @@ mod tests {
             false,
         ));
 
-        let state = work.join("state");
         let exe = work.join("installed-ka");
         std::fs::write(&exe, "OLD").unwrap();
 
@@ -776,7 +995,6 @@ mod tests {
             "owner/ka",
             "stable",
             Some(&pubkey),
-            &state,
             &exe,
             false,
         )
@@ -805,7 +1023,6 @@ mod tests {
             "owner/ka",
             "stable",
             Some(&pubkey),
-            &state,
             &exe,
             false,
         )
@@ -829,7 +1046,6 @@ mod tests {
             "owner/ka",
             "stable",
             Some(&pubkey),
-            &state,
             &exe,
             false,
         )
@@ -857,7 +1073,6 @@ mod tests {
             "owner/ka",
             "stable",
             Some(&pubkey),
-            &state,
             &exe,
             true,
         )
@@ -888,7 +1103,6 @@ mod tests {
         let tarball = make_tarball(&work, marker);
         let good_sha = sha256_hex(&tarball);
 
-        let state = work.join("state");
         let exe = work.join("installed-ka");
         std::fs::write(&exe, "OLD").unwrap();
 
@@ -908,7 +1122,6 @@ mod tests {
             "owner/ka",
             "stable",
             None,
-            &state,
             &exe,
             false,
         )
@@ -933,7 +1146,6 @@ mod tests {
             "owner/ka",
             "stable",
             None,
-            &state,
             &exe,
             false,
         )

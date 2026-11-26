@@ -328,222 +328,33 @@ async fn speak_anthropic(
             let Ok(v) = serde_json::from_str::<Value>(&evt.data) else {
                 continue;
             };
-            match v.get("type").and_then(Value::as_str).unwrap_or("") {
-                "message_start" => {
-                    if let Some(u) = v.pointer("/message/usage") {
-                        usage.input = u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
-                        usage.cache_read = u
-                            .get("cache_read_input_tokens")
-                            .and_then(Value::as_u64)
-                            .unwrap_or(0);
-                        usage.cache_write = u
-                            .get("cache_creation_input_tokens")
-                            .and_then(Value::as_u64)
-                            .unwrap_or(0);
-                    }
-                }
-                "content_block_start" => {
-                    let index = v.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-                    let kind = v
-                        .pointer("/content_block/type")
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
-                    // wire-controlled index: a garbage/hostile frame must
-                    // not drive an unbounded pad allocation
-                    if index > 1024 {
-                        continue;
-                    }
-                    while blocks.len() <= index {
-                        blocks.push(Block::default());
-                    }
-                    blocks[index] = Block {
-                        kind: kind.to_string(),
-                        id: v
-                            .pointer("/content_block/id")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string(),
-                        tool: v
-                            .pointer("/content_block/name")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string(),
-                        args: String::new(),
-                        // some proxies ship the full tool input on the
-                        // start event with no input_json_delta to follow
-                        input: v
-                            .pointer("/content_block/input")
-                            .filter(|i| i.as_object().is_some_and(|o| !o.is_empty()))
-                            .map(|i| i.to_string()),
-                    };
-                    // web_search_tool_result arrives complete in the
-                    // start event: surface the sources as text the
-                    // model and the transcript both read — or the
-                    // failure, when the provider reports one
-                    if kind == "web_search_tool_result" {
-                        if let Some(sources) = search_sources(&v) {
-                            out.send(StreamEvent::Text(sources)).await.ok();
-                        } else if let Some(err) = search_error(&v) {
-                            out.send(StreamEvent::Text(err)).await.ok();
-                        }
-                    }
-                }
-                "content_block_delta" => {
-                    let index = v.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-                    if index >= blocks.len() {
-                        continue;
-                    }
-                    let block = &mut blocks[index];
-                    match v
-                        .pointer("/delta/type")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                    {
-                        "text_delta" => {
-                            if let Some(text) = v.pointer("/delta/text").and_then(Value::as_str) {
-                                if !text.is_empty() {
-                                    out.send(StreamEvent::Text(text.to_string())).await.ok();
-                                }
-                            }
-                        }
-                        "thinking_delta" => {
-                            if let Some(thinking) =
-                                v.pointer("/delta/thinking").and_then(Value::as_str)
-                            {
-                                if !thinking.is_empty() {
-                                    out.send(StreamEvent::Thought(thinking.to_string()))
-                                        .await
-                                        .ok();
-                                }
-                            }
-                        }
-                        "input_json_delta" => {
-                            if let Some(part) =
-                                v.pointer("/delta/partial_json").and_then(Value::as_str)
-                            {
-                                block.args.push_str(part);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                "content_block_stop" => {
-                    let index = v.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-                    if index < blocks.len() {
-                        let b = &blocks[index];
-                        // no deltas accumulated → the start event's full
-                        // input object (if any) is the argument set
-                        let args = if b.args.trim().is_empty() {
-                            b.input.as_deref().unwrap_or("")
-                        } else {
-                            b.args.as_str()
-                        };
-                        if b.kind == "tool_use" && !b.tool.is_empty() {
-                            // a structured-output request surfaces the forced
-                            // tool's arguments as the reply text
-                            if b.tool == "structured_output" {
-                                out.send(StreamEvent::Text(args.to_string())).await.ok();
-                            } else {
-                                out.send(StreamEvent::Call(ToolCall {
-                                    id: b.id.clone(),
-                                    tool: b.tool.clone(),
-                                    arguments: repair_json(args),
-                                }))
-                                .await
-                                .ok();
-                            }
-                        }
-                        // provider-executed search: the harness never
-                        // runs it — surface the query the model asked
-                        // (same input-at-start fallback as tool_use:
-                        // some proxies ship the full input object on
-                        // content_block_start with no delta frames)
-                        if b.kind == "server_tool_use" {
-                            let query = repair_json(args)
-                                .get("query")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default()
-                                .to_string();
-                            if !query.is_empty() {
-                                out.send(StreamEvent::Text(format!("\n[web_search: {query}]")))
-                                    .await
-                                    .ok();
-                            }
-                        }
-                    }
-                }
-                "message_delta" => {
-                    if let Some(reason) = v.pointer("/delta/stop_reason").and_then(Value::as_str) {
-                        saw_terminal = true;
-                        stop = match reason {
-                            "max_tokens" => Stop::Length,
-                            // server tools (web search) can pause the
-                            // turn server-side — surface it as a
-                            // length stop, never a silent Done
-                            "pause_turn" => Stop::Length,
-                            _ => Stop::Done,
-                        };
-                    }
-                    if let Some(u) = v.pointer("/usage") {
-                        usage.output = u
-                            .get("output_tokens")
-                            .and_then(Value::as_u64)
-                            .unwrap_or(usage.output);
-                    }
-                }
-                "message_stop" => saw_terminal = true,
-                "error" => {
-                    let message = v
-                        .pointer("/error/message")
-                        .and_then(Value::as_str)
-                        .unwrap_or("provider stream error")
-                        .to_string();
-                    // Anthropic streams transient overloads as mid-stream
-                    // error events: map them retryable so the engine's
-                    // backoff re-drives the request instead of failing the
-                    // turn on a 529-class blip
-                    let etype = v.pointer("/error/type").and_then(Value::as_str);
-                    return Err(match etype {
-                        Some(
-                            "overloaded_error" | "api_error" | "rate_limit_error" | "timeout_error",
-                        ) => WireError::network(message),
-                        _ => WireError {
-                            class: ka_protocol::ErrorClass::Protocol,
-                            retryable: false,
-                            message,
-                        },
-                    });
-                }
-                _ => {} // ping etc.
-            }
+            handle_anthropic_event(
+                &v,
+                &mut blocks,
+                &mut usage,
+                &mut stop,
+                &mut saw_terminal,
+                out,
+            )
+            .await?;
         }
     }
-    // trailing frame without a final blank line: a dropped
-    // message_delta would silently lose stop_reason + output usage —
-    // drain like the openai wire does
+    // trailing frame without a final blank line: drain through the same
+    // handler so content_block_stop, message_delta, message_stop, and error
+    // events are never silently dropped
     for evt in parser.finish() {
         let Ok(v) = serde_json::from_str::<Value>(&evt.data) else {
             continue;
         };
-        match v.get("type").and_then(Value::as_str).unwrap_or("") {
-            "message_stop" => saw_terminal = true,
-            "message_delta" => {
-                if let Some(reason) = v.pointer("/delta/stop_reason").and_then(Value::as_str) {
-                    saw_terminal = true;
-                    stop = match reason {
-                        "max_tokens" | "pause_turn" => Stop::Length,
-                        _ => Stop::Done,
-                    };
-                }
-                if let Some(u) = v.pointer("/usage") {
-                    usage.output = u
-                        .get("output_tokens")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(usage.output);
-                }
-            }
-            _ => {}
-        }
+        handle_anthropic_event(
+            &v,
+            &mut blocks,
+            &mut usage,
+            &mut stop,
+            &mut saw_terminal,
+            out,
+        )
+        .await?;
     }
     // A clean EOF is not a completed turn: without message_stop (or a
     // stop_reason) the provider may have cut the stream mid-answer.
@@ -568,6 +379,225 @@ async fn speak_anthropic(
         .ok();
     }
     out.send(StreamEvent::Finished { stop, usage }).await.ok();
+    Ok(())
+}
+
+const MAX_TOOL_ARGS_BYTES: usize = 4 * 1024 * 1024;
+
+async fn handle_anthropic_event(
+    v: &Value,
+    blocks: &mut Vec<Block>,
+    usage: &mut ka_protocol::Usage,
+    stop: &mut Stop,
+    saw_terminal: &mut bool,
+    out: &mpsc::Sender<StreamEvent>,
+) -> Result<(), WireError> {
+    match v.get("type").and_then(Value::as_str).unwrap_or("") {
+        "message_start" => {
+            if let Some(u) = v.pointer("/message/usage") {
+                usage.input = u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
+                usage.cache_read = u
+                    .get("cache_read_input_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                usage.cache_write = u
+                    .get("cache_creation_input_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+            }
+        }
+        "content_block_start" => {
+            let index = v.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let kind = v
+                .pointer("/content_block/type")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            // wire-controlled index: a garbage/hostile frame must
+            // not drive an unbounded pad allocation
+            if index > 1024 {
+                return Ok(());
+            }
+            let input = v
+                .pointer("/content_block/input")
+                .filter(|i| i.as_object().is_some_and(|o| !o.is_empty()))
+                .map(|i| i.to_string());
+            if input
+                .as_ref()
+                .is_some_and(|s| s.len() > MAX_TOOL_ARGS_BYTES)
+            {
+                return Err(WireError {
+                    class: ka_protocol::ErrorClass::Protocol,
+                    retryable: false,
+                    message: format!(
+                        "tool call arguments exceeded {MAX_TOOL_ARGS_BYTES} byte limit"
+                    ),
+                });
+            }
+            while blocks.len() <= index {
+                blocks.push(Block::default());
+            }
+            blocks[index] = Block {
+                kind: kind.to_string(),
+                id: v
+                    .pointer("/content_block/id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                tool: v
+                    .pointer("/content_block/name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                args: String::new(),
+                // some proxies ship the full tool input on the
+                // start event with no input_json_delta to follow
+                input,
+            };
+            // web_search_tool_result arrives complete in the
+            // start event: surface the sources as text the
+            // model and the transcript both read — or the
+            // failure, when the provider reports one
+            if kind == "web_search_tool_result" {
+                if let Some(sources) = search_sources(v) {
+                    out.send(StreamEvent::Text(sources)).await.ok();
+                } else if let Some(err) = search_error(v) {
+                    out.send(StreamEvent::Text(err)).await.ok();
+                }
+            }
+        }
+        "content_block_delta" => {
+            let index = v.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+            if index >= blocks.len() {
+                return Ok(());
+            }
+            let block = &mut blocks[index];
+            match v
+                .pointer("/delta/type")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+            {
+                "text_delta" => {
+                    if let Some(text) = v.pointer("/delta/text").and_then(Value::as_str) {
+                        if !text.is_empty() {
+                            out.send(StreamEvent::Text(text.to_string())).await.ok();
+                        }
+                    }
+                }
+                "thinking_delta" => {
+                    if let Some(thinking) = v.pointer("/delta/thinking").and_then(Value::as_str) {
+                        if !thinking.is_empty() {
+                            out.send(StreamEvent::Thought(thinking.to_string()))
+                                .await
+                                .ok();
+                        }
+                    }
+                }
+                "input_json_delta" => {
+                    if let Some(part) = v.pointer("/delta/partial_json").and_then(Value::as_str) {
+                        if block.args.len().saturating_add(part.len()) > MAX_TOOL_ARGS_BYTES {
+                            return Err(WireError {
+                                class: ka_protocol::ErrorClass::Protocol,
+                                retryable: false,
+                                message: format!(
+                                    "tool call arguments exceeded {MAX_TOOL_ARGS_BYTES} byte limit"
+                                ),
+                            });
+                        }
+                        block.args.push_str(part);
+                    }
+                }
+                _ => {}
+            }
+        }
+        "content_block_stop" => {
+            let index = v.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+            if index < blocks.len() {
+                let b = &blocks[index];
+                // no deltas accumulated → the start event's full
+                // input object (if any) is the argument set
+                let args = if b.args.trim().is_empty() {
+                    b.input.as_deref().unwrap_or("")
+                } else {
+                    b.args.as_str()
+                };
+                if b.kind == "tool_use" && !b.tool.is_empty() {
+                    // a structured-output request surfaces the forced
+                    // tool's arguments as the reply text
+                    if b.tool == "structured_output" {
+                        out.send(StreamEvent::Text(args.to_string())).await.ok();
+                    } else {
+                        out.send(StreamEvent::Call(ToolCall {
+                            id: b.id.clone(),
+                            tool: b.tool.clone(),
+                            arguments: repair_json(args),
+                        }))
+                        .await
+                        .ok();
+                    }
+                }
+                // provider-executed search: the harness never
+                // runs it — surface the query the model asked
+                // (same input-at-start fallback as tool_use:
+                // some proxies ship the full input object on
+                // content_block_start with no delta frames)
+                if b.kind == "server_tool_use" {
+                    let query = repair_json(args)
+                        .get("query")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    if !query.is_empty() {
+                        out.send(StreamEvent::Text(format!("\n[web_search: {query}]")))
+                            .await
+                            .ok();
+                    }
+                }
+            }
+        }
+        "message_delta" => {
+            if let Some(reason) = v.pointer("/delta/stop_reason").and_then(Value::as_str) {
+                *saw_terminal = true;
+                *stop = match reason {
+                    "max_tokens" => Stop::Length,
+                    // server tools (web search) can pause the
+                    // turn server-side — surface it as a
+                    // length stop, never a silent Done
+                    "pause_turn" => Stop::Length,
+                    _ => Stop::Done,
+                };
+            }
+            if let Some(u) = v.pointer("/usage") {
+                usage.output = u
+                    .get("output_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(usage.output);
+            }
+        }
+        "message_stop" => *saw_terminal = true,
+        "error" => {
+            let message = v
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .unwrap_or("provider stream error")
+                .to_string();
+            // Anthropic streams transient overloads as mid-stream
+            // error events: map them retryable so the engine's
+            // backoff re-drives the request instead of failing the
+            // turn on a 529-class blip
+            let etype = v.pointer("/error/type").and_then(Value::as_str);
+            return Err(match etype {
+                Some("overloaded_error" | "api_error" | "rate_limit_error" | "timeout_error") => {
+                    WireError::network(message)
+                }
+                _ => WireError {
+                    class: ka_protocol::ErrorClass::Protocol,
+                    retryable: false,
+                    message,
+                },
+            });
+        }
+        _ => {} // ping etc.
+    }
     Ok(())
 }
 

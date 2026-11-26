@@ -104,6 +104,34 @@ const TAR_RAW_CAP: u64 = 256 * 1024 * 1024;
 const ARCHIVE_DECOMP_CAP: usize = 64 * 1024 * 1024;
 /// Per-archive-member extraction cap.
 const MEMBER_CAP: usize = 16 * 1024 * 1024;
+/// Maximum bytes buffered for a single line (prevents OOM on newline-free files).
+const MAX_LINE_BYTES: usize = 2 * 1024 * 1024;
+
+/// Read a single line up to `cap` bytes; any remainder past `cap` up to
+/// the next newline is discarded without allocating.
+fn read_line_capped<R: BufRead>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    cap: usize,
+) -> std::io::Result<usize> {
+    buf.clear();
+    let n = reader.take(cap as u64).read_until(b'\n', buf)?;
+    if n == cap && !buf.ends_with(b"\n") {
+        loop {
+            let avail = reader.fill_buf()?;
+            if avail.is_empty() {
+                break;
+            }
+            if let Some(pos) = avail.iter().position(|&b| b == b'\n') {
+                reader.consume(pos + 1);
+                break;
+            }
+            let len = avail.len();
+            reader.consume(len);
+        }
+    }
+    Ok(n)
+}
 
 /// Blocking worker: the whole read — metadata, listing, minting, image
 /// sniffing/base64, rich-format extraction, line windowing.
@@ -122,6 +150,12 @@ fn read_blocking(
     };
     if meta.is_dir() {
         return list_dir(path);
+    }
+    if !meta.is_file() {
+        return ToolOutput::err(format!(
+            "read {}: refusing non-regular file (FIFO, socket, or device)",
+            path.display()
+        ));
     }
 
     // rich formats first: magic-byte detection on the file head
@@ -190,8 +224,7 @@ fn read_blocking(
     let mut window: Vec<String> = Vec::new();
     let mut buf: Vec<u8> = Vec::new();
     loop {
-        buf.clear();
-        match reader.read_until(b'\n', &mut buf) {
+        match read_line_capped(&mut reader, &mut buf, MAX_LINE_BYTES) {
             Ok(0) => break,
             Ok(_) => {}
             Err(e) => return ToolOutput::err(format!("read {}: {e}", path.display())),
@@ -531,6 +564,14 @@ pub(crate) fn resolve(ctx: &HandContext, p: &str) -> PathBuf {
     } else {
         ctx.cwd.join(expanded)
     }
+}
+
+/// Resolve `raw` against `ctx.cwd` (expanding `~/`) and lexically
+/// normalize `..`/`.` while canonicalizing the deepest existing
+/// ancestor to defeat symlink escapes.
+#[allow(dead_code)]
+pub(crate) fn resolve_normalized(ctx: &HandContext, raw: &str) -> PathBuf {
+    super::protected::canonicalize_deepest(&resolve(ctx, raw))
 }
 
 #[cfg(test)]

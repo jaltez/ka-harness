@@ -822,7 +822,8 @@ async fn run(
     // them now (cfg-gated — no cost without the `code` feature)
     #[cfg(feature = "code")]
     let code_gate = (rules.clone(), prompt_policy, allowed_tools.clone());
-    let hooks = if crate::conventions::bare_mode() {
+    let delegate_rules = rules.clone();
+    let hooks = if crate::conventions::bare_mode() || leaf {
         Vec::new()
     } else {
         config.hooks.clone()
@@ -936,7 +937,8 @@ async fn run(
     // MODEL-03: the pass-through service_tier hint rides every
     // main-line request from here on
     voice.set_service_tier(config.service_tier.clone());
-    voice.set_shell_env(config.effective_shell_env());
+    let delegate_shell_env = config.effective_shell_env();
+    voice.set_shell_env(delegate_shell_env.clone());
     let sandbox_policy = ka_sandbox::policy_from_config(&config.sandbox.to_policy_config(), &cwd)?;
     voice.set_sandbox(sandbox_policy);
     // [permissions] prompt_policy: reviewable asks pose or are refused
@@ -1038,6 +1040,10 @@ async fn run(
         mcp_prompts: Vec::new(),
         roles_cfg: roles_table,
     };
+    // Leaf team members never get scheduling/monitoring automation hands.
+    if leaf {
+        ctx.voice.remove_hands(&["cron", "monitor"]);
+    }
     // markdown agents: .ka/agents/*.md etc. become one `delegate` hand
     // (empty in safe mode). The hands register even when `agents` is
     // toggled off — disabling hides, so a re-enable is pure set
@@ -1058,7 +1064,16 @@ async fn run(
                 ctx.events.clone(),
                 features.clone(),
             )
-            .with_hooks(std::sync::Arc::new(hooks.clone())),
+            .with_hooks(std::sync::Arc::new(hooks.clone()))
+            .with_mode_slot(ctx.state.mode_slot.clone())
+            .with_policy(crate::hands::delegate::DelegatePolicy {
+                // read at wiring time from the LIVE policy: a
+                // strand-restored `/sandbox` override has already been
+                // applied to the parent by now
+                sandbox: Some(ctx.voice.sandbox_policy().clone()),
+                rules: delegate_rules,
+                shell_env: Some(delegate_shell_env),
+            }),
         ));
         ctx.voice
             .push_hand(std::sync::Arc::new(crate::hands::tasks::TasksHand::new(
@@ -1103,15 +1118,16 @@ async fn run(
         ctx.teams = Some(table);
     }
     // memory inbox: the model stages durable notes for user review
-    // (customization tier — inert in safe mode)
-    if !crate::conventions::bare_mode() {
+    // (customization tier — inert in safe mode and leaf members)
+    if !crate::conventions::bare_mode() && !leaf {
         ctx.voice
             .push_hand(std::sync::Arc::new(crate::hands::memory::RememberHand));
     }
     // LSP hands: navigation (symbols/definition/references/diagnostics)
     // plus write-through on [lsp] write_through — only when the tier is
-    // both configured and not toggled off
-    if lsp_cfg.enable == Some(true)
+    // both configured and not toggled off (stripped on leaf members)
+    if !leaf
+        && lsp_cfg.enable == Some(true)
         && lsp_cfg.commands.as_ref().is_some_and(|c| !c.is_empty())
         && !features.read().is_disabled(&ka_protocol::FeatureSpec::Lsp)
     {
@@ -1121,8 +1137,9 @@ async fn run(
         }
     }
     // debug tier: manager + hand only when configured and not toggled
-    // off (runtime enable constructs them on demand)
-    if debug_cfg.enable == Some(true)
+    // off (runtime enable constructs them on demand; stripped on leaves)
+    if !leaf
+        && debug_cfg.enable == Some(true)
         && !features
             .read()
             .is_disabled(&ka_protocol::FeatureSpec::Debug)
@@ -1161,31 +1178,35 @@ async fn run(
             .collect(),
     );
 
-    // web search + fetch hands (search only when a provider is set)
-    for hand in crate::hands::web::hands(search_providers, web_allow_private) {
-        ctx.voice.push_hand(hand);
+    // web search + fetch hands (search only when a provider is set;
+    // stripped on leaf team members)
+    if !leaf {
+        for hand in crate::hands::web::hands(search_providers, web_allow_private) {
+            ctx.voice.push_hand(hand);
+        }
     }
     // generate_image hand: GATED on [generate_image] provider + API key
     // resolution (env/dotenv/keyring ladder) — an unkeyed config never
     // shows the tool; the `generate_image` feature toggle can still
-    // hide a registered one mid-session
-    if let Some(gen_cfg) = gen_image_cfg {
-        ctx.voice.push_hand(std::sync::Arc::new(
-            crate::hands::generate_image::GenerateImageHand::new(gen_cfg),
-        ));
+    // hide a registered one mid-session (stripped on leaf members)
+    if !leaf {
+        if let Some(gen_cfg) = gen_image_cfg {
+            ctx.voice.push_hand(std::sync::Arc::new(
+                crate::hands::generate_image::GenerateImageHand::new(gen_cfg),
+            ));
+        }
     }
     // code hand (TOOL-04): one JavaScript script per call orchestrating
     // ka tools, only the final value back to the model. Gated on the
     // `code` CARGO feature (default-OFF — the default binary stays
-    // byte-identical) + the session `tool:code` runtime toggle, in the
-    // spirit of the cron/monitor feature toggles: registered last so
-    // its router snapshot sees every hand the model can call, and
-    // hidden by the toggle both at registration (here) and at admit
-    // time (the voice's stray-call guard) when disabled mid-session.
+    // byte-identical), safe mode, leaf status, and the session
+    // `tool:code` runtime toggle.
     #[cfg(feature = "code")]
-    if !features
-        .read()
-        .is_disabled(&ka_protocol::FeatureSpec::Tool("code".into()))
+    if !crate::conventions::bare_mode()
+        && !leaf
+        && !features
+            .read()
+            .is_disabled(&ka_protocol::FeatureSpec::Tool("code".into()))
     {
         let (code_rules, code_prompt_policy, code_allowed_tools) = code_gate;
         let fast_role = ctx
@@ -1547,7 +1568,49 @@ async fn handle_mcp_server_request(
                     .await;
                 return;
             };
-            match ctx.voice.mcp_sampling(&model, &params).await {
+            let current_mode = *ctx.state.mode_slot.read();
+            if current_mode != ka_protocol::Mode::Allow {
+                if current_mode == ka_protocol::Mode::DontAsk
+                    || ctx.voice.prompt_policy() == crate::config::PromptPolicy::Deny
+                {
+                    let _ = shared
+                        .respond_error(
+                            &id,
+                            -32000,
+                            "MCP sampling denied by permission posture (dontAsk / prompt_policy=deny)",
+                        )
+                        .await;
+                    return;
+                }
+                let max_tok = params["maxTokens"].as_u64().unwrap_or(512).clamp(1, 4096);
+                let choice = engine_ask(
+                    &ctx.events,
+                    commands,
+                    ka_protocol::AskId(format!("mcp-sampling-{server}")),
+                    format!(
+                        "MCP server `{server}` requests model sampling with {model} \
+                         (maxTokens={max_tok}). Allow?"
+                    ),
+                    vec!["allow".into(), "deny".into()],
+                )
+                .await;
+                if choice != Some(0) {
+                    let _ = shared
+                        .respond_error(&id, -32000, "MCP sampling request denied by user")
+                        .await;
+                    return;
+                }
+            }
+            let mut capped_params = params;
+            if let Some(obj) = capped_params.as_object_mut() {
+                let clamped = obj
+                    .get("maxTokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(512)
+                    .clamp(1, 4096);
+                obj.insert("maxTokens".to_string(), serde_json::json!(clamped));
+            }
+            match ctx.voice.mcp_sampling(&model, &capped_params).await {
                 Ok(result) => {
                     ctx.events
                         .send(Event::Note {

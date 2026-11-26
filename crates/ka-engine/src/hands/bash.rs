@@ -112,6 +112,7 @@ impl BashHand {
                     ));
                 }
             };
+            restrict_spill_perms(&spill_path);
             let done_path = super::jobs::done_path(&spill_path);
             let script = format!(
                 "( {command} ) > {} 2>&1; echo $? > {}",
@@ -217,7 +218,12 @@ impl BashHand {
                 Ok(Phase::Exited) => {
                     guard.disarm();
                     ctx.ledger.lock().invalidate_all();
-                    let text = std::fs::read_to_string(&spill_path).unwrap_or_default();
+                    let raw_text = std::fs::read_to_string(&spill_path).unwrap_or_default();
+                    let text = super::secrets::redact(&raw_text);
+                    if text != raw_text {
+                        let _ = std::fs::write(&spill_path, &text);
+                        restrict_spill_perms(&spill_path);
+                    }
                     // the inner command's code comes from the .done marker
                     // (the outer shell itself exits with echo's status)
                     let code = std::fs::read_to_string(super::jobs::done_path(&spill_path))
@@ -381,8 +387,21 @@ struct Capped {
     pointer: Option<String>,
 }
 
+/// Restrict a spill file to owner-only permissions (0600) on Unix so
+/// command output cannot be read by other local users.
+fn restrict_spill_perms(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
 fn cap_output(ctx: &HandContext, raw: &str) -> Capped {
-    let line_capped: Vec<String> = raw
+    let redacted = super::secrets::redact(raw);
+    let line_capped: Vec<String> = redacted
         .lines()
         .map(|l| {
             if l.chars().count() > LINE_CAP {
@@ -410,7 +429,10 @@ fn cap_output(ctx: &HandContext, raw: &str) -> Capped {
         .into_iter()
         .rev()
         .collect();
-    let pointer = ctx.spill.park(raw).ok();
+    let pointer = ctx.spill.park(&redacted).ok();
+    if let Some(id) = pointer.as_deref().and_then(|p| p.strip_prefix("spill://")) {
+        restrict_spill_perms(&super::spills_root().join(id));
+    }
     Capped {
         text: format!(
             "{head}\n[…{} bytes elided…]\n{tail}",

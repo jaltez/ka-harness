@@ -43,6 +43,28 @@ impl Layer {
     }
 }
 
+/// Maximum input config file size (16 MiB).
+const MAX_IMPORT_BYTES: u64 = 16 * 1024 * 1024;
+
+fn read_bounded(path: &std::path::Path) -> Result<String, String> {
+    use std::io::Read as _;
+    // the cap must ride the READ: `metadata().len()` is 0 for /dev/zero
+    // and FIFOs, which would otherwise read forever
+    let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_IMPORT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    if bytes.len() as u64 > MAX_IMPORT_BYTES {
+        return Err(format!(
+            "{}: file size exceeds {} byte import cap",
+            path.display(),
+            MAX_IMPORT_BYTES
+        ));
+    }
+    String::from_utf8(bytes).map_err(|e| format!("{}: not UTF-8: {e}", path.display()))
+}
+
 /// Run `ka import <format> <path>`.
 pub fn run(
     format: &str,
@@ -52,21 +74,18 @@ pub fn run(
 ) -> Result<std::process::ExitCode, String> {
     let (conversion, source) = match format {
         "claude" => {
-            let text =
-                std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+            let text = read_bounded(path)?;
             (
                 convert_claude(&text)?,
                 "claude code settings.json (ka import claude)",
             )
         }
         "codex" => {
-            let text =
-                std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+            let text = read_bounded(path)?;
             (convert_codex(&text)?, "codex config.toml (ka import codex)")
         }
         "gemini" => {
-            let text =
-                std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+            let text = read_bounded(path)?;
             (
                 convert_gemini(&text)?,
                 "gemini settings.json (ka import gemini)",
@@ -188,40 +207,82 @@ fn map_entry(entry: &str, verdict: Verdict) -> Result<Rule, String> {
     };
     match tool_expr.as_str() {
         // Bash(pattern): claude `prefix:*` is prefix-match → ka `prefix*`;
-        // other globs pass through as ka globs
+        // other globs pass through as ka globs. Empty patterns like
+        // `Bash("")` or `Bash()` are rejected instead of widening to allow-all.
         "Bash" => {
-            let pattern =
-                pattern.map(|p| p.trim().trim_matches('"').trim_matches('\'').to_string());
-            let pattern = pattern.map(|p| {
-                if let Some(prefix) = p.strip_suffix(":*") {
-                    // claude `git commit:*` = prefix match → ka `git commit*`
-                    format!("{prefix}*")
-                } else if let Some(exact) = p.strip_suffix(':') {
-                    // `git commit:` = the bare prefix itself
-                    exact.to_string()
+            // An empty pattern on an `allow` entry would widen to
+            // allow-all (refuse, reported); on deny/ask it is a
+            // legitimate scope-less rule and must be KEPT.
+            let empty = |entry: &str| -> Result<Rule, String> {
+                if verdict == Verdict::Allow {
+                    Err(format!(
+                        "empty pattern in {entry:?} — refusing to widen to allow-all"
+                    ))
                 } else {
-                    p
+                    rule_for("bash", None)
                 }
-            });
-            let pattern = pattern.filter(|p| !p.is_empty());
+            };
+            let pattern = match pattern {
+                None => None,
+                Some(p) => {
+                    let cleaned = p.trim().trim_matches('"').trim_matches('\'').to_string();
+                    if cleaned.is_empty() {
+                        return empty(entry);
+                    }
+                    let mapped = if let Some(prefix) = cleaned.strip_suffix(":*") {
+                        if prefix.is_empty() {
+                            return empty(entry);
+                        }
+                        // claude `git commit:*` = prefix match → ka `git commit*`
+                        format!("{prefix}*")
+                    } else if let Some(exact) = cleaned.strip_suffix(':') {
+                        if exact.is_empty() {
+                            return empty(entry);
+                        }
+                        // `git commit:` = the bare prefix itself
+                        exact.to_string()
+                    } else {
+                        cleaned
+                    };
+                    Some(mapped)
+                }
+            };
             rule_for("bash", pattern)
         }
-        "Edit" => rule_for("edit", clean_pattern(pattern)),
-        "Write" => rule_for("write", clean_pattern(pattern)),
-        "Read" => rule_for("read", clean_pattern(pattern)),
+        "Edit" => rule_for("edit", clean_non_empty_pattern(entry, pattern, verdict)?),
+        "Write" => rule_for("write", clean_non_empty_pattern(entry, pattern, verdict)?),
+        "Read" => rule_for("read", clean_non_empty_pattern(entry, pattern, verdict)?),
         "WebFetch" => {
             // claude `WebFetch(domain:example.com)` → ka's web_fetch
-            // domain semantics take the bare host
-            let pattern = pattern.map(|p| {
-                p.trim()
-                    .strip_prefix("domain:")
-                    .unwrap_or(p.trim())
-                    .to_string()
-            });
-            let pattern = pattern.filter(|p| !p.is_empty());
+            // domain semantics take the bare host. Reject `WebFetch(domain:)`.
+            let pattern = match pattern {
+                None => None,
+                Some(p) => {
+                    let trimmed = p.trim().trim_matches('"').trim_matches('\'');
+                    let host = trimmed
+                        .strip_prefix("domain:")
+                        .unwrap_or(trimmed)
+                        .trim()
+                        .trim_matches('"')
+                        .trim_matches('\'');
+                    if host.is_empty() {
+                        return if verdict == Verdict::Allow {
+                            Err(format!(
+                                "empty pattern in {entry:?} — refusing to widen to allow-all"
+                            ))
+                        } else {
+                            rule_for("web_fetch", None)
+                        };
+                    }
+                    Some(host.to_string())
+                }
+            };
             rule_for("web_fetch", pattern)
         }
-        "WebSearch" => rule_for("web_search", clean_pattern(pattern)),
+        "WebSearch" => rule_for(
+            "web_search",
+            clean_non_empty_pattern(entry, pattern, verdict)?,
+        ),
         // mcp__server__tool → ka's `<server>.<tool>` hand names; ka
         // mcp rules carry no pattern, so a claude restriction like
         // mcp__github__create_issue(args) is reported as skipped
@@ -229,7 +290,7 @@ fn map_entry(entry: &str, verdict: Verdict) -> Result<Rule, String> {
         other if other.starts_with("mcp__") => {
             let parts: Vec<&str> = other.trim_start_matches("mcp__").splitn(2, "__").collect();
             if parts.len() == 2 {
-                if let Some(p) = clean_pattern(pattern) {
+                if let Some(p) = clean_non_empty_pattern(entry, pattern, verdict)? {
                     Err(format!(
                         "ka mcp rules carry no pattern — {other:?} loses its ({p}) restriction"
                     ))
@@ -614,10 +675,31 @@ fn codex_rules_from_grants(grants: &[CodexGrant], notes: &mut Vec<String>) -> Ve
     rules
 }
 
-fn clean_pattern(pattern: Option<String>) -> Option<String> {
-    pattern
-        .map(|p| p.trim().trim_matches('"').trim_matches('\'').to_string())
-        .filter(|p| !p.is_empty())
+fn clean_non_empty_pattern(
+    entry: &str,
+    pattern: Option<String>,
+    verdict: Verdict,
+) -> Result<Option<String>, String> {
+    match pattern {
+        None => Ok(None),
+        Some(p) => {
+            let cleaned = p.trim().trim_matches('"').trim_matches('\'').to_string();
+            if cleaned.is_empty() {
+                // a scope-less `allow` would widen to allow-all — refuse.
+                // A scope-less deny/ask is a legitimate "all calls" rule:
+                // keep the restriction instead of dropping it.
+                if verdict == Verdict::Allow {
+                    Err(format!(
+                        "empty pattern in {entry:?} — refusing to widen to allow-all"
+                    ))
+                } else {
+                    Ok(None)
+                }
+            } else {
+                Ok(Some(cleaned))
+            }
+        }
+    }
 }
 
 /// Parse a gemini-cli `settings.json` and convert its tool-approval
@@ -727,14 +809,23 @@ fn map_gemini_entry(entry: &str, verdict: Verdict) -> Result<Rule, String> {
         // gemini `run_shell_command(git)` is a prefix match (`git`,
         // `git status`, ...) → ka glob `git*`
         "run_shell_command" | "shell" => {
-            let pattern = clean_pattern(pattern).map(|p| format!("{p}*"));
+            let pattern =
+                clean_non_empty_pattern(entry, pattern, verdict)?.map(|p| format!("{p}*"));
             rule_for("bash", pattern)
         }
-        "replace" => rule_for("edit", clean_pattern(pattern)),
-        "write_file" => rule_for("write", clean_pattern(pattern)),
-        "read_file" | "read_many_files" => rule_for("read", clean_pattern(pattern)),
-        "web_fetch" => rule_for("web_fetch", clean_pattern(pattern)),
-        "web_search" => rule_for("web_search", clean_pattern(pattern)),
+        "replace" => rule_for("edit", clean_non_empty_pattern(entry, pattern, verdict)?),
+        "write_file" => rule_for("write", clean_non_empty_pattern(entry, pattern, verdict)?),
+        "read_file" | "read_many_files" => {
+            rule_for("read", clean_non_empty_pattern(entry, pattern, verdict)?)
+        }
+        "web_fetch" => rule_for(
+            "web_fetch",
+            clean_non_empty_pattern(entry, pattern, verdict)?,
+        ),
+        "web_search" => rule_for(
+            "web_search",
+            clean_non_empty_pattern(entry, pattern, verdict)?,
+        ),
         // tools ka does not gate (glob, grep_search, list_directory,
         // save_memory, ...) or unknown
         other => Err(format!("no ka counterpart for {other:?}")),
@@ -812,7 +903,11 @@ fn write_rules(
     conversion: &Conversion,
     source: &str,
 ) -> Result<(), String> {
-    let existing = std::fs::read_to_string(target).unwrap_or_default();
+    let existing = match std::fs::read_to_string(target) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("read {}: {e}", target.display())),
+    };
     if existing.contains("[[rules]]") {
         // ka is first-match-wins and these rules are appended, so any
         // pre-existing [[rules]] entry beats them. Warn; never reorder
@@ -837,14 +932,48 @@ fn write_rules(
     }
     // strict validation before writing: the merged file must parse
     Config::parse_layer(&text, &target.display().to_string()).map_err(|e| e.to_string())?;
-    if let Some(dir) = target.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+    let parent = target.parent().unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+    let tmp = parent.join(format!(
+        ".{}.{}.tmp",
+        target
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("ka.toml"),
+        std::process::id()
+    ));
+    std::fs::write(&tmp, &text).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    if let Err(e) = std::fs::rename(&tmp, target) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!(
+            "rename {} → {}: {e}",
+            tmp.display(),
+            target.display()
+        ));
     }
-    std::fs::write(target, &text).map_err(|e| format!("write {}: {e}", target.display()))
+    Ok(())
 }
 
 fn toml_quote(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\x08' => out.push_str("\\b"),
+            '\x0c' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 || c == '\x7f' => {
+                out.push_str(&format!("\\u{:04X}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 #[cfg(test)]

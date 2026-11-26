@@ -1879,12 +1879,12 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
                 tool,
                 joined
             );
-            // the gate's first-match-wins, replayed rule by rule: the
-            // first suffix that still yields a verdict identifies the
-            // matching rule
+            // the gate is first-match across the whole list: testing one
+            // rule at a time (a one-element slice) identifies the match
+            // without re-running the later rules as a suffix
             let mut matched: Option<(usize, &ka_engine::config::Rule)> = None;
             for (idx, rule) in rules.iter().enumerate() {
-                if ka_engine::config::evaluate_rules(&rules[idx..], &tool, &joined).is_some() {
+                if ka_engine::config::evaluate_rules(&rules[idx..=idx], &tool, &joined).is_some() {
                     matched = Some((idx, rule));
                     break;
                 }
@@ -2380,7 +2380,7 @@ async fn http_json_request(
         .map(|t| format!("Authorization: Bearer {t}\r\n"))
         .unwrap_or_default();
     let req = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n{auth}Content-Length: {}\r\nAccept: */*\r\n\r\n{body}",
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n{auth}Content-Type: application/json\r\nContent-Length: {}\r\nAccept: */*\r\n\r\n{body}",
         body.len()
     );
     tokio::time::timeout(
@@ -2761,6 +2761,24 @@ impl StreamJsonPrinter {
     }
 }
 
+/// Restart into the freshly installed binary after an in-TUI update:
+/// re-exec in place on Unix, spawn-and-wait elsewhere (no `exec()`).
+fn resume_after_update(relaunch: &mut std::process::Command) -> Result<ExitCode, String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let err = relaunch.exec();
+        Err(format!("resume after update failed: {err}"))
+    }
+    #[cfg(not(unix))]
+    {
+        let status = relaunch
+            .status()
+            .map_err(|e| format!("resume after update failed: {e}"))?;
+        Ok(ExitCode::from(status.code().unwrap_or(1) as u8))
+    }
+}
+
 /// The interactive surface: picker (unless -c/--session) then the TUI.
 async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
     let cwd = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
@@ -3093,9 +3111,7 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
                 }
             }
             println!("⟳ resuming session…");
-            use std::os::unix::process::CommandExt;
-            let err = relaunch.exec();
-            Err(format!("resume after update failed: {err}"))
+            resume_after_update(&mut relaunch)
         }
     }
 }

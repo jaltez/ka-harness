@@ -1,0 +1,68 @@
+[package]
+name = "ka-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# Standalone workspace so fuzz dependencies never enter the root Cargo.lock,
+# workspace build, or `cargo xtask deps` graph.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+ka-dialect = { path = "../crates/ka-dialect" }
+ka-strand = { path = "../crates/ka-strand" }
+ka-sandbox = { path = "../crates/ka-sandbox" }
+ka-engine = { path = "../crates/ka-engine" }
+
+[[bin]]
+name = "fuzz_sse"
+path = "fuzz_targets/fuzz_sse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_json_repair"
+path = "fuzz_targets/fuzz_json_repair.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_readers_pdf"
+path = "fuzz_targets/fuzz_readers_pdf.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_readers_archive"
+path = "fuzz_targets/fuzz_readers_archive.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_bashp"
+path = "fuzz_targets/fuzz_bashp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_strand_read"
+path = "fuzz_targets/fuzz_strand_read.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_proxy_host"
+path = "fuzz_targets/fuzz_proxy_host.rs"
+test = false
+doc = false
+bench = false

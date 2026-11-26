@@ -98,7 +98,11 @@ mod tests {
     fn template_carries_every_contract_section() {
         let t = WORKFLOW_TEMPLATE;
         assert!(t.contains("workflow_dispatch"), "dispatch trigger");
-        assert!(t.contains("pull_request_target"), "label trigger");
+        assert!(t.contains("pull_request:"), "label trigger");
+        assert!(
+            !t.contains("pull_request_target"),
+            "must not use pull_request_target"
+        );
         assert!(
             t.contains("github.event.label.name == 'ka'"),
             "label gate on `ka`"

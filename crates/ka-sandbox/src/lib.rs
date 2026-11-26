@@ -2,10 +2,9 @@
 //!
 //! `[sandbox] mode = "fs"` restricts bash children to: read everything,
 //! write only the working directory, the OS temp dir, and XDG state/cache
-//! dirs. Enforcement prefers an external sandbox tool that applies
-//! `PR_SET_NO_NEW_PRIVS` semantics (bubblewrap, then firejail); when
-//! neither tool exists, in-kernel landlock takes over via a self re-exec
-//! trampoline — the hidden `ka ka-sandbox-exec <policy-json> -- <argv…>`
+//! dirs. Enforcement runs bubblewrap → in-kernel landlock (no external
+//! binary needed) → firejail; landlock uses a self re-exec trampoline —
+//! the hidden `ka ka-sandbox-exec <policy-json> -- <argv…>`
 //! subcommand applies the ruleset to itself and execs the real command
 //! (the workspace forbids `unsafe`, so rules cannot ride
 //! `Command::pre_exec`). When none of the three is available the policy
@@ -217,8 +216,21 @@ pub fn caps() -> Caps {
 /// needing them stay denied (fail-closed).
 fn broad_dirs() -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = [
-        "/", "/bin", "/etc", "/home", "/lib", "/lib64", "/opt", "/root", "/sbin", "/srv", "/usr",
-        "/var", "/Users",
+        "/",
+        "/bin",
+        "/etc",
+        "/home",
+        "/lib",
+        "/lib64",
+        "/opt",
+        "/root",
+        "/sbin",
+        "/srv",
+        "/usr",
+        "/var",
+        "/Users",
+        r"C:\",
+        r"C:\Windows",
     ]
     .iter()
     .map(PathBuf::from)
@@ -232,14 +244,15 @@ fn broad_dirs() -> Vec<PathBuf> {
 /// The only `/dev` entries the landlock backend grants writes to —
 /// an enumerated surface matching what builds need, instead of the
 /// whole host `/dev` (bwrap's `--dev` is a fresh tmpfs, so wholesale
-/// `/dev` there was never the parity).
+/// `/dev` there was never the parity). `/dev/shm` is intentionally
+/// excluded so sandboxed children cannot persist files outside
+/// `allow_write` via host shared memory.
 const DEV_NODES: &[&str] = &[
     "/dev/null",
     "/dev/zero",
     "/dev/full",
     "/dev/random",
     "/dev/urandom",
-    "/dev/shm",
 ];
 
 /// Resolve a writable-allowlist entry to its real on-disk target:
@@ -561,8 +574,8 @@ pub fn policy_from_config(cfg: &SandboxConfig, cwd: &Path) -> Result<Policy, Str
 }
 
 /// Which sandbox engine is available, if any. Detection order:
-/// bubblewrap, then firejail, then in-kernel landlock (linux only,
-/// no external binary needed), then macOS Seatbelt (`sandbox-exec`,
+/// bubblewrap, then in-kernel landlock (linux only, no external binary
+/// needed), then firejail, then macOS Seatbelt (`sandbox-exec`,
 /// deprecated by Apple but functional). On Windows nothing is ever
 /// detected — sandboxing is unsupported there and fs mode fails closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -571,10 +584,41 @@ pub enum Tool {
     Firejail,
     /// In-kernel LSM enforcement via the self re-exec trampoline.
     Landlock,
-    /// macOS Seatbelt via `sandbox-exec -p <profile>` (PERM-04). The
+    /// macOS Seatbelt via `/usr/bin/sandbox-exec -p <profile>` (PERM-04). The
     /// variant exists on every OS so downstream matches don't need
     /// cfg-gating; detection only ever returns it on macOS.
     Seatbelt,
+}
+
+/// Pure backend selection logic — testable for every OS regardless of the
+/// host running the test suite. On Windows (`is_windows == true`) this
+/// always returns `None` (fail closed), even if a binary named `bwrap` or
+/// `firejail` happens to be on `PATH`. On non-Windows hosts the priority
+/// order is: `bwrap` → `landlock` → `firejail` → `seatbelt`.
+#[must_use]
+pub fn detect_tool_for_os(
+    is_windows: bool,
+    has_bwrap: bool,
+    has_landlock: bool,
+    has_firejail: bool,
+    has_seatbelt: bool,
+) -> Option<Tool> {
+    if is_windows {
+        return None;
+    }
+    if has_bwrap {
+        return Some(Tool::Bubblewrap);
+    }
+    if has_landlock {
+        return Some(Tool::Landlock);
+    }
+    if has_firejail {
+        return Some(Tool::Firejail);
+    }
+    if has_seatbelt {
+        return Some(Tool::Seatbelt);
+    }
+    None
 }
 
 pub fn detect_tool() -> Option<Tool> {
@@ -607,31 +651,43 @@ pub fn detect_reason() -> &'static str {
 
 /// The probes fork bwrap/firejail and create a landlock ruleset fd —
 /// `wrap_command` runs per bash call, so resolve once per process.
+/// On Windows detection is unconditionally `None` (fail closed) — never
+/// probe `bwrap`/`firejail` on `PATH`.
 static DETECTED: std::sync::LazyLock<Option<Tool>> = std::sync::LazyLock::new(|| {
-    for (bin, tool) in [("bwrap", Tool::Bubblewrap), ("firejail", Tool::Firejail)] {
-        if std::process::Command::new(bin)
-            .arg("--version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-        {
-            return Some(tool);
+    #[cfg(target_os = "windows")]
+    {
+        detect_tool_for_os(true, false, false, false, false)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let probe_bin = |bin: &str| {
+            std::process::Command::new(bin)
+                .arg("--version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        if probe_bin("bwrap") {
+            return detect_tool_for_os(false, true, false, false, false);
         }
+        #[cfg(target_os = "linux")]
+        if landlock_supported() {
+            return detect_tool_for_os(false, false, true, false, false);
+        }
+        if probe_bin("firejail") {
+            return detect_tool_for_os(false, false, false, true, false);
+        }
+        // PERM-04: Seatbelt ships with macOS — presence of sandbox-exec is
+        // the only probe needed. Sits last in the chain: bwrap, landlock,
+        // and firejail stay preferred where installed.
+        #[cfg(target_os = "macos")]
+        if Path::new("/usr/bin/sandbox-exec").exists() {
+            return detect_tool_for_os(false, false, false, false, true);
+        }
+        None
     }
-    #[cfg(target_os = "linux")]
-    if landlock_supported() {
-        return Some(Tool::Landlock);
-    }
-    // PERM-04: Seatbelt ships with macOS — presence of sandbox-exec is
-    // the only probe needed. Sits last in the chain: bwrap and firejail
-    // stay preferred where installed.
-    #[cfg(target_os = "macos")]
-    if Path::new("/usr/bin/sandbox-exec").exists() {
-        return Some(Tool::Seatbelt);
-    }
-    None
 });
 /// Whether the kernel can create landlock rulesets. Probe only:
 /// `Ruleset::create()` issues `landlock_create_ruleset(2)` and returns
@@ -852,7 +908,7 @@ pub fn wrap_command(policy: &Policy, command: &str, cwd: &Path) -> Result<Vec<St
                         net: net.clone(),
                     };
                     seatbelt_profile_check(&resolved_policy)?;
-                    let profile = seatbelt_profile(&resolved_policy);
+                    let profile = seatbelt_profile_with_port(&resolved_policy, proxy_port);
                     let _ = cwd;
                     Ok(seatbelt_argv(&profile, command))
                 }
@@ -904,19 +960,32 @@ fn seatbelt_quote(p: &Path) -> String {
     p.to_string_lossy()
         .replace('\\', "\\\\")
         .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
 }
 
 /// Generate the Seatbelt profile for `policy` — a PURE function so it is
 /// testable on every OS (the profile is only executed on macOS).
 ///
-/// SBPL is deny-wins: an allow never overrides a matching deny, so the
-/// write allowlist is enforced by a deny scoped to everything OUTSIDE
-/// the allowlist (`(require-not (subpath …))` per entry) while the
-/// explicit `(allow file-write* …)` documents the granted trees. The
-/// enumerated `/dev` nodes ride the allowlist like the landlock backend
-/// (shells need `/dev/null` for redirections). `Off` policies get a
-/// no-op profile (everything allowed) — callers never wrap `Off` runs.
+/// SBPL is **last-matching-rule-wins**: later matching rules override
+/// earlier broader rules. For filesystem writes, the explicit
+/// `(allow file-write* (subpath …))` is followed by a scoped
+/// `(deny file-write* (require-all (require-not (subpath …)) …))` that
+/// matches only paths OUTSIDE the allowlist. For domain-scoped network,
+/// `(deny network*)` is emitted FIRST and the specific loopback
+/// `(allow network-outbound (remote ip …))` is emitted AFTER so the
+/// loopback proxy remains reachable while all other network access stays
+/// denied. The enumerated `/dev` nodes ride the allowlist like the
+/// landlock backend (shells need `/dev/null` for redirections). `Off`
+/// policies get a no-op profile (everything allowed) — callers never
+/// wrap `Off` runs.
 pub fn seatbelt_profile(policy: &Policy) -> String {
+    seatbelt_profile_with_port(policy, None)
+}
+
+/// Generate the Seatbelt profile for `policy`, optionally scoping the
+/// domain-proxy loopback exception to a specific `proxy_port`.
+pub fn seatbelt_profile_with_port(policy: &Policy, proxy_port: Option<u16>) -> String {
     // Off policies are never wrapped; if one reaches here the profile is
     // inert (allow everything, deny nothing)
     let (allow_write, allow_net, net) = match policy {
@@ -930,7 +999,7 @@ pub fn seatbelt_profile(policy: &Policy) -> String {
     };
     let mut profile = String::from(
         "; ka fs sandbox (PERM-04) — allow-by-default base with scoped denies;\n\
-         ; deny beats allow in SBPL, so the write deny carves out the allowlist\n\
+         ; SBPL is last-matching-rule-wins: specific allows follow broader denies\n\
          (version 1)\n(allow default)\n(allow file-read*)\n",
     );
     // enumerated /dev surface: pure parity with the landlock trampoline
@@ -977,25 +1046,30 @@ pub fn seatbelt_profile(policy: &Policy) -> String {
     if allow_net {
         profile.push_str("(allow network*)\n");
     } else if net.is_restricted() {
-        // PERM-03: with a domain policy the loopback proxy is the only
-        // network path — the blanket deny would black out even the
-        // CONNECT to the proxy itself. The specific loopback allow is
-        // emitted BEFORE the deny so it wins; everything else stays
-        // denied (proxy-side filtering is the enforcement).
-        profile.push_str("(allow network-outbound (remote ip \"127.0.0.1\"))\n");
+        // PERM-03: SBPL is last-matching-rule-wins. Emit the blanket
+        // `(deny network*)` FIRST, then the specific loopback allow
+        // AFTER so the child can reach the loopback proxy while all
+        // other network traffic stays denied.
         profile.push_str("(deny network*)\n");
+        if let Some(port) = proxy_port {
+            profile.push_str(&format!(
+                "(allow network-outbound (remote ip \"127.0.0.1:{port}\"))\n"
+            ));
+        } else {
+            profile.push_str("(allow network-outbound (remote ip \"127.0.0.1\"))\n");
+        }
     } else {
         profile.push_str("(deny network*)\n");
     }
     profile
 }
 
-/// The `sandbox-exec` argv shape for a profile + command — pure so the
-/// argv contract is testable on every OS.
+/// The `/usr/bin/sandbox-exec` argv shape for a profile + command — pure
+/// so the argv contract is testable on every OS.
 #[must_use]
 pub fn seatbelt_argv(profile: &str, command: &str) -> Vec<String> {
     vec![
-        "sandbox-exec".to_string(),
+        "/usr/bin/sandbox-exec".to_string(),
         "-p".to_string(),
         profile.to_string(),
         "sh".to_string(),
@@ -1517,10 +1591,10 @@ mod tests {
     }
 
     #[test]
-    fn seatbelt_profile_proxy_loopback_allow_precedes_deny() {
-        // PERM-03: a domain-restricted policy without a network grant
-        // must still let the child reach the loopback proxy — the deny
-        // alone would black out even the CONNECT to 127.0.0.1
+    fn seatbelt_profile_proxy_loopback_allow_follows_deny() {
+        // PERM-03: SBPL is last-matching-rule-wins, so the blanket deny
+        // must precede the specific loopback allow for the child to reach
+        // the loopback proxy while everything else stays denied.
         let restricted = Policy::Fs {
             allow_write: vec![PathBuf::from("/tmp")],
             allow_net: false,
@@ -1539,8 +1613,8 @@ mod tests {
         );
         assert!(deny.is_some(), "everything else stays denied: {profile}");
         assert!(
-            loopback.unwrap() < deny.unwrap(),
-            "the specific loopback allow precedes the deny: {profile}"
+            deny.unwrap() < loopback.unwrap(),
+            "SBPL is last-match-wins: blanket deny must precede the specific loopback allow: {profile}"
         );
         // deny-only policy (proxy active, no allows): same shape
         let deny_only = Policy::Fs {
@@ -1618,7 +1692,7 @@ mod tests {
         assert_eq!(
             argv,
             vec![
-                "sandbox-exec".to_string(),
+                "/usr/bin/sandbox-exec".to_string(),
                 "-p".to_string(),
                 "(version 1)".to_string(),
                 "sh".to_string(),
@@ -1660,7 +1734,7 @@ mod tests {
             let fs = Policy::fs(Vec::new());
             let argv = wrap_command(&fs, "true", Path::new("/tmp")).unwrap();
             assert_eq!(
-                argv[0], "sandbox-exec",
+                argv[0], "/usr/bin/sandbox-exec",
                 "seatbelt wraps the command: {argv:?}"
             );
             assert_eq!(argv[1], "-p", "{argv:?}");
@@ -1746,7 +1820,7 @@ mod tests {
             Some(Tool::Seatbelt) => {
                 // sandbox-exec inherits the wrapping process env: the
                 // hand-level injection covers it, the profile needs no env
-                assert_eq!(argv[0], "sandbox-exec", "{argv:?}");
+                assert_eq!(argv[0], "/usr/bin/sandbox-exec", "{argv:?}");
             }
             None => {}
         }

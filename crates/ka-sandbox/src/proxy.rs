@@ -28,14 +28,19 @@
 
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::Policy;
 
-/// Idle/read timeout while parsing a request head from the client.
+/// Total deadline for reading a request head (request line + headers).
 const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
+/// Idle timeout for established tunnels so abandoned connections do not
+/// pin worker threads indefinitely.
+const TUNNEL_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+/// Maximum concurrent active proxy connections.
+const MAX_CONCURRENT_CONNS: usize = 64;
 /// Upstream TCP connect timeout (the pinned address gets one shot).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Cap on a request head (request line + headers) accepted from a client.
@@ -107,21 +112,24 @@ impl DomainFilter {
     }
 }
 
-/// Fold one config entry: trim, lowercase, strip a `*.` prefix, drop
-/// empties. `*.example.com` and `example.com` both become `example.com`.
+/// Fold one config entry: trim, lowercase, strip any `*.` prefix and
+/// trailing FQDN dots, drop empties. `*.example.com`, `*.example.com.`,
+/// and `example.com.` all become `example.com`.
 fn normalize_entry(s: &str) -> Option<String> {
-    let t = s.trim().to_ascii_lowercase();
-    let t = t
-        .strip_suffix('.')
-        .unwrap_or(&t)
-        .strip_prefix("*.")
-        .unwrap_or(&t);
+    let owned = s.trim().to_ascii_lowercase();
+    let t = owned.strip_prefix("*.").unwrap_or(&owned);
+    let t = t.trim_end_matches('.');
+    let t = t.strip_prefix("*.").unwrap_or(t).trim_end_matches('.');
     (!t.is_empty()).then(|| t.to_string())
 }
 
-/// Normalize a request host for matching.
+/// Normalize a request host for matching (trim, lowercase, strip trailing
+/// FQDN dots so `evil.com.` cannot bypass a `deny = ["evil.com"]` rule).
 fn normalize_host(host: &str) -> String {
-    host.trim().to_ascii_lowercase()
+    host.trim()
+        .to_ascii_lowercase()
+        .trim_end_matches('.')
+        .to_string()
 }
 
 /// Hosts that name a unix socket rather than a DNS host: bare `unix`,
@@ -144,23 +152,45 @@ fn is_unix_socket_target(host: &str) -> bool {
 pub fn ip_is_local(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
+            let o = v4.octets();
             v4.is_loopback()
                 || v4.is_private()
                 || v4.is_link_local()
                 || v4.is_unspecified()
                 || v4.is_broadcast()
                 || v4.is_documentation()
+                || v4.is_multicast()
+                || o[0] == 0 // 0.0.0.0/8 ("this network")
+                || (o[0] == 100 && (o[1] & 0xc0) == 64) // 100.64.0.0/10 CGNAT
+                || (o[0] == 192 && o[1] == 0 && o[2] == 0) // 192.0.0.0/24 IETF protocol
+                || (o[0] == 198 && (o[1] & 0xfe) == 18) // 198.18.0.0/15 benchmark
+                || o[0] >= 240 // 240.0.0.0/4 reserved
         }
         IpAddr::V6(v6) => {
             let o = v6.octets();
+            let seg = v6.segments();
             let mapped = o[..12] == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff];
             if mapped {
                 return ip_is_local(IpAddr::V4(Ipv4Addr::new(o[12], o[13], o[14], o[15])));
             }
+            let nat64 = seg[0] == 0x0064
+                && seg[1] == 0xff9b
+                && seg[2] == 0
+                && seg[3] == 0
+                && seg[4] == 0
+                && seg[5] == 0;
+            let ipv4_compat = o[..12] == [0; 12] && o[12..] != [0; 4];
+            let six_to_four = seg[0] == 0x2002;
+            let teredo = seg[0] == 0x2001 && seg[1] == 0x0000;
             v6.is_loopback()
                 || v6.is_unspecified()
+                || v6.is_multicast()
                 || (o[0] & 0xfe) == 0xfc // fc00::/7 unique local
                 || (o[0] == 0xfe && (o[1] & 0xc0) == 0x80) // fe80::/10 link local
+                || nat64
+                || ipv4_compat
+                || six_to_four
+                || teredo
         }
     }
 }
@@ -177,17 +207,22 @@ fn parse_authority(auth: &str, default_port: Option<u16>) -> Option<(String, u16
     if let Some(rest) = auth.strip_prefix('[') {
         let end = rest.find(']')?;
         let host = &rest[..end];
+        if host.is_empty() {
+            return None;
+        }
         let tail = &rest[end + 1..];
-        let port = match tail.strip_prefix(':') {
-            Some(p) => p.parse::<u16>().ok()?,
-            None => default_port?,
+        let port = if tail.is_empty() {
+            default_port?
+        } else {
+            let p = tail.strip_prefix(':')?;
+            p.parse::<u16>().ok()?
         };
-        return Some((host.to_string(), port));
+        return (port != 0).then(|| (host.to_string(), port));
     }
     match auth.rsplit_once(':') {
         Some((host, port)) => {
-            if host.contains(':') {
-                return None; // bare IPv6 — unparseable authority
+            if host.is_empty() || host.contains(':') {
+                return None; // bare IPv6 or empty host — unparseable authority
             }
             let port = port.parse::<u16>().ok()?;
             (port != 0).then(|| (host.to_string(), port))
@@ -198,9 +233,15 @@ fn parse_authority(auth: &str, default_port: Option<u16>) -> Option<(String, u16
     }
 }
 
+/// Case-insensitively strip a leading `http://` scheme prefix.
+fn strip_http_scheme(target: &str) -> Option<&str> {
+    let prefix = target.get(..7)?;
+    prefix.eq_ignore_ascii_case("http://").then(|| &target[7..])
+}
+
 /// Split an absolute-form request target `http://[user@]host[:port]/path`.
 fn split_absolute(target: &str) -> Option<(String, u16, String)> {
-    let rest = target.strip_prefix("http://")?;
+    let rest = strip_http_scheme(target)?;
     let (auth, path) = match rest.find('/') {
         Some(i) => (&rest[..i], rest[i..].to_string()),
         None => (rest, "/".to_string()),
@@ -211,35 +252,58 @@ fn split_absolute(target: &str) -> Option<(String, u16, String)> {
     Some((host, port, path))
 }
 
+/// Verify whether a resolved `ip` is permitted for `host` under `filter`.
+/// Private/loopback/link-local IPs are ONLY permitted when `host` itself is
+/// a literal IP address or `localhost` AND explicitly matches `filter.allow`
+/// — an allowlisted arbitrary DNS domain is NEVER exempt from anti-rebinding.
+pub fn check_resolved_ip(filter: &DomainFilter, host: &str, ip: IpAddr) -> Result<(), String> {
+    if !ip_is_local(ip) {
+        return Ok(());
+    }
+    let trimmed = host.trim();
+    let explicit_local_host =
+        trimmed.parse::<IpAddr>().is_ok() || normalize_host(trimmed) == "localhost";
+    if explicit_local_host && filter.allow_matches(trimmed) {
+        return Ok(());
+    }
+    Err(format!(
+        "sandbox proxy: {host} resolved to {ip}, a private/loopback/link-local \
+         address — refusing (anti-DNS-rebinding: only allowlisted IP literals \
+         and `localhost` may resolve here)"
+    ))
+}
+
 /// Resolve `host` ONCE and return the FIRST address (the pin — the
 /// upstream connect never re-resolves, so a rebinding rotation between
 /// resolve and connect is out of the model). IP literals skip DNS. Any
-/// private/loopback/link-local result is refused unless the host is
-/// explicitly in the ALLOW list: deny-only policies never unlock local
-/// targets, which is what keeps the proxy from being turned into an SSRF
-/// hop into the ka process's own machine.
+/// private/loopback/link-local result is refused unless `host` itself is a
+/// literal IP or `localhost` AND explicitly in the ALLOW list: deny-only
+/// policies and allowlisted DNS domains never unlock local targets, which
+/// is what keeps the proxy from being turned into an SSRF hop into the ka
+/// process's own machine.
 pub fn resolve_pinned(filter: &DomainFilter, host: &str, port: u16) -> Result<SocketAddr, String> {
-    let rebinding = |what: &str| {
-        format!(
-            "sandbox proxy: {host} resolved to {what}, a private/loopback/link-local \
-             address that is not explicitly allowlisted — refusing (anti-DNS-rebinding)"
-        )
-    };
-    if let Ok(ip) = host.trim().parse::<IpAddr>() {
-        if ip_is_local(ip) && !filter.allow_matches(host) {
-            return Err(rebinding("itself"));
-        }
+    let trimmed = host.trim();
+    if let Ok(ip) = trimmed.parse::<IpAddr>() {
+        check_resolved_ip(filter, host, ip)?;
         return Ok(SocketAddr::new(ip, port));
     }
-    let first = (host, port)
+    let first = (trimmed, port)
         .to_socket_addrs()
         .map_err(|e| format!("sandbox proxy: cannot resolve {host}: {e}"))?
         .next()
         .ok_or_else(|| format!("sandbox proxy: {host} resolved to no addresses"))?;
-    if ip_is_local(first.ip()) && !filter.allow_matches(host) {
-        return Err(rebinding(&first.ip().to_string()));
-    }
+    check_resolved_ip(filter, host, first.ip())?;
     Ok(first)
+}
+
+/// RAII guard that decrements the active-connection counter when a
+/// connection handler exits (including on panic or thread-spawn failure).
+struct ConnGuard(Arc<AtomicUsize>);
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// A live loopback proxy instance. Dropping it stops the listener and
@@ -264,6 +328,7 @@ impl NetProxy {
             .set_nonblocking(true)
             .map_err(|e| format!("sandbox proxy: nonblocking: {e}"))?;
         let shutdown = Arc::new(AtomicBool::new(false));
+        let active_conns = Arc::new(AtomicUsize::new(0));
         let accept = {
             let shutdown = shutdown.clone();
             std::thread::Builder::new()
@@ -271,12 +336,28 @@ impl NetProxy {
                 .spawn(move || {
                     while !shutdown.load(Ordering::Relaxed) {
                         match listener.accept() {
-                            Ok((stream, _)) => {
+                            Ok((mut stream, _)) => {
+                                let _ = stream.set_nonblocking(false);
+                                let prev = active_conns.fetch_add(1, Ordering::AcqRel);
+                                if prev >= MAX_CONCURRENT_CONNS {
+                                    active_conns.fetch_sub(1, Ordering::AcqRel);
+                                    let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
+                                    respond(
+                                        &mut stream,
+                                        "503 Service Unavailable",
+                                        "sandbox proxy: too many concurrent connections",
+                                    );
+                                    continue;
+                                }
+                                let guard = ConnGuard(active_conns.clone());
                                 let filter = filter.clone();
                                 let shutdown = shutdown.clone();
                                 let _ = std::thread::Builder::new()
                                     .name("ka-sbx-conn".into())
-                                    .spawn(move || serve_connection(stream, filter, shutdown));
+                                    .spawn(move || {
+                                        let _guard = guard;
+                                        serve_connection(stream, filter, shutdown);
+                                    });
                             }
                             // nonblocking accept: idle poll at 50 ms —
                             // shutdown is observed within one tick
@@ -407,14 +488,22 @@ fn stop_proxy() {
 // ---------------------------------------------------------------------
 // connection serving
 
-/// Read one `\n`-terminated line (returned WITH its terminator), capped.
-fn read_line(stream: &mut TcpStream, cap: usize) -> Result<String, String> {
+/// Read one `\n`-terminated line (returned WITH its terminator), capped
+/// in length and bounded by a total wall-clock `deadline`.
+fn read_line(stream: &mut TcpStream, cap: usize, deadline: Instant) -> Result<String, String> {
     let mut line = Vec::new();
     let mut byte = [0u8; 1];
     loop {
         if line.len() >= cap {
             return Err("request line too long".to_string());
         }
+        let Some(rem) = deadline.checked_duration_since(Instant::now()) else {
+            return Err("request head timeout".to_string());
+        };
+        if rem.is_zero() {
+            return Err("request head timeout".to_string());
+        }
+        let _ = stream.set_read_timeout(Some(rem));
         match stream.read(&mut byte) {
             Ok(0) => return Err("client closed".to_string()),
             Ok(_) => {
@@ -428,16 +517,23 @@ fn read_line(stream: &mut TcpStream, cap: usize) -> Result<String, String> {
     }
 }
 
-/// Read a request head (request line + headers, INCLUDING the final
-/// blank line) as raw bytes so forwarding is byte-exact. `Ok(None)` =
-/// clean EOF before any byte (idle keep-alive probes).
-fn read_head(stream: &mut TcpStream) -> Result<Option<Vec<u8>>, String> {
+/// Read the header block AFTER the request line (INCLUDING the final
+/// blank line) as raw bytes, bounded by a total wall-clock `deadline`.
+/// `Ok(None)` = clean EOF before any byte (idle keep-alive probes).
+fn read_head(stream: &mut TcpStream, deadline: Instant) -> Result<Option<Vec<u8>>, String> {
     let mut buf: Vec<u8> = Vec::new();
     let mut byte = [0u8; 1];
     loop {
         if buf.len() >= MAX_HEAD {
             return Err("request head too large".to_string());
         }
+        let Some(rem) = deadline.checked_duration_since(Instant::now()) else {
+            return Err("request head timeout".to_string());
+        };
+        if rem.is_zero() {
+            return Err("request head timeout".to_string());
+        }
+        let _ = stream.set_read_timeout(Some(rem));
         match stream.read(&mut byte) {
             Ok(0) => {
                 if buf.is_empty() {
@@ -462,38 +558,51 @@ fn read_head(stream: &mut TcpStream) -> Result<Option<Vec<u8>>, String> {
     }
 }
 
-/// Lowercase a header NAME and return its value, from raw head bytes.
-/// `head` is the header block AFTER the request line (the request line
-/// was consumed to pick CONNECT vs method), so line 0 is a header.
-fn header_value(head: &str, name: &str) -> Option<String> {
+/// Return all values for a header NAME (case-insensitive) from raw head
+/// text. `head` is the header block AFTER the request line (the request
+/// line was consumed to pick CONNECT vs method), so line 0 is a header.
+fn header_values(head: &str, name: &str) -> Vec<String> {
+    let mut out = Vec::new();
     for line in head.lines() {
         let Some((key, value)) = line.split_once(':') else {
             continue;
         };
         if key.trim().eq_ignore_ascii_case(name) {
-            return Some(value.trim().to_string());
+            out.push(value.trim().to_string());
         }
     }
-    None
+    out
 }
 
-/// Write a small plain-text response and close.
+/// Return the first value for a header NAME (case-insensitive).
+#[cfg(test)]
+fn header_value(head: &str, name: &str) -> Option<String> {
+    header_values(head, name).into_iter().next()
+}
+
+/// Write a small plain-text response in a single write and half-close.
 fn respond(stream: &mut TcpStream, status: &str, body: &str) {
-    let _ = write!(stream, "HTTP/1.1 {status}\r\n");
-    let _ = write!(stream, "Content-Type: text/plain; charset=utf-8\r\n");
-    let _ = write!(stream, "Content-Length: {}\r\n", body.len());
-    let _ = write!(stream, "Connection: close\r\n\r\n");
-    let _ = stream.write_all(body.as_bytes());
+    let payload = format!(
+        "HTTP/1.1 {status}\r\n\
+         Content-Type: text/plain; charset=utf-8\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\r\n\
+         {body}",
+        body.len()
+    );
+    let _ = stream.write_all(payload.as_bytes());
     let _ = stream.flush();
+    let _ = stream.shutdown(std::net::Shutdown::Write);
 }
 
 fn serve_connection(mut client: TcpStream, filter: DomainFilter, shutdown: Arc<AtomicBool>) {
     if shutdown.load(Ordering::Relaxed) {
         return;
     }
+    let deadline = Instant::now() + HEAD_TIMEOUT;
     let _ = client.set_read_timeout(Some(HEAD_TIMEOUT));
     let _ = client.set_write_timeout(Some(HEAD_TIMEOUT));
-    let first = match read_line(&mut client, MAX_LINE) {
+    let first = match read_line(&mut client, MAX_LINE, deadline) {
         Ok(l) => l,
         Err(_) => return, // idle probe or garbage: just close
     };
@@ -508,15 +617,15 @@ fn serve_connection(mut client: TcpStream, filter: DomainFilter, shutdown: Arc<A
         return;
     };
     if method.eq_ignore_ascii_case("CONNECT") {
-        serve_connect(client, &filter, target);
+        serve_connect(client, &filter, target, deadline);
     } else {
-        serve_http(client, &filter, method, target, version);
+        serve_http(client, &filter, method, target, version, deadline);
     }
 }
 
 /// CONNECT host:port — filter the host BEFORE any tunnel exists, then
 /// pass bytes through untouched in both directions (no MITM, no certs).
-fn serve_connect(mut client: TcpStream, filter: &DomainFilter, target: &str) {
+fn serve_connect(mut client: TcpStream, filter: &DomainFilter, target: &str, deadline: Instant) {
     let Some((host, port)) = parse_authority(target, None) else {
         respond(
             &mut client,
@@ -532,7 +641,7 @@ fn serve_connect(mut client: TcpStream, filter: &DomainFilter, target: &str) {
     // (they would be indistinguishable from TLS records downstream).
     let mut head_consumed = false;
     for _ in 0..64 {
-        match read_line(&mut client, MAX_LINE) {
+        match read_line(&mut client, MAX_LINE, deadline) {
             Ok(line) if line == "\r\n" || line == "\n" => {
                 head_consumed = true;
                 break;
@@ -546,7 +655,7 @@ fn serve_connect(mut client: TcpStream, filter: &DomainFilter, target: &str) {
         // FIN, not an RST: unread receive data makes the kernel reset
         // the connection and destroys the in-flight 400 response
         for _ in 0..256 {
-            match read_line(&mut client, MAX_LINE) {
+            match read_line(&mut client, MAX_LINE, deadline) {
                 Ok(line) if line == "\r\n" || line == "\n" => break,
                 Ok(_) => continue,
                 Err(_) => break,
@@ -585,26 +694,28 @@ fn serve_connect(mut client: TcpStream, filter: &DomainFilter, target: &str) {
             return;
         }
     };
-    let _ = client.set_read_timeout(None);
-    let _ = client.set_write_timeout(None);
-    let _ = upstream.set_read_timeout(None);
-    let _ = upstream.set_write_timeout(None);
+    let _ = client.set_read_timeout(Some(TUNNEL_IDLE_TIMEOUT));
+    let _ = client.set_write_timeout(Some(TUNNEL_IDLE_TIMEOUT));
+    let _ = upstream.set_read_timeout(Some(TUNNEL_IDLE_TIMEOUT));
+    let _ = upstream.set_write_timeout(Some(TUNNEL_IDLE_TIMEOUT));
     let _ = client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n");
     let _ = client.flush();
     tunnel(client, upstream);
 }
 
-/// Plain HTTP: absolute-form targets are rewritten to origin-form (the
-/// only change made to the stream — the header block itself is forwarded
-/// byte-exact); origin-form requests are routed by the Host header.
+/// Plain HTTP: absolute-form targets are rewritten to origin-form,
+/// `Connection` / `Proxy-Connection` headers are stripped and replaced
+/// with `Connection: close` to prevent keep-alive request smuggling;
+/// origin-form requests are routed by the Host header.
 fn serve_http(
     mut client: TcpStream,
     filter: &DomainFilter,
     method: &str,
     target: &str,
     version: &str,
+    deadline: Instant,
 ) {
-    let head = match read_head(&mut client) {
+    let head = match read_head(&mut client, deadline) {
         Ok(Some(h)) => h,
         Ok(None) => return,
         Err(e) => {
@@ -617,7 +728,17 @@ fn serve_http(
         }
     };
     let text = String::from_utf8_lossy(&head).into_owned();
-    let (target_host, target_port, forward_first) = if target.starts_with("http://") {
+    let host_headers = header_values(&text, "host");
+    if host_headers.len() > 1 {
+        respond(
+            &mut client,
+            "400 Bad Request",
+            "sandbox proxy: duplicate Host header",
+        );
+        return;
+    }
+    let host_header = host_headers.into_iter().next();
+    let (target_host, target_port, forward_first) = if strip_http_scheme(target).is_some() {
         // absolute-form: authority rides the request line
         let Some((host, port, path)) = split_absolute(target) else {
             respond(
@@ -627,10 +748,28 @@ fn serve_http(
             );
             return;
         };
+        if let Some(ref hh) = host_header {
+            let Some((hdr_host, _)) = parse_authority(hh, Some(80)) else {
+                respond(
+                    &mut client,
+                    "400 Bad Request",
+                    "sandbox proxy: bad Host header",
+                );
+                return;
+            };
+            if normalize_host(&hdr_host) != normalize_host(&host) {
+                respond(
+                    &mut client,
+                    "400 Bad Request",
+                    "sandbox proxy: Host header does not match request URI",
+                );
+                return;
+            }
+        }
         (host, port, format!("{method} {path} {version}"))
     } else {
         // origin-form: authority rides the Host header
-        let Some(host_header) = header_value(&text, "host") else {
+        let Some(host_header) = host_header else {
             respond(
                 &mut client,
                 "400 Bad Request",
@@ -665,20 +804,30 @@ fn serve_http(
             return;
         }
     };
-    // the first line is the only rewritten region; everything up to and
-    // including the blank line is forwarded as received
-    let Some(first_nl) = head.iter().position(|b| *b == b'\n') else {
-        respond(
-            &mut client,
-            "400 Bad Request",
-            "sandbox proxy: truncated head",
-        );
-        return;
-    };
+    // `serve_connection` already consumed the request line, so `head`
+    // starts at header 0 (or is an immediate blank line for header-less
+    // requests). Forward the rewritten request line + all headers except
+    // Connection / Proxy-Connection, and force `Connection: close`.
     let mut forward = Vec::with_capacity(head.len() + 128);
     forward.extend_from_slice(forward_first.as_bytes());
     forward.extend_from_slice(b"\r\n");
-    forward.extend_from_slice(&head[first_nl + 1..]);
+    for raw_line in text.lines() {
+        let line = raw_line.trim_end_matches('\r');
+        if line.is_empty() {
+            break;
+        }
+        if let Some((key, _)) = line.split_once(':') {
+            let key_trimmed = key.trim();
+            if key_trimmed.eq_ignore_ascii_case("connection")
+                || key_trimmed.eq_ignore_ascii_case("proxy-connection")
+            {
+                continue;
+            }
+        }
+        forward.extend_from_slice(line.as_bytes());
+        forward.extend_from_slice(b"\r\n");
+    }
+    forward.extend_from_slice(b"Connection: close\r\n\r\n");
     let mut upstream = match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
         Ok(u) => u,
         Err(e) => {
@@ -690,10 +839,10 @@ fn serve_http(
             return;
         }
     };
-    let _ = client.set_read_timeout(None);
-    let _ = client.set_write_timeout(None);
-    let _ = upstream.set_read_timeout(None);
-    let _ = upstream.set_write_timeout(None);
+    let _ = client.set_read_timeout(Some(TUNNEL_IDLE_TIMEOUT));
+    let _ = client.set_write_timeout(Some(TUNNEL_IDLE_TIMEOUT));
+    let _ = upstream.set_read_timeout(Some(TUNNEL_IDLE_TIMEOUT));
+    let _ = upstream.set_write_timeout(Some(TUNNEL_IDLE_TIMEOUT));
     if let Err(e) = upstream.write_all(&forward).and_then(|()| upstream.flush()) {
         respond(
             &mut client,
@@ -705,42 +854,89 @@ fn serve_http(
     tunnel(client, upstream);
 }
 
-/// Byte-exact bidirectional copy until EITHER side closes; when one
-/// direction ends both sockets are shut down so the other thread's
-/// blocking read unblocks promptly.
+/// Byte-exact bidirectional copy until EITHER side closes or the WHOLE
+/// connection has been idle for [`TUNNEL_IDLE_TIMEOUT`]. Idleness is
+/// measured across both directions: a long download (client silent,
+/// origin streaming) must never be cut at the per-direction timeout.
 fn tunnel(client: TcpStream, upstream: TcpStream) {
-    let Ok(mut client_c) = client.try_clone() else {
+    const POLL: Duration = Duration::from_millis(500);
+
+    /// Copy one direction; a poll timeout checks the shared
+    /// last-activity stamp and ends only when the whole tunnel idled.
+    fn relay(
+        mut from: TcpStream,
+        mut to: TcpStream,
+        started: Instant,
+        last_active: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) {
+        let mut buf = [0u8; 16 * 1024];
+        loop {
+            match from.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if to.write_all(&buf[..n]).is_err() {
+                        break;
+                    }
+                    last_active.store(
+                        started.elapsed().as_millis() as u64 + 1,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    let now = started.elapsed().as_millis() as u64;
+                    let last = last_active.load(std::sync::atomic::Ordering::Relaxed);
+                    if now.saturating_sub(last) >= TUNNEL_IDLE_TIMEOUT.as_millis() as u64 {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = to.shutdown(std::net::Shutdown::Both);
+        let _ = from.shutdown(std::net::Shutdown::Both);
+    }
+
+    let started = Instant::now();
+    let last_active = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // short read polls so idleness is judged across both legs; writes
+    // keep the long timeout (a stalled consumer is the abnormal case)
+    let _ = client.set_read_timeout(Some(POLL));
+    let _ = upstream.set_read_timeout(Some(POLL));
+    let Ok(client_c) = client.try_clone() else {
         return;
     };
-    let Ok(mut upstream_c) = upstream.try_clone() else {
+    let Ok(upstream_c) = upstream.try_clone() else {
         return;
     };
-    let to_upstream = std::thread::Builder::new()
-        .name("ka-sbx-fwd".into())
-        .spawn(move || {
-            let _ = std::io::copy(&mut client_c, &mut upstream_c);
-            let _ = upstream_c.shutdown(std::net::Shutdown::Both);
-        })
-        .ok();
-    let Ok(mut client_c) = client.try_clone() else {
+    let up = {
+        let last = last_active.clone();
+        std::thread::Builder::new()
+            .name("ka-sbx-fwd".into())
+            .spawn(move || relay(client_c, upstream_c, started, last))
+            .ok()
+    };
+    let Ok(client_c) = client.try_clone() else {
         return;
     };
-    let Ok(mut upstream_c) = upstream.try_clone() else {
+    let Ok(upstream_c) = upstream.try_clone() else {
         return;
     };
-    let to_client = std::thread::Builder::new()
-        .name("ka-sbx-fwd".into())
-        .spawn(move || {
-            let _ = std::io::copy(&mut upstream_c, &mut client_c);
-            let _ = client_c.shutdown(std::net::Shutdown::Both);
-        })
-        .ok();
-    // the originator ends both legs on shutdown: dropping the originals
-    // closes the fd dup'd into the workers after they finish their copy
-    if let Some(h) = to_upstream {
+    let down = {
+        let last = last_active.clone();
+        std::thread::Builder::new()
+            .name("ka-sbx-fwd".into())
+            .spawn(move || relay(upstream_c, client_c, started, last))
+            .ok()
+    };
+    if let Some(h) = up {
         let _ = h.join();
     }
-    if let Some(h) = to_client {
+    if let Some(h) = down {
         let _ = h.join();
     }
     let _ = client.shutdown(std::net::Shutdown::Both);
@@ -1118,9 +1314,10 @@ pub(crate) mod tests {
                 .unwrap();
         });
         let (mut client, _) = listener.accept().unwrap();
-        let line = read_line(&mut client, MAX_LINE).unwrap();
+        let deadline = Instant::now() + HEAD_TIMEOUT;
+        let line = read_line(&mut client, MAX_LINE, deadline).unwrap();
         assert_eq!(line, "CONNECT host:443 HTTP/1.1\r\n");
-        let head = read_head(&mut client).unwrap();
+        let head = read_head(&mut client, deadline).unwrap();
         assert_eq!(head, Some(b"X-A: b\r\n\r\n".to_vec()));
         writer.join().unwrap();
         // a header-less head terminates on the immediate blank line
@@ -1132,8 +1329,9 @@ pub(crate) mod tests {
                 .unwrap();
         });
         let (mut client, _) = listener.accept().unwrap();
-        let _ = read_line(&mut client, MAX_LINE).unwrap();
-        let head = read_head(&mut client).unwrap();
+        let deadline = Instant::now() + HEAD_TIMEOUT;
+        let _ = read_line(&mut client, MAX_LINE, deadline).unwrap();
+        let head = read_head(&mut client, deadline).unwrap();
         assert_eq!(head, Some(b"\r\n".to_vec()));
         writer.join().unwrap();
     }

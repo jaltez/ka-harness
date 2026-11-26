@@ -3,21 +3,27 @@
 //! connection per request). Routes:
 //!
 //! - `GET /health` → `{"ok":true}`
-//! - `POST /sessions` → spawn an engine → `{"id":"s1"}`; optional body
-//!   `{"resume":"latest"}` or `{"resume":"<strand id/prefix>"}` attaches
-//!   to a strand on disk (replayed over SSE)
+//! - `POST /sessions` → spawn an engine → `{"id":"<32 hex chars>"}`;
+//!   optional body `{"resume":"latest"}` or `{"resume":"<strand id/prefix>"}`
+//!   attaches to a strand on disk (replayed over SSE)
 //! - `GET /sessions` → `[{"id","busy","attached","title"}, …]`
 //! - `GET /sessions/{id}` → `{"id","busy","attached","title"}`
 //! - `POST /sessions/{id}/prompt` `{"text":...,"schema":...}` → queues
 //!   the turn → `{"ok":true}` (the single writer path — observers have
 //!   no write route)
 //! - `GET /sessions/{id}/events` → SSE stream of ka events as
-//!   `data:` NDJSON lines, each with an `id:` sequence number. Any
-//!   number of concurrent subscribers (roadmap 9.6: observe-only
-//!   multi-client); `Last-Event-ID` replays the per-session ring
-//!   buffer from the next event. Presence changes broadcast a
-//!   `{"type":"presence", ...}` event so attached clients (and the
-//!   attach UI) can show `busy · N attached`.
+//!   `data:` NDJSON lines, each with an `id:` sequence number. Up to
+//!   `MAX_SUBSCRIBERS_PER_SESSION` concurrent subscribers per session
+//!   (roadmap 9.6: observe-only multi-client); `Last-Event-ID` replays
+//!   the per-session ring buffer from the next event. Presence changes
+//!   broadcast a `{"type":"presence", ...}` event so attached clients
+//!   (and the attach UI) can show `busy · N attached`.
+//!
+//! Every POST body must carry `Content-Type: application/json`
+//! (415 otherwise) — the header is what forces a CORS preflight, so a
+//! web page cannot drive the loopback server. Session creation is
+//! capped at `MAX_SESSIONS` (429) and concurrent connections at
+//! `MAX_CONCURRENT_CONNECTIONS` (503).
 //!
 //! `--token T` enables bearer-token auth on every route; without it the
 //! server binds loopback only (refused otherwise). Both ends honor the
@@ -39,11 +45,111 @@ use tokio::sync::{Mutex, mpsc};
 /// full history no matter how busy the session has been.
 const RING_CAP: usize = 512;
 
-/// Monotonic session-id source (`s1`, `s2`, …) — a counter, not
-/// `map.len()+1`, so ids stay unique even if entries ever leave the map.
+/// Maximum concurrent TCP connections accepted by `ka serve`.
+const MAX_CONCURRENT_CONNECTIONS: usize = 64;
+
+/// Maximum live sessions kept in memory.
+const MAX_SESSIONS: usize = 32;
+
+/// Maximum concurrent SSE subscribers per session.
+const MAX_SUBSCRIBERS_PER_SESSION: usize = 16;
+
+/// Monotonic session creation order (for stable `GET /sessions` sorting);
+/// session IDs themselves are CSPRNG hex strings, never sequential.
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Generate a 128-bit random hex session ID (32 lowercase hex chars).
+/// Uses `/dev/urandom` on Unix and OS-seeded `RandomState` + SHA-256 as a
+/// portable fallback (e.g. Windows).
+fn new_session_id() -> String {
+    let mut bytes = [0u8; 16];
+    let filled = std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut bytes))
+        .is_ok();
+    if !filled {
+        use sha2::{Digest, Sha256};
+        use std::hash::{BuildHasher, Hasher};
+        let mut h = Sha256::new();
+        for _ in 0..4 {
+            let state = std::collections::hash_map::RandomState::new();
+            h.update(state.build_hasher().finish().to_le_bytes());
+        }
+        h.update(
+            SESSION_COUNTER
+                .fetch_add(1, Ordering::Relaxed)
+                .to_le_bytes(),
+        );
+        let digest = h.finalize();
+        bytes.copy_from_slice(&digest[..16]);
+    }
+    let mut out = String::with_capacity(32);
+    for b in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{b:02x}");
+    }
+    out
+}
+
+/// Constant-time byte slice equality (prevents timing leaks on bearer tokens).
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// True iff `host` (with optional `:port`) is a loopback host (`127.0.0.1`,
+/// `localhost`, or `[::1]`).
+fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim();
+    if let Some(rest) = host.strip_prefix('[') {
+        let Some((addr, after)) = rest.split_once(']') else {
+            return false;
+        };
+        if addr != "::1" {
+            return false;
+        }
+        return match after.strip_prefix(':') {
+            None => after.is_empty(),
+            Some(port) => !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()),
+        };
+    }
+    let (name, port) = match host.split_once(':') {
+        Some((n, p)) => (n, Some(p)),
+        None => (host, None),
+    };
+    if let Some(p) = port {
+        if p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) {
+            return false;
+        }
+    }
+    name.eq_ignore_ascii_case("localhost") || name == "127.0.0.1"
+}
+
+/// True iff `origin` is an `http://` or `https://` origin whose authority
+/// host is loopback (`127.0.0.1`, `localhost`, `[::1]`). Rejects `null`,
+/// `file://`, userinfo (`@`), and any non-loopback host.
+fn is_loopback_origin(origin: &str) -> bool {
+    let rest = origin
+        .trim()
+        .strip_prefix("http://")
+        .or_else(|| origin.trim().strip_prefix("https://"));
+    let Some(rest) = rest else {
+        return false;
+    };
+    let authority = rest.split('/').next().unwrap_or("");
+    if authority.contains('@') {
+        return false;
+    }
+    is_loopback_host(authority)
+}
+
 struct Session {
+    created_order: u64,
     commands: mpsc::Sender<Command>,
     /// Fan-out to every SSE subscriber (plus the ring buffer writer);
     /// each payload carries the event's own seq.
@@ -118,17 +224,14 @@ pub async fn run(
     Ok(ExitCode::SUCCESS)
 }
 
-/// Does `host:port` resolve to a loopback address?
+/// Does every address `host:port` resolves to lie on loopback?
 fn binds_loopback(addr: &str) -> Result<bool, String> {
     use std::net::ToSocketAddrs;
-    addr.to_socket_addrs()
-        .map_err(|e| format!("resolve {addr}: {e}"))
-        .map(|mut it| {
-            it.any(|sa| match sa.ip() {
-                std::net::IpAddr::V4(v4) => v4.is_loopback(),
-                std::net::IpAddr::V6(v6) => v6.is_loopback(),
-            })
-        })
+    let addrs: Vec<_> = addr
+        .to_socket_addrs()
+        .map_err(|e| format!("resolve {addr}: {e}"))?
+        .collect();
+    Ok(!addrs.is_empty() && addrs.iter().all(|sa| sa.ip().is_loopback()))
 }
 
 async fn serve(
@@ -140,10 +243,25 @@ async fn serve(
     let configs = Arc::new(configs);
     let base = Arc::new(base);
     let sessions: Arc<Mutex<std::collections::HashMap<String, Arc<Session>>>> = Arc::default();
+    let conn_sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
     let mut next_id = 0u64;
     loop {
         let Ok((socket, _)) = listener.accept().await else {
             return;
+        };
+        let Ok(permit) = conn_sem.clone().try_acquire_owned() else {
+            // answer instead of dropping: a silent close looks like a hang
+            tokio::spawn(async move {
+                let mut socket = socket;
+                let body = r#"{"error":"too many connections"}"#;
+                let resp = format!(
+                    "HTTP/1.1 503 Service Unavailable\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(resp.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            });
+            continue;
         };
         next_id += 1;
         tokio::spawn(handle_connection(
@@ -153,6 +271,7 @@ async fn serve(
             Arc::clone(&configs),
             Arc::clone(&base),
             next_id,
+            permit,
         ));
     }
 }
@@ -162,18 +281,32 @@ struct Request {
     path: String,
     last_event_id: Option<u64>,
     bearer: Option<String>,
+    origin: Option<String>,
+    host: Option<String>,
+    content_type: Option<String>,
     body: Vec<u8>,
 }
 
-/// Read one request: bounded (1 MB), timeout-guarded (15 s), UTF-8
-/// tolerant in the body, Content-Length parsed from the head only.
+/// Case-insensitive RFC 9110 header lookup in the request head (skipping
+/// the request line).
+fn header_value<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+    head.lines().skip(1).find_map(|l| {
+        let (k, v) = l.split_once(':')?;
+        k.trim().eq_ignore_ascii_case(name).then(|| v.trim())
+    })
+}
+
+/// Read one request: bounded (1 MB), total-deadline-guarded (15 s across
+/// all reads), UTF-8 tolerant in the body, Content-Length parsed from
+/// the head only.
 async fn read_request(socket: &mut tokio::net::TcpStream) -> Option<Request> {
     use tokio::io::AsyncReadExt;
     /// One request (headers + body) may not exceed this.
     const MAX_REQUEST: usize = 1024 * 1024;
-    /// A request must arrive within this window (slowloris bound).
+    /// Total time allowed to receive the entire request (slowloris bound).
     const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
+    let deadline = tokio::time::Instant::now() + READ_TIMEOUT;
     // byte-exact head boundary hoisted out of the loop: lossy-converted
     // head text must never be used to index the raw buffer
     let mut head_end;
@@ -183,8 +316,8 @@ async fn read_request(socket: &mut tokio::net::TcpStream) -> Option<Request> {
         if buf.len() > MAX_REQUEST {
             return None;
         }
-        let n = match tokio::time::timeout(READ_TIMEOUT, socket.read(&mut tmp)).await {
-            Err(_) => return None, // read timeout
+        let n = match tokio::time::timeout_at(deadline, socket.read(&mut tmp)).await {
+            Err(_) => return None, // total read deadline exceeded
             Ok(Ok(0)) | Ok(Err(_)) => return None,
             Ok(Ok(n)) => n,
         };
@@ -197,14 +330,8 @@ async fn read_request(socket: &mut tokio::net::TcpStream) -> Option<Request> {
         // Content-Length is taken from the HEAD only — a body line
         // containing `content-length:` must not stall the read
         let head = String::from_utf8_lossy(&buf[..head_end]);
-        let cl = head
-            .lines()
-            .find_map(|l| {
-                let (k, v) = l.split_once(':')?;
-                k.eq_ignore_ascii_case("content-length")
-                    .then(|| v.trim().parse::<usize>().ok())
-                    .flatten()
-            })
+        let cl = header_value(&head, "content-length")
+            .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(0);
         if cl > MAX_REQUEST {
             return None;
@@ -220,22 +347,24 @@ async fn read_request(socket: &mut tokio::net::TcpStream) -> Option<Request> {
     let mut parts = request_line.split_whitespace();
     let method = parts.next()?.to_string();
     let path = parts.next()?.to_string();
-    let last_event_id = head.lines().find_map(|l| {
-        l.strip_prefix("last-event-id:")
-            .or_else(|| l.strip_prefix("Last-Event-ID:"))
-            .and_then(|v| v.trim().parse::<u64>().ok())
+    let last_event_id = header_value(&head, "last-event-id").and_then(|v| v.parse::<u64>().ok());
+    let bearer = header_value(&head, "authorization").and_then(|v| {
+        let (scheme, tok) = v.split_once(char::is_whitespace)?;
+        scheme
+            .eq_ignore_ascii_case("bearer")
+            .then(|| tok.trim().to_string())
     });
-    let bearer = head.lines().find_map(|l| {
-        let v = l
-            .strip_prefix("authorization: Bearer ")
-            .or_else(|| l.strip_prefix("Authorization: Bearer "))?;
-        Some(v.trim().to_string())
-    });
+    let origin = header_value(&head, "origin").map(str::to_string);
+    let host = header_value(&head, "host").map(str::to_string);
+    let content_type = header_value(&head, "content-type").map(str::to_string);
     Some(Request {
         method,
         path,
         last_event_id,
         bearer,
+        origin,
+        host,
+        content_type,
         body,
     })
 }
@@ -247,22 +376,61 @@ async fn handle_connection(
     configs: Arc<Vec<std::path::PathBuf>>,
     base: Arc<Option<ka_engine::config::Config>>,
     _conn_id: u64,
+    _permit: tokio::sync::OwnedSemaphorePermit,
 ) {
     let Some(req) = read_request(&mut socket).await else {
         return;
     };
 
-    // bearer token gate
+    // bearer token gate (constant-time comparison)
     if let Some(expected) = &token {
-        if req.bearer.as_deref() != Some(expected.as_str()) {
+        let ok = req
+            .bearer
+            .as_deref()
+            .is_some_and(|got| ct_eq(got.as_bytes(), expected.as_bytes()));
+        if !ok {
             respond(&mut socket, 401, r#"{"error":"unauthorized"}"#).await;
+            return;
+        }
+    } else {
+        // Unauthenticated loopback mode: defend against DNS rebinding (Host)
+        // and cross-origin browser-to-localhost CSRF (Origin).
+        if req.host.as_deref().is_some_and(|h| !is_loopback_host(h)) {
+            respond(&mut socket, 403, r#"{"error":"forbidden host"}"#).await;
+            return;
+        }
+        if req
+            .origin
+            .as_deref()
+            .is_some_and(|o| !is_loopback_origin(o))
+        {
+            respond(&mut socket, 403, r#"{"error":"forbidden origin"}"#).await;
             return;
         }
     }
 
+    let is_json_content_type = || {
+        req.content_type.as_deref().is_some_and(|ct| {
+            ct.trim()
+                .to_ascii_lowercase()
+                .starts_with("application/json")
+        })
+    };
+
     if req.path == "/sessions" {
         match req.method.as_str() {
-            "POST" => create_session(&mut socket, &sessions, &req.body, &configs, &base).await,
+            "POST" => {
+                if !is_json_content_type() {
+                    respond(
+                        &mut socket,
+                        415,
+                        r#"{"error":"content-type must be application/json"}"#,
+                    )
+                    .await;
+                    return;
+                }
+                create_session(&mut socket, &sessions, &req.body, &configs, &base).await;
+            }
             "GET" => list_sessions(&mut socket, &sessions).await,
             _ => respond(&mut socket, 404, r#"{"error":"not found"}"#).await,
         }
@@ -276,7 +444,18 @@ async fn handle_connection(
             return;
         };
         match (req.method.as_str(), action) {
-            ("POST", "prompt") => prompt(&mut socket, &session, &req.body).await,
+            ("POST", "prompt") => {
+                if !is_json_content_type() {
+                    respond(
+                        &mut socket,
+                        415,
+                        r#"{"error":"content-type must be application/json"}"#,
+                    )
+                    .await;
+                    return;
+                }
+                prompt(&mut socket, &session, &req.body).await;
+            }
             ("GET", "events") => stream_events(socket, &session, req.last_event_id).await,
             ("GET", "") => {
                 let (busy, attached) = session.snapshot();
@@ -358,14 +537,24 @@ async fn create_session(
             }
         }
     };
+    if sessions.lock().await.len() >= MAX_SESSIONS {
+        respond(socket, 429, r#"{"error":"too many sessions"}"#).await;
+        return;
+    }
     let ka_engine::EngineHandle {
         commands, events, ..
     } = spawn_full(cfg, ka_dialect::Catalog::embedded(), choice);
     let (broadcast, _) = tokio::sync::broadcast::channel::<(u64, Event)>(256);
     let mut sessions = sessions.lock().await;
+    if sessions.len() >= MAX_SESSIONS {
+        drop(sessions);
+        respond(socket, 429, r#"{"error":"too many sessions"}"#).await;
+        return;
+    }
     let order = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
-    let id = format!("s{order}");
+    let id = new_session_id();
     let session = Arc::new(Session {
+        created_order: order,
         commands,
         broadcast: broadcast.clone(),
         ring: Mutex::new(Vec::new()),
@@ -420,27 +609,25 @@ async fn list_sessions(
     socket: &mut tokio::net::TcpStream,
     sessions: &Arc<Mutex<std::collections::HashMap<String, Arc<Session>>>>,
 ) {
-    let mut rows: Vec<serde_json::Value> = Vec::new();
+    let mut rows: Vec<(u64, serde_json::Value)> = Vec::new();
     {
         let sessions = sessions.lock().await;
         for (id, s) in sessions.iter() {
             let (busy, attached) = s.snapshot();
-            rows.push(json!({
-                "id": id,
-                "busy": busy,
-                "attached": attached,
-                "title": *s.title.lock().await,
-            }));
+            rows.push((
+                s.created_order,
+                json!({
+                    "id": id,
+                    "busy": busy,
+                    "attached": attached,
+                    "title": *s.title.lock().await,
+                }),
+            ));
         }
     }
-    rows.sort_by_key(|r| {
-        r.get("id")
-            .and_then(Value::as_str)
-            .and_then(|s| s.strip_prefix('s'))
-            .and_then(|n| n.parse::<u64>().ok())
-            .unwrap_or(u64::MAX)
-    });
-    let body = serde_json::to_string(&rows).unwrap_or_else(|_| "[]".to_string());
+    rows.sort_by_key(|(order, _)| *order);
+    let values: Vec<serde_json::Value> = rows.into_iter().map(|(_, v)| v).collect();
+    let body = serde_json::to_string(&values).unwrap_or_else(|_| "[]".to_string());
     respond(socket, 200, &body).await;
 }
 
@@ -503,7 +690,11 @@ async fn respond(socket: &mut tokio::net::TcpStream, status: u16, body: &str) {
         200 => "OK",
         400 => "Bad Request",
         401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
+        415 => "Unsupported Media Type",
+        429 => "Too Many Requests",
+        503 => "Service Unavailable",
         _ => "Error",
     };
     let resp = format!(
@@ -537,11 +728,15 @@ async fn sse_write(socket: &mut tokio::net::tcp::OwnedWriteHalf, bytes: &[u8]) -
 /// arrive/leave. A comment ping keeps idle proxies from dropping the
 /// stream mid-turn.
 async fn stream_events(
-    socket: tokio::net::TcpStream,
+    mut socket: tokio::net::TcpStream,
     session: &Arc<Session>,
     last_event_id: Option<u64>,
 ) {
     use tokio::io::AsyncReadExt;
+    if session.attached.load(Ordering::Relaxed) >= MAX_SUBSCRIBERS_PER_SESSION {
+        respond(&mut socket, 429, r#"{"error":"too many subscribers"}"#).await;
+        return;
+    }
     let (mut read_half, mut socket) = socket.into_split();
     let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
     if !sse_write(&mut socket, head.as_bytes()).await {
@@ -681,7 +876,8 @@ mod tests {
         let auth = token
             .map(|t| format!("Authorization: Bearer {t}\r\n"))
             .unwrap_or_default();
-        let req = format!("GET {path} HTTP/1.1\r\nHost: x\r\n{auth}Connection: close\r\n\r\n");
+        let req =
+            format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{auth}Connection: close\r\n\r\n");
         sock.write_all(req.as_bytes()).await.unwrap();
         let mut buf = Vec::new();
         sock.read_to_end(&mut buf).await.unwrap();
@@ -714,7 +910,7 @@ mod tests {
             .map(|t| format!("Authorization: Bearer {t}\r\n"))
             .unwrap_or_default();
         let req = format!(
-            "POST {path} HTTP/1.1\r\nHost: x\r\n{auth}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{auth}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );
         sock.write_all(req.as_bytes()).await.unwrap();
@@ -762,7 +958,9 @@ mod tests {
                 .as_deref()
                 .map(|t| format!("Authorization: Bearer {t}\r\n"))
                 .unwrap_or_default();
-            let req = format!("GET {path} HTTP/1.1\r\nHost: x\r\n{auth}Connection: close\r\n\r\n");
+            let req = format!(
+                "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{auth}Connection: close\r\n\r\n"
+            );
             if sock.write_all(req.as_bytes()).await.is_err() {
                 return;
             }
@@ -802,7 +1000,7 @@ mod tests {
                 .map(|t| format!("Authorization: Bearer {t}\r\n"))
                 .unwrap_or_default();
             let req = format!(
-                "GET {path} HTTP/1.1\r\nHost: x\r\n{auth}Last-Event-ID: {last_id}\r\nConnection: close\r\n\r\n"
+                "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{auth}Last-Event-ID: {last_id}\r\nConnection: close\r\n\r\n"
             );
             if sock.write_all(req.as_bytes()).await.is_err() {
                 return;
@@ -1120,7 +1318,7 @@ mod tests {
 
         // mangled path → clean 404 error, not a panic/reset
         let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let req = b"GET /hea\xFFlth HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+        let req = b"GET /hea\xFFlth HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
         sock.write_all(req).await.unwrap();
         let mut buf = Vec::new();
         sock.read_to_end(&mut buf).await.unwrap();
@@ -1137,7 +1335,7 @@ mod tests {
         // junk byte in an unused header, valid Content-Length body:
         // the body must survive byte-exact (session is created)
         let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let req = b"POST /sessions HTTP/1.1\r\nHost: x\r\nX-Junk: \xC3\x28\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+        let req = b"POST /sessions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nX-Junk: \xC3\x28\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
         sock.write_all(req).await.unwrap();
         let mut buf = Vec::new();
         sock.read_to_end(&mut buf).await.unwrap();
@@ -1172,6 +1370,7 @@ mod tests {
         let (commands, _rx) = tokio::sync::mpsc::channel(1);
         let (broadcast, mut brx) = tokio::sync::broadcast::channel(4);
         let session = super::Session {
+            created_order: 1,
             commands,
             broadcast,
             ring: tokio::sync::Mutex::new(Vec::new()),

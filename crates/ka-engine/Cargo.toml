@@ -21,6 +21,8 @@ ignore = { workspace = true }
 regex = { workspace = true }
 flate2 = { workspace = true }
 ka-sandbox = { workspace = true }
+# OS CSPRNG for MCP OAuth state/PKCE (same dependency ka-passport uses)
+getrandom = { workspace = true }
 parking_lot = { workspace = true }
 rquickjs = { workspace = true, optional = true }
 

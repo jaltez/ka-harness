@@ -61,6 +61,8 @@ fn quote_escaped(s: &str, quote_end: usize) -> bool {
         == 1
 }
 
+const MAX_NESTING_DEPTH: usize = 128;
+
 fn close_open(s: &str) -> String {
     let mut out = s.to_string();
     // Drop a trailing fragment that cannot be part of a complete value:
@@ -98,8 +100,15 @@ fn close_open(s: &str) -> String {
         } else {
             match ch {
                 '"' => in_string = true,
-                '{' | '[' => stack.push(ch),
-                '}' | ']' => {
+                '{' | '[' => {
+                    if stack.len() < MAX_NESTING_DEPTH {
+                        stack.push(ch);
+                    }
+                }
+                '}' if stack.last() == Some(&'{') => {
+                    stack.pop();
+                }
+                ']' if stack.last() == Some(&'[') => {
                     stack.pop();
                 }
                 _ => {}
@@ -107,6 +116,10 @@ fn close_open(s: &str) -> String {
         }
     }
     if in_string {
+        if escape {
+            // Strip a dangling trailing `\` so the closing quote is not escaped.
+            out.pop();
+        }
         out.push('"');
     }
     while let Some(open) = stack.pop() {
@@ -390,5 +403,38 @@ mod tests {
                 let _ = repair_json(&s);
             }
         }
+    }
+
+    #[test]
+    fn trailing_odd_and_even_backslashes_in_open_string() {
+        // Odd trailing backslash inside an open string must be stripped before
+        // closing the quote so the repaired JSON is valid.
+        let v1 = repair_json(r#"{"a": "foo\"#);
+        assert_eq!(v1.get("a").and_then(Value::as_str), Some("foo"));
+
+        // Even trailing backslashes represent literal backslash(es) and stay intact.
+        let v2 = repair_json(r#"{"a": "foo\\"#);
+        assert_eq!(v2.get("a").and_then(Value::as_str), Some(r"foo\"));
+
+        // 3 backslashes: 2 form one literal `\`, the 3rd dangling `\` is stripped.
+        let v3 = repair_json(r#"{"a": "foo\\\"#);
+        assert_eq!(v3.get("a").and_then(Value::as_str), Some(r"foo\"));
+
+        // 4 backslashes: 2 literal `\\`.
+        let v4 = repair_json(r#"{"a": "foo\\\\"#);
+        assert_eq!(v4.get("a").and_then(Value::as_str), Some(r"foo\\"));
+    }
+
+    #[test]
+    fn deep_nesting_is_capped_and_does_not_amplify() {
+        let deep = "{".repeat(500);
+        let repaired = close_open(&deep);
+        assert!(
+            repaired.len() <= deep.len() + MAX_NESTING_DEPTH,
+            "closing brackets must be capped at {MAX_NESTING_DEPTH}"
+        );
+        // repair_json must not panic and falls back cleanly to `{}`.
+        let v = repair_json(&deep);
+        assert!(v.is_object());
     }
 }

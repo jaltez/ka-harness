@@ -293,77 +293,32 @@ async fn speak_openai(
         };
         let chunk = chunk.map_err(|e| WireError::network(e.to_string()))?;
         for evt in parser.feed(&chunk) {
-            if evt.data.trim() == "[DONE]" {
-                finished = true;
-                continue;
-            }
-            let Ok(v) = serde_json::from_str::<Value>(&evt.data) else {
-                continue; // malformed chunk: drop, keep streaming
-            };
-            if let Some(u) = v.get("usage").filter(|u| u.is_object()) {
-                parse_usage(u, &mut usage);
-            }
-            let Some(choice) = v.pointer("/choices/0") else {
-                continue;
-            };
-            if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
-                saw_finish_reason = true;
-                stop = match reason {
-                    "length" => Stop::Length,
-                    _ => Stop::Done,
-                };
-            }
-            let Some(delta) = choice.get("delta") else {
-                continue;
-            };
-            if let Some(text) = delta.get("content").and_then(Value::as_str) {
-                if !text.is_empty() {
-                    out.send(StreamEvent::Text(text.to_string())).await.ok();
-                }
-            }
-            for key in ["reasoning_content", "reasoning"] {
-                if let Some(thought) = delta.get(key).and_then(Value::as_str) {
-                    if !thought.is_empty() {
-                        out.send(StreamEvent::Thought(thought.to_string()))
-                            .await
-                            .ok();
-                    }
-                    break;
-                }
-            }
-            if let Some(tc) = delta.get("tool_calls").and_then(Value::as_array) {
-                for frag in tc {
-                    ingest_tool_fragment(&mut calls, frag);
-                }
-            }
+            handle_openai_event(
+                &evt,
+                &mut calls,
+                &mut usage,
+                &mut stop,
+                &mut finished,
+                &mut saw_finish_reason,
+                out,
+            )
+            .await?;
         }
     }
     for evt in parser.finish() {
-        // trailing frame without [DONE]: treat identically
-        if evt.data.trim() == "[DONE]" {
-            finished = true;
-            continue;
-        }
-        if let Ok(v) = serde_json::from_str::<Value>(&evt.data) {
-            // a final usage frame without a trailing separator still counts
-            if let Some(u) = v.get("usage").filter(|u| u.is_object()) {
-                parse_usage(u, &mut usage);
-            }
-            if let Some(choice) = v.pointer("/choices/0") {
-                if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
-                    saw_finish_reason = true;
-                    stop = match reason {
-                        "length" => Stop::Length,
-                        _ => Stop::Done,
-                    };
-                }
-                if let Some(delta) = choice.get("delta") {
-                    if let Some(text) = delta.get("content").and_then(Value::as_str) {
-                        out.send(StreamEvent::Text(text.to_string())).await.ok();
-                    }
-                }
-            }
-        }
+        // trailing frame without a final blank line: drain through the same
+        // handler so usage, tool_calls, reasoning_content, content, and
+        // finish_reason are never lost
+        handle_openai_event(
+            &evt,
+            &mut calls,
+            &mut usage,
+            &mut stop,
+            &mut finished,
+            &mut saw_finish_reason,
+            out,
+        )
+        .await?;
     }
 
     // A clean EOF is not a completed turn: without [DONE] or a
@@ -393,6 +348,63 @@ async fn speak_openai(
     Ok(())
 }
 
+const MAX_TOOL_ARGS_BYTES: usize = 4 * 1024 * 1024;
+
+async fn handle_openai_event(
+    evt: &crate::sse::SseEvent,
+    calls: &mut Vec<PendingCall>,
+    usage: &mut ka_protocol::Usage,
+    stop: &mut Stop,
+    finished: &mut bool,
+    saw_finish_reason: &mut bool,
+    out: &mpsc::Sender<StreamEvent>,
+) -> Result<(), WireError> {
+    if evt.data.trim() == "[DONE]" {
+        *finished = true;
+        return Ok(());
+    }
+    let Ok(v) = serde_json::from_str::<Value>(&evt.data) else {
+        return Ok(()); // malformed chunk: drop, keep streaming
+    };
+    if let Some(u) = v.get("usage").filter(|u| u.is_object()) {
+        parse_usage(u, usage);
+    }
+    let Some(choice) = v.pointer("/choices/0") else {
+        return Ok(());
+    };
+    if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+        *saw_finish_reason = true;
+        *stop = match reason {
+            "length" => Stop::Length,
+            _ => Stop::Done,
+        };
+    }
+    let Some(delta) = choice.get("delta") else {
+        return Ok(());
+    };
+    if let Some(text) = delta.get("content").and_then(Value::as_str) {
+        if !text.is_empty() {
+            out.send(StreamEvent::Text(text.to_string())).await.ok();
+        }
+    }
+    for key in ["reasoning_content", "reasoning"] {
+        if let Some(thought) = delta.get(key).and_then(Value::as_str) {
+            if !thought.is_empty() {
+                out.send(StreamEvent::Thought(thought.to_string()))
+                    .await
+                    .ok();
+            }
+            break;
+        }
+    }
+    if let Some(tc) = delta.get("tool_calls").and_then(Value::as_array) {
+        for frag in tc {
+            ingest_tool_fragment(calls, frag)?;
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Default)]
 struct PendingCall {
     id: String,
@@ -400,12 +412,12 @@ struct PendingCall {
     args: String,
 }
 
-fn ingest_tool_fragment(calls: &mut Vec<PendingCall>, frag: &Value) {
+fn ingest_tool_fragment(calls: &mut Vec<PendingCall>, frag: &Value) -> Result<(), WireError> {
     let index = frag.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
     // wire-controlled index: a garbage/hostile frame must not drive an
     // unbounded pad allocation
     if index > 1024 {
-        return;
+        return Ok(());
     }
     while calls.len() <= index {
         calls.push(PendingCall::default());
@@ -418,8 +430,16 @@ fn ingest_tool_fragment(calls: &mut Vec<PendingCall>, frag: &Value) {
         pending.tool = name.to_string();
     }
     if let Some(args) = frag.pointer("/function/arguments").and_then(Value::as_str) {
+        if pending.args.len().saturating_add(args.len()) > MAX_TOOL_ARGS_BYTES {
+            return Err(WireError {
+                class: ka_protocol::ErrorClass::Protocol,
+                retryable: false,
+                message: format!("tool call arguments exceeded {MAX_TOOL_ARGS_BYTES} byte limit"),
+            });
+        }
         pending.args.push_str(args);
     }
+    Ok(())
 }
 
 /// Merge one Chat Completions `usage` object into the running total.

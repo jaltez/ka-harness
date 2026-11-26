@@ -17,6 +17,11 @@ use serde_json::{Value, json};
 
 use super::{Clearance, Hand, HandContext, HandDef, ToolOutput};
 
+/// Maximum interval for a cron entry (30 days — prevents Instant overflow).
+pub const MAX_INTERVAL_SECS: u64 = 86_400 * 30;
+/// Maximum number of concurrently armed cron entries per session.
+pub const MAX_CRON_ENTRIES: usize = 16;
+
 /// One armed schedule.
 #[derive(Debug, Clone)]
 pub struct CronEntry {
@@ -68,7 +73,8 @@ impl CronTable {
 
     /// Arm a schedule; returns its id. The first fire lands one full
     /// `interval_secs` from now (an immediate fire would race the
-    /// turn that created it).
+    /// turn that created it). `interval_secs` is clamped to
+    /// `1..=MAX_INTERVAL_SECS` to prevent `Instant` overflow.
     pub fn create(
         &self,
         schedule_text: String,
@@ -76,18 +82,63 @@ impl CronTable {
         interval_secs: u64,
         one_shot: bool,
     ) -> String {
+        let interval_secs = interval_secs.clamp(1, MAX_INTERVAL_SECS);
         let mut t = self.inner.lock();
         t.next_id += 1;
         let id = format!("cron-{}", t.next_id);
+        let now = Instant::now();
+        let next_due = now
+            .checked_add(std::time::Duration::from_secs(interval_secs))
+            .unwrap_or(now);
         t.entries.push(CronEntry {
             id: id.clone(),
             schedule_text,
             prompt,
             interval_secs,
             one_shot,
-            next_due: Instant::now() + std::time::Duration::from_secs(interval_secs),
+            next_due,
         });
         id
+    }
+
+    /// Checked version of [`create`]: enforces `1..=MAX_INTERVAL_SECS`
+    /// and the [`MAX_CRON_ENTRIES`] concurrency cap atomically.
+    pub fn try_create(
+        &self,
+        schedule_text: String,
+        prompt: String,
+        interval_secs: u64,
+        one_shot: bool,
+    ) -> Result<String, String> {
+        if interval_secs < 1 {
+            return Err("cron create: 'interval_secs' must be >= 1".to_string());
+        }
+        if interval_secs > MAX_INTERVAL_SECS {
+            return Err(format!(
+                "cron create: 'interval_secs' must be <= {MAX_INTERVAL_SECS} (30 days)"
+            ));
+        }
+        let mut t = self.inner.lock();
+        if t.entries.len() >= MAX_CRON_ENTRIES {
+            return Err(format!(
+                "cron create: limit of {MAX_CRON_ENTRIES} armed entries reached (delete one first)"
+            ));
+        }
+        t.next_id += 1;
+        let id = format!("cron-{}", t.next_id);
+        let now = Instant::now();
+        let next_due = now
+            .checked_add(std::time::Duration::from_secs(interval_secs))
+            .unwrap_or(now);
+        t.entries.push(CronEntry {
+            id: id.clone(),
+            schedule_text,
+            prompt,
+            interval_secs,
+            one_shot,
+            next_due,
+        });
+        Ok(id)
     }
 
     /// Disarm one schedule by id; Err when unknown.
@@ -136,10 +187,11 @@ impl CronTable {
             if !e.one_shot {
                 // schedule the next fire from NOW (a starved tick
                 // catches up on the following tick, not N times over)
-                kept.push(CronEntry {
-                    next_due: now + std::time::Duration::from_secs(e.interval_secs),
-                    ..e
-                });
+                let secs = e.interval_secs.clamp(1, MAX_INTERVAL_SECS);
+                let next_due = now
+                    .checked_add(std::time::Duration::from_secs(secs))
+                    .unwrap_or(now);
+                kept.push(CronEntry { next_due, ..e });
             }
         }
         t.entries = kept;
@@ -243,7 +295,7 @@ impl Hand for CronHand {
                     };
                     let interval_secs = args.get("interval_secs").and_then(Value::as_u64);
                     match interval_secs {
-                        Some(secs) if secs >= 1 => {
+                        Some(secs) => {
                             let schedule_text = args
                                 .get("schedule_text")
                                 .and_then(Value::as_str)
@@ -253,19 +305,22 @@ impl Hand for CronHand {
                                 .get("one_shot")
                                 .and_then(Value::as_bool)
                                 .unwrap_or(false);
-                            let id = self.table.create(schedule_text, prompt, secs, one_shot);
-                            let kind = if one_shot { " once" } else { "" };
-                            ToolOutput::ok(format!(
-                                "cron {id} armed: fires{kind} in {secs}s (`{}`)",
-                                self.table
-                                    .snapshot()
-                                    .iter()
-                                    .find(|v| v.id == id)
-                                    .map(|v| v.schedule_text.as_str())
-                                    .unwrap_or("")
-                            ))
+                            match self.table.try_create(schedule_text, prompt, secs, one_shot) {
+                                Ok(id) => {
+                                    let kind = if one_shot { " once" } else { "" };
+                                    ToolOutput::ok(format!(
+                                        "cron {id} armed: fires{kind} in {secs}s (`{}`)",
+                                        self.table
+                                            .snapshot()
+                                            .iter()
+                                            .find(|v| v.id == id)
+                                            .map(|v| v.schedule_text.as_str())
+                                            .unwrap_or("")
+                                    ))
+                                }
+                                Err(e) => ToolOutput::err(e),
+                            }
                         }
-                        Some(_) => ToolOutput::err("cron create: 'interval_secs' must be >= 1"),
                         None => ToolOutput::err("cron create: missing required 'interval_secs'"),
                     }
                 }

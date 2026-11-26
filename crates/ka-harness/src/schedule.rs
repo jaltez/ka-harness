@@ -126,27 +126,36 @@ pub fn run(cmd: ScheduleCmd) -> Result<ExitCode, String> {
     }
 }
 
-/// Build one crontab line: `<cron> ka run --print text "<prompt>" # ka-schedule <name>`.
+/// Build one crontab line: `<cron> ka run --print text -- "<prompt>" # ka-schedule <name>`.
 /// Validation is strict where cron or the shell would silently mangle
-/// input: five cron fields, no newline anywhere (a crontab line IS a
-/// line), no double quote in name/cron, and the prompt's cron/shell
-/// specials (`"`, `\`, `` ` ``, `$`, `%`) escaped for the double-quoted
-/// command string (`%` is newline-to-stdin in cron unless backslashed).
+/// input: five space-separated cron fields using only `[0-9*/,-]`, no
+/// newline anywhere (a crontab line IS a line), no `%`/quotes/whitespace
+/// in name, and the prompt's cron/shell specials (`"`, `\`, `` ` ``,
+/// `$`, `%`) escaped for the double-quoted command string (`%` is
+/// newline-to-stdin in cron unless backslashed).
 pub(crate) fn schedule_line(cron: &str, prompt: &str, name: &str) -> Result<String, String> {
-    if cron.split_whitespace().count() != 5 {
+    if cron.contains(['\n', '\r']) {
         return Err(format!(
-            "cron expression {cron:?} must have exactly 5 fields \
-             (minute hour day month weekday)"
+            "cron expression {cron:?} must be a single line (no newlines)"
         ));
     }
-    if cron.contains(['"', '\\']) {
+    let fields: Vec<&str> = cron.split(' ').filter(|s| !s.is_empty()).collect();
+    if fields.len() != 5
+        || cron
+            .chars()
+            .any(|c| c != ' ' && !matches!(c, '0'..='9' | '*' | '/' | ',' | '-'))
+    {
         return Err(format!(
-            "cron expression {cron:?} must not contain quotes or backslashes"
+            "cron expression {cron:?} must have exactly 5 space-separated fields \
+             using only [0-9*/,-] (minute hour day month weekday)"
         ));
     }
-    if name.is_empty() || name.contains(char::is_whitespace) || name.contains('"') {
+    if name.is_empty()
+        || name.contains(char::is_whitespace)
+        || name.contains(['"', '%', '\n', '\r'])
+    {
         return Err(format!(
-            "entry name {name:?} must be non-empty, whitespace-free and quote-free"
+            "entry name {name:?} must be non-empty, whitespace-free, quote-free, and '%'-free"
         ));
     }
     if prompt.contains('\n') || prompt.contains('\r') {
@@ -155,8 +164,8 @@ pub(crate) fn schedule_line(cron: &str, prompt: &str, name: &str) -> Result<Stri
             .to_string());
     }
     Ok(format!(
-        "{} ka run --print text \"{}\" {}{}",
-        cron,
+        "{} ka run --print text -- \"{}\" {}{}",
+        fields.join(" "),
         shell_quote_prompt(prompt),
         MARKER,
         name
@@ -183,7 +192,7 @@ pub(crate) fn parse_entries(crontab: &str) -> Vec<Entry> {
     crontab
         .lines()
         .filter_map(|line| {
-            let idx = line.find(MARKER)?;
+            let idx = line.rfind(MARKER)?;
             let name = line[idx + MARKER.len()..].trim();
             (!name.is_empty()).then(|| Entry {
                 name: name.to_string(),
@@ -198,7 +207,7 @@ pub(crate) fn parse_entries(crontab: &str) -> Vec<Entry> {
 /// many lines went away.
 pub(crate) fn remove_named(crontab: &str, name: &str) -> (String, usize) {
     let is_named = |line: &str| {
-        line.find(MARKER)
+        line.rfind(MARKER)
             .is_some_and(|i| line[i + MARKER.len()..].trim() == name)
     };
     let mut rest = String::with_capacity(crontab.len());
@@ -301,7 +310,7 @@ mod tests {
         let line = schedule_line("30 9 * * 1-5", "fix the flaky tests", "daily").unwrap();
         assert_eq!(
             line,
-            "30 9 * * 1-5 ka run --print text \"fix the flaky tests\" # ka-schedule daily"
+            "30 9 * * 1-5 ka run --print text -- \"fix the flaky tests\" # ka-schedule daily"
         );
     }
 
@@ -310,7 +319,7 @@ mod tests {
         let line = schedule_line("* * * * *", "say \"hi\" $USER `id` 50% a\\b", "n").unwrap();
         assert_eq!(
             line,
-            "* * * * * ka run --print text \"say \\\"hi\\\" \\$USER \\`id\\` 50\\% a\\\\b\" # ka-schedule n"
+            "* * * * * ka run --print text -- \"say \\\"hi\\\" \\$USER \\`id\\` 50\\% a\\\\b\" # ka-schedule n"
         );
     }
 
@@ -367,5 +376,22 @@ mod tests {
         assert_eq!(slug("   ---  "), "ka");
         assert_eq!(slug("Ünïcödé drops"), "n-c-d-drops");
         assert_eq!(slug("a-b--c"), "a-b-c");
+    }
+
+    #[test]
+    fn marker_in_prompt_cannot_spoof_entry_name() {
+        let line = match schedule_line("0 9 * * *", "check # ka-schedule spoofed", "real") {
+            Ok(l) => l,
+            Err(e) => panic!("expected valid line: {e}"),
+        };
+        let entries = parse_entries(&line);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "real");
+        let (rest, removed) = remove_named(&line, "spoofed");
+        assert_eq!(removed, 0);
+        assert_eq!(rest, line);
+        let (rest, removed) = remove_named(&line, "real");
+        assert_eq!(removed, 1);
+        assert!(rest.is_empty());
     }
 }

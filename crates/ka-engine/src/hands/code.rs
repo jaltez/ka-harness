@@ -223,9 +223,10 @@ impl CodeRouter {
         };
         let primary = call.primary_arg();
         let clearance = hand.clearance_for(args);
-        // protected paths outrank every posture below (except readonly
-        // mode, which already denies the same set via the plans-dir rule)
-        if clearance == Clearance::Write && *self.mode.read() != Mode::Readonly {
+        // protected paths outrank every posture below, including
+        // readonly mode (which must not wave protected paths through
+        // via symlinks or traversal).
+        if clearance == Clearance::Write {
             if let Some(reason) = super::protected::reason(&hctx.cwd, &primary) {
                 return self.ask(
                     format!("PROTECTED — {reason}: `{primary}`. Proceed anyway?"),
@@ -256,8 +257,10 @@ impl CodeRouter {
                 }
                 Mode::Readonly => {
                     // research mode: only the project plans dir is writable
-                    let plans_dir = crate::project_root(&hctx.cwd).join(".ka/plans");
-                    let path = super::read::resolve(hctx, &primary);
+                    let plans_dir = super::protected::canonicalize_deepest(
+                        &crate::project_root(&hctx.cwd).join(".ka/plans"),
+                    );
+                    let path = super::read::resolve_normalized(hctx, &primary);
                     if path.starts_with(&plans_dir) {
                         Decision::Allow
                     } else {
@@ -282,7 +285,7 @@ impl CodeRouter {
                         false,
                     );
                 }
-                if super::bashp::all_readonly(&analysis) {
+                if name == "bash" && super::bashp::all_readonly(&analysis) {
                     return Decision::Allow;
                 }
                 match *self.mode.read() {
@@ -349,7 +352,7 @@ impl CodeRouter {
         let lowered = reply.to_lowercase();
         if let Some(label) = labels
             .iter()
-            .find(|l| lowered.contains(&l.trim().to_lowercase()))
+            .find(|l| contains_word(&lowered, &l.trim().to_lowercase()))
         {
             return Ok((label.clone(), 0.6));
         }
@@ -358,6 +361,29 @@ impl CodeRouter {
              one of the labels ({list})"
         ))
     }
+}
+
+/// Word-boundary substring match so `"unsafe"` does not match `"safe"`.
+fn contains_word(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let mut start = 0;
+    while let Some(pos) = haystack[start..].find(needle) {
+        let abs = start + pos;
+        let end = abs + needle.len();
+        let before_ok = haystack[..abs]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !is_word(c));
+        let after_ok = haystack[end..].chars().next().is_none_or(|c| !is_word(c));
+        if before_ok && after_ok {
+            return true;
+        }
+        start = abs + needle.chars().next().map_or(1, char::len_utf8);
+    }
+    false
 }
 
 /// `{"error": …}` rendering for script-facing tool outcomes.
@@ -390,7 +416,9 @@ impl CodeHand {
             Ok(rt) => rt,
             Err(e) => return ToolOutput::err(format!("code: QuickJS runtime init failed: {e}")),
         };
-        rt.set_memory_limit(memory_mb as usize * 1024 * 1024).await;
+        rt.set_memory_limit((memory_mb as usize).saturating_mul(1024 * 1024))
+            .await;
+        rt.set_max_stack_size(512 * 1024).await;
         // checked while JS executes; past the deadline it raises an
         // uncatchable exception, so even `while (true) {}` ends on time.
         // Owned by the runtime and dropped with it.
@@ -407,25 +435,46 @@ impl CodeHand {
         let router = self.router.clone();
         let hctx = hctx.clone();
         let park_hctx = hctx.clone();
-        let run = ctx.async_with(async move |ctx| {
-            run_locked(ctx, router, hctx, script, deadline, timeout_ms, memory_mb).await
-        });
+        let run = async {
+            let res = ctx
+                .async_with(async move |ctx| {
+                    run_locked(ctx, router, hctx, script, deadline, timeout_ms, memory_mb).await
+                })
+                .await;
+            // leftover microtask jobs hold GC references (the async wrapper's
+            // own completion jobs included); draining them inside the timeout
+            // budget prevents an infinite microtask chain from hanging past
+            // timeout_ms while letting QuickJS free cleanly.
+            while rt.execute_pending_job().await.unwrap_or(false) {}
+            res
+        };
         let run = tokio::time::timeout(Duration::from_millis(timeout_ms) + RUN_GRACE, run);
         let text = match run.await {
             Err(_) => {
+                // Deadline has elapsed so the interrupt handler is active;
+                // briefly drain pending jobs before dropping ctx/rt so
+                // QuickJS frees cleanly without tripping gc_obj_list.
+                let _ = tokio::time::timeout(Duration::from_millis(50), async {
+                    while rt.execute_pending_job().await.unwrap_or(false) {}
+                })
+                .await;
+                drop(ctx);
+                drop(rt);
                 return ToolOutput::err(format!(
                     "code: script timed out after {timeout_ms} ms ([code] timeout_ms)"
                 ));
             }
-            Ok(Err(message)) => return ToolOutput::err(message),
-            Ok(Ok(text)) => text,
+            Ok(Err(message)) => {
+                drop(ctx);
+                drop(rt);
+                return ToolOutput::err(message);
+            }
+            Ok(Ok(text)) => {
+                drop(ctx);
+                drop(rt);
+                text
+            }
         };
-        // leftover microtask jobs hold GC references (the async wrapper's
-        // own completion jobs included); draining them before the drop is
-        // what lets QuickJS free the runtime without tripping its
-        // gc_obj_list assertion
-        while rt.execute_pending_job().await.unwrap_or(false) {}
-        drop(ctx);
         if text.len() <= RESULT_CAP {
             return ToolOutput::ok(text);
         }

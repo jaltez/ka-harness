@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+### Security
+- Read-only auto-allow fails closed on any env-assignment prefix (an `env -u X PATH=…` flag value no longer hides the assignment), quoted redirect targets are scanned, `timeout -- 5 <cmd>` keeps its command, and a downloader piped through intermediate filters (`curl … | tail … | sh`) still hardstops.
+- Protected paths resolve symlinks component by component — including dangling links and `..` across a link; `ka mcp-serve` refuses `~/` arguments and hands the tool the verified path.
+- `web_fetch` re-validates every redirect hop and pins the connection to the validated addresses with the system proxy disabled; the updater applies the HTTPS rule to redirects and rejects userinfo loopback look-alikes.
+- The sandbox proxy's 120 s idle timeout is measured across both directions, so a long download is no longer cut.
+- The `ka action` workflow template skips fork PRs (they have no secrets) and keeps the job token out of the agent's checkout (`persist-credentials: false`).
+- The landlock `/dev` surface drops `/dev/shm`; add it to `[sandbox] allow_write` when a workload needs shared memory.
+
+### Fixed
+- `ka queue` sends `Content-Type: application/json` (the server requires it), and `ka attach` opens the newest session now that ids are hex.
+- `ka rules check` reports the actually-matching rule under first-match-wins.
+- Delegated children answer inherited `ask` rules with the deny option instead of hanging until the 10-minute cap; the child sandbox follows a strand-restored override.
+- A PDF that exhausts the extraction budget is reported instead of silently truncated; monitor buffers announce the cap on exact-fill chunks; MCP responses over the size cap fail the waiting request instead of timing it out.
+- Strands refuse records over the 64 MiB line cap instead of writing a session that never opens again; Windows opens strands with write access again; the index no longer forces persistent WAL.
+- Config imports keep scope-less deny/ask rules, and import size caps ride the read (`/dev/zero` cannot OOM).
+- `ka update` no longer fails without `HOME` for an unused state directory.
+- The new `cross-platform` CI job compiles on Windows (`exec()` is gated behind `#[cfg(unix)]`).
+
+### Changed
+- `[[rules]]` evaluation is true first-match-wins (README already said so): a trailing allow that was previously shadowed can now match. Review rules that relied on "the first rule naming the tool".
+
 ## 0.11.0 — 2026-11-25
 
 ### TUI

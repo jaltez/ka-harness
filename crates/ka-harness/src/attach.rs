@@ -77,27 +77,18 @@ pub async fn run(
     Ok(ExitCode::SUCCESS)
 }
 
-/// Resolve the session reference against the server's listing: an id
-/// prefix match first (s1, s12…), then a title substring; `None` picks
-/// the highest-numbered (newest) session.
+/// Resolve the session reference against the server's listing: an exact
+/// id first, then an id prefix, then a title substring; `None` picks the
+/// newest session (the server lists oldest-first by creation order).
 fn pick_session(needle: Option<&str>, rows: &[serde_json::Value]) -> Result<String, String> {
     fn id_of(v: &serde_json::Value) -> &str {
         v.get("id").and_then(|i| i.as_str()).unwrap_or("")
     }
-    // s2 vs s10: order by the numeric suffix, not lexicographically
-    fn id_rank(v: &serde_json::Value) -> u64 {
-        id_of(v).trim_start_matches('s').parse().unwrap_or(0)
-    }
     match needle {
-        None => {
-            let mut best = &rows[0];
-            for row in rows {
-                if id_rank(row) > id_rank(best) {
-                    best = row;
-                }
-            }
-            Ok(id_of(best).to_string())
-        }
+        None => rows
+            .last()
+            .map(|row| Ok(id_of(row).to_string()))
+            .unwrap_or_else(|| Err("no live sessions on the server".to_string())),
         Some(n) => {
             // exact id wins even when it is also a prefix of others
             // (`ka attach s1` must work while `s10` exists)
@@ -268,21 +259,34 @@ mod tests {
 
     #[test]
     fn session_picking_prefers_exact_then_prefix_then_title_then_newest() {
+        // ids are 32 hex chars; the server lists oldest-first
         let rows = vec![
-            json!({"id": "s1", "title": "fix the parser"}),
-            json!({"id": "s2", "title": "write docs"}),
-            json!({"id": "s10", "title": "refactor engine"}),
+            json!({"id": "0a1b2c3d4e5f60718293a4b5c6d7e8f9", "title": "fix the parser"}),
+            json!({"id": "1a1b2c3d4e5f60718293a4b5c6d7e8f9", "title": "write docs"}),
+            json!({"id": "2a1b2c3d4e5f60718293a4b5c6d7e8f9", "title": "refactor engine"}),
         ];
-        // None → newest (highest id)
-        assert_eq!(super::pick_session(None, &rows).unwrap(), "s10");
+        // None → newest (last row in creation order)
+        assert_eq!(
+            super::pick_session(None, &rows).unwrap(),
+            "2a1b2c3d4e5f60718293a4b5c6d7e8f9"
+        );
         // id prefix, unique
-        assert_eq!(super::pick_session(Some("s2"), &rows).unwrap(), "s2");
-        // exact id wins even when it is also a prefix of s10
-        assert_eq!(super::pick_session(Some("s1"), &rows).unwrap(), "s1");
-        // id prefix ambiguity is an error ("s" matches everything)
-        assert!(super::pick_session(Some("s"), &rows).is_err());
+        assert_eq!(
+            super::pick_session(Some("1a1b"), &rows).unwrap(),
+            "1a1b2c3d4e5f60718293a4b5c6d7e8f9"
+        );
+        // exact id wins even when it is also a prefix of another
+        assert_eq!(
+            super::pick_session(Some("0a1b2c3d4e5f60718293a4b5c6d7e8f9"), &rows).unwrap(),
+            "0a1b2c3d4e5f60718293a4b5c6d7e8f9"
+        );
+        // a shared prefix is ambiguous (matches two ids)
+        assert!(super::pick_session(Some("a1b2c3d4e5f6"), &rows).is_err());
         // title substring fallback
-        assert_eq!(super::pick_session(Some("docs"), &rows).unwrap(), "s2");
+        assert_eq!(
+            super::pick_session(Some("docs"), &rows).unwrap(),
+            "1a1b2c3d4e5f60718293a4b5c6d7e8f9"
+        );
         assert!(super::pick_session(Some("nope"), &rows).is_err());
     }
 

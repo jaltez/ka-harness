@@ -67,9 +67,16 @@ pub fn run(cmd: WorktreeCmd) -> Result<ExitCode, String> {
             }
             match &branch {
                 Some(b) => {
+                    validate_branch(b)?;
                     git(
                         &root,
-                        &["worktree", "add", wt.to_string_lossy().as_ref(), b.as_str()],
+                        &[
+                            "worktree",
+                            "add",
+                            "--",
+                            wt.to_string_lossy().as_ref(),
+                            b.as_str(),
+                        ],
                     )?;
                     println!("worktree {} on existing branch {b}", wt.display());
                 }
@@ -82,6 +89,7 @@ pub fn run(cmd: WorktreeCmd) -> Result<ExitCode, String> {
                             "add",
                             "-b",
                             new_branch.as_str(),
+                            "--",
                             wt.to_string_lossy().as_ref(),
                         ],
                     )?;
@@ -113,14 +121,15 @@ pub fn run(cmd: WorktreeCmd) -> Result<ExitCode, String> {
                 .and_then(|e| e.branch);
             git(
                 &root,
-                &["worktree", "remove", wt.to_string_lossy().as_ref()],
+                &["worktree", "remove", "--", wt.to_string_lossy().as_ref()],
             )?;
             println!("removed worktree {}", wt.display());
             if delete_branch {
                 let branch = branch.ok_or_else(|| {
                     "cannot --delete-branch: the worktree had no branch checked out".to_string()
                 })?;
-                git(&root, &["branch", "-d", branch.as_str()])?;
+                validate_branch(&branch)?;
+                git(&root, &["branch", "-d", "--", branch.as_str()])?;
                 println!("deleted branch {branch}");
             }
             Ok(ExitCode::SUCCESS)
@@ -189,9 +198,11 @@ pub(crate) fn parse_porcelain(text: &str) -> Vec<WorktreeEntry> {
     entries
 }
 
-/// Worktree names are single path components under .worktrees/.
+/// Worktree names are single path components under .worktrees/ and must
+/// not start with '-' (prevents git option injection).
 fn validate_name(name: &str) -> Result<(), String> {
     let ok = !name.is_empty()
+        && !name.starts_with('-')
         && name != "."
         && name != ".."
         && name
@@ -201,10 +212,21 @@ fn validate_name(name: &str) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "worktree name {name:?} must be a single path component \
+            "worktree name {name:?} must be a single path component not starting with '-' \
              (letters, digits, '-', '_', '.')"
         ))
     }
+}
+
+/// Branch names must be non-empty and must not start with '-' (prevents
+/// git flag injection such as `--detach` or `--force`).
+fn validate_branch(branch: &str) -> Result<(), String> {
+    if branch.is_empty() || branch.starts_with('-') {
+        return Err(format!(
+            "branch name {branch:?} must be non-empty and must not start with '-'"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

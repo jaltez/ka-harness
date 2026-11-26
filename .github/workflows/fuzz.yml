@@ -1,0 +1,63 @@
+name: Fuzz
+
+on:
+  schedule:
+    # Weekly on Sundays at 03:00 UTC
+    - cron: "0 3 * * 0"
+  workflow_dispatch:
+    inputs:
+      duration_seconds:
+        description: "Max fuzz time per target (seconds)"
+        required: false
+        default: "60"
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: cargo-fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - fuzz_sse
+          - fuzz_json_repair
+          - fuzz_readers_pdf
+          - fuzz_readers_archive
+          - fuzz_bashp
+          - fuzz_strand_read
+          - fuzz_proxy_host
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install nightly Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Cache corpus
+        uses: actions/cache@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+
+      - name: Run ${{ matrix.target }}
+        env:
+          FUZZ_SECONDS: ${{ github.event.inputs.duration_seconds || '60' }}
+        run: |
+          cargo +nightly fuzz run "${{ matrix.target }}" \
+            --fuzz-dir fuzz \
+            -- -max_total_time="${FUZZ_SECONDS}"
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore

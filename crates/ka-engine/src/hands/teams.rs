@@ -291,20 +291,46 @@ impl TeamTable {
                 skills: Vec::new(),
             })
             .await;
-        self.inner.members.lock().push(Member {
-            name: name.to_string(),
-            session_name: session_name.clone(),
-            state: MemberState::Working,
-            turns: 0,
-            last: None,
-            error: None,
-            cmds: Some(handle.commands.clone()),
-            engine: task.abort_handle(),
-        });
+        {
+            let mut members = self.inner.members.lock();
+            // Re-check under lock after spawning to close the TOCTOU window
+            // if two concurrent spawns raced on the same name or the cap.
+            members.retain(|m| !(m.name == name && m.state == MemberState::Dead));
+            if members.iter().any(|m| m.name == name) {
+                task.abort();
+                drop(handle.commands);
+                return Err(format!("team: member '{name}' already exists"));
+            }
+            let live = members
+                .iter()
+                .filter(|m| m.state != MemberState::Dead)
+                .count();
+            if live as u32 >= self.inner.max {
+                task.abort();
+                drop(handle.commands);
+                return Err(format!(
+                    "team: the team is full ({live}/{} members) — dismiss one first \
+                     ([delegate] team_max)",
+                    self.inner.max
+                ));
+            }
+            members.push(Member {
+                name: name.to_string(),
+                session_name: session_name.clone(),
+                state: MemberState::Working,
+                turns: 0,
+                last: None,
+                error: None,
+                cmds: Some(handle.commands.clone()),
+                engine: task.abort_handle(),
+            });
+        }
         // the watcher consumes the member's event stream: reply
-        // capture, ask auto-deny, turn accounting, completion notes
+        // capture, ask auto-deny, turn accounting, completion notes.
+        // Weak ref breaks the Arc<TeamInner> cycle so dropping TeamTable
+        // runs TeamInner::drop and aborts all member engines.
         tokio::spawn(watch_member(
-            Arc::clone(&self.inner),
+            Arc::downgrade(&self.inner),
             name.to_string(),
             handle.events,
         ));
@@ -486,7 +512,7 @@ impl TeamTable {
     /// One finished member turn: account it, store the reply, emit the
     /// completion note (suppressed for dismissed members).
     async fn finish_turn(inner: &TeamInner, name: &str, reply: String, failed: Option<String>) {
-        let note = {
+        let mut note = {
             let mut members = inner.members.lock();
             let Some(m) = members.iter_mut().find(|m| m.name == name) else {
                 return;
@@ -511,20 +537,19 @@ impl TeamTable {
                     .map(str::to_string)
                     .unwrap_or_else(|| "no reply".to_string())
             };
-            let mut note = format!(
+            format!(
                 "{}{} — {}",
                 TEAM_NOTE_PREFIX,
                 name,
                 super::delegate::truncate_for_note(&head, NOTE_CAP)
-            );
-            if reply.len() > SPILL_AT {
-                match Spill::new().park(&reply) {
-                    Ok(ptr) => note.push_str(&format!(" (full: {ptr})")),
-                    Err(_) => note.push_str(" (full reply via team_read — spilling failed)"),
-                }
-            }
-            note
+            )
         };
+        if reply.len() > SPILL_AT {
+            match Spill::new().park(&reply) {
+                Ok(ptr) => note.push_str(&format!(" (full: {ptr})")),
+                Err(_) => note.push_str(" (full reply via team_read — spilling failed)"),
+            }
+        }
         inner
             .events
             .send(ka_protocol::Event::Note { message: note })
@@ -549,12 +574,27 @@ impl Drop for TeamInner {
     }
 }
 
+/// Pick the deny/decline option index from an Ask prompt's questions,
+/// falling back to the last option (never assuming index 2 blindly).
+pub(super) fn deny_choice(questions: &[ka_protocol::AskQuestion]) -> usize {
+    let Some(q) = questions.first() else {
+        return 2;
+    };
+    if let Some(idx) = q.options.iter().position(|o| {
+        let l = o.to_ascii_lowercase();
+        l.contains("deny") || l.contains("decline") || l.contains("no") || l.contains("cancel")
+    }) {
+        return idx;
+    }
+    q.options.len().saturating_sub(1)
+}
+
 /// One member's event watcher: reply capture, ask auto-deny (nobody is
 /// there to answer — the deny option is answered on the member's
 /// behalf), turn accounting, and the state machine. Exits when the
-/// member engine ends.
+/// member engine ends or the parent table drops.
 async fn watch_member(
-    inner: Arc<TeamInner>,
+    inner: std::sync::Weak<TeamInner>,
     name: String,
     mut events: mpsc::Receiver<ka_protocol::Event>,
 ) {
@@ -566,6 +606,9 @@ async fn watch_member(
     // spurious idle that must not flip a freshly spawned member to done
     let mut turns_seen = 0u32;
     while let Some(evt) = events.recv().await {
+        let Some(inner) = inner.upgrade() else {
+            break;
+        };
         match evt {
             ka_protocol::Event::Delta {
                 kind: ka_protocol::DeltaKind::Text(t),
@@ -573,15 +616,23 @@ async fn watch_member(
             ka_protocol::Event::Delta {
                 kind: ka_protocol::DeltaKind::Thought(t),
             } => thought.push_str(&t),
-            ka_protocol::Event::Ask { id, .. } => {
-                if let Some(m) = inner.members.lock().iter().find(|m| m.name == name) {
-                    if let Some(cmds) = &m.cmds {
-                        // options are [allow, always, deny] — deny = 2
-                        let _ = cmds.try_send(ka_protocol::Command::Answer {
-                            question: id,
-                            choice: 2,
-                        });
-                    }
+            ka_protocol::Event::Ask { id, questions } => {
+                let choice = deny_choice(&questions);
+                let cmds = inner
+                    .members
+                    .lock()
+                    .iter()
+                    .find(|m| m.name == name)
+                    .and_then(|m| m.cmds.clone());
+                if let Some(cmds) = cmds {
+                    tokio::spawn(async move {
+                        let _ = cmds
+                            .send(ka_protocol::Command::Answer {
+                                question: id,
+                                choice,
+                            })
+                            .await;
+                    });
                 }
             }
             ka_protocol::Event::Error { message, .. } => last_error = Some(message),
@@ -627,13 +678,15 @@ async fn watch_member(
     // the member engine ended (dismiss close, parent drop, or crash):
     // the row reads dead — but never resurrect a dismissed member's
     // state change, and never note (the dismissal already did)
-    if let Some(m) = inner
-        .members
-        .lock()
-        .iter_mut()
-        .find(|m| m.name == name && m.state != MemberState::Dead)
-    {
-        m.state = MemberState::Dead;
+    if let Some(inner) = inner.upgrade() {
+        if let Some(m) = inner
+            .members
+            .lock()
+            .iter_mut()
+            .find(|m| m.name == name && m.state != MemberState::Dead)
+        {
+            m.state = MemberState::Dead;
+        }
     }
 }
 
@@ -889,7 +942,7 @@ mod tests {
     #[tokio::test]
     async fn watcher_auto_denies_asks() {
         let (table, mut cmds_rx, _notes) = one_row_table("ask");
-        let inner = Arc::clone(&table.inner);
+        let inner = Arc::downgrade(&table.inner);
         let (evt_tx, evt_rx) = mpsc::channel(8);
         let watcher = tokio::spawn(watch_member(inner, "scout".to_string(), evt_rx));
         evt_tx
@@ -917,7 +970,7 @@ mod tests {
     #[tokio::test]
     async fn watcher_notes_turns_and_marks_engine_death() {
         let (table, _cmds, mut notes) = one_row_table("notes");
-        let inner = Arc::clone(&table.inner);
+        let inner = Arc::downgrade(&table.inner);
         let (evt_tx, evt_rx) = mpsc::channel(8);
         let watcher = tokio::spawn(watch_member(inner, "scout".to_string(), evt_rx));
         // the bootstrap idle (before any turn) must not flip the row

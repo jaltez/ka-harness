@@ -132,7 +132,7 @@ pub async fn post_sse(
                     .get(reqwest::header::RETRY_AFTER)
                     .and_then(|v| v.to_str().ok())
                     .and_then(|v| v.trim().parse::<u64>().ok());
-                let body = resp.text().await.unwrap_or_default();
+                let body = read_error_body(resp).await;
                 let err = classify_status(status, &body);
                 if !err.retryable || attempt >= attempts {
                     return Err(err);
@@ -157,6 +157,28 @@ pub async fn post_sse(
             }
         }
     }
+}
+
+const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+const ERROR_BODY_TIMEOUT: Duration = Duration::from_secs(5);
+
+async fn read_error_body(mut resp: reqwest::Response) -> String {
+    let mut buf = Vec::new();
+    let _ = tokio::time::timeout(ERROR_BODY_TIMEOUT, async {
+        while let Ok(Some(chunk)) = resp.chunk().await {
+            let remaining = MAX_ERROR_BODY_BYTES.saturating_sub(buf.len());
+            if remaining == 0 {
+                break;
+            }
+            let take = chunk.len().min(remaining);
+            buf.extend_from_slice(&chunk[..take]);
+            if buf.len() >= MAX_ERROR_BODY_BYTES {
+                break;
+            }
+        }
+    })
+    .await;
+    String::from_utf8_lossy(&buf).into_owned()
 }
 
 fn clone_headers(headers: &[(String, String)]) -> Result<reqwest::header::HeaderMap, WireError> {

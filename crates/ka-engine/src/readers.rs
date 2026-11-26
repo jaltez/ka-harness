@@ -253,7 +253,7 @@ fn split_obj(body: &[u8]) -> (String, Option<Vec<u8>>) {
     (dict, Some(data.to_vec()))
 }
 
-/// Scan every classic `N G obj … endobj` unit in the file.
+/// Scan every classic `N G obj … endobj` unit in the file (single-pass O(N)).
 fn scan_objects(bytes: &[u8]) -> Vec<PdfObj> {
     let mut objs = Vec::new();
     let mut pos = 0usize;
@@ -265,19 +265,21 @@ fn scan_objects(bytes: &[u8]) -> Vec<PdfObj> {
             && parse_obj_header(&bytes[..idx]).is_some();
         let body_start = idx + b"obj".len();
         if header_ok {
-            if let Some(end_rel) = find(&bytes[body_start..], b"endobj") {
-                if let Some((num, _gen)) = parse_obj_header(&bytes[..idx]) {
-                    let (dict, stream) = split_obj(&bytes[body_start..body_start + end_rel]);
-                    objs.push(PdfObj {
-                        num,
-                        flated: dict.contains("/FlateDecode"),
-                        dict,
-                        stream,
-                    });
-                }
-                pos = body_start + end_rel + b"endobj".len();
-                continue;
+            let Some(end_rel) = find(&bytes[body_start..], b"endobj") else {
+                // No remaining `endobj` anywhere in the rest of the file.
+                break;
+            };
+            if let Some((num, _gen)) = parse_obj_header(&bytes[..idx]) {
+                let (dict, stream) = split_obj(&bytes[body_start..body_start + end_rel]);
+                objs.push(PdfObj {
+                    num,
+                    flated: dict.contains("/FlateDecode"),
+                    dict,
+                    stream,
+                });
             }
+            pos = body_start + end_rel + b"endobj".len();
+            continue;
         }
         pos = body_start;
     }
@@ -635,18 +637,25 @@ fn content_stream_text(data: &[u8]) -> String {
         .join("\n")
 }
 
+/// Sentinel for "the PDF decompresses over the extraction cap": callers
+/// must surface it, never treat it as a broken stream.
+const PDF_OVER_CAP: &str = "the PDF decompresses over the extraction cap";
+
 /// Decode one content stream (inflating it when the object says
-/// FlateDecode) and extract its text.
-fn decode_stream(obj: &PdfObj) -> Result<String, String> {
+/// FlateDecode) bounded by `budget`, returning the raw decoded bytes.
+fn decode_stream_bytes(obj: &PdfObj, budget: usize) -> Result<Vec<u8>, String> {
     let Some(data) = &obj.stream else {
-        return Ok(String::new());
+        return Ok(Vec::new());
     };
-    let decoded = if obj.flated {
-        zlib_inflate(data, PDF_STREAM_CAP)?
+    let cap = PDF_STREAM_CAP.min(budget);
+    if obj.flated {
+        zlib_inflate(data, cap)
     } else {
-        data.clone()
-    };
-    Ok(content_stream_text(&decoded))
+        if data.len() > cap {
+            return Err(PDF_OVER_CAP.to_string());
+        }
+        Ok(data.clone())
+    }
 }
 
 /// Text of every page, resolved through the page tree when possible
@@ -691,13 +700,14 @@ pub fn pdf_text(bytes: &[u8]) -> Result<String, String> {
                     let Some(&cidx) = by_num.get(&r) else {
                         continue;
                     };
-                    let mut text = decode_stream(&objs[cidx])?;
-                    if text.len() > budget {
-                        return Err("the PDF decompresses over the extraction cap".to_string());
+                    let decoded = decode_stream_bytes(&objs[cidx], budget)?;
+                    if decoded.len() > budget {
+                        return Err(PDF_OVER_CAP.to_string());
                     }
-                    budget -= text.len();
+                    budget -= decoded.len();
+                    let text = content_stream_text(&decoded);
                     if !text.is_empty() {
-                        pages.push(std::mem::take(&mut text));
+                        pages.push(text);
                     }
                 }
             }
@@ -709,16 +719,22 @@ pub fn pdf_text(bytes: &[u8]) -> Result<String, String> {
                 if o.stream.is_none() || o.dict.contains("/Image") || o.dict.contains("/FontFile") {
                     continue;
                 }
-                let text = match decode_stream(o) {
-                    Ok(t) => t,
+                let decoded = match decode_stream_bytes(o, budget) {
+                    Ok(d) => d,
+                    // an exhausted extraction budget is NOT a broken stream:
+                    // surface it instead of silently truncating the text
+                    Err(e) if e == PDF_OVER_CAP => return Err(e),
                     Err(_) => continue, // a broken non-text stream must not sink the read
                 };
-                if text.len() > budget {
-                    return Err("the PDF decompresses over the extraction cap".to_string());
+                if decoded.len() > budget {
+                    return Err(PDF_OVER_CAP.to_string());
                 }
-                budget -= text.len();
-                if text.contains("Tj") || text.contains("TJ") {
-                    pages.push(text);
+                budget -= decoded.len();
+                if find(&decoded, b"Tj").is_some() || find(&decoded, b"TJ").is_some() {
+                    let text = content_stream_text(&decoded);
+                    if !text.is_empty() {
+                        pages.push(text);
+                    }
                 }
             }
             if !pages.is_empty() {
@@ -835,6 +851,7 @@ pub struct ZipEntry {
 }
 
 const ZIP_ENTRY_CAP: usize = 8192;
+const MAX_ZIP_CD_BYTES: u64 = 16 * 1024 * 1024;
 
 impl ZipDir {
     /// Parse the end-of-central-directory record and central directory.
@@ -852,6 +869,9 @@ impl ZipDir {
             .map_err(|e| format!("zip: {e}"))?;
         let eocd = rfind(&tail, &[0x50, 0x4B, 0x05, 0x06])
             .ok_or_else(|| "not a zip container (no end-of-central-directory)".to_string())?;
+        if eocd + 22 > tail.len() {
+            return Err("zip is corrupt (truncated end-of-central-directory)".to_string());
+        }
         let rd16 = |at: usize| u16::from_le_bytes([tail[at], tail[at + 1]]);
         let rd32 =
             |at: usize| u32::from_le_bytes([tail[at], tail[at + 1], tail[at + 2], tail[at + 3]]);
@@ -860,7 +880,13 @@ impl ZipDir {
         }
         let cd_size = u64::from(rd32(eocd + 12));
         let cd_offset = u64::from(rd32(eocd + 16));
-        if cd_offset + cd_size > len {
+        if cd_size > MAX_ZIP_CD_BYTES {
+            return Err(format!(
+                "zip central directory is over the {} MB cap",
+                MAX_ZIP_CD_BYTES / (1024 * 1024)
+            ));
+        }
+        if cd_offset.checked_add(cd_size).is_none_or(|end| end > len) {
             return Err("zip is corrupt (central directory out of bounds)".to_string());
         }
         file.seek(std::io::SeekFrom::Start(cd_offset))
@@ -1038,8 +1064,15 @@ pub fn tar_entries(data: &[u8]) -> Result<Vec<TarEntry>, String> {
             .map_err(|_| format!("tar is corrupt (bad size field at offset {pos})"))?;
         let typeflag = hdr[156];
         let data_at = pos + 512;
-        let round = size.div_ceil(512) * 512;
-        let next = data_at + round as usize;
+        let round = size
+            .div_ceil(512)
+            .checked_mul(512)
+            .ok_or_else(|| format!("tar is corrupt (size overflow at offset {pos})"))?;
+        let round_usize = usize::try_from(round)
+            .map_err(|_| format!("tar is corrupt (size overflow at offset {pos})"))?;
+        let next = data_at
+            .checked_add(round_usize)
+            .ok_or_else(|| format!("tar is corrupt (offset overflow at offset {pos})"))?;
 
         let header_name = tar_cstr(hdr, 0, 100);
         match typeflag {
@@ -1070,12 +1103,19 @@ pub fn tar_entries(data: &[u8]) -> Result<Vec<TarEntry>, String> {
             }
             b'L' => {
                 // GNU long name: the payload IS the next entry's name
-                let end = (data_at + size as usize).min(data.len());
-                long_name = Some(
-                    tar_cstr(&data[data_at..end], 0, end - data_at)
-                        .trim()
-                        .to_string(),
-                );
+                let size_usize = usize::try_from(size)
+                    .map_err(|_| format!("tar is corrupt (long-name overflow at offset {pos})"))?;
+                let end = data_at
+                    .checked_add(size_usize)
+                    .map(|e| e.min(data.len()))
+                    .unwrap_or(data.len());
+                if data_at <= end {
+                    long_name = Some(
+                        tar_cstr(&data[data_at..end], 0, end - data_at)
+                            .trim()
+                            .to_string(),
+                    );
+                }
             }
             // dirs-of-other-kinds (symlinks, pax headers, devices…) are
             // skipped, not listed

@@ -1,9 +1,13 @@
 # Vendored by `ka action init` — ka automation for pull requests (AUTO-01).
 # Triggers: a manual dispatch (with a prompt input) or a PR labeled `ka`.
-# The job checks out the PR at its pinned HEAD SHA, installs the released
-# ka binary (sha256-verified against the release assets), runs ka in
-# read-only mode with the issue/PR body (or dispatch input) as the prompt,
-# and posts the final answer as a PR comment.
+# Uses the standard `pull_request` event so untrusted fork PR checkouts
+# never execute with repository secrets. Fork PRs are therefore SKIPPED
+# for label runs (they have no secrets and a read-only token); maintainers
+# run the agent on a branch in this repository instead. The job checks out
+# the PR at its pinned HEAD SHA, installs the released ka binary (sha256
+# verified against the release assets), runs ka in read-only mode with the
+# issue/PR body (or dispatch input) as the prompt, and posts the final
+# answer as a PR comment.
 #
 # Secret surface: the job receives ONLY KA_MODEL and the KA_*_API_KEY
 # provider keys — no write tokens beyond the built-in github.token, which
@@ -18,7 +22,7 @@ on:
         description: "Prompt for ka (used as-is; a PR label run uses the PR body instead)"
         required: false
         default: ""
-  pull_request_target:
+  pull_request:
     types: [labeled]
 
 permissions:
@@ -31,11 +35,14 @@ concurrency:
 
 jobs:
   ka:
-    # PR runs fire only when the added label is `ka`; manual dispatch
-    # always runs (the label guard does not apply to it)
+    # PR runs fire only when the added label is `ka` AND the head repo is
+    # this repository (forks get no secrets; running them only yields a
+    # red check with nothing to say); manual dispatch always runs.
     if: >-
       ${{
-        github.event_name == 'workflow_dispatch' || github.event.label.name == 'ka'
+        github.event_name == 'workflow_dispatch'
+        || (github.event.label.name == 'ka'
+            && !github.event.pull_request.head.repo.fork)
       }}
     runs-on: ubuntu-latest
     env:
@@ -52,7 +59,7 @@ jobs:
       # attacker-controlled and must not reach the shell as script text.
       KA_PROMPT: >-
         ${{
-          github.event_name == 'pull_request_target'
+          github.event_name == 'pull_request'
           && github.event.pull_request.body
           || inputs.prompt
         }}
@@ -60,25 +67,42 @@ jobs:
       - name: Check out the PR at its pinned HEAD SHA
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
-          # the pull_request_target event checks out the BASE by default;
-          # pin the PR head so the reviewed tree is the proposed one
+          # pin the exact PR head SHA so the reviewed tree is immutable
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
+          # the agent runs inside this checkout: never leave the job
+          # token in .git/config where a read-only `cat`/`git` can reach it
+          persist-credentials: false
 
       - name: Install ka from the latest release (checksum verified)
         run: |
           set -euo pipefail
           asset="ka-x86_64-unknown-linux-musl.tar.gz"
           api="https://api.github.com/repos/jaltez/ka-harness/releases/latest"
-          url="$(curl -fsSL --header 'User-Agent: ka-action' "$api" \
+          release_json="$(curl -fsSL --proto '=https' --tlsv1.2 --header 'User-Agent: ka-action' "$api")"
+          url="$(printf '%s' "$release_json" \
             | jq -r --arg asset "$asset" \
                 '.assets[] | select(.name == $asset) | .browser_download_url')"
+          sha_url="$(printf '%s' "$release_json" \
+            | jq -r --arg asset "$asset.sha256" \
+                '.assets[] | select(.name == $asset) | .browser_download_url')"
+          sig_url="$(printf '%s' "$release_json" \
+            | jq -r --arg asset "$asset.sig" \
+                '.assets[] | select(.name == $asset) | .browser_download_url')"
           test -n "$url" || { echo "release asset $asset not found" >&2; exit 1; }
-          curl -fsSL --header 'User-Agent: ka-action' -o "$asset" "$url"
-          curl -fsSL --header 'User-Agent: ka-action' -o "$asset.sha256" "$url.sha256"
+          test -n "$sha_url" || { echo "release checksum $asset.sha256 not found" >&2; exit 1; }
+          curl -fsSL --proto '=https' --tlsv1.2 --header 'User-Agent: ka-action' -o "$asset" "$url"
+          curl -fsSL --proto '=https' --tlsv1.2 --header 'User-Agent: ka-action' -o "$asset.sha256" "$sha_url"
           # refuse a tampered or partial download before it ever runs
           sha256sum --check "$asset.sha256"
-          tar -xzf "$asset"
+          # Optional ed25519 signature verification: every official release
+          # also ships "$asset.sig" (base64 ed25519 signature over "$asset").
+          # Pin your trusted KA_RELEASE_PUBKEY and verify "$asset.sig" here
+          # if your org requires offline cryptographic release pinning.
+          if [ -n "$sig_url" ]; then
+            curl -fsSL --proto '=https' --tlsv1.2 --header 'User-Agent: ka-action' -o "$asset.sig" "$sig_url"
+          fi
+          tar -xzf "$asset" ka
           ./ka --version
 
       - name: Run ka (read-only) on the issue/PR body
@@ -93,10 +117,10 @@ jobs:
             echo "no prompt: label a PR with 'ka' (body is the prompt) or pass the workflow_dispatch 'prompt' input" >&2
             exit 1
           fi
-          ./ka run --mode readonly --print text "$KA_PROMPT" > ka-answer.md
+          ./ka run --mode readonly --print text -- "$KA_PROMPT" > ka-answer.md
 
       - name: Post the answer as a PR comment
-        if: ${{ github.event_name == 'pull_request_target' }}
+        if: ${{ github.event_name == 'pull_request' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

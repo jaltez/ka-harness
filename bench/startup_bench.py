@@ -87,9 +87,7 @@ def side_env(work, name, spills, repo=False, files=40):
         "XDG_DATA_HOME": os.path.join(root, "data"),
         "KA_DATA_DIR": os.path.join(root, "data", "ka"),
         "TMPDIR": os.path.join(root, "tmp"),
-        "PATH": "/usr/local/go/bin:/snap/bin:/root/go/bin:/root/.local/bin:/root/bin:"
-        "/root/.opencode/bin:/root/.config/herd-lite/bin:/root/.bun/bin:/usr/local/sbin:"
-        "/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "PATH": os.environ.get("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"),
     }
     for key in ("HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME", "KA_DATA_DIR", "TMPDIR"):
         os.makedirs(env[key], exist_ok=True)

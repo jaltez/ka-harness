@@ -10,7 +10,7 @@
 //! SSRF-guarded against private targets.
 
 use std::future::Future;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -130,6 +130,30 @@ async fn chained_search(
     ))
 }
 
+/// Search response size cap (2 MiB) and timeout (20s).
+const SEARCH_BODY_CAP: usize = 2 * 1024 * 1024;
+const SEARCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Stream a response body up to `cap` bytes; returns an error if the
+/// response exceeds `cap` so a hostile endpoint cannot OOM ka.
+async fn read_body_capped(
+    mut resp: reqwest::Response,
+    cap: usize,
+    label: &str,
+) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|e| format!("{label}: {e}"))? {
+        if out.len() + chunk.len() > cap {
+            return Err(format!(
+                "{label}: response body exceeds {} KB cap",
+                cap / 1024
+            ));
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
+}
+
 /// DuckDuckGo HTML endpoint (keyless): `html.duckduckgo.com/html/?q=`
 /// serves an HTML result page; anchors carry `result__a` (title/link)
 /// and `result__snippet` classes. Hits often point at DDG's redirector
@@ -141,18 +165,17 @@ async fn ddg_search(provider: &SearchProvider, query: &str) -> Result<Vec<Search
         urlencode(query)
     );
     let client = reqwest::Client::new();
-    let html = client
+    let resp = client
         .get(&url)
         .header("User-Agent", "ka-web-search")
-        .timeout(std::time::Duration::from_secs(20))
+        .timeout(SEARCH_TIMEOUT)
         .send()
         .await
         .map_err(|e| format!("duckduckgo: {e}"))?
         .error_for_status()
-        .map_err(|e| format!("duckduckgo: {e}"))?
-        .text()
-        .await
         .map_err(|e| format!("duckduckgo: {e}"))?;
+    let bytes = read_body_capped(resp, SEARCH_BODY_CAP, "duckduckgo").await?;
+    let html = String::from_utf8_lossy(&bytes);
     Ok(parse_ddg_html(&html))
 }
 
@@ -176,19 +199,18 @@ async fn searxng_search(provider: &SearchProvider, query: &str) -> Result<Vec<Se
         urlencode(query)
     );
     let client = reqwest::Client::new();
-    let resp: Value = client
+    let resp = client
         .get(&url)
         .header("User-Agent", "ka-web-search")
         .header("Accept", "application/json")
-        .timeout(std::time::Duration::from_secs(20))
+        .timeout(SEARCH_TIMEOUT)
         .send()
         .await
         .map_err(|e| format!("searxng: {e}"))?
         .error_for_status()
-        .map_err(|e| format!("searxng: {e}"))?
-        .json()
-        .await
-        .map_err(|e| format!("searxng JSON: {e}"))?;
+        .map_err(|e| format!("searxng: {e}"))?;
+    let bytes = read_body_capped(resp, SEARCH_BODY_CAP, "searxng").await?;
+    let resp: Value = serde_json::from_slice(&bytes).map_err(|e| format!("searxng JSON: {e}"))?;
     Ok(resp["results"]
         .as_array()
         .map(|a| {
@@ -343,18 +365,19 @@ async fn provider_search_with(
     let hits: Vec<SearchHit> = match provider.provider.as_str() {
         "tavily" => {
             let url = format!("{}/search", base_for(provider, "https://api.tavily.com"));
-            let resp: Value = client
+            let resp = client
                 .post(&url)
                 .header("Authorization", format!("Bearer {key}"))
+                .timeout(SEARCH_TIMEOUT)
                 .json(&json!({"query": query, "max_results": 5}))
                 .send()
                 .await
                 .map_err(|e| format!("tavily: {e}"))?
                 .error_for_status()
-                .map_err(|e| format!("tavily: {e}"))?
-                .json()
-                .await
-                .map_err(|e| format!("tavily JSON: {e}"))?;
+                .map_err(|e| format!("tavily: {e}"))?;
+            let bytes = read_body_capped(resp, SEARCH_BODY_CAP, "tavily").await?;
+            let resp: Value =
+                serde_json::from_slice(&bytes).map_err(|e| format!("tavily JSON: {e}"))?;
             resp["results"]
                 .as_array()
                 .map(|a| {
@@ -374,18 +397,19 @@ async fn provider_search_with(
                 base_for(provider, "https://api.search.brave.com"),
                 urlencode(query)
             );
-            let resp: Value = client
+            let resp = client
                 .get(&url)
                 .header("X-Subscription-Token", key)
                 .header("Accept", "application/json")
+                .timeout(SEARCH_TIMEOUT)
                 .send()
                 .await
                 .map_err(|e| format!("brave: {e}"))?
                 .error_for_status()
-                .map_err(|e| format!("brave: {e}"))?
-                .json()
-                .await
-                .map_err(|e| format!("brave JSON: {e}"))?;
+                .map_err(|e| format!("brave: {e}"))?;
+            let bytes = read_body_capped(resp, SEARCH_BODY_CAP, "brave").await?;
+            let resp: Value =
+                serde_json::from_slice(&bytes).map_err(|e| format!("brave JSON: {e}"))?;
             resp["web"]["results"]
                 .as_array()
                 .map(|a| {
@@ -405,17 +429,18 @@ async fn provider_search_with(
                 base_for(provider, "https://api.bing.microsoft.com"),
                 urlencode(query)
             );
-            let resp: Value = client
+            let resp = client
                 .get(&url)
                 .header("Ocp-Apim-Subscription-Key", key)
+                .timeout(SEARCH_TIMEOUT)
                 .send()
                 .await
                 .map_err(|e| format!("bing: {e}"))?
                 .error_for_status()
-                .map_err(|e| format!("bing: {e}"))?
-                .json()
-                .await
-                .map_err(|e| format!("bing JSON: {e}"))?;
+                .map_err(|e| format!("bing: {e}"))?;
+            let bytes = read_body_capped(resp, SEARCH_BODY_CAP, "bing").await?;
+            let resp: Value =
+                serde_json::from_slice(&bytes).map_err(|e| format!("bing JSON: {e}"))?;
             resp["webPages"]["value"]
                 .as_array()
                 .map(|a| {
@@ -492,21 +517,62 @@ const IMPERATIVE_SHAPE: &str = "imperative instruction shape";
 /// The label the fake `<tool_use>` markup shape reports.
 const TOOL_USE_SHAPE: &str = "<tool_use> markup shape";
 
+/// Normalize text before prompt-injection matching: decode numeric/named
+/// HTML entities, strip zero-width / format obfuscation characters,
+/// lowercase, and collapse runs of horizontal whitespace per line.
+fn normalize_for_injection(text: &str) -> String {
+    let decoded = decode_entities(text);
+    let mut out = String::with_capacity(decoded.len());
+    let mut prev_space = false;
+    for c in decoded.chars() {
+        if matches!(
+            c,
+            '\u{200B}'..='\u{200F}' | '\u{FEFF}' | '\u{2060}' | '\u{00AD}'
+        ) {
+            continue;
+        }
+        if c == '\n' || c == '\r' {
+            out.push('\n');
+            prev_space = false;
+            continue;
+        }
+        if c.is_whitespace() {
+            if !prev_space {
+                out.push(' ');
+                prev_space = true;
+            }
+            continue;
+        }
+        prev_space = false;
+        for lc in c.to_lowercase() {
+            out.push(lc);
+        }
+    }
+    out
+}
+
 /// Deterministic prompt-injection scan for web results (PERM-08a).
 /// Returns the labels of every marker the text matched; empty = clean.
 /// Pure and side-effect-free so it stays table-testable — the voice
 /// layer applies the warning prefix and the optional fast-role
 /// classifier (`[guards] injection_check`) on top of this.
 pub fn injection_markers(text: &str) -> Vec<&'static str> {
-    let lower = text.to_lowercase();
+    let lower = normalize_for_injection(text);
     let mut found: Vec<&'static str> = Vec::new();
     for &phrase in INJECTION_PHRASES {
         if lower.contains(phrase) && !found.contains(&phrase) {
             found.push(phrase);
         }
     }
-    if lower.contains("<tool_use") && !found.contains(&TOOL_USE_SHAPE) {
-        found.push(TOOL_USE_SHAPE);
+    for (needle, label) in [
+        ("<tool_use", TOOL_USE_SHAPE),
+        ("<|im_start|>", "<|im_start|> delimiter"),
+        ("<system>", "<system> markup"),
+        ("<function_calls>", "<function_calls> markup"),
+    ] {
+        if lower.contains(needle) && !found.contains(&label) {
+            found.push(label);
+        }
     }
     for line in lower.lines() {
         let line = line.trim_start();
@@ -536,46 +602,156 @@ pub fn injection_warning_prefix(markers: &[&str]) -> String {
     )
 }
 
-/// Whether a URL's host is private/loopback/link-local.
-pub fn is_private_host(url: &str) -> bool {
-    let Some(host) = host_of(url) else {
-        return true; // unparseable: treat as private (refuse)
-    };
-    let lower = host.to_ascii_lowercase();
-    if lower == "localhost" || lower.ends_with(".localhost") || lower.ends_with(".local") {
-        return true;
-    }
-    match lower.parse::<IpAddr>() {
-        Ok(IpAddr::V4(v4)) => {
-            v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
+/// Whether `ip` is private, loopback, link-local, CGNAT, unspecified,
+/// multicast, reserved, or an IPv6 translation/tunnel embedding a
+/// private IPv4 address.
+pub(crate) fn is_private_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+                || o[0] == 0 // 0.0.0.0/8
+                || (o[0] == 100 && (o[1] & 0xC0) == 64) // CGNAT 100.64.0.0/10
+                || (o[0] == 198 && (o[1] == 18 || o[1] == 19)) // benchmarking 198.18.0.0/15
+                || (o[0] == 192 && o[1] == 0 && (o[2] == 0 || o[2] == 2))
+                || o[0] >= 240 // reserved 240.0.0.0/4
         }
-        Ok(IpAddr::V6(v6)) => {
-            // unique-local fc00::/7, loopback, link-local fe80::/10 ...
-            let scoped = v6.is_loopback()
-                || (v6.segments()[0] & 0xfe00) == 0xfc00
-                || (v6.segments()[0] & 0xffc0) == 0xfe80;
-            // ... and anything IPv4-mapped (e.g. ::ffff:127.0.0.1) judged
-            // by its embedded v4 address — the mapped spelling must not
-            // slip past the v4 checks
-            scoped
-                || v6
-                    .to_ipv4_mapped()
-                    .is_some_and(|v4| v4.is_loopback() || v4.is_private() || v4.is_link_local())
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            if v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (s[0] & 0xfe00) == 0xfc00 // unique-local fc00::/7
+                || (s[0] & 0xffc0) == 0xfe80
+            // link-local fe80::/10
+            {
+                return true;
+            }
+            // IPv4-mapped ::ffff:a.b.c.d
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_private_ip(IpAddr::V4(v4));
+            }
+            // IPv4-compatible ::a.b.c.d
+            if s[0..6] == [0, 0, 0, 0, 0, 0] {
+                let v4 = std::net::Ipv4Addr::new(
+                    (s[6] >> 8) as u8,
+                    s[6] as u8,
+                    (s[7] >> 8) as u8,
+                    s[7] as u8,
+                );
+                return is_private_ip(IpAddr::V4(v4));
+            }
+            // NAT64 well-known prefix 64:ff9b::/96 and local-use 64:ff9b:1::/48
+            if s[0] == 0x0064 && s[1] == 0xff9b && (s[2] == 0x0001 || s[2..6] == [0, 0, 0, 0]) {
+                return true;
+            }
+            // 6to4 2002::/16 (embeds IPv4 in segments 1..=2)
+            if s[0] == 0x2002 {
+                let v4 = std::net::Ipv4Addr::new(
+                    (s[1] >> 8) as u8,
+                    s[1] as u8,
+                    (s[2] >> 8) as u8,
+                    s[2] as u8,
+                );
+                return is_private_ip(IpAddr::V4(v4));
+            }
+            // Teredo 2001:0000::/32
+            s[0] == 0x2001 && s[1] == 0x0000
         }
-        Err(_) => false, // public hostname: allowed (SSRF via DNS rebinding
-                         // is out of scope for a tool-level guard)
     }
 }
 
-/// Extract the host component of a URL (no external crates).
-fn host_of(url: &str) -> Option<String> {
-    let (_, rest) = url.split_once("://").unwrap_or(("https", url));
-    let rest = rest.split('/').next()?;
-    let rest = rest.rsplit_once('@').map_or(rest, |(_, h)| h);
-    if let Some(inner) = rest.strip_prefix('[') {
-        return inner.split(']').next().map(str::to_string);
+/// Whether a URL's host is private/loopback/link-local (or unparseable).
+/// Uses `reqwest::Url::parse` (WHATWG URL parser), which normalizes
+/// decimal/octal/hex/shorthand IPv4 spellings and strips `?`/`#`.
+pub fn is_private_host(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return true; // unparseable: treat as private (refuse)
+    };
+    let Some(raw_host) = parsed.host_str() else {
+        return true;
+    };
+    let host = raw_host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if host.is_empty()
+        || host == "localhost"
+        || host.ends_with(".localhost")
+        || host.ends_with(".local")
+        || host.ends_with(".internal")
+    {
+        return true;
     }
-    Some(rest.split(':').next()?.to_string())
+    match host.parse::<IpAddr>() {
+        Ok(ip) => is_private_ip(ip),
+        Err(_) => false,
+    }
+}
+
+/// Resolve `url`'s host once, validate EVERY resolved address (a
+/// private answer refuses the fetch), and return the host plus the
+/// addresses for `resolve_to_addrs`: the connect must use these exact
+/// addresses — a second by-name lookup would reopen the DNS-rebinding
+/// window.
+pub(crate) async fn resolve_public_addrs(url: &str) -> Result<(String, Vec<SocketAddr>), String> {
+    if is_private_host(url) {
+        return Err(format!("refusing private/loopback target {url}"));
+    }
+    let parsed = reqwest::Url::parse(url).map_err(|e| format!("invalid URL {url}: {e}"))?;
+    let raw_host = parsed
+        .host_str()
+        .ok_or_else(|| format!("URL has no host: {url}"))?;
+    let host = raw_host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_string();
+    if host.parse::<IpAddr>().is_ok() {
+        return Ok((host, Vec::new()));
+    }
+    let port = parsed.port_or_known_default().unwrap_or(80);
+    let lookup_host = host.clone();
+    let addrs = tokio::task::spawn_blocking(move || {
+        use std::net::ToSocketAddrs;
+        (lookup_host.as_str(), port)
+            .to_socket_addrs()
+            .map(|iter| iter.collect::<Vec<_>>())
+    })
+    .await
+    .map_err(|e| format!("DNS resolution task failed: {e}"))?
+    .map_err(|e| format!("DNS resolution failed for {host}: {e}"))?;
+    if addrs.is_empty() {
+        return Err(format!("DNS resolution returned no addresses for {host}"));
+    }
+    for addr in &addrs {
+        if is_private_ip(addr.ip()) {
+            return Err(format!(
+                "refusing {url}: host {host} resolved to private address {}",
+                addr.ip()
+            ));
+        }
+    }
+    Ok((host, addrs))
+}
+
+/// Verify that `url` is not a private/local target — both syntactically
+/// and after DNS resolution (rejects domains resolving to any private IP).
+pub(crate) async fn check_url_not_private(url: &str) -> Result<(), String> {
+    resolve_public_addrs(url).await.map(|_| ())
+}
+
+/// Validate a remote http(s) URL (scheme + SSRF/DNS check).
+pub(crate) async fn validate_remote_url(url: &str) -> Result<(), String> {
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return Err(format!("only http(s) URLs are supported: {url}"));
+    }
+    check_url_not_private(url).await
 }
 
 /// Reduce HTML to readable plain text: drop script/style/nav blocks,
@@ -782,76 +958,109 @@ impl Hand for WebFetchHand {
             if !url.starts_with("http://") && !url.starts_with("https://") {
                 return ToolOutput::err("web_fetch: only http(s) URLs are supported");
             }
-            if !allow_private && is_private_host(url) {
-                return ToolOutput::err(format!(
-                    "web_fetch: refusing private/loopback target {url} ([tools.web] \
-                     allow_private_hosts = true to override)"
-                ));
+            // one 20 s budget covers redirects AND the body stream; the
+            // guard resolves, validates, and pins every hop
+            let fetched = tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                fetch_body(url, allow_private),
+            )
+            .await;
+            match fetched {
+                Ok(Ok(text)) if text.trim().is_empty() => ToolOutput::ok("(empty page)"),
+                Ok(Ok(text)) => ToolOutput::ok(text),
+                Ok(Err(e)) => ToolOutput::err(format!("web_fetch: {e}")),
+                Err(_) => ToolOutput::err("web_fetch: request timed out (20s)"),
             }
-            // redirect policy: every hop is re-validated — an open
-            // redirect (or shortened URL) pointing at a private host
-            // must fail the fetch, not bypass the guard above
-            let client = reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::custom(move |attempt| {
-                    if attempt.previous().len() > 10 {
-                        return attempt.error("web_fetch: too many redirects");
-                    }
-                    if !allow_private && is_private_host(attempt.url().as_str()) {
-                        return attempt
-                            .error("web_fetch: redirect to private/loopback target refused");
-                    }
-                    attempt.follow()
-                }))
-                .build();
-            let Ok(client) = client else {
-                return ToolOutput::err("web_fetch: client build failed");
-            };
-            let resp = client
-                .get(url)
-                .header("User-Agent", "ka-web-fetch")
-                .timeout(std::time::Duration::from_secs(20))
-                .send()
-                .await;
-            let resp = match resp {
-                Ok(r) => r,
-                Err(e) => return ToolOutput::err(format!("web_fetch: {e}")),
-            };
-            let status = resp.status();
-            if !status.is_success() {
-                return ToolOutput::err(format!("web_fetch: status {status}"));
-            }
-            let ct = resp
-                .headers()
-                .get("content-type")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("")
-                .to_string();
-            // stream the body with a hard byte budget — a multi-GB
-            // response must never be fully materialized before capping
-            let mut body: Vec<u8> = Vec::with_capacity(64 * 1024);
-            let mut resp = resp;
-            while body.len() < FETCH_CAP {
-                match resp.chunk().await {
-                    Ok(Some(chunk)) => {
-                        let room = FETCH_CAP - body.len();
-                        body.extend_from_slice(&chunk[..chunk.len().min(room)]);
-                    }
-                    Ok(None) => break,
-                    Err(e) => return ToolOutput::err(format!("web_fetch: {e}")),
-                }
-            }
-            let raw = String::from_utf8_lossy(&body).into_owned();
-            let text = if ct.contains("html") || raw.trim_start().starts_with('<') {
-                html_to_text(&raw)
-            } else {
-                raw
-            };
-            if text.trim().is_empty() {
-                return ToolOutput::ok("(empty page)");
-            }
-            ToolOutput::ok(text)
         })
     }
+}
+
+/// Follow redirects by hand so every hop is re-validated with the full
+/// DNS check (reqwest's redirect callback is synchronous and cannot
+/// resolve), and pin the connection to the validated addresses with the
+/// system proxy disabled (a proxy would resolve the private target
+/// itself).
+const MAX_FETCH_REDIRECTS: usize = 10;
+
+async fn fetch_guarded(url: &str, allow_private: bool) -> Result<reqwest::Response, String> {
+    let mut current = url.to_string();
+    for _ in 0..=MAX_FETCH_REDIRECTS {
+        let mut builder = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy();
+        if !allow_private {
+            let (host, addrs) = resolve_public_addrs(&current)
+                .await
+                .map_err(|e| format!("{e} ([tools.web] allow_private_hosts = true to override)"))?;
+            if !addrs.is_empty() {
+                builder = builder.resolve_to_addrs(&host, &addrs);
+            }
+        }
+        let client = builder
+            .build()
+            .map_err(|e| format!("client build failed: {e}"))?;
+        let resp = client
+            .get(&current)
+            .header("User-Agent", "ka-web-fetch")
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !resp.status().is_redirection() {
+            return Ok(resp);
+        }
+        let Some(location) = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+        else {
+            return Ok(resp);
+        };
+        let base = reqwest::Url::parse(&current).map_err(|e| format!("bad URL {current}: {e}"))?;
+        let next = base
+            .join(location)
+            .map_err(|e| format!("bad redirect target {location}: {e}"))?;
+        if !matches!(next.scheme(), "http" | "https") {
+            return Err(format!("redirect to unsupported scheme: {next}"));
+        }
+        current = next.to_string();
+    }
+    Err(format!("too many redirects (>{MAX_FETCH_REDIRECTS})"))
+}
+
+async fn fetch_body(url: &str, allow_private: bool) -> Result<String, String> {
+    let resp = fetch_guarded(url, allow_private).await?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("status {status}"));
+    }
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    // stream the body with a hard byte budget — a multi-GB response
+    // must never be fully materialized before capping
+    let mut body: Vec<u8> = Vec::with_capacity(64 * 1024);
+    let mut resp = resp;
+    while body.len() < FETCH_CAP {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                let room = FETCH_CAP - body.len();
+                body.extend_from_slice(&chunk[..chunk.len().min(room)]);
+            }
+            Ok(None) => break,
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    let raw = String::from_utf8_lossy(&body).into_owned();
+    Ok(
+        if ct.contains("html") || raw.trim_start().starts_with('<') {
+            html_to_text(&raw)
+        } else {
+            raw
+        },
+    )
 }
 
 /// Both web hands over the provider chain (engine bootstrap). The

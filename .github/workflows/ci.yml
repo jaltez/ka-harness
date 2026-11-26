@@ -19,6 +19,12 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Feature-matrix check (isolated optional features)
+        run: |
+          cargo check -p ka-harness --no-default-features
+          cargo check -p ka-harness --features index
+          cargo check -p ka-harness --features passport
+          cargo check -p ka-engine --features code
       - name: Dependency allowlist (the ka binary's graph — agent-product concerns stay out)
         run: cargo run -p xtask --quiet -- deps
 
@@ -28,6 +34,20 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --workspace --all-features
+
+  cross-platform:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Sandbox & passport tests (${{ matrix.os }})
+        run: cargo test -p ka-sandbox -p ka-passport
+      - name: Harness check (${{ matrix.os }})
+        run: cargo check -p ka-harness
 
   musl:
     runs-on: ubuntu-latest
@@ -56,6 +76,7 @@ jobs:
       - run: cargo run -p xtask --quiet -- bench --quick --bin target/x86_64-unknown-linux-musl/release/ka
 
   release:
+    needs: [check, test, cross-platform, musl, bench]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:

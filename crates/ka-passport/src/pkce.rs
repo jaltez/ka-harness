@@ -2,16 +2,13 @@
 //! the Claude public-client OAuth flow (no client secret).
 //!
 //! Entropy: the OS CSPRNG via `getrandom` on every target (Linux
-//! `getrandom(2)`, Windows `BCryptGenRandom`); the hash-stretch fallback
-//! mixes wall-clock nanoseconds, the pid, a process-lifetime counter and
-//! an address through SHA-256 and exists only if the OS randomness
-//! source itself fails — unique-per-login material, not a CSPRNG
-//! contract. The verifier is base64url (`A-Z a-z 0-9 - _`, no
-//! padding), 43 chars for 32 bytes: inside the RFC 7636 alphabet and
-//! length range.
+//! `getrandom(2)`, Windows `BCryptGenRandom`, macOS `getentropy`). Fails
+//! closed with an error if the OS CSPRNG is unavailable — never falls
+//! back to predictable material. The verifier is base64url
+//! (`A-Z a-z 0-9 - _`, no padding), 43 chars for 32 bytes: inside the
+//! RFC 7636 alphabet and length range.
 
 use sha2::{Digest, Sha256};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Everything one login attempt needs to bind the browser round-trip to
 /// the token exchange.
@@ -27,16 +24,17 @@ pub struct Pkce {
 }
 
 impl Pkce {
-    /// Fresh verifier/challenge/state triple.
-    pub fn generate() -> Self {
-        let verifier = base64url_no_pad(&random_bytes(32));
+    /// Fresh verifier/challenge/state triple from the OS CSPRNG.
+    /// Fails closed if OS randomness is unavailable.
+    pub fn generate() -> Result<Self, String> {
+        let verifier = base64url_no_pad(&random_bytes(32)?);
         let challenge = base64url_no_pad(Sha256::digest(verifier.as_bytes()).as_slice());
-        let state = base64url_no_pad(&random_bytes(16));
-        Self {
+        let state = base64url_no_pad(&random_bytes(16)?);
+        Ok(Self {
             verifier,
             challenge,
             state,
-        }
+        })
     }
 }
 
@@ -45,47 +43,12 @@ pub fn challenge_matches(verifier: &str, challenge: &str) -> bool {
     base64url_no_pad(Sha256::digest(verifier.as_bytes()).as_slice()) == challenge
 }
 
-/// Fill `buf` with random bytes from the OS CSPRNG (`getrandom` — the
-/// `getrandom(2)` syscall on Linux, `BCryptGenRandom`/`SecRandomCopyBytes`
-/// on Windows/macOS: a real CSPRNG contract on every target, unlike the
-/// old hand-rolled fallback whose hash-stretched seed was locally
-/// guessable). The hash-stretch remains only as a never-expected
-/// last resort if the syscall itself fails.
-fn random_bytes(len: usize) -> Vec<u8> {
+/// Fill a buffer with random bytes from the OS CSPRNG (`getrandom`).
+/// Fails closed if the OS randomness source fails.
+fn random_bytes(len: usize) -> Result<Vec<u8>, String> {
     let mut buf = vec![0u8; len];
-    if getrandom::fill(&mut buf).is_ok() {
-        return buf;
-    }
-    fallback_bytes(len)
-}
-
-/// Non-urandom fallback: mix time/pid/counter/address through SHA-256
-/// and stretch to `len` by re-hashing (documented best-effort, never
-/// a CSPRNG).
-fn fallback_bytes(len: usize) -> Vec<u8> {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let mut seed = Vec::new();
-    let mut block = format!(
-        "{}|{}|{}|{:p}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0),
-        std::process::id(),
-        COUNTER.fetch_add(1, Ordering::Relaxed),
-        &seed as *const _
-    );
-    while seed.len() < len {
-        let digest = Sha256::digest(block.as_bytes()).to_vec();
-        seed.extend_from_slice(&digest);
-        block = digest
-            .iter()
-            .map(|b| b.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-    }
-    seed.truncate(len);
-    seed
+    getrandom::fill(&mut buf).map_err(|e| format!("OS CSPRNG unavailable: {e}"))?;
+    Ok(buf)
 }
 
 /// Standard base64 alphabet with the URL-unsafe pair mapped: `+` → `-`,
@@ -120,7 +83,9 @@ mod tests {
 
     #[test]
     fn verifier_binds_to_challenge_via_s256() {
-        let pkce = Pkce::generate();
+        let Ok(pkce) = Pkce::generate() else {
+            panic!("Pkce::generate failed");
+        };
         assert!(challenge_matches(&pkce.verifier, &pkce.challenge));
         assert!(
             !challenge_matches("not-the-verifier", &pkce.challenge),
@@ -130,7 +95,9 @@ mod tests {
 
     #[test]
     fn verifier_and_state_use_rfc7636_shapes() {
-        let pkce = Pkce::generate();
+        let Ok(pkce) = Pkce::generate() else {
+            panic!("Pkce::generate failed");
+        };
         // 32 bytes → exactly 43 unpadded base64 chars
         assert_eq!(pkce.verifier.len(), 43);
         assert!(pkce.state.len() >= 22, "state is 16 bytes encoded");
@@ -147,27 +114,33 @@ mod tests {
 
     #[test]
     fn generation_is_independent() {
-        let a = Pkce::generate();
-        let b = Pkce::generate();
+        let Ok(a) = Pkce::generate() else {
+            panic!("Pkce::generate failed");
+        };
+        let Ok(b) = Pkce::generate() else {
+            panic!("Pkce::generate failed");
+        };
         assert_ne!(a.verifier, b.verifier);
         assert_ne!(a.state, b.state);
     }
 
     #[test]
     fn os_csprng_yields_distinct_material_across_calls() {
-        // the OS CSPRNG (getrandom) must never repeat material across a
-        // burst of back-to-back generations — this pins the fix away
-        // from the old hash-stretch fallback whose seed was locally
-        // guessable (nanos+pid+counter+stack address)
         let mut verifiers = Vec::new();
         for _ in 0..64 {
-            let pkce = Pkce::generate();
+            let Ok(pkce) = Pkce::generate() else {
+                panic!("Pkce::generate failed");
+            };
             assert_eq!(pkce.verifier.len(), 43, "length stays RFC 7636");
             assert!(!verifiers.contains(&pkce.verifier), "no verifier reuse");
             verifiers.push(pkce.verifier);
         }
-        let raw = random_bytes(32);
-        let again = random_bytes(32);
+        let Ok(raw) = random_bytes(32) else {
+            panic!("random_bytes failed");
+        };
+        let Ok(again) = random_bytes(32) else {
+            panic!("random_bytes failed");
+        };
         assert_ne!(raw, again, "raw random_bytes never repeats");
     }
 

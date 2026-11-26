@@ -35,7 +35,116 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+
+/// Maximum incoming JSON-RPC line length (4 MiB) to prevent OOM DoS.
+const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Maximum `sessions_search` results per call.
+const MAX_SEARCH_LIMIT: usize = 50;
+
+enum BoundedLine {
+    Line(String),
+    TooLong,
+    Eof,
+}
+
+async fn read_bounded_line<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> Result<BoundedLine, std::io::Error> {
+    let mut buf = Vec::new();
+    let mut oversized = false;
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            if oversized {
+                return Ok(BoundedLine::TooLong);
+            }
+            if buf.is_empty() {
+                return Ok(BoundedLine::Eof);
+            }
+            break;
+        }
+        if let Some(pos) = available.iter().position(|&b| b == b'\n') {
+            if !oversized && buf.len().saturating_add(pos) <= max_bytes {
+                buf.extend_from_slice(&available[..pos]);
+            } else {
+                oversized = true;
+            }
+            reader.consume(pos + 1);
+            if oversized {
+                return Ok(BoundedLine::TooLong);
+            }
+            break;
+        }
+        let len = available.len();
+        if !oversized && buf.len().saturating_add(len) <= max_bytes {
+            buf.extend_from_slice(available);
+        } else {
+            oversized = true;
+        }
+        reader.consume(len);
+    }
+    if buf.last() == Some(&b'\r') {
+        buf.pop();
+    }
+    Ok(BoundedLine::Line(
+        String::from_utf8_lossy(&buf).into_owned(),
+    ))
+}
+
+/// Resolve `raw` relative to `cwd` and verify its canonicalized path (or
+/// deepest existing ancestor) stays inside canonicalized `cwd`.
+fn confine_path(cwd: &Path, raw: &str) -> Result<PathBuf, String> {
+    if raw.contains('\0') {
+        return Err("path must not contain NUL bytes".to_string());
+    }
+    // `~` is expanded by the hands themselves (to $HOME), AFTER this
+    // check would have joined it as a literal cwd-relative name: refuse
+    if raw.starts_with('~') {
+        return Err(format!(
+            "path escapes workspace root: `~` is not expanded here ({raw})"
+        ));
+    }
+    let canon_cwd =
+        std::fs::canonicalize(cwd).map_err(|e| format!("workspace root unavailable: {e}"))?;
+    let candidate = if Path::new(raw).is_absolute() {
+        PathBuf::from(raw)
+    } else {
+        cwd.join(raw)
+    };
+    let resolved = if candidate.exists() {
+        std::fs::canonicalize(&candidate)
+            .map_err(|e| format!("cannot resolve path {}: {e}", candidate.display()))?
+    } else {
+        let mut tail = Vec::new();
+        let mut cur = candidate.as_path();
+        while !cur.exists() {
+            let Some(name) = cur.file_name() else {
+                return Err(format!("path escapes workspace root: {raw}"));
+            };
+            tail.push(name.to_os_string());
+            let Some(parent) = cur.parent() else {
+                return Err(format!("path escapes workspace root: {raw}"));
+            };
+            cur = parent;
+        }
+        let mut base = std::fs::canonicalize(cur)
+            .map_err(|e| format!("cannot resolve path {}: {e}", cur.display()))?;
+        for seg in tail.into_iter().rev() {
+            if seg == ".." {
+                return Err(format!("path escapes workspace root: {raw}"));
+            }
+            base.push(seg);
+        }
+        base
+    };
+    if !resolved.starts_with(&canon_cwd) {
+        return Err(format!("path escapes workspace root: {raw}"));
+    }
+    Ok(resolved)
+}
 
 use ka_engine::hands::{
     Clearance, Hand, HandContext, HandDef, Ledger, Spill, ToolOutput, glob::GlobHand,
@@ -125,12 +234,24 @@ where
 {
     let tools = registry(&opts);
     let mut output = output;
-    let mut lines = BufReader::new(input).lines();
-    while let Some(line) = lines
-        .next_line()
-        .await
-        .map_err(|e| format!("read stdin: {e}"))?
-    {
+    let mut reader = BufReader::new(input);
+    loop {
+        let line = match read_bounded_line(&mut reader, MAX_LINE_BYTES)
+            .await
+            .map_err(|e| format!("read stdin: {e}"))?
+        {
+            BoundedLine::Eof => break,
+            BoundedLine::TooLong => {
+                respond(
+                    &mut output,
+                    &json!({"jsonrpc": "2.0", "id": null,
+                            "error": {"code": -32600, "message": "request exceeds 4 MiB line limit"}}),
+                )
+                .await?;
+                continue;
+            }
+            BoundedLine::Line(l) => l,
+        };
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -261,10 +382,42 @@ async fn call_tool(
             "isError": true,
         }));
     };
-    let args = params
+    let mut args = params
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
+    if matches!(name, "read" | "glob" | "grep") {
+        if let Some(p) = args.get("path").and_then(Value::as_str).map(str::to_string) {
+            match confine_path(cwd, &p) {
+                Ok(resolved) => {
+                    // hand the tool the VERIFIED path: re-resolving the raw
+                    // string (the hands expand `~/`) would escape the check
+                    args["path"] = json!(resolved.to_string_lossy());
+                }
+                Err(msg) => {
+                    return Ok(json!({
+                        "content": [{"type": "text", "text": msg}],
+                        "isError": true,
+                    }));
+                }
+            }
+        }
+        if name == "glob" {
+            if let Some(pat) = args.get("pattern").and_then(Value::as_str) {
+                let pat_path = Path::new(pat);
+                let escapes = pat_path.is_absolute()
+                    || pat_path
+                        .components()
+                        .any(|c| matches!(c, std::path::Component::ParentDir));
+                if escapes {
+                    return Ok(json!({
+                        "content": [{"type": "text", "text": format!("glob pattern escapes workspace root: {pat}")}],
+                        "isError": true,
+                    }));
+                }
+            }
+        }
+    }
     let ctx = fresh_context(cwd);
     let out = entry.hand.execute(&args, &ctx).await;
     let mut content = vec![json!({"type": "text", "text": out.content})];
@@ -334,12 +487,12 @@ impl Hand for SessionsSearchHand {
             let limit = args
                 .get("limit")
                 .and_then(Value::as_u64)
-                .map(|l| (l as usize).max(1))
+                .map(|l| (l as usize).clamp(1, MAX_SEARCH_LIMIT))
                 .unwrap_or(20);
             // The listing reads are small (header-only strand scans);
             // inline is fine — no MB-scale work like the file hands.
             #[cfg(feature = "index")]
-            if let Some(text) = search_indexed(query, limit) {
+            if let Some(text) = search_indexed(&ctx.cwd, query, limit) {
                 return ToolOutput::ok(text);
             }
             ToolOutput::ok(search_listings(&ctx.cwd, query, limit))
@@ -347,12 +500,28 @@ impl Hand for SessionsSearchHand {
     }
 }
 
-/// FTS5 answer, `None` when the index feature is off or the db cannot
-/// answer (missing, stale schema, unsupported query syntax).
+/// FTS5 answer scoped to `cwd`'s sessions, `None` when the index feature
+/// is off or the db cannot answer (missing, stale schema, unsupported
+/// query syntax, or no hits belonging to `cwd`).
 #[cfg(feature = "index")]
-fn search_indexed(query: &str, limit: usize) -> Option<String> {
+fn search_indexed(cwd: &Path, query: &str, limit: usize) -> Option<String> {
+    let allowed: std::collections::HashSet<String> = ka_strand::list(cwd)
+        .unwrap_or_default()
+        .into_iter()
+        .chain(ka_strand::list_archived(cwd))
+        .map(|s| s.id)
+        .collect();
+    if allowed.is_empty() {
+        return None;
+    }
     let db = ka_index::open_db(&ka_index::default_db_path()).ok()?;
-    let hits = ka_index::search(&db, query, None, limit).ok()?;
+    let fetch = limit.saturating_mul(4).min(200);
+    let hits: Vec<_> = ka_index::search(&db, query, None, fetch)
+        .ok()?
+        .into_iter()
+        .filter(|r| allowed.contains(&r.session))
+        .take(limit)
+        .collect();
     if hits.is_empty() {
         // an empty answer from a stale/unbuilt index must not shadow the
         // listings fallback — return None so the caller scans those
@@ -588,6 +757,23 @@ mod tests {
             std::env::temp_dir().join(format!("ka-mcpserve-{}-{n}-{tag}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn confine_path_refuses_tilde_and_outside_paths() {
+        let dir = temp_dir("confine");
+        // a relative path resolves inside the workspace
+        let ok = super::confine_path(&dir, "note.txt").expect("relative path allowed");
+        assert_eq!(
+            ok,
+            std::fs::canonicalize(&dir).unwrap().join("note.txt"),
+            "returned path is the verified one, not the raw string"
+        );
+        // `~` is expanded by the hands AFTER the check: refuse it here
+        assert!(super::confine_path(&dir, "~/.ssh/id_rsa").is_err());
+        assert!(super::confine_path(&dir, "/etc/hostname").is_err());
+        assert!(super::confine_path(&dir, "../escape").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

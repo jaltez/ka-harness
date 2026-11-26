@@ -31,7 +31,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
@@ -404,6 +404,21 @@ fn classify_frame(frame: Value) -> Option<ServerMessage> {
     }
 }
 
+/// Maximum size for one MCP HTTP response body, stdio JSON-RPC line,
+/// or SSE frame buffer (16 MiB).
+const MCP_BODY_CAP: usize = 16 * 1024 * 1024;
+
+/// Whether two http(s) URLs share the same origin (scheme, lowercased
+/// host, and effective port).
+fn same_origin(a: &str, b: &str) -> bool {
+    let (Ok(ua), Ok(ub)) = (reqwest::Url::parse(a), reqwest::Url::parse(b)) else {
+        return false;
+    };
+    ua.scheme() == ub.scheme()
+        && ua.host_str().map(str::to_ascii_lowercase) == ub.host_str().map(str::to_ascii_lowercase)
+        && ua.port_or_known_default() == ub.port_or_known_default()
+}
+
 impl HttpRpc {
     fn new(url: String, headers: Vec<(String, String)>) -> Self {
         Self {
@@ -431,6 +446,9 @@ impl HttpRpc {
             .header("Accept", "application/json, text/event-stream")
             .header("MCP-Protocol-Version", PROTOCOL_VERSION);
         for (k, v) in &self.headers {
+            if self.auth.is_some() && k.eq_ignore_ascii_case("authorization") {
+                continue;
+            }
             req = req.header(k.as_str(), v.as_str());
         }
         if let Some(auth) = &self.auth {
@@ -456,7 +474,7 @@ impl HttpRpc {
             return Ok(false);
         };
         auth.refreshed_401 = true;
-        let fresh = crate::mcp_oauth::refresh_tokens(
+        let mut fresh = crate::mcp_oauth::refresh_tokens(
             &self.client,
             &auth.token_endpoint,
             &auth.client_id,
@@ -464,6 +482,15 @@ impl HttpRpc {
             &auth.scopes,
         )
         .await?;
+        // RFC 6749 §6: preserve the prior refresh_token if the server
+        // did not rotate it, and keep client_id so future refreshes
+        // continue to work across reconnects.
+        if fresh.refresh_token.is_none() {
+            fresh.refresh_token = Some(refresh);
+        }
+        if fresh.client_id.is_none() && !auth.client_id.is_empty() {
+            fresh.client_id = Some(auth.client_id.clone());
+        }
         auth.bearer = fresh.access_token.clone();
         auth.refresh = fresh.refresh_token.clone();
         if let Some(key) = &auth.cache_key {
@@ -495,7 +522,7 @@ impl HttpRpc {
         // keep a verbatim copy for id matching when the server streams
         // extra frames (server-initiated requests) beside the response
         let own_id = msg.get("id").cloned();
-        let resp = self
+        let mut resp = self
             .apply_common(self.client.post(&self.url))
             .json(msg)
             .send()
@@ -530,10 +557,20 @@ impl HttpRpc {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
-        let body = resp
-            .text()
+        let mut buf: Vec<u8> = Vec::new();
+        while let Some(chunk) = resp
+            .chunk()
             .await
-            .map_err(|e| HttpError::plain(format!("mcp http: {e}")))?;
+            .map_err(|e| HttpError::plain(format!("mcp http: {e}")))?
+        {
+            if buf.len().saturating_add(chunk.len()) > MCP_BODY_CAP {
+                return Err(HttpError::plain(
+                    "mcp http: response exceeded 16 MiB limit".to_string(),
+                ));
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        let body = String::from_utf8_lossy(&buf).into_owned();
         if ct.contains("event-stream") {
             return Ok(self.consume_sse(&body, own_id));
         }
@@ -809,6 +846,11 @@ impl McpClient {
             let host = rest.split('/').next().unwrap_or(rest);
             format!("{scheme}://{host}{endpoint}")
         };
+        if !same_origin(&base, &post_url) {
+            return Err(format!(
+                "mcp sse: refusing cross-origin endpoint {post_url:?} (expected origin of {base:?})"
+            ));
+        }
         Ok(HttpRpc {
             url: post_url,
             headers,
@@ -1614,14 +1656,89 @@ fn extract_text(result: &Value) -> String {
         .unwrap_or_default()
 }
 
+/// Read one newline-delimited line from `reader`, capping buffered
+/// memory at `cap` bytes. An oversized line is drained and reported as
+/// [`CappedLine::Oversized`] so the caller can fail the waiter instead
+/// of letting it time out.
+enum CappedLine {
+    Line(String),
+    Oversized,
+}
+
+/// Fail every in-flight request: the response that would have answered
+/// one of them was dropped, so waiting longer only burns the timeout.
+async fn fail_pending(pending: &Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>, message: &str) {
+    let err = json!({
+        "jsonrpc": "2.0",
+        "id": null,
+        "error": {"code": -32603, "message": message},
+    });
+    let mut map = pending.lock().await;
+    for (_, tx) in map.drain() {
+        let _ = tx.send(err.clone());
+    }
+}
+
+async fn read_capped_line<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    cap: usize,
+) -> std::io::Result<Option<CappedLine>> {
+    use tokio::io::AsyncBufReadExt;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut oversized = false;
+    loop {
+        let chunk = reader.fill_buf().await?;
+        if chunk.is_empty() {
+            if buf.is_empty() && !oversized {
+                return Ok(None);
+            }
+            break;
+        }
+        if let Some(nl) = chunk.iter().position(|&b| b == b'\n') {
+            if !oversized && buf.len().saturating_add(nl) <= cap {
+                buf.extend_from_slice(&chunk[..nl]);
+            } else {
+                oversized = true;
+            }
+            reader.consume(nl + 1);
+            break;
+        } else {
+            let len = chunk.len();
+            if !oversized && buf.len().saturating_add(len) <= cap {
+                buf.extend_from_slice(chunk);
+            } else {
+                oversized = true;
+                buf.clear();
+            }
+            reader.consume(len);
+        }
+    }
+    if oversized {
+        return Ok(Some(CappedLine::Oversized));
+    }
+    if buf.last() == Some(&b'\r') {
+        buf.pop();
+    }
+    Ok(Some(CappedLine::Line(
+        String::from_utf8_lossy(&buf).into_owned(),
+    )))
+}
+
 /// Reader task: one JSON-RPC message per line, responses routed by id.
 async fn read_loop(
     stdout: ChildStdout,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
     noise: mpsc::Sender<ServerMessage>,
 ) {
-    let mut lines = BufReader::new(stdout).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
+    let mut reader = BufReader::new(stdout);
+    while let Ok(Some(item)) = read_capped_line(&mut reader, MCP_BODY_CAP).await {
+        let line = match item {
+            CappedLine::Line(line) => line,
+            CappedLine::Oversized => {
+                fail_pending(&pending, "mcp: response line exceeded the size limit").await;
+                continue;
+            }
+        };
         let Ok(msg) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
@@ -1640,7 +1757,9 @@ async fn route_message(
 ) {
     if msg.get("method").is_some() {
         if let Some(message) = classify_frame(msg) {
-            let _ = noise.send(message).await;
+            // Non-blocking send: a server notification flood must never
+            // stall the reader loop and deadlock pending responses.
+            let _ = noise.try_send(message);
         }
     } else if let Some(id) = msg["id"].as_u64() {
         if let Some(tx) = pending.lock().await.remove(&id) {
@@ -1662,6 +1781,11 @@ async fn sse_read_loop(
     loop {
         match resp.chunk().await {
             Ok(Some(bytes)) => {
+                if buf.len().saturating_add(bytes.len()) > MCP_BODY_CAP {
+                    buf.clear();
+                    fail_pending(&pending, "mcp: SSE frame exceeded the size limit").await;
+                    continue;
+                }
                 buf.push_str(&String::from_utf8_lossy(&bytes));
                 while let Some(pos) = buf.find("\n\n") {
                     let frame: String = buf.drain(..pos + 2).collect();
@@ -1895,10 +2019,14 @@ pub struct ElicitAsk {
 /// string renders accept-empty/decline; with no properties the ask is
 /// a plain accept/decline on the message.
 pub fn elicitation_ask(params: &Value) -> ElicitAsk {
-    let message = params["message"]
+    const MSG_CAP: usize = 2048;
+    const OPTIONS_CAP: usize = 32;
+    let message: String = params["message"]
         .as_str()
         .unwrap_or("(the server requests input)")
-        .to_string();
+        .chars()
+        .take(MSG_CAP)
+        .collect();
     let props = params["requestedSchema"]["properties"].as_object();
     let Some((prop, schema)) = props.and_then(|p| p.iter().next()) else {
         return ElicitAsk {
@@ -1914,6 +2042,7 @@ pub fn elicitation_ask(params: &Value) -> ElicitAsk {
         .as_array()
         .map(|a| {
             a.iter()
+                .take(OPTIONS_CAP.saturating_sub(1))
                 .map(|v| match v {
                     Value::String(s) => s.clone(),
                     other => other.to_string(),

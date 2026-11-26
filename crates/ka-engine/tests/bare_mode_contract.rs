@@ -12,9 +12,33 @@ use ka_engine::trust;
 /// flip it — they run serialized.
 static FLAG_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
+/// RAII guard holding [`FLAG_LOCK`] and resetting `bare_mode(false)` on
+/// drop (even on panic), preventing cross-test leakage.
+struct BareModeGuard {
+    _lock: parking_lot::MutexGuard<'static, ()>,
+}
+
+impl BareModeGuard {
+    fn new(bare: bool) -> Self {
+        let lock = FLAG_LOCK.lock();
+        conventions::set_bare_mode(bare);
+        Self { _lock: lock }
+    }
+
+    fn set(&self, bare: bool) {
+        conventions::set_bare_mode(bare);
+    }
+}
+
+impl Drop for BareModeGuard {
+    fn drop(&mut self) {
+        conventions::set_bare_mode(false);
+    }
+}
+
 #[test]
 fn safe_mode_disables_every_customization_tier() {
-    let _guard = FLAG_LOCK.lock();
+    let guard = BareModeGuard::new(false);
     let dir = std::env::temp_dir().join(format!("ka-bare-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     // a fully-loaded project: instructions, memory, skills, rules
@@ -56,7 +80,7 @@ fn safe_mode_disables_every_customization_tier() {
         );
 
         // safe mode: all of it goes dark
-        conventions::set_bare_mode(true);
+        guard.set(true);
         assert!(
             conventions::discover_agents(&dir).is_empty(),
             "safe mode hides AGENTS.md"
@@ -81,7 +105,7 @@ fn safe_mode_disables_every_customization_tier() {
             !ka_engine::agents::AgentDef::discover(&dir).is_empty(),
             "agent discovery is engine-gated, not self-gated"
         );
-        conventions::set_bare_mode(false);
+        guard.set(false);
 
         // back on: everything returns
         assert!(!conventions::discover_agents(&dir).is_empty());
@@ -102,9 +126,9 @@ fn safe_mode_disables_every_customization_tier() {
         },
         ..ka_engine::config::Config::default()
     };
-    conventions::set_bare_mode(true);
+    guard.set(true);
     let lsp = ka_engine::effective_lsp_cfg(&loaded);
-    conventions::set_bare_mode(false);
+    guard.set(false);
     assert_ne!(
         lsp.enable,
         Some(true),
@@ -135,7 +159,7 @@ fn safe_mode_disables_every_customization_tier() {
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn safe_mode_pins_feature_toggles_off() {
-    let _guard = FLAG_LOCK.lock();
+    let _guard = BareModeGuard::new(true);
     use ka_protocol::{Command, Event};
     let dir = std::env::temp_dir().join(format!("ka-bare-tgl-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -148,7 +172,6 @@ async fn safe_mode_pins_feature_toggles_off() {
         "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000000\n",
     )
     .unwrap();
-    conventions::set_bare_mode(true);
     let mut handle = ka_engine::spawn_with(cfg, catalog);
     for cmd in [
         Command::SetFeature {
@@ -182,7 +205,6 @@ async fn safe_mode_pins_feature_toggles_off() {
             _ => panic!("expected two refusals, saw {refused}"),
         }
     }
-    conventions::set_bare_mode(false);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -193,11 +215,7 @@ async fn safe_mode_pins_feature_toggles_off() {
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn safe_mode_never_arms_cron() {
-    // the guard spans the whole test, as in its siblings: the flag is
-    // flipped again at the end, and a scoped guard let that happen with
-    // no lock held, under whichever test held it
-    let _guard = FLAG_LOCK.lock();
-    conventions::set_bare_mode(true);
+    let guard = BareModeGuard::new(true);
     let dir = std::env::temp_dir().join(format!("ka-bare-cron-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -217,7 +235,6 @@ async fn safe_mode_never_arms_cron() {
         sandbox: ka_sandbox::Policy::Off,
         shell_env: Default::default(),
     };
-    conventions::set_bare_mode(true);
     let out = hand
         .execute(
             &serde_json::json!({
@@ -227,7 +244,7 @@ async fn safe_mode_never_arms_cron() {
             &ctx,
         )
         .await;
-    conventions::set_bare_mode(false);
+    guard.set(false);
     assert!(
         out.is_error,
         "cron create must refuse in safe mode: {}",
@@ -271,10 +288,7 @@ async fn safe_mode_never_arms_cron() {
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn safe_mode_never_spawns_team_members() {
-    {
-        let _guard = FLAG_LOCK.lock();
-        conventions::set_bare_mode(true);
-    }
+    let guard = BareModeGuard::new(true);
     let dir = std::env::temp_dir().join(format!("ka-bare-team-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -308,48 +322,39 @@ async fn safe_mode_never_spawns_team_members() {
         sandbox: ka_sandbox::Policy::Off,
         shell_env: Default::default(),
     };
-    {
-        let _guard = FLAG_LOCK.lock();
-        conventions::set_bare_mode(true);
-        let out = hand
-            .execute(
-                &serde_json::json!({
-                    "action": "spawn",
-                    "name": "scout",
-                    "prompt": "survey the repo"
-                }),
-                &ctx,
-            )
-            .await;
-        conventions::set_bare_mode(false);
-        assert!(
-            out.is_error && out.content.contains("safe mode"),
-            "team spawn must refuse in safe mode: {}",
-            out.content
-        );
-    }
+    let out = hand
+        .execute(
+            &serde_json::json!({
+                "action": "spawn",
+                "name": "scout",
+                "prompt": "survey the repo"
+            }),
+            &ctx,
+        )
+        .await;
+    guard.set(false);
+    assert!(
+        out.is_error && out.content.contains("safe mode"),
+        "team spawn must refuse in safe mode: {}",
+        out.content
+    );
     // outside safe mode the same hand reaches its grammar (nothing
     // spawns for an invalid name — the refusal is the name, not the mode).
-    // Still under FLAG_LOCK: sibling tests flip the process-global bare
-    // flag while holding it, and this execute reads the flag at its top.
-    {
-        let _guard = FLAG_LOCK.lock();
-        let out = hand
-            .execute(
-                &serde_json::json!({
-                    "action": "spawn",
-                    "name": "Scout!",
-                    "prompt": "survey the repo"
-                }),
-                &ctx,
-            )
-            .await;
-        assert!(
-            out.is_error && out.content.contains("invalid name"),
-            "outside safe mode the refusal is the name grammar: {}",
-            out.content
-        );
-    }
+    let out = hand
+        .execute(
+            &serde_json::json!({
+                "action": "spawn",
+                "name": "Scout!",
+                "prompt": "survey the repo"
+            }),
+            &ctx,
+        )
+        .await;
+    assert!(
+        out.is_error && out.content.contains("invalid name"),
+        "outside safe mode the refusal is the name grammar: {}",
+        out.content
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -359,7 +364,7 @@ async fn safe_mode_never_spawns_team_members() {
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn safe_mode_never_arms_the_loop() {
-    let _guard = FLAG_LOCK.lock();
+    let _guard = BareModeGuard::new(true);
     use ka_protocol::{Command, Event};
     let dir = std::env::temp_dir().join(format!("ka-bare-loop-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -372,7 +377,6 @@ async fn safe_mode_never_arms_the_loop() {
         "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000000\n",
     )
     .unwrap();
-    conventions::set_bare_mode(true);
     let mut handle = ka_engine::spawn_with(cfg, catalog);
     handle
         .commands
@@ -411,7 +415,6 @@ async fn safe_mode_never_arms_the_loop() {
         }
     }
     assert!(!fired, "loop fired despite safe mode");
-    conventions::set_bare_mode(false);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -540,11 +543,10 @@ async fn safe_mode_keeps_llm_guards_dark_and_gate_posture_on() {
     use ka_engine::config::{AutoReviewTier, PromptPolicy};
     use ka_protocol::Event;
 
-    let _guard = FLAG_LOCK.lock();
+    let _guard = BareModeGuard::new(true);
     let dir = std::env::temp_dir().join(format!("ka-bare-perms-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    conventions::set_bare_mode(true);
 
     // prompt_policy deny refuses the reviewable exec ask in safe mode
     let mut voice =

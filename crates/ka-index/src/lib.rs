@@ -5,6 +5,7 @@
 //! Incremental: per-file mtime is tracked; unchanged files are skipped,
 //! changed ones are re-indexed (old rows deleted first).
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
@@ -46,7 +47,8 @@ pub fn open_db(path: &Path) -> Result<Connection, String> {
     }
     let conn = Connection::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS files (
+        "PRAGMA busy_timeout = 5000;
+         CREATE TABLE IF NOT EXISTS files (
              path TEXT PRIMARY KEY,
              mtime_ns INTEGER NOT NULL
          );
@@ -82,8 +84,8 @@ fn mtime_ns(path: &Path) -> Option<i64> {
 pub fn rebuild(strands_root: &Path, db: &Connection) -> Result<RebuildStats, String> {
     let mut indexed = 0usize;
     let mut skipped = 0usize;
-    let mut seen_paths: Vec<String> = Vec::new();
-    let mut seen_ids: Vec<String> = Vec::new();
+    let mut seen_paths: HashSet<String> = HashSet::new();
+    let mut seen_ids: HashSet<String> = HashSet::new();
     let mut dirs: Vec<PathBuf> = Vec::new();
     let mut loose: Vec<PathBuf> = Vec::new();
     let entries = match std::fs::read_dir(strands_root) {
@@ -107,14 +109,16 @@ pub fn rebuild(strands_root: &Path, db: &Connection) -> Result<RebuildStats, Str
         }
     }
     let visit = |path: &Path,
-                 seen_paths: &mut Vec<String>,
-                 seen_ids: &mut Vec<String>,
+                 seen_paths: &mut HashSet<String>,
+                 seen_ids: &mut HashSet<String>,
                  indexed: &mut usize,
                  skipped: &mut usize| {
-        seen_paths.push(path.to_string_lossy().into_owned());
-        if let Some(id) = strand_header_id(path) {
-            seen_ids.push(id);
-        }
+        let Some(id) = strand_header_id(path) else {
+            *skipped += 1;
+            return;
+        };
+        seen_paths.insert(path.to_string_lossy().into_owned());
+        seen_ids.insert(id);
         // one malformed strand (torn write, future record format) must
         // not poison the whole index — skip it and keep going
         match index_one_file(path, db) {
@@ -187,8 +191,8 @@ fn strand_header_id(path: &Path) -> Option<String> {
 /// `sessions`/`messages` rows for strand ids no longer present.
 fn remove_missing(
     db: &Connection,
-    seen_paths: &[String],
-    seen_ids: &[String],
+    seen_paths: &HashSet<String>,
+    seen_ids: &HashSet<String>,
 ) -> Result<(), String> {
     let stale_files: Vec<String> = {
         let mut stmt = db
@@ -214,12 +218,15 @@ fn remove_missing(
     db.execute_batch("BEGIN")
         .map_err(|e| format!("begin: {e}"))?;
     let result = (|| -> Result<(), rusqlite::Error> {
+        let mut del_file = db.prepare("DELETE FROM files WHERE path = ?1")?;
         for path in &stale_files {
-            db.execute("DELETE FROM files WHERE path = ?1", [path])?;
+            del_file.execute([path])?;
         }
+        let mut del_msg = db.prepare("DELETE FROM messages WHERE session = ?1")?;
+        let mut del_sess = db.prepare("DELETE FROM sessions WHERE id = ?1")?;
         for id in &stale_sessions {
-            db.execute("DELETE FROM messages WHERE session = ?1", [id])?;
-            db.execute("DELETE FROM sessions WHERE id = ?1", [id])?;
+            del_msg.execute([id])?;
+            del_sess.execute([id])?;
         }
         Ok(())
     })();
@@ -254,10 +261,16 @@ fn index_one_file(path: &Path, db: &Connection) -> Result<bool, String> {
     db.execute(
         "INSERT INTO files (path, mtime_ns) VALUES (?1, ?2)
          ON CONFLICT(path) DO UPDATE SET mtime_ns = excluded.mtime_ns",
-        [path.to_string_lossy().as_ref(), &current_ns.to_string()],
+        rusqlite::params![path.to_string_lossy().as_ref(), current_ns],
     )
     .map_err(|e| format!("files update: {e}"))?;
     Ok(true)
+}
+
+struct IndexedMsg {
+    id: String,
+    role: Option<&'static str>,
+    content: String,
 }
 
 /// Index one strand file: replace its rows and register the session.
@@ -274,17 +287,13 @@ fn index_file(path: &Path, db: &Connection) -> Result<(), String> {
         })
         .ok_or_else(|| "strand has no header".to_string())?;
 
-    // collect (role, content) pairs, folding Rewind records the same
-    // way the engine's replay does: a Rewind drops the messages (and
-    // title state) recorded after its kept_from id; subsequent records
-    // are still collected. Digest records are left as-is (documented
-    // divergence: the index keeps full history around digests).
-    // msg_ids tracks EVERY message record — Tool results and
-    // empty-content messages included, mapped to the rows length at
-    // their point — because the engine's kept_from can name either
-    // (an abort after tool results ends the turn on a Tool record).
-    let mut rows: Vec<(String, String)> = Vec::new();
-    let mut msg_ids: Vec<(String, usize)> = Vec::new();
+    // collect messages, folding Rewind, Boundary, and ContextEdit records
+    // the same way the engine's replay does. Digest records are left as-is
+    // (documented divergence: the index keeps full history around digests).
+    // `msgs` tracks EVERY message record — Tool results and empty-content
+    // messages included — because kept_from and ContextEdit targets can
+    // name any message id.
+    let mut msgs: Vec<IndexedMsg> = Vec::new();
     let mut title_history: Vec<(usize, String)> = Vec::new();
     let mut title = String::new();
     for r in records.iter() {
@@ -292,28 +301,25 @@ fn index_file(path: &Path, db: &Connection) -> Result<(), String> {
             ka_strand::Record::Message {
                 id, role, content, ..
             } => {
-                let role = match role {
-                    ka_strand::Role::User => "user",
-                    ka_strand::Role::Assistant | ka_strand::Role::System => "assistant",
-                    ka_strand::Role::Tool => {
-                        msg_ids.push((id.0.clone(), rows.len()));
-                        continue;
-                    }
+                let role_str = match role {
+                    ka_strand::Role::User => Some("user"),
+                    ka_strand::Role::Assistant | ka_strand::Role::System => Some("assistant"),
+                    ka_strand::Role::Tool => None,
                 };
-                if !content.trim().is_empty() {
-                    rows.push((role.to_string(), content.clone()));
-                }
-                msg_ids.push((id.0.clone(), rows.len()));
+                msgs.push(IndexedMsg {
+                    id: id.0.clone(),
+                    role: role_str,
+                    content: content.clone(),
+                });
             }
             ka_strand::Record::Title { title: t, .. } => {
                 title = t.clone();
-                title_history.push((rows.len(), t.clone()));
+                title_history.push((msgs.len(), t.clone()));
             }
             ka_strand::Record::Rewind { kept_from, .. } => {
-                if let Some(pos) = msg_ids.iter().position(|(i, _)| i == &kept_from.0) {
-                    let keep = msg_ids[pos].1;
-                    msg_ids.truncate(pos + 1);
-                    rows.truncate(keep);
+                if let Some(pos) = msgs.iter().position(|m| m.id == kept_from.0) {
+                    let keep = pos + 1;
+                    msgs.truncate(keep);
                     title = title_history
                         .iter()
                         .rev()
@@ -326,14 +332,40 @@ fn index_file(path: &Path, db: &Connection) -> Result<(), String> {
             // clears history AND the digest, so the index must too —
             // else rewound-away content stays searchable
             ka_strand::Record::Boundary { .. } => {
-                rows.clear();
-                msg_ids.clear();
+                msgs.clear();
                 title_history.clear();
                 title = String::new();
+            }
+            ka_strand::Record::ContextEdit {
+                target,
+                new_content,
+                ..
+            } => {
+                if let Some(pos) = msgs.iter().rposition(|m| m.id == target.0) {
+                    match new_content {
+                        Some(text) => msgs[pos].content = text.clone(),
+                        None => {
+                            msgs.remove(pos);
+                            for (n, _) in &mut title_history {
+                                if *n > pos {
+                                    *n -= 1;
+                                }
+                            }
+                        }
+                    }
+                }
             }
             _ => {}
         }
     }
+
+    let rows: Vec<(&str, &str)> = msgs
+        .iter()
+        .filter_map(|m| {
+            let role = m.role?;
+            (!m.content.trim().is_empty()).then_some((role, m.content.as_str()))
+        })
+        .collect();
 
     db.execute_batch("BEGIN")
         .map_err(|e| format!("begin: {e}"))?;
@@ -344,11 +376,10 @@ fn index_file(path: &Path, db: &Connection) -> Result<(), String> {
              ON CONFLICT(id) DO UPDATE SET ts = excluded.ts, title = excluded.title",
             [&id, &ts, &title],
         )?;
+        let mut insert_msg =
+            db.prepare("INSERT INTO messages (session, role, content) VALUES (?1, ?2, ?3)")?;
         for (role, content) in &rows {
-            db.execute(
-                "INSERT INTO messages (session, role, content) VALUES (?1, ?2, ?3)",
-                [&id, role, content],
-            )?;
+            insert_msg.execute(rusqlite::params![&id, role, content])?;
         }
         Ok(())
     })();
@@ -363,6 +394,8 @@ fn index_file(path: &Path, db: &Connection) -> Result<(), String> {
     }
 }
 
+const MAX_SEARCH_LIMIT: usize = 10_000;
+
 /// FTS5 query → top-N rows with snippets. `session` filters to one
 /// strand id.
 pub fn search(
@@ -371,7 +404,10 @@ pub fn search(
     session: Option<&str>,
     limit: usize,
 ) -> Result<Vec<SearchRow>, String> {
-    let limit_i = limit as i64;
+    if limit == 0 || !query.chars().any(char::is_alphanumeric) {
+        return Ok(Vec::new());
+    }
+    let limit_i = limit.min(MAX_SEARCH_LIMIT) as i64;
     let mut stmt = db
         .prepare(
             "SELECT messages.session, sessions.ts, messages.role,
@@ -385,11 +421,14 @@ pub fn search(
         .map_err(|e| format!("prepare: {e}"))?;
     let quoted = format!("\"{}\"", query.replace('"', "\"\""));
     let pattern = match session {
-        Some(s) => format!("{quoted} AND session:\"{s}\""),
+        Some(s) => {
+            let escaped = s.replace('"', "\"\"");
+            format!("{quoted} AND session:\"{escaped}\"")
+        }
         None => quoted,
     };
     let rows = stmt
-        .query_map([&pattern, &limit_i.to_string()], |r| {
+        .query_map(rusqlite::params![pattern, limit_i], |r| {
             Ok(SearchRow {
                 session: r.get::<_, String>(0)?,
                 ts: r.get::<_, String>(1)?,
@@ -574,5 +613,96 @@ mod tests {
             .map(|n| n > 0)
             .unwrap_or(false);
         assert!(ok, "bundled SQLite must enable FTS5");
+    }
+
+    #[test]
+    fn search_escapes_session_quotes_handles_empty_queries_and_large_limits() {
+        let dir = std::env::temp_dir().join(format!("ka-index-hard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let strands = dir.join("strands");
+        assert!(std::fs::create_dir_all(&strands).is_ok());
+
+        let h1 = format!(
+            "{{\"record\":\"header\",\"id\":\"s-one\",\"ts\":\"2026-09-07T00:00:00Z\",\"cwd\":\"{}\",\"version\":1,\"repo\":null,\"parent\":null}}",
+            dir.display()
+        );
+        let h2 = format!(
+            "{{\"record\":\"header\",\"id\":\"s-two\",\"ts\":\"2026-09-07T00:00:01Z\",\"cwd\":\"{}\",\"version\":1,\"repo\":null,\"parent\":null}}",
+            dir.display()
+        );
+        let m = r#"{"record":"message","id":"m1","role":"user","content":"SECRET_TOKEN_XYZ"}"#;
+        assert!(std::fs::write(strands.join("one.jsonl"), format!("{h1}\n{m}\n")).is_ok());
+        assert!(std::fs::write(strands.join("two.jsonl"), format!("{h2}\n{m}\n")).is_ok());
+
+        let Ok(db) = open_db(&dir.join("index.db")) else {
+            panic!("open_db failed");
+        };
+        assert!(rebuild(&strands, &db).is_ok());
+
+        // Attempt FTS5 quote breakout in `session` filter: must return 0 rows, not an error or s-two.
+        let injected = search(
+            &db,
+            "SECRET_TOKEN_XYZ",
+            Some("s-none\" OR session:\"s-two"),
+            20,
+        );
+        assert_eq!(injected, Ok(Vec::new()));
+
+        // Empty and punctuation-only queries return empty without FTS5 syntax error.
+        for q in ["", "   ", "!!!", "\"\"\"", "---"] {
+            assert_eq!(search(&db, q, None, 20), Ok(Vec::new()), "query={q:?}");
+        }
+
+        // usize::MAX limit is safely clamped and returns both matches.
+        let Ok(all) = search(&db, "SECRET_TOKEN_XYZ", None, usize::MAX) else {
+            panic!("search with usize::MAX failed");
+        };
+        assert_eq!(all.len(), 2);
+
+        // limit 0 returns empty cleanly.
+        assert_eq!(search(&db, "SECRET_TOKEN_XYZ", None, 0), Ok(Vec::new()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn index_respects_context_edit_records() {
+        let dir = std::env::temp_dir().join(format!("ka-index-ce-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let strands = dir.join("strands");
+        assert!(std::fs::create_dir_all(&strands).is_ok());
+
+        let header = format!(
+            "{{\"record\":\"header\",\"id\":\"s-ce\",\"ts\":\"2026-09-07T00:00:00Z\",\"cwd\":\"{}\",\"version\":1,\"repo\":null,\"parent\":null}}",
+            dir.display()
+        );
+        let m1 = r#"{"record":"message","id":"m1","role":"user","content":"OLD_WORD_ALPHA"}"#;
+        let m2 =
+            r#"{"record":"message","id":"m2","role":"assistant","content":"DROPPED_WORD_BETA"}"#;
+        let e1 =
+            r#"{"record":"context_edit","id":"e1","target":"m1","new_content":"NEW_WORD_GAMMA"}"#;
+        let e2 = r#"{"record":"context_edit","id":"e2","target":"m2"}"#;
+        assert!(
+            std::fs::write(
+                strands.join("ce.jsonl"),
+                format!("{header}\n{m1}\n{m2}\n{e1}\n{e2}\n"),
+            )
+            .is_ok()
+        );
+
+        let Ok(db) = open_db(&dir.join("index.db")) else {
+            panic!("open_db failed");
+        };
+        assert!(rebuild(&strands, &db).is_ok());
+
+        assert_eq!(search(&db, "OLD_WORD_ALPHA", None, 20), Ok(Vec::new()));
+        assert_eq!(search(&db, "DROPPED_WORD_BETA", None, 20), Ok(Vec::new()));
+        let Ok(hits) = search(&db, "NEW_WORD_GAMMA", None, 20) else {
+            panic!("search failed");
+        };
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].session, "s-ce");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

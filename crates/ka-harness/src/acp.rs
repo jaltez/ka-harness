@@ -15,8 +15,68 @@ use ka_engine::config::Config;
 use ka_engine::{EngineHandle, spawn};
 use ka_protocol::{Command, DeltaKind, Event, Stop};
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, mpsc, oneshot};
+
+/// Maximum incoming JSON-RPC line size (4 MiB) to prevent OOM DoS.
+const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Bounded outbound message queue capacity.
+const OUT_CHANNEL_CAP: usize = 512;
+
+/// Maximum concurrent active sessions per ACP process.
+const MAX_SESSIONS: usize = 16;
+
+enum BoundedLine {
+    Line(String),
+    TooLong,
+    Eof,
+}
+
+async fn read_bounded_line<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> Result<BoundedLine, std::io::Error> {
+    let mut buf = Vec::new();
+    let mut oversized = false;
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            if oversized {
+                return Ok(BoundedLine::TooLong);
+            }
+            if buf.is_empty() {
+                return Ok(BoundedLine::Eof);
+            }
+            break;
+        }
+        if let Some(pos) = available.iter().position(|&b| b == b'\n') {
+            if !oversized && buf.len().saturating_add(pos) <= max_bytes {
+                buf.extend_from_slice(&available[..pos]);
+            } else {
+                oversized = true;
+            }
+            reader.consume(pos + 1);
+            if oversized {
+                return Ok(BoundedLine::TooLong);
+            }
+            break;
+        }
+        let len = available.len();
+        if !oversized && buf.len().saturating_add(len) <= max_bytes {
+            buf.extend_from_slice(available);
+        } else {
+            oversized = true;
+        }
+        reader.consume(len);
+    }
+    if buf.last() == Some(&b'\r') {
+        buf.pop();
+    }
+    Ok(BoundedLine::Line(
+        String::from_utf8_lossy(&buf).into_owned(),
+    ))
+}
 
 /// Pending client permission responses: rpc request id →
 /// (engine ask id, session id, answer channel to the drive task).
@@ -49,7 +109,7 @@ where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Value>();
+    let (out_tx, mut out_rx) = mpsc::channel::<Value>(OUT_CHANNEL_CAP);
     // writer task: serialized stdout
     tokio::spawn(async move {
         while let Some(v) = out_rx.recv().await {
@@ -67,15 +127,32 @@ where
     // entries ever leave the map (same invariant as serve.rs)
     let mut session_counter = 0u64;
 
-    let mut lines = BufReader::new(input).lines();
-    while let Some(line) = lines.next_line().await.map_err(|e| format!("stdin: {e}"))? {
+    let mut reader = BufReader::new(input);
+    loop {
+        let line = match read_bounded_line(&mut reader, MAX_LINE_BYTES)
+            .await
+            .map_err(|e| format!("stdin: {e}"))?
+        {
+            BoundedLine::Eof => break,
+            BoundedLine::TooLong => {
+                let _ = out_tx
+                    .send(rpc_error(
+                        Value::Null,
+                        -32600,
+                        "request exceeds 4 MiB line limit",
+                    ))
+                    .await;
+                continue;
+            }
+            BoundedLine::Line(l) => l,
+        };
         if line.trim().is_empty() {
             continue;
         }
         let Ok(msg) = serde_json::from_str::<Value>(&line) else {
-            out_tx
+            let _ = out_tx
                 .send(rpc_error(Value::Null, -32700, "parse error"))
-                .ok();
+                .await;
             continue;
         };
         let id = msg.get("id").cloned().unwrap_or(Value::Null);
@@ -105,7 +182,7 @@ where
                 }
             }
             Some(m) if m == "initialize" => {
-                out_tx
+                let _ = out_tx
                     .send(rpc_result(
                         id,
                         json!({
@@ -114,9 +191,19 @@ where
                             "authMethods": [],
                         }),
                     ))
-                    .ok();
+                    .await;
             }
             Some(m) if m == "session/new" => {
+                if sessions.lock().await.len() >= MAX_SESSIONS {
+                    let _ = out_tx
+                        .send(rpc_error(
+                            id,
+                            -32603,
+                            format!("too many active sessions (max {MAX_SESSIONS})"),
+                        ))
+                        .await;
+                    continue;
+                }
                 let cwd = msg["params"]["cwd"]
                     .as_str()
                     .map(std::path::PathBuf::from)
@@ -127,9 +214,9 @@ where
                         ..cfg
                     },
                     Err(e) => {
-                        out_tx
+                        let _ = out_tx
                             .send(rpc_error(id, -32603, format!("config: {e}")))
-                            .ok();
+                            .await;
                         continue;
                     }
                 };
@@ -148,9 +235,10 @@ where
                         engine: handle,
                     },
                 );
-                out_tx
+                drop(sessions);
+                let _ = out_tx
                     .send(rpc_result(id, json!({"sessionId": session})))
-                    .ok();
+                    .await;
             }
             Some(m) if m == "session/load" => {
                 let session = msg["params"]["sessionId"].as_str().unwrap_or_default();
@@ -158,7 +246,8 @@ where
                     let sessions = sessions.lock().await;
                     // exact hit …
                     if sessions.contains_key(session) {
-                        out_tx.send(rpc_result(id, json!({}))).ok();
+                        drop(sessions);
+                        let _ = out_tx.send(rpc_result(id, json!({}))).await;
                         continue;
                     }
                     // … or a prefix of an in-memory strand id: reuse that
@@ -169,7 +258,18 @@ where
                     {
                         let key = key.clone();
                         drop(sessions);
-                        out_tx.send(rpc_result(id, json!({"sessionId": key}))).ok();
+                        let _ = out_tx.send(rpc_result(id, json!({"sessionId": key}))).await;
+                        continue;
+                    }
+                    if sessions.len() >= MAX_SESSIONS {
+                        drop(sessions);
+                        let _ = out_tx
+                            .send(rpc_error(
+                                id,
+                                -32603,
+                                format!("too many active sessions (max {MAX_SESSIONS})"),
+                            ))
+                            .await;
                         continue;
                     }
                 }
@@ -202,9 +302,9 @@ where
                                 ..cfg
                             },
                             Err(e) => {
-                                out_tx
+                                let _ = out_tx
                                     .send(rpc_error(id, -32603, format!("config: {e}")))
-                                    .ok();
+                                    .await;
                                 continue;
                             }
                         };
@@ -259,18 +359,19 @@ where
                                 engine: handle,
                             },
                         );
-                        out_tx
+                        drop(sessions);
+                        let _ = out_tx
                             .send(rpc_result(id, json!({"sessionId": summary.id})))
-                            .ok();
+                            .await;
                     }
                     None => {
-                        out_tx
+                        let _ = out_tx
                             .send(rpc_error(
                                 id,
                                 -32602,
                                 format!("unknown session {session:?}"),
                             ))
-                            .ok();
+                            .await;
                     }
                 }
             }
@@ -280,20 +381,21 @@ where
                     .unwrap_or_default()
                     .to_string();
                 let Some(prompt) = prompt_text(&msg["params"]["prompt"]) else {
-                    out_tx
+                    let _ = out_tx
                         .send(rpc_error(id, -32602, "prompt: no text content".to_string()))
-                        .ok();
+                        .await;
                     continue;
                 };
                 let sessions = sessions.lock().await;
                 let Some(engine) = sessions.get(&session).map(|s| s.engine.clone()) else {
-                    out_tx
+                    drop(sessions);
+                    let _ = out_tx
                         .send(rpc_error(
                             id,
                             -32602,
                             format!("unknown session {session:?}"),
                         ))
-                        .ok();
+                        .await;
                     continue;
                 };
                 drop(sessions);
@@ -327,9 +429,9 @@ where
                 deny_pending(&pending, session).await;
             }
             Some(other) => {
-                out_tx
+                let _ = out_tx
                     .send(rpc_error(id, -32601, format!("method not found: {other}")))
-                    .ok();
+                    .await;
             }
         }
     }
@@ -369,7 +471,7 @@ async fn drive_turn(
     session: String,
     prompt: String,
     request_id: Value,
-    out: mpsc::UnboundedSender<Value>,
+    out: mpsc::Sender<Value>,
     pending: Pending,
     counter: Arc<AtomicU64>,
 ) {
@@ -388,18 +490,20 @@ async fn drive_turn(
         .await
         .is_err()
     {
-        out.send(rpc_error(request_id, -32603, String::from("engine closed")))
-            .ok();
+        let _ = out
+            .send(rpc_error(request_id, -32603, String::from("engine closed")))
+            .await;
         return;
     }
     let stop = loop {
         let Some(evt) = engine.events.recv().await else {
-            out.send(rpc_error(
-                request_id,
-                -32603,
-                String::from("engine closed mid-turn"),
-            ))
-            .ok();
+            let _ = out
+                .send(rpc_error(
+                    request_id,
+                    -32603,
+                    String::from("engine closed mid-turn"),
+                ))
+                .await;
             return;
         };
         match evt {
@@ -501,16 +605,17 @@ async fn drive_turn(
                     .lock()
                     .await
                     .insert(req_id, (id.0.clone(), session.clone(), tx));
-                out.send(json!({
-                    "jsonrpc": "2.0",
-                    "method": "session/request_permission",
-                    "params": {
-                        "sessionId": session,
-                        "toolCall": {"title": question_text},
-                        "options": options,
-                    }
-                }))
-                .ok();
+                let _ = out
+                    .send(json!({
+                        "jsonrpc": "2.0",
+                        "method": "session/request_permission",
+                        "params": {
+                            "sessionId": session,
+                            "toolCall": {"title": question_text},
+                            "options": options,
+                        }
+                    }))
+                    .await;
                 // the main loop resolves us when the client responds
                 // client went away: deny
                 let choice = rx.await.unwrap_or(2);
@@ -559,23 +664,25 @@ async fn drive_turn(
             _ => {}
         }
     };
-    out.send(rpc_result(request_id, json!({"stopReason": stop})))
-        .ok();
+    let _ = out
+        .send(rpc_result(request_id, json!({"stopReason": stop})))
+        .await;
 }
 
-async fn session_update(out: &mpsc::UnboundedSender<Value>, session: &str, update: Value) {
-    out.send(json!({
-        "jsonrpc": "2.0",
-        "method": "session/update",
-        "params": {"sessionId": session, "update": update}
-    }))
-    .ok();
+async fn session_update(out: &mpsc::Sender<Value>, session: &str, update: Value) {
+    let _ = out
+        .send(json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {"sessionId": session, "update": update}
+        }))
+        .await;
 }
 
 /// Map replayed messages (bootstrap or prompt-time) onto the client as
 /// message-chunk updates; digest boundaries become divider rows.
 async fn forward_replay(
-    out: &mpsc::UnboundedSender<Value>,
+    out: &mpsc::Sender<Value>,
     session: &str,
     messages: Vec<ka_protocol::ReplayedMessage>,
 ) {

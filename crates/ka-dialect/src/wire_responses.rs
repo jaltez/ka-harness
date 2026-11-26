@@ -4,6 +4,8 @@
 //! flat tool definitions, `reasoning.effort`, and per-event stream
 //! frames instead of chat chunks.
 
+use std::collections::HashSet;
+
 use futures_util::StreamExt;
 use ka_protocol::Stop;
 use serde_json::{Value, json};
@@ -254,190 +256,32 @@ async fn speak_responses(
         };
         let chunk = chunk.map_err(|e| WireError::network(e.to_string()))?;
         for evt in parser.feed(&chunk) {
-            if evt.data.trim() == "[DONE]" {
-                saw_terminal = true;
-                continue;
-            }
-            let Ok(v) = serde_json::from_str::<Value>(&evt.data) else {
-                continue; // malformed frame: drop, keep streaming
-            };
-            saw_any_event = true;
-            let evt_type = v.get("type").and_then(Value::as_str).unwrap_or("");
-            match evt_type {
-                "response.output_text.delta" => {
-                    if let Some(text) = v.get("delta").and_then(Value::as_str) {
-                        if !text.is_empty() {
-                            out.send(StreamEvent::Text(text.to_string())).await.ok();
-                        }
-                    }
-                }
-                "response.reasoning_summary_text.delta" => {
-                    if let Some(thought) = v.get("delta").and_then(Value::as_str) {
-                        if !thought.is_empty() {
-                            out.send(StreamEvent::Thought(thought.to_string()))
-                                .await
-                                .ok();
-                        }
-                    }
-                }
-                "response.output_item.added" => {
-                    let item = &v["item"];
-                    // provider-executed search: the harness never runs
-                    // it — surface the action the model took
-                    if item.get("type").and_then(Value::as_str) == Some("web_search_call") {
-                        if let Some(action) = item.get("action") {
-                            let q = action
-                                .pointer("/query/text")
-                                .or_else(|| action.get("query"))
-                                .and_then(Value::as_str)
-                                .unwrap_or_default();
-                            if !q.is_empty() {
-                                out.send(StreamEvent::Text(format!("\n[web_search: {q}]")))
-                                    .await
-                                    .ok();
-                            }
-                        }
-                    }
-                    if item.get("type").and_then(Value::as_str) == Some("function_call") {
-                        calls.push(PendingItem {
-                            item_id: item
-                                .get("id")
-                                .and_then(Value::as_str)
-                                .unwrap_or("")
-                                .to_string(),
-                            call_id: item
-                                .get("call_id")
-                                .and_then(Value::as_str)
-                                .unwrap_or("")
-                                .to_string(),
-                            tool: item
-                                .get("name")
-                                .and_then(Value::as_str)
-                                .unwrap_or("")
-                                .to_string(),
-                            args: String::new(),
-                        });
-                    }
-                }
-                "response.function_call_arguments.delta" => {
-                    let item_id = v.get("item_id").and_then(Value::as_str).unwrap_or("");
-                    if let Some(pending) = calls.iter_mut().find(|c| c.item_id == item_id) {
-                        if let Some(chunk) = v.get("delta").and_then(Value::as_str) {
-                            pending.args.push_str(chunk);
-                        }
-                    }
-                }
-                "response.output_item.done" => {
-                    let item = &v["item"];
-                    if item.get("type").and_then(Value::as_str) == Some("function_call") {
-                        // authoritative full form: replace any accumulated state
-                        let call_id = item
-                            .get("call_id")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string();
-                        let tool = item
-                            .get("name")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string();
-                        let args = item
-                            .get("arguments")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string();
-                        if !tool.is_empty() {
-                            let incoming_id = item
-                                .get("id")
-                                .and_then(Value::as_str)
-                                .unwrap_or("")
-                                .to_string();
-                            calls.retain(|c| {
-                                dedup_key(&c.call_id, &c.item_id)
-                                    != dedup_key(&call_id, &incoming_id)
-                            });
-                            calls.push(PendingItem {
-                                // a call_id-less proxy emits `id` on both
-                                // added and done: keep it, or emission
-                                // would send an empty call id the
-                                // provider rejects; with call_id present
-                                // the deltas match by call_id, so the
-                                // item id stays blank as before
-                                item_id: if call_id.is_empty() {
-                                    incoming_id
-                                } else {
-                                    String::new()
-                                },
-                                call_id,
-                                tool,
-                                args,
-                            });
-                        }
-                    }
-                }
-                "response.completed" | "response.incomplete" => {
-                    saw_terminal = true;
-                    let response = &v["response"];
-                    if evt_type == "response.incomplete" {
-                        stop = Stop::Length;
-                    }
-                    if let Some(status) = response.get("status").and_then(Value::as_str) {
-                        if status == "incomplete" {
-                            stop = Stop::Length;
-                        }
-                    }
-                    if let Some(u) = response.get("usage").filter(|u| u.is_object()) {
-                        let input_tokens =
-                            u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
-                        let cached = u
-                            .get("input_tokens_details")
-                            .and_then(|d| d.get("cached_tokens"))
-                            .and_then(Value::as_u64)
-                            .unwrap_or(0);
-                        usage.input = input_tokens.saturating_sub(cached);
-                        usage.cache_read = cached;
-                        usage.output = u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0);
-                    }
-                }
-                "response.failed" => {
-                    let message = v
-                        .pointer("/response/error/message")
-                        .and_then(Value::as_str)
-                        .unwrap_or("response failed");
-                    let code = v
-                        .pointer("/response/error/code")
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
-                    return Err(failed_wire_error(code, message.to_string()));
-                }
-                "error" => {
-                    let message = v
-                        .pointer("/error/message")
-                        .and_then(Value::as_str)
-                        .unwrap_or("stream error event");
-                    let code = v
-                        .pointer("/error/code")
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
-                    return Err(failed_wire_error(code, message.to_string()));
-                }
-                _ => {} // created/in_progress/other frames: ignored
-            }
+            handle_responses_event(
+                &evt,
+                &mut calls,
+                &mut usage,
+                &mut stop,
+                &mut saw_any_event,
+                &mut saw_terminal,
+                out,
+            )
+            .await?;
         }
     }
     for evt in parser.finish() {
-        // trailing frame without a final blank line: the only event
-        // worth draining is the terminal marker itself
-        if evt.data.trim() == "[DONE]" {
-            saw_terminal = true;
-        } else if let Ok(v) = serde_json::from_str::<Value>(&evt.data) {
-            if matches!(
-                v.get("type").and_then(Value::as_str),
-                Some("response.completed" | "response.incomplete")
-            ) {
-                saw_terminal = true;
-            }
-        }
+        // trailing frame without a final blank line: drain through the same
+        // handler so Stop::Length, usage, output_item.done, and failed/error
+        // events are never dropped
+        handle_responses_event(
+            &evt,
+            &mut calls,
+            &mut usage,
+            &mut stop,
+            &mut saw_any_event,
+            &mut saw_terminal,
+            out,
+        )
+        .await?;
     }
 
     if !saw_any_event {
@@ -458,13 +302,12 @@ async fn speak_responses(
 
     // Emit complete calls (deduped by call_id, falling back to item_id
     // when parallel calls ship without one, arguments repaired).
-    let mut seen: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
     for pending in calls {
         let key = dedup_key(&pending.call_id, &pending.item_id);
-        if pending.tool.is_empty() || seen.contains(&key) {
+        if pending.tool.is_empty() || !seen.insert(key) {
             continue;
         }
-        seen.push(key.clone());
         let id = if pending.call_id.is_empty() {
             pending.item_id
         } else {
@@ -479,6 +322,210 @@ async fn speak_responses(
         .ok();
     }
     out.send(StreamEvent::Finished { stop, usage }).await.ok();
+    Ok(())
+}
+
+const MAX_TOOL_ARGS_BYTES: usize = 4 * 1024 * 1024;
+const MAX_TOOL_CALLS: usize = 1024;
+
+async fn handle_responses_event(
+    evt: &crate::sse::SseEvent,
+    calls: &mut Vec<PendingItem>,
+    usage: &mut ka_protocol::Usage,
+    stop: &mut Stop,
+    saw_any_event: &mut bool,
+    saw_terminal: &mut bool,
+    out: &mpsc::Sender<StreamEvent>,
+) -> Result<(), WireError> {
+    if evt.data.trim() == "[DONE]" {
+        *saw_terminal = true;
+        return Ok(());
+    }
+    let Ok(v) = serde_json::from_str::<Value>(&evt.data) else {
+        return Ok(()); // malformed frame: drop, keep streaming
+    };
+    *saw_any_event = true;
+    let evt_type = v.get("type").and_then(Value::as_str).unwrap_or("");
+    match evt_type {
+        "response.output_text.delta" => {
+            if let Some(text) = v.get("delta").and_then(Value::as_str) {
+                if !text.is_empty() {
+                    out.send(StreamEvent::Text(text.to_string())).await.ok();
+                }
+            }
+        }
+        "response.reasoning_summary_text.delta" => {
+            if let Some(thought) = v.get("delta").and_then(Value::as_str) {
+                if !thought.is_empty() {
+                    out.send(StreamEvent::Thought(thought.to_string()))
+                        .await
+                        .ok();
+                }
+            }
+        }
+        "response.output_item.added" => {
+            let item = &v["item"];
+            // provider-executed search: the harness never runs
+            // it — surface the action the model took
+            if item.get("type").and_then(Value::as_str) == Some("web_search_call") {
+                if let Some(action) = item.get("action") {
+                    let q = action
+                        .pointer("/query/text")
+                        .or_else(|| action.get("query"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    if !q.is_empty() {
+                        out.send(StreamEvent::Text(format!("\n[web_search: {q}]")))
+                            .await
+                            .ok();
+                    }
+                }
+            }
+            if item.get("type").and_then(Value::as_str) == Some("function_call")
+                && calls.len() < MAX_TOOL_CALLS
+            {
+                calls.push(PendingItem {
+                    item_id: item
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    call_id: item
+                        .get("call_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    tool: item
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    args: String::new(),
+                });
+            }
+        }
+        "response.function_call_arguments.delta" => {
+            let item_id = v.get("item_id").and_then(Value::as_str).unwrap_or("");
+            if let Some(pending) = calls.iter_mut().find(|c| c.item_id == item_id) {
+                if let Some(chunk) = v.get("delta").and_then(Value::as_str) {
+                    if pending.args.len().saturating_add(chunk.len()) > MAX_TOOL_ARGS_BYTES {
+                        return Err(WireError {
+                            class: ka_protocol::ErrorClass::Protocol,
+                            retryable: false,
+                            message: format!(
+                                "tool call arguments exceeded {MAX_TOOL_ARGS_BYTES} byte limit"
+                            ),
+                        });
+                    }
+                    pending.args.push_str(chunk);
+                }
+            }
+        }
+        "response.output_item.done" => {
+            let item = &v["item"];
+            if item.get("type").and_then(Value::as_str) == Some("function_call") {
+                // authoritative full form: replace any accumulated state
+                let call_id = item
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let tool = item
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let args = item
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                if args.len() > MAX_TOOL_ARGS_BYTES {
+                    return Err(WireError {
+                        class: ka_protocol::ErrorClass::Protocol,
+                        retryable: false,
+                        message: format!(
+                            "tool call arguments exceeded {MAX_TOOL_ARGS_BYTES} byte limit"
+                        ),
+                    });
+                }
+                if !tool.is_empty() {
+                    let incoming_id = item
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    calls.retain(|c| {
+                        dedup_key(&c.call_id, &c.item_id) != dedup_key(&call_id, &incoming_id)
+                    });
+                    if calls.len() < MAX_TOOL_CALLS {
+                        calls.push(PendingItem {
+                            // a call_id-less proxy emits `id` on both
+                            // added and done: keep it, or emission
+                            // would send an empty call id the
+                            // provider rejects; with call_id present
+                            // the deltas match by call_id, so the
+                            // item id stays blank as before
+                            item_id: if call_id.is_empty() {
+                                incoming_id
+                            } else {
+                                String::new()
+                            },
+                            call_id,
+                            tool,
+                            args,
+                        });
+                    }
+                }
+            }
+        }
+        "response.completed" | "response.incomplete" => {
+            *saw_terminal = true;
+            let response = &v["response"];
+            if evt_type == "response.incomplete" {
+                *stop = Stop::Length;
+            }
+            if let Some(status) = response.get("status").and_then(Value::as_str) {
+                if status == "incomplete" {
+                    *stop = Stop::Length;
+                }
+            }
+            if let Some(u) = response.get("usage").filter(|u| u.is_object()) {
+                let input_tokens = u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
+                let cached = u
+                    .get("input_tokens_details")
+                    .and_then(|d| d.get("cached_tokens"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                usage.input = input_tokens.saturating_sub(cached);
+                usage.cache_read = cached;
+                usage.output = u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0);
+            }
+        }
+        "response.failed" => {
+            let message = v
+                .pointer("/response/error/message")
+                .and_then(Value::as_str)
+                .unwrap_or("response failed");
+            let code = v
+                .pointer("/response/error/code")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            return Err(failed_wire_error(code, message.to_string()));
+        }
+        "error" => {
+            let message = v
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .unwrap_or("stream error event");
+            let code = v
+                .pointer("/error/code")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            return Err(failed_wire_error(code, message.to_string()));
+        }
+        _ => {} // created/in_progress/other frames: ignored
+    }
     Ok(())
 }
 
@@ -511,5 +558,84 @@ fn failed_wire_error(code: &str, message: String) -> WireError {
             retryable: false,
             message,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sse::SseEvent;
+
+    #[tokio::test]
+    async fn responses_caps_pending_tool_calls_at_limit() {
+        let (tx, _rx) = mpsc::channel(16);
+        let mut calls = Vec::new();
+        let mut usage = ka_protocol::Usage::default();
+        let mut stop = Stop::Done;
+        let mut saw_any = false;
+        let mut saw_terminal = false;
+
+        for i in 0..(MAX_TOOL_CALLS + 200) {
+            let evt = SseEvent {
+                data: json!({
+                    "type": "response.output_item.added",
+                    "item": {
+                        "type": "function_call",
+                        "id": format!("item_{i}"),
+                        "call_id": format!("call_{i}"),
+                        "name": "read",
+                    }
+                })
+                .to_string(),
+            };
+            let res = handle_responses_event(
+                &evt,
+                &mut calls,
+                &mut usage,
+                &mut stop,
+                &mut saw_any,
+                &mut saw_terminal,
+                &tx,
+            )
+            .await;
+            assert!(res.is_ok());
+        }
+        assert_eq!(calls.len(), MAX_TOOL_CALLS);
+    }
+
+    #[tokio::test]
+    async fn responses_rejects_oversized_tool_arguments() {
+        let (tx, _rx) = mpsc::channel(16);
+        let mut calls = Vec::new();
+        let mut usage = ka_protocol::Usage::default();
+        let mut stop = Stop::Done;
+        let mut saw_any = false;
+        let mut saw_terminal = false;
+
+        let big = "x".repeat(MAX_TOOL_ARGS_BYTES + 1);
+        let evt = SseEvent {
+            data: json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "function_call",
+                    "id": "item_1",
+                    "call_id": "call_1",
+                    "name": "write",
+                    "arguments": big,
+                }
+            })
+            .to_string(),
+        };
+        let res = handle_responses_event(
+            &evt,
+            &mut calls,
+            &mut usage,
+            &mut stop,
+            &mut saw_any,
+            &mut saw_terminal,
+            &tx,
+        )
+        .await;
+        assert!(res.is_err());
     }
 }

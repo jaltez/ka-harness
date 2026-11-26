@@ -674,11 +674,14 @@ impl StrandFile {
         // in arrival order, each with whether it goes to disk
         let mut batch: Vec<(Record, bool)> = Vec::new();
         let mut lines: Vec<Vec<u8>> = Vec::new();
+        // Stage settings updates on a clone so a failed write/materialize
+        // leaves `self.settings` unchanged.
+        let mut next_settings = self.settings.clone();
         // the ceiling is checked record by record, against the size
         // the file has reached once the records before it are written
         let mut size: Option<u64> = None;
         for record in records {
-            self.settings.apply(&record);
+            next_settings.apply(&record);
             if matches!(
                 record,
                 Record::Message {
@@ -686,9 +689,9 @@ impl StrandFile {
                     ..
                 }
             ) {
-                self.settings.dangling = true;
+                next_settings.dangling = true;
             } else if matches!(record, Record::Message { .. }) {
-                self.settings.dangling = false;
+                next_settings.dangling = false;
             }
             if !self.persist {
                 batch.push((record, false));
@@ -727,6 +730,7 @@ impl StrandFile {
             let mut writer = StrandWriter::open(&path)?;
             writer.append_lines(&lines)?;
         }
+        self.settings = next_settings;
         self.records
             .extend(batch.into_iter().map(|(record, _)| record));
         Ok(())
@@ -778,6 +782,10 @@ impl StrandFile {
     }
 }
 
+/// Hard cap on a single JSONL line read from disk (64 MiB), preventing
+/// unbounded allocations on corrupt files without newlines.
+const MAX_LINE_BYTES: usize = 64 * 1024 * 1024;
+
 /// One line of the writer. Kept separate so raw appending stays cheap.
 ///
 /// Single-writer-per-strand: opening the same strand from two processes
@@ -785,6 +793,9 @@ impl StrandFile {
 /// appender wins the tail.
 pub struct StrandWriter {
     file: File,
+    /// True when the file is 0 bytes (freshly created or truncated to 0
+    /// by `heal_torn_tail`), requiring line 1 to be a `Record::Header`.
+    needs_header: bool,
 }
 
 impl StrandWriter {
@@ -792,29 +803,35 @@ impl StrandWriter {
     /// tail left by a crash mid-append (SIGKILL, power loss, ENOSPC).
     pub fn open(path: &Path) -> std::io::Result<Self> {
         // Windows: append-only handles drop FILE_WRITE_DATA, which
-        // FlushFileBuffers (sync_data) and FileEndOfFileInfo (set_len
-        // in the heal) are documented to require — open with write
-        // access there and rely on the single-writer invariant (the
-        // heal seeks to EOF before truncating, so writes stay
-        // append-shaped).
+        // FlushFileBuffers (sync_data) and FileEndOfFileInfo (set_len in
+        // the heal) require — open with write access there and rely on
+        // the single-writer invariant (every heal path leaves the
+        // pointer at EOF, so writes stay append-shaped).
         #[cfg(windows)]
         let mut file = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
-            .open(path)?;
+            .open(store_path(path))?;
         #[cfg(not(windows))]
         let mut file = OpenOptions::new()
             .create(true)
             .read(true)
             .append(true)
-            .open(path)?;
+            .open(store_path(path))?;
         heal_torn_tail(&mut file)?;
-        Ok(Self { file })
+        let needs_header = file.metadata()?.len() == 0;
+        Ok(Self { file, needs_header })
     }
 
     /// Append one record, fsync its bytes, and flush.
     pub fn append(&mut self, record: &Record) -> std::io::Result<()> {
+        if self.needs_header && !matches!(record, Record::Header { .. }) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "cannot append non-header record to empty strand file",
+            ));
+        }
         let mut line = serde_json::to_string(record)
             .map_err(|e| std::io::Error::other(format!("record serialize: {e}")))?;
         line.push('\n');
@@ -827,20 +844,48 @@ impl StrandWriter {
     /// so every record before it stays resumable. Appends are the only
     /// writes strands get.
     pub fn append_lines(&mut self, lines: &[Vec<u8>]) -> std::io::Result<()> {
+        if lines.is_empty() {
+            return Ok(());
+        }
+        if self.needs_header {
+            let is_header = lines
+                .iter()
+                .find(|l| !l.is_empty())
+                .and_then(|l| std::str::from_utf8(l).ok())
+                .and_then(|s| serde_json::from_str::<Record>(s.trim_end_matches('\n')).ok())
+                .is_some_and(|r| matches!(r, Record::Header { .. }));
+            if !is_header {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "cannot append non-header record to empty strand file",
+                ));
+            }
+        }
         let mut bytes = Vec::new();
         for line in lines {
+            // the reader rejects >64 MiB lines; refuse to CREATE one and
+            // wedge the session into "never opens again"
+            if line.len() > MAX_LINE_BYTES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "record exceeds the 64 MiB strand line cap",
+                ));
+            }
             bytes.extend_from_slice(line);
         }
         self.file.write_all(&bytes)?;
         self.file.sync_data()?;
-        self.file.flush()
+        self.file.flush()?;
+        self.needs_header = false;
+        Ok(())
     }
 }
 
-/// Truncate an unterminated trailing line (a torn write) so the next
-/// append lands after a clean record boundary instead of gluing onto
-/// the fragment — without this, one torn tail makes the session
-/// permanently unresumable. Files ending in '\\n' are left untouched.
+/// Heal an unterminated trailing line so the next append lands after a clean
+/// record boundary instead of gluing onto the tail. If the trailing bytes
+/// already parse as a valid JSON [`Record`], append `\n` to preserve it
+/// (matching [`read`]); otherwise truncate the torn fragment away.
+/// Files ending in `\n` are left untouched.
 fn heal_torn_tail(file: &mut File) -> std::io::Result<()> {
     let len = file.metadata()?.len();
     if len == 0 {
@@ -867,6 +912,21 @@ fn heal_torn_tail(file: &mut File) -> std::io::Result<()> {
             break;
         }
         unscanned = start;
+    }
+    let tail_len = len - cut;
+    if tail_len <= MAX_LINE_BYTES as u64 {
+        let mut tail = vec![0u8; tail_len as usize];
+        file.seek(SeekFrom::Start(cut))?;
+        file.read_exact(&mut tail)?;
+        if let Ok(text) = std::str::from_utf8(&tail)
+            && !text.trim().is_empty()
+            && serde_json::from_str::<Record>(text).is_ok()
+        {
+            file.seek(SeekFrom::End(0))?;
+            file.write_all(b"\n")?;
+            file.sync_data()?;
+            return Ok(());
+        }
     }
     file.set_len(cut)?;
     file.seek(SeekFrom::End(0))?;
@@ -949,9 +1009,111 @@ struct CustomDataProbe {
     text: Option<String>,
 }
 
+const SUMMARIES_CACHE_FILE: &str = ".summaries-cache.json";
+const SUMMARIES_CACHE_VERSION: u32 = 1;
+
+#[derive(Serialize, Deserialize)]
+struct SummariesCache {
+    version: u32,
+    entries: HashMap<String, CachedSummaryEntry>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct CachedSummaryEntry {
+    len: u64,
+    mtime_ns: u128,
+    id: String,
+    ts: String,
+    title: String,
+    messages: usize,
+    cost: f64,
+    parent: Option<String>,
+    name: Option<String>,
+    tokens: u64,
+    pinned: bool,
+    recap: Option<String>,
+}
+
+impl CachedSummaryEntry {
+    fn from_summary(len: u64, mtime_ns: u128, s: &StrandSummary) -> Self {
+        Self {
+            len,
+            mtime_ns,
+            id: s.id.clone(),
+            ts: s.ts.clone(),
+            title: s.title.clone(),
+            messages: s.messages,
+            cost: s.cost,
+            parent: s.parent.clone(),
+            name: s.name.clone(),
+            tokens: s.tokens,
+            pinned: s.pinned,
+            recap: s.recap.clone(),
+        }
+    }
+
+    fn into_summary(self, path: PathBuf) -> StrandSummary {
+        StrandSummary {
+            path,
+            id: self.id,
+            ts: self.ts,
+            title: self.title,
+            messages: self.messages,
+            cost: self.cost,
+            parent: self.parent,
+            name: self.name,
+            tokens: self.tokens,
+            pinned: self.pinned,
+            recap: self.recap,
+        }
+    }
+}
+
+fn load_summaries_cache(dir: &Path) -> HashMap<String, CachedSummaryEntry> {
+    let cache_path = store_path(&dir.join(SUMMARIES_CACHE_FILE));
+    let Ok(bytes) = std::fs::read(&cache_path) else {
+        return HashMap::new();
+    };
+    let Ok(parsed) = serde_json::from_slice::<SummariesCache>(&bytes) else {
+        return HashMap::new();
+    };
+    if parsed.version != SUMMARIES_CACHE_VERSION {
+        return HashMap::new();
+    }
+    parsed.entries
+}
+
+fn save_summaries_cache(dir: &Path, entries: HashMap<String, CachedSummaryEntry>) {
+    let cache_path = store_path(&dir.join(SUMMARIES_CACHE_FILE));
+    if entries.is_empty() {
+        let _ = std::fs::remove_file(&cache_path);
+        return;
+    }
+    let payload = SummariesCache {
+        version: SUMMARIES_CACHE_VERSION,
+        entries,
+    };
+    let Ok(bytes) = serde_json::to_vec(&payload) else {
+        return;
+    };
+    let tmp_name = format!(
+        "{SUMMARIES_CACHE_FILE}.tmp.{}.{}",
+        std::process::id(),
+        RECORD_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+    let tmp_path = store_path(&dir.join(tmp_name));
+    let written =
+        std::fs::write(&tmp_path, &bytes).and_then(|()| std::fs::rename(&tmp_path, &cache_path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+}
+
 /// Summarize every .jsonl strand under `dir`, newest first (shared by
-/// [`list`] and [`list_archived`]). A missing directory is an empty
-/// listing, like `list` always treated fresh cwds.
+/// [`list`] and [`list_archived`]). Uses a per-directory metadata cache
+/// (`.summaries-cache.json`) keyed by filename, byte length, and mtime so
+/// unchanged strands are not re-read from disk. A missing directory is an
+/// empty listing, like `list` always treated fresh cwds.
 fn summaries_in(dir: &Path) -> std::io::Result<Vec<StrandSummary>> {
     let mut summaries = Vec::new();
     let entries = match std::fs::read_dir(store_path(dir)) {
@@ -959,15 +1121,58 @@ fn summaries_in(dir: &Path) -> std::io::Result<Vec<StrandSummary>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(summaries),
         Err(e) => return Err(e),
     };
+    let mut cache = load_summaries_cache(dir);
+    let initial_cache_len = cache.len();
+    let mut next_cache: HashMap<String, CachedSummaryEntry> = HashMap::new();
+    let mut dirty = false;
+
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().is_none_or(|e| e != "jsonl") {
             continue;
         }
+        let file_name = entry.file_name().to_string_lossy().into_owned();
+        let meta = entry.metadata().ok();
+        let stat = meta.as_ref().and_then(|m| {
+            let mtime_ns = m
+                .modified()
+                .ok()?
+                .duration_since(UNIX_EPOCH)
+                .ok()?
+                .as_nanos();
+            Some((m.len(), mtime_ns))
+        });
+
+        if let Some((len, mtime_ns)) = stat
+            && let Some(cached) = cache.remove(&file_name)
+        {
+            if cached.len == len && cached.mtime_ns == mtime_ns {
+                next_cache.insert(file_name, cached.clone());
+                summaries.push(cached.into_summary(path));
+                continue;
+            }
+            dirty = true;
+        }
+
         if let Some(summary) = summarize(&path) {
+            if let Some((len, mtime_ns)) = stat {
+                next_cache.insert(
+                    file_name,
+                    CachedSummaryEntry::from_summary(len, mtime_ns, &summary),
+                );
+                dirty = true;
+            }
             summaries.push(summary);
         }
     }
+
+    if next_cache.len() != initial_cache_len {
+        dirty = true;
+    }
+    if dirty {
+        save_summaries_cache(dir, next_cache);
+    }
+
     // ids embed millisecond timestamps (s{millis:x}), so they sort newer
     // first even when RFC 3339 timestamps tie at second granularity.
     summaries.sort_by(|a, b| b.id.cmp(&a.id));
@@ -990,10 +1195,28 @@ pub fn list_archived(cwd: &Path) -> Vec<StrandSummary> {
     summaries_in(&archived_strand_dir(cwd)).unwrap_or_default()
 }
 
+/// Read the first line of `path`, capped at `MAX_LINE_BYTES`.
+fn read_first_line(path: &Path) -> Option<String> {
+    let file = File::open(store_path(path)).ok()?;
+    let mut reader = BufReader::new(file);
+    let mut buf = Vec::new();
+    let bytes = reader
+        .by_ref()
+        .take((MAX_LINE_BYTES + 1) as u64)
+        .read_until(b'\n', &mut buf)
+        .ok()?;
+    if bytes == 0 || (buf.len() > MAX_LINE_BYTES && buf.last() != Some(&b'\n')) {
+        return None;
+    }
+    if buf.last() == Some(&b'\n') {
+        buf.pop();
+    }
+    String::from_utf8(buf).ok()
+}
+
 /// One strand's header (first line only): `(id, ts, parent)`.
 fn header_of(path: &Path) -> Option<(String, String, Option<String>)> {
-    let file = File::open(path).ok()?;
-    let first = BufReader::new(file).lines().next()?.ok()?;
+    let first = read_first_line(path)?;
     let Ok(Record::Header { id, ts, parent, .. }) = serde_json::from_str(&first) else {
         return None;
     };
@@ -1004,7 +1227,7 @@ fn header_of(path: &Path) -> Option<(String, String, Option<String>)> {
 /// single open + pass: the header comes off the first line and the
 /// counters walk the same reader — no second open, no re-read prefix.
 fn summarize(path: &Path) -> Option<StrandSummary> {
-    let file = File::open(path).ok()?;
+    let file = File::open(store_path(path)).ok()?;
     let mut reader = BufReader::new(file);
     let mut buf: Vec<u8> = Vec::new();
     let first = read_line_lossy(&mut reader, &mut buf)?;
@@ -1064,7 +1287,11 @@ fn summarize(path: &Path) -> Option<StrandSummary> {
         } else if line.starts_with("{\"record\":\"usage\"") {
             if let Ok(probe) = serde_json::from_str::<UsageProbe>(line) {
                 cost += probe.cost;
-                tokens += probe.input + probe.output + probe.cache_read + probe.cache_write;
+                tokens = tokens
+                    .saturating_add(probe.input)
+                    .saturating_add(probe.output)
+                    .saturating_add(probe.cache_read)
+                    .saturating_add(probe.cache_write);
             }
         }
     }
@@ -1086,20 +1313,47 @@ fn summarize(path: &Path) -> Option<StrandSummary> {
     })
 }
 
-/// Read one '\\n'-terminated line as `&str` into `buf`. `None` at EOF
-/// or on a read/UTF-8 error — the tolerant listing path just stops
-/// there, like the old `map_while(Result::ok)`.
+/// Read the next valid-UTF-8 `'\n'`-terminated line as `&str` into `buf`,
+/// capping each line at `MAX_LINE_BYTES`. Invalid-UTF-8 or oversized lines
+/// are skipped rather than aborting the scan of the rest of the file.
+/// Returns `None` at EOF or on an I/O read error.
 fn read_line_lossy<'a>(reader: &mut BufReader<File>, buf: &'a mut Vec<u8>) -> Option<&'a str> {
-    buf.clear();
-    reader.read_until(b'\n', buf).ok()?;
-    if buf.is_empty() {
-        return None;
-    }
-    let trimmed: &[u8] = match buf.last() {
-        Some(b'\n') => &buf[..buf.len() - 1],
-        _ => &buf[..],
+    let valid_len = loop {
+        buf.clear();
+        let bytes = reader
+            .by_ref()
+            .take((MAX_LINE_BYTES + 1) as u64)
+            .read_until(b'\n', buf)
+            .ok()?;
+        if bytes == 0 {
+            return None;
+        }
+        if buf.len() > MAX_LINE_BYTES && buf.last() != Some(&b'\n') {
+            // Drain the remainder of this oversized line up to and including '\n'.
+            loop {
+                let avail = reader.fill_buf().ok()?;
+                if avail.is_empty() {
+                    return None;
+                }
+                if let Some(pos) = avail.iter().position(|&b| b == b'\n') {
+                    reader.consume(pos + 1);
+                    break;
+                }
+                let n = avail.len();
+                reader.consume(n);
+            }
+            continue;
+        }
+        let len = match buf.last() {
+            Some(b'\n') => buf.len() - 1,
+            _ => buf.len(),
+        };
+        if std::str::from_utf8(&buf[..len]).is_ok() {
+            break len;
+        }
+        // Single invalid-UTF-8 line: skip and continue scanning.
     };
-    std::str::from_utf8(trimmed).ok()
+    std::str::from_utf8(&buf[..valid_len]).ok()
 }
 
 /// Every strand file under `cwd`'s strand dir, header-only (first line
@@ -1134,23 +1388,39 @@ pub fn latest(cwd: &Path) -> std::io::Result<Option<StrandSummary>> {
         .and_then(|(path, _)| summarize(&path)))
 }
 
-/// Append a [`Record::Title`] to the strand at `path`: replay and
-/// [`list`] then report `title` as the display title, while every other
-/// record — messages, the memorable [`Record::Name`] alias, settings —
-/// stays untouched (the `ka session rename` contract). Errors when the
-/// file is missing or is not a strand (no header record).
-pub fn retitle(path: &Path, title: &str) -> std::io::Result<()> {
+/// Validate that `path` is an existing strand file (checking line 1's
+/// header cheaply) and append `record` directly via [`StrandWriter`]
+/// without deserializing the whole strand into memory.
+fn append_to_existing_strand(path: &Path, record: &Record) -> std::io::Result<()> {
     if !path.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             format!("no strand file at {}", path.display()),
         ));
     }
-    let mut strand = StrandFile::open(path)?;
-    strand.append(Record::Title {
-        id: new_record_id(),
-        title: title.to_string(),
-    })
+    if header_of(path).is_none() {
+        return Err(std::io::Error::other(format!(
+            "not a strand file (missing header record): {}",
+            path.display()
+        )));
+    }
+    let mut writer = StrandWriter::open(path)?;
+    writer.append(record)
+}
+
+/// Append a [`Record::Title`] to the strand at `path`: replay and
+/// [`list`] then report `title` as the display title, while every other
+/// record — messages, the memorable [`Record::Name`] alias, settings —
+/// stays untouched (the `ka session rename` contract). Errors when the
+/// file is missing or is not a strand (no header record).
+pub fn retitle(path: &Path, title: &str) -> std::io::Result<()> {
+    append_to_existing_strand(
+        path,
+        &Record::Title {
+            id: new_record_id(),
+            title: title.to_string(),
+        },
+    )
 }
 
 /// Namespace of the session pin flag (`set_pinned`): the LAST record
@@ -1169,18 +1439,14 @@ pub const BRANCH_SUMMARY_NS: &str = "x.ka.branch_summary";
 /// Shared by the session-flag appenders below; validation matches
 /// [`retitle`] (a real file carrying a strand header).
 fn append_custom(path: &Path, ns: &str, data: serde_json::Value) -> std::io::Result<()> {
-    if !path.is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("no strand file at {}", path.display()),
-        ));
-    }
-    let mut strand = StrandFile::open(path)?;
-    strand.append(Record::Custom {
-        id: new_record_id(),
-        ns: ns.to_string(),
-        data,
-    })
+    append_to_existing_strand(
+        path,
+        &Record::Custom {
+            id: new_record_id(),
+            ns: ns.to_string(),
+            data,
+        },
+    )
 }
 
 /// Pin or unpin the session at `path` by appending a [`Record::Custom`]
@@ -1355,8 +1621,7 @@ pub struct GcReport {
 /// A strand's header-declared creation cwd (first line only, like
 /// [`header_of`]).
 fn header_cwd(path: &Path) -> Option<String> {
-    let file = File::open(path).ok()?;
-    let first = BufReader::new(file).lines().next()?.ok()?;
+    let first = read_first_line(path)?;
     let Ok(Record::Header { cwd, .. }) = serde_json::from_str(&first) else {
         return None;
     };
@@ -1421,10 +1686,14 @@ pub fn gc(
     let strands = data_root.join("strands");
     let archived = data_root.join("strands-archived");
 
-    // (c) empty strand dirs first: they carry no sessions, and keeping
-    // them out of the live-key set before orphan detection keeps a
-    // dry run and the real pass in exact agreement.
-    for tree in [&strands, &archived] {
+    // Single consolidated walk across live (`strands`) and archived
+    // (`strands-archived`) trees:
+    // - (c) remove empty strand directories (ignoring any leftover
+    //       `.summaries-cache.json`),
+    // - collect `live_keys` for snapshot orphan detection,
+    // - (d) sum bytes of live strand files older than `threshold`.
+    let mut live_keys: HashSet<String> = HashSet::new();
+    for (tree, is_live_tree) in [(&strands, true), (&archived, false)] {
         for entry in dir_entries(tree)? {
             let Ok(meta) = entry.metadata() else {
                 continue;
@@ -1432,35 +1701,37 @@ pub fn gc(
             if !meta.is_dir() {
                 continue;
             }
-            if dir_entries(&entry.path())?.is_empty() {
+            let dir_path = entry.path();
+            let children = dir_entries(&dir_path)?;
+            let is_empty = children
+                .iter()
+                .all(|c| c.file_name().to_str() == Some(SUMMARIES_CACHE_FILE));
+            if is_empty {
                 report.empty_dirs_removed += 1;
                 if !dry_run {
-                    std::fs::remove_dir(store_path(&entry.path()))?;
+                    if !children.is_empty() {
+                        let _ =
+                            std::fs::remove_file(store_path(&dir_path.join(SUMMARIES_CACHE_FILE)));
+                    }
+                    std::fs::remove_dir(store_path(&dir_path))?;
                 }
+                continue;
             }
-        }
-    }
 
-    // The keys that still own strands: every strand directory holding
-    // at least one header-bearing file, plus all three encodings of
-    // each strand's header cwd — snapshot dirs are keyed by the legacy
-    // snapshot encoding, strand dirs by the injective (or legacy)
-    // strand encoding, and a strand resumed under a different cwd
-    // still declares its original one in the header.
-    let mut live_keys: HashSet<String> = HashSet::new();
-    for tree in [&strands, &archived] {
-        for entry in dir_entries(tree)? {
-            let Ok(meta) = entry.metadata() else {
-                continue;
-            };
-            if !meta.is_dir() {
-                continue;
-            }
             let mut has_strand = false;
-            for strand in dir_entries(&entry.path())? {
+            for strand in children {
                 let path = strand.path();
                 if path.extension().is_none_or(|e| e != "jsonl") {
                     continue;
+                }
+                if is_live_tree
+                    && let Ok(smeta) = strand.metadata()
+                    && smeta
+                        .modified()
+                        .ok()
+                        .is_some_and(|m| is_older(now, m, threshold))
+                {
+                    report.strand_bytes_reported += smeta.len();
                 }
                 let Some(cwd) = header_cwd(&path) else {
                     continue;
@@ -1522,32 +1793,6 @@ pub fn gc(
                 if !dry_run {
                     std::fs::remove_file(store_path(&entry.path()))?;
                 }
-            }
-        }
-    }
-
-    // (d) strands: report-only — bytes of files past the threshold.
-    for entry in dir_entries(&strands)? {
-        let Ok(meta) = entry.metadata() else {
-            continue;
-        };
-        if !meta.is_dir() {
-            continue;
-        }
-        for strand in dir_entries(&entry.path())? {
-            let path = strand.path();
-            if path.extension().is_none_or(|e| e != "jsonl") {
-                continue;
-            }
-            let Ok(meta) = strand.metadata() else {
-                continue;
-            };
-            if meta
-                .modified()
-                .ok()
-                .is_some_and(|m| is_older(now, m, threshold))
-            {
-                report.strand_bytes_reported += meta.len();
             }
         }
     }
@@ -1652,14 +1897,14 @@ impl IdMatch {
     }
 }
 
-/// The display title for a strand's records: the stored [`Record::Title`]
+/// The display title for a strand's records: the last stored [`Record::Title`]
 /// when present, else the first user message (truncated), else
 /// `"(empty)"`. Shared by [`list`] and the engine's fork path.
 pub fn title_of(records: &[Record]) -> String {
     let mut title = String::new();
     for record in records {
         match record {
-            Record::Title { title: t, .. } => return t.clone(),
+            Record::Title { title: t, .. } => title = t.clone(),
             Record::Message {
                 role: Role::User,
                 content,
@@ -1728,11 +1973,25 @@ pub fn read(path: &Path) -> std::io::Result<Vec<Record>> {
     let mut idx = 0usize;
     loop {
         buf.clear();
-        let bytes = reader.read_until(b'\n', &mut buf)?;
+        let bytes = reader
+            .by_ref()
+            .take((MAX_LINE_BYTES + 1) as u64)
+            .read_until(b'\n', &mut buf)?;
         if bytes == 0 {
             break;
         }
         idx += 1;
+        if buf.len() > MAX_LINE_BYTES && buf.last() != Some(&b'\n') {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "{}:{}: record exceeds {} byte limit",
+                    path.display(),
+                    idx,
+                    MAX_LINE_BYTES
+                ),
+            ));
+        }
         // an unterminated chunk is necessarily the file's last: a torn
         // append. Everything else carries its newline.
         let terminated = buf.last() == Some(&b'\n');
@@ -3313,19 +3572,41 @@ mod tests {
     fn torn_tail_heal_handles_no_trailing_newline_at_all() {
         let data = temp_data("heal-all");
         let path = data.join("torn-only.jsonl");
-        std::fs::write(&path, b"{\"record\":\"hea").unwrap(); // no newline
-        let mut writer = StrandWriter::open(&path).unwrap();
-        writer
-            .append(&Record::Title {
-                id: new_record_id(),
-                title: "after full-file heal".into(),
-            })
-            .unwrap();
+        assert!(std::fs::write(&path, b"{\"record\":\"hea").is_ok()); // no newline
+        let Ok(mut writer) = StrandWriter::open(&path) else {
+            panic!("StrandWriter::open failed");
+        };
+        // After line 1 is torn and truncated to 0, a non-header must be rejected.
+        assert!(
+            writer
+                .append(&Record::Title {
+                    id: new_record_id(),
+                    title: "cannot start with title".into(),
+                })
+                .is_err(),
+            "non-header at line 1 must be rejected after full-file heal"
+        );
+        // Writing a valid Header at line 1 succeeds.
+        assert!(
+            writer
+                .append(&Record::Header {
+                    id: new_strand_id(),
+                    ts: now_rfc3339(),
+                    cwd: data.to_string_lossy().into_owned(),
+                    version: 1,
+                    repo: None,
+                    parent: None,
+                })
+                .is_ok()
+        );
         drop(writer);
+        let Ok(contents) = std::fs::read_to_string(&path) else {
+            panic!("read_to_string failed");
+        };
         assert_eq!(
-            std::fs::read_to_string(&path).unwrap().lines().count(),
+            contents.lines().count(),
             1,
-            "entirely-torn file truncates to empty before the append"
+            "entirely-torn file truncates to empty before header append"
         );
         let _ = std::fs::remove_dir_all(&data);
     }
@@ -3429,6 +3710,254 @@ mod tests {
         assert!(migrated.exists(), "new-key dir exists after access");
         assert!(migrated.join("marker.txt").exists(), "contents moved");
         assert!(!legacy.exists(), "legacy dir renamed away");
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn valid_json_without_trailing_newline_survives_reopen_and_append() {
+        let data = temp_data("valid-no-nl");
+        let path = data.join("no-nl.jsonl");
+        let header = Record::Header {
+            id: new_strand_id(),
+            ts: now_rfc3339(),
+            cwd: data.to_string_lossy().into_owned(),
+            version: 1,
+            repo: None,
+            parent: None,
+        };
+        let msg1 = Record::Message {
+            images: Vec::new(),
+            id: new_record_id(),
+            role: Role::User,
+            content: "valid json missing newline".into(),
+            calls: Vec::new(),
+            results: Vec::new(),
+            thinking: None,
+        };
+        let Ok(h_line) = serde_json::to_string(&header) else {
+            panic!("serialize header");
+        };
+        let Ok(m1_line) = serde_json::to_string(&msg1) else {
+            panic!("serialize msg1");
+        };
+        // Deliberately omit the trailing '\n' after msg1.
+        assert!(std::fs::write(&path, format!("{h_line}\n{m1_line}")).is_ok());
+
+        let Ok(mut writer) = StrandWriter::open(&path) else {
+            panic!("StrandWriter::open failed");
+        };
+        let msg2 = Record::Message {
+            images: Vec::new(),
+            id: new_record_id(),
+            role: Role::Assistant,
+            content: "appended after heal".into(),
+            calls: Vec::new(),
+            results: Vec::new(),
+            thinking: None,
+        };
+        assert!(writer.append(&msg2).is_ok());
+        drop(writer);
+
+        let Ok(reopened) = StrandFile::open(&path) else {
+            panic!("StrandFile::open failed");
+        };
+        assert_eq!(reopened.records().len(), 3);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn title_of_matches_summarize_after_multiple_retitles() {
+        let data = temp_data("retitle-match");
+        let cwd = data.join("proj");
+        assert!(std::fs::create_dir_all(&cwd).is_ok());
+        let Ok(mut strand) = StrandFile::create(&cwd, None) else {
+            panic!("create failed");
+        };
+        assert!(
+            strand
+                .append(Record::Message {
+                    images: Vec::new(),
+                    id: new_record_id(),
+                    role: Role::User,
+                    content: "initial prompt".into(),
+                    calls: Vec::new(),
+                    results: Vec::new(),
+                    thinking: None,
+                })
+                .is_ok()
+        );
+        let Some(path) = strand.path().map(Path::to_path_buf) else {
+            panic!("missing path");
+        };
+        assert!(retitle(&path, "first title").is_ok());
+        assert!(retitle(&path, "second title").is_ok());
+
+        let Ok(reopened) = StrandFile::open(&path) else {
+            panic!("open failed");
+        };
+        let Some(summary) = summarize(&path) else {
+            panic!("summarize returned None");
+        };
+        assert_eq!(summary.title, "second title");
+        assert_eq!(title_of(reopened.records()), summary.title);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn summarize_saturates_token_overflow() {
+        let data = temp_data("tok-sat");
+        let path = data.join("overflow.jsonl");
+        let header = Record::Header {
+            id: new_strand_id(),
+            ts: now_rfc3339(),
+            cwd: data.to_string_lossy().into_owned(),
+            version: 1,
+            repo: None,
+            parent: None,
+        };
+        let u1 = Record::Usage {
+            id: new_record_id(),
+            cost: 0.0,
+            input: u64::MAX - 10,
+            output: 100,
+            cache_read: 50,
+            cache_write: 25,
+        };
+        let u2 = Record::Usage {
+            id: new_record_id(),
+            cost: 0.0,
+            input: u64::MAX,
+            output: u64::MAX,
+            cache_read: 0,
+            cache_write: 0,
+        };
+        let Ok(mut writer) = StrandWriter::open(&path) else {
+            panic!("open failed");
+        };
+        assert!(writer.append(&header).is_ok());
+        assert!(writer.append(&u1).is_ok());
+        assert!(writer.append(&u2).is_ok());
+        drop(writer);
+
+        let Some(summary) = summarize(&path) else {
+            panic!("summarize returned None");
+        };
+        assert_eq!(summary.tokens, u64::MAX);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn summarize_survives_mid_file_invalid_utf8_line() {
+        let data = temp_data("bad-utf8-mid");
+        let path = data.join("mid-utf8.jsonl");
+        let header = Record::Header {
+            id: new_strand_id(),
+            ts: now_rfc3339(),
+            cwd: data.to_string_lossy().into_owned(),
+            version: 1,
+            repo: None,
+            parent: None,
+        };
+        let m1 = Record::Message {
+            images: Vec::new(),
+            id: new_record_id(),
+            role: Role::User,
+            content: "before bad utf8".into(),
+            calls: Vec::new(),
+            results: Vec::new(),
+            thinking: None,
+        };
+        let t1 = Record::Title {
+            id: new_record_id(),
+            title: "after bad utf8".into(),
+        };
+        let Ok(h_line) = serde_json::to_string(&header) else {
+            panic!("serialize header");
+        };
+        let Ok(m_line) = serde_json::to_string(&m1) else {
+            panic!("serialize msg");
+        };
+        let Ok(t_line) = serde_json::to_string(&t1) else {
+            panic!("serialize title");
+        };
+        let mut raw = Vec::new();
+        raw.extend_from_slice(h_line.as_bytes());
+        raw.push(b'\n');
+        raw.extend_from_slice(m_line.as_bytes());
+        raw.push(b'\n');
+        raw.extend_from_slice(b"{\"record\":\"message\",\"content\":\"\xff\xfe\"}\n");
+        raw.extend_from_slice(t_line.as_bytes());
+        raw.push(b'\n');
+        assert!(std::fs::write(&path, raw).is_ok());
+
+        let Some(summary) = summarize(&path) else {
+            panic!("summarize returned None");
+        };
+        assert_eq!(summary.messages, 1);
+        assert_eq!(summary.title, "after bad utf8");
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn summaries_metadata_cache_hits_invalidates_and_recovers_from_corruption() {
+        let data = temp_data("meta-cache");
+        let cwd = data.join("proj");
+        assert!(std::fs::create_dir_all(&cwd).is_ok());
+        let Ok(mut strand) = StrandFile::create(&cwd, None) else {
+            panic!("create failed");
+        };
+        assert!(
+            strand
+                .append(Record::Message {
+                    images: Vec::new(),
+                    id: new_record_id(),
+                    role: Role::User,
+                    content: "original title".into(),
+                    calls: Vec::new(),
+                    results: Vec::new(),
+                    thinking: None,
+                })
+                .is_ok()
+        );
+        let Some(path) = strand.path().map(Path::to_path_buf) else {
+            panic!("missing path");
+        };
+
+        // First list builds the cache file.
+        let Ok(first) = list(&cwd) else {
+            panic!("first list failed");
+        };
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].title, "original title");
+        let cache_file = strand_dir(&cwd).join(SUMMARIES_CACHE_FILE);
+        assert!(cache_file.exists(), "metadata cache file should be written");
+
+        // Second list hits the cache and returns identical summary.
+        let Ok(second) = list(&cwd) else {
+            panic!("second list failed");
+        };
+        assert_eq!(second, first);
+
+        // Append a new title -> file len changes -> cache invalidates.
+        assert!(retitle(&path, "updated title").is_ok());
+        let Ok(third) = list(&cwd) else {
+            panic!("third list failed");
+        };
+        assert_eq!(third.len(), 1);
+        assert_eq!(third[0].title, "updated title");
+
+        // Corrupt the cache file -> list gracefully ignores and rebuilds it.
+        assert!(std::fs::write(&cache_file, b"{corrupt json").is_ok());
+        let Ok(fourth) = list(&cwd) else {
+            panic!("fourth list failed");
+        };
+        assert_eq!(fourth.len(), 1);
+        assert_eq!(fourth[0].title, "updated title");
+        let Ok(rebuilt) = std::fs::read_to_string(&cache_file) else {
+            panic!("cache file missing after rebuild");
+        };
+        assert!(serde_json::from_str::<SummariesCache>(&rebuilt).is_ok());
+
         let _ = std::fs::remove_dir_all(&data);
     }
 }

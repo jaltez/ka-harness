@@ -7,6 +7,7 @@ use std::sync::LazyLock;
 static SECRETS: LazyLock<Vec<(String, String)>> = LazyLock::new(|| {
     let mut found = Vec::new();
     for (name, value) in std::env::vars() {
+        let upper = name.to_ascii_uppercase();
         let looks_secret = [
             "KEY",
             "SECRET",
@@ -16,9 +17,15 @@ static SECRETS: LazyLock<Vec<(String, String)>> = LazyLock::new(|| {
             "AUTH",
             "CREDENTIAL",
             "PRIVATE",
+            "DATABASE_URL",
+            "REDIS_URL",
+            "DSN",
+            "JWT",
+            "COOKIE",
+            "WEBHOOK",
         ]
         .iter()
-        .any(|m| name.to_uppercase().contains(m));
+        .any(|m| upper.contains(m));
         if looks_secret && value.len() >= 8 && !value.contains(' ') {
             found.push((name, value));
         }
@@ -26,21 +33,46 @@ static SECRETS: LazyLock<Vec<(String, String)>> = LazyLock::new(|| {
     found
 });
 
+static PATTERNS: LazyLock<Vec<(&'static str, regex::Regex)>> = LazyLock::new(|| {
+    [
+        (
+            "[redacted:private-key]",
+            r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----",
+        ),
+        ("[redacted:anthropic-key]", r"\bsk-ant-[A-Za-z0-9_-]{16,}"),
+        ("[redacted:api-key]", r"\bsk-[A-Za-z0-9_-]{20,}"),
+        ("[redacted:github-token]", r"github_pat_[A-Za-z0-9_]{20,}"),
+        ("[redacted:github-token]", r"ghp_[A-Za-z0-9]{20,}"),
+        ("[redacted:aws-key]", r"AKIA[0-9A-Z]{16}"),
+        ("://[redacted:credentials]@", r"://[^:@/\s]+:[^@/\s]+@"),
+    ]
+    .into_iter()
+    .filter_map(|(replacement, pat)| regex::Regex::new(pat).ok().map(|re| (replacement, re)))
+    .collect()
+});
+
 /// Redact known secret values inside `text`, replacing each occurrence
-/// with `[redacted:NAME]`. Values are matched longest-first so overlapping
+/// with `[redacted:NAME]` and well-known secret formats with typed
+/// placeholders. Values are matched longest-first so overlapping
 /// prefixes don't leave fragments.
 pub fn redact(text: &str) -> String {
     redact_from(text, &SECRETS)
 }
 
-/// Redaction core against explicit pairs (testable without env mutation).
+/// Redaction core against explicit pairs plus well-known secret
+/// patterns (testable without env mutation).
 pub fn redact_from(text: &str, pairs: &[(String, String)]) -> String {
     let mut out = text.to_string();
     let mut sorted = pairs.to_vec();
     sorted.sort_by_key(|(_, v)| std::cmp::Reverse(v.len()));
     for (name, value) in sorted {
-        if out.contains(&value) {
+        if !value.is_empty() && out.contains(&value) {
             out = out.replace(&value, &format!("[redacted:{name}]"));
+        }
+    }
+    for (replacement, re) in PATTERNS.iter() {
+        if re.is_match(&out) {
+            out = re.replace_all(&out, *replacement).into_owned();
         }
     }
     out

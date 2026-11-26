@@ -44,6 +44,9 @@ const SPILL_AT: usize = 32 * 1024;
 /// frontmatter means 12), the same turn cap every delegate run gets.
 const TAN_MAX_STEPS: u32 = 12;
 
+/// Maximum concurrent live tangential jobs.
+const MAX_LIVE_TAN: usize = 8;
+
 /// One parsed `Command::Tan` text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TanAction {
@@ -68,15 +71,17 @@ fn parse_tan(text: &str) -> TanAction {
         return TanAction::List;
     }
     if let Some(rest) = text.strip_prefix("cancel") {
-        let rest = rest.trim();
         if rest.is_empty() {
             return TanAction::Cancel(None);
         }
-        let digits = rest.strip_prefix("t-").unwrap_or(rest);
-        return match digits.parse::<u64>() {
-            Ok(id) => TanAction::Cancel(Some(id)),
-            Err(_) => TanAction::Usage,
-        };
+        if rest.starts_with(char::is_whitespace) {
+            let rest = rest.trim();
+            let digits = rest.strip_prefix("t-").unwrap_or(rest);
+            return match digits.parse::<u64>() {
+                Ok(id) => TanAction::Cancel(Some(id)),
+                Err(_) => TanAction::Usage,
+            };
+        }
     }
     TanAction::Ask(text.to_string())
 }
@@ -182,6 +187,20 @@ impl Tangential {
     /// note: the dispatching surface confirms locally, the transcript
     /// stays quiet until the answer itself arrives.
     async fn spawn(&self, question: &str, cwd: &std::path::Path) {
+        if crate::conventions::bare_mode() {
+            send_note(&self.inner, "tan: unavailable in safe mode".to_string()).await;
+            return;
+        }
+        if self.inner.live.lock().len() >= MAX_LIVE_TAN {
+            send_note(
+                &self.inner,
+                format!(
+                    "tan: too many concurrent tangential jobs (max {MAX_LIVE_TAN}) — wait or /tan cancel"
+                ),
+            )
+            .await;
+            return;
+        }
         let subject =
             super::delegate::truncate_for_note(first_line(question), SUBJECT_CAP).to_string();
         let def = AgentDef {

@@ -192,19 +192,31 @@ fn url_host(url: &str) -> Option<String> {
 }
 
 pub fn glob_match(pattern: &str, text: &str) -> bool {
-    fn inner(p: &[char], t: &[char]) -> bool {
-        match (p.first(), t.first()) {
-            (None, None) => true,
-            (None, Some(_)) => false,
-            (Some('*'), _) => (0..=t.len()).any(|skip| inner(&p[1..], &t[skip..])),
-            (Some('?'), Some(_)) => inner(&p[1..], &t[1..]),
-            (Some(pc), Some(tc)) if pc == tc => inner(&p[1..], &t[1..]),
-            _ => false,
-        }
-    }
     let p: Vec<char> = pattern.chars().collect();
     let t: Vec<char> = text.chars().collect();
-    inner(&p, &t)
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let mut star_p: Option<usize> = None;
+    let mut star_t: usize = 0;
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star_p = Some(pi);
+            star_t = ti;
+            pi += 1;
+        } else if let Some(sp) = star_p {
+            pi = sp + 1;
+            star_t += 1;
+            ti = star_t;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 /// EXT-11: one `[virtual_models.<name>]` route — member selectors, the
@@ -496,7 +508,7 @@ impl Voice {
     /// Replace one MCP server's hands in registry order (reconnect or
     /// refresh tool diff). Absent prefixes append at the end.
     pub fn replace_server_hands(&mut self, server: &str, hands: Vec<std::sync::Arc<dyn Hand>>) {
-        let prefix = format!("{server}.");
+        let prefix = crate::mcp::wire_prefix(server);
         let mut result: Vec<std::sync::Arc<dyn Hand>> = Vec::with_capacity(self.hands.len());
         let mut replaced = false;
         for h in self.hands.drain(..) {
@@ -513,6 +525,20 @@ impl Voice {
             result.extend(hands);
         }
         self.hands = result;
+        self.specs_cache.lock().take();
+    }
+
+    /// Remove hands by exact name (e.g. stripping cron/monitor from
+    /// leaf team members) and invalidate the specs cache.
+    pub(crate) fn remove_hands(&mut self, names: &[&str]) {
+        self.hands
+            .retain(|h| !names.contains(&h.def().name.as_str()));
+        self.specs_cache.lock().take();
+    }
+
+    /// Current `[permissions] prompt_policy`.
+    pub(crate) fn prompt_policy(&self) -> crate::config::PromptPolicy {
+        self.prompt_policy
     }
 
     /// Tool names in registry order (built-ins, then anything pushed at
@@ -995,6 +1021,11 @@ impl Voice {
     /// Set the bash sandbox policy (engine bootstrap).
     pub fn set_sandbox(&mut self, policy: ka_sandbox::Policy) {
         self.hand_ctx.sandbox = policy;
+    }
+
+    /// The live bash sandbox policy (delegate children inherit this).
+    pub fn sandbox_policy(&self) -> &ka_sandbox::Policy {
+        &self.hand_ctx.sandbox
     }
 
     /// Set `[prompt] identity_file` (engine bootstrap; None = default
@@ -2114,7 +2145,7 @@ impl Voice {
             return Err("sampling: empty messages array".to_string());
         }
         let prompt = transcript.join("\n\n");
-        let max_tokens = params["maxTokens"].as_u64().unwrap_or(512).clamp(1, 8192);
+        let max_tokens = params["maxTokens"].as_u64().unwrap_or(512).clamp(1, 4096);
         let cap = (max_tokens as u32).saturating_mul(4);
         let mut dialect = self
             .catalog
@@ -4170,7 +4201,7 @@ impl Voice {
                 let analysis = analyze(&command);
                 hardstop(&command, &analysis).map(|s| s.reason)
             }
-            Clearance::Write if self.mode != ka_protocol::Mode::Readonly => {
+            Clearance::Write => {
                 crate::hands::protected::reason(&self.hand_ctx.cwd, &call.primary_arg())
                     .map(str::to_string)
             }
@@ -4186,11 +4217,12 @@ impl Voice {
         output: &ToolOutput,
         events: &mpsc::Sender<Event>,
     ) {
+        let redacted = crate::hands::secrets::redact(&output.content);
         events
             .send(Event::CallOutput {
                 tool: call.tool.clone(),
                 id: call.id.clone(),
-                excerpt: truncate_excerpt(&output.content),
+                excerpt: truncate_excerpt(&redacted),
                 is_error: output.is_error,
                 spill: None,
             })
@@ -4209,13 +4241,20 @@ impl Voice {
     fn gate(&self, clearance: Clearance, call: &ToolCall) -> Gate {
         // protected paths are hardstop-class: checked before rules so no
         // allow-rule or session always-allow can bypass them, and before
-        // mode logic so free mode cannot wave them through. Readonly mode is
-        // exempt here — it already denies every write outside .ka/plans/,
-        // which covers everything the protected list contains.
-        if clearance == Clearance::Write && self.mode != ka_protocol::Mode::Readonly {
+        // mode logic so free mode or readonly plans-dir cannot wave them
+        // through.
+        if clearance == Clearance::Write {
             if let Some(reason) =
                 crate::hands::protected::reason(&self.hand_ctx.cwd, &call.primary_arg())
             {
+                if self.mode == ka_protocol::Mode::Readonly {
+                    return Gate::Deny {
+                        reason: format!(
+                            "plan mode is read-only (protected path — {reason}): `{}`",
+                            call.primary_arg()
+                        ),
+                    };
+                }
                 let question = format!(
                     "PROTECTED — {reason}: `{}`. Proceed anyway?",
                     call.primary_arg()
@@ -4260,12 +4299,14 @@ impl Voice {
                 }
                 ka_protocol::Mode::Readonly => {
                     // research mode: only the project root's plans
-                    // directory is writable. Resolve the argument
-                    // (absolute or relative) before comparing, so every
-                    // spelling lands where the plan prompt and the TUI
-                    // watcher look
-                    let plans_dir = crate::project_root(&self.hand_ctx.cwd).join(".ka/plans");
-                    let path = crate::hands::read::resolve(&self.hand_ctx, &call.primary_arg());
+                    // directory is writable. Resolve, normalize, and
+                    // canonicalize both sides so `..` and symlinks
+                    // cannot escape .ka/plans/.
+                    let plans_dir = crate::hands::protected::canonicalize_deepest(
+                        &crate::project_root(&self.hand_ctx.cwd).join(".ka/plans"),
+                    );
+                    let path =
+                        crate::hands::read::resolve_normalized(&self.hand_ctx, &call.primary_arg());
                     if path.starts_with(&plans_dir) {
                         Gate::Allow
                     } else {
@@ -4300,18 +4341,16 @@ use /build to switch to implementation",
                         reviewable: false,
                     };
                 }
-                if self.state.rules.contains(&format!(
-                    "bash:{}",
-                    analysis
-                        .segments
-                        .first()
-                        .and_then(|s| s.first())
-                        .cloned()
-                        .unwrap_or_default()
-                )) {
+                if call.tool == "bash"
+                    && !analysis.segments.is_empty()
+                    && analysis.segments.iter().all(|seg| {
+                        seg.first()
+                            .is_some_and(|prog| self.state.rules.contains(&format!("bash:{prog}")))
+                    })
+                {
                     return Gate::Allow;
                 }
-                if all_readonly(&analysis) {
+                if call.tool == "bash" && all_readonly(&analysis) {
                     return Gate::Allow;
                 }
                 match self.mode {
@@ -4775,6 +4814,34 @@ enum HookRun {
     Failed(String),
 }
 
+/// Maximum HTTP hook response body size (256 KiB).
+const HOOK_BODY_CAP: usize = 256 * 1024;
+
+/// Whether a hook URL targets loopback (`localhost` / `127.0.0.1` / `::1`)
+/// over http(s) — allowed for local hook servers, while non-loopback
+/// private/link-local/metadata IPs (e.g. 169.254.169.254) are blocked.
+fn is_loopback_hook_url(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return false;
+    }
+    let Some(raw_host) = parsed.host_str() else {
+        return false;
+    };
+    let host = raw_host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if host == "localhost" {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
+}
+
 /// Execute one configured hook: a shell command (payload on stdin) or
 /// an HTTP handler (payload POSTed as JSON, response body parsed with
 /// the same steering language). The per-hook `timeout_secs` (default
@@ -4786,19 +4853,43 @@ async fn run_one_hook(
 ) -> HookRun {
     let timeout = std::time::Duration::from_secs(hook.effective_timeout_secs());
     if let Some(url) = &hook.url {
-        let client = match reqwest::Client::builder().timeout(timeout).build() {
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            return HookRun::Failed(format!("hook url must be http(s): {url}"));
+        }
+        if !is_loopback_hook_url(url) {
+            if let Err(e) = crate::hands::web::validate_remote_url(url).await {
+                return HookRun::Failed(format!("hook url blocked: {e}"));
+            }
+        }
+        let client = match reqwest::Client::builder()
+            .timeout(timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+        {
             Ok(c) => c,
             Err(e) => return HookRun::Failed(format!("hook client failed to build: {e}")),
         };
-        let response = match client.post(url).json(payload).send().await {
+        let mut response = match client.post(url).json(payload).send().await {
             Ok(r) => r,
             Err(e) => return HookRun::Failed(format!("hook url failed: {e}")),
         };
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
         if !status.is_success() {
             return HookRun::Failed(format!("hook url returned status {status}"));
         }
+        let mut buf: Vec<u8> = Vec::new();
+        while let Ok(Some(chunk)) = response.chunk().await {
+            let remaining = HOOK_BODY_CAP.saturating_sub(buf.len());
+            if remaining == 0 {
+                break;
+            }
+            let take = chunk.len().min(remaining);
+            buf.extend_from_slice(&chunk[..take]);
+            if buf.len() >= HOOK_BODY_CAP {
+                break;
+            }
+        }
+        let body = String::from_utf8_lossy(&buf).into_owned();
         return HookRun::Ok(body);
     }
     let mut child = match tokio::process::Command::new("sh")

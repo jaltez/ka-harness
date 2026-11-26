@@ -22,6 +22,10 @@ use super::{Clearance, Hand, HandContext, HandDef, ToolOutput};
 /// flood one tool result; the caller iterates via `next_offset`.
 const READ_LINE_CAP: usize = 200;
 const READ_BYTE_CAP: usize = 32 * 1024;
+/// Per-monitor in-memory output cap (2 MiB) so chatty processes cannot OOM ka.
+const MAX_BUFFER_BYTES: usize = 2 * 1024 * 1024;
+/// Maximum number of concurrently running monitors per session.
+const MAX_MONITORS: usize = 16;
 
 /// One monitored process. Shared between the spawning hand and the
 /// engine's settle tick.
@@ -82,11 +86,61 @@ impl MonitorTable {
         cmd: &str,
         env: &crate::config::ShellEnvPolicy,
     ) -> Result<(String, u32), String> {
-        let mut command = std::process::Command::new("sh");
-        command.arg("-c").arg(cmd);
+        self.spawn_in(cmd, None, env, &ka_sandbox::Policy::Off)
+    }
+
+    /// Spawn `cmd` honoring `cwd`, `[shell]` env policy, and `[sandbox]`
+    /// policy, enforcing [`MAX_MONITORS`] live monitors and placing the
+    /// child in its own process group on Unix.
+    pub(crate) fn spawn_in(
+        &self,
+        cmd: &str,
+        cwd: Option<&std::path::Path>,
+        env: &crate::config::ShellEnvPolicy,
+        sandbox: &ka_sandbox::Policy,
+    ) -> Result<(String, u32), String> {
+        {
+            let t = self.inner.lock();
+            let active = t.entries.iter().filter(|e| e.exit.lock().is_none()).count();
+            if active >= MAX_MONITORS {
+                return Err(format!(
+                    "monitor spawn: limit of {MAX_MONITORS} concurrent monitors reached (kill one first)"
+                ));
+            }
+        }
+        let work_dir = cwd
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir()));
+        let mut command = if matches!(sandbox, ka_sandbox::Policy::Off) {
+            let mut c = std::process::Command::new("sh");
+            c.arg("-c").arg(cmd);
+            c
+        } else {
+            let argv = ka_sandbox::wrap_command(sandbox, cmd, &work_dir)?;
+            let mut c = std::process::Command::new(&argv[0]);
+            c.args(&argv[1..]);
+            c
+        };
+        if let Some(dir) = cwd {
+            command.current_dir(dir);
+        }
         command.stdout(std::process::Stdio::piped());
         command.stderr(std::process::Stdio::piped());
         env.apply_to_std(&mut command);
+        match ka_sandbox::proxy_env(sandbox) {
+            Ok(Some(proxy)) => {
+                for (name, value) in proxy.vars() {
+                    command.env(name, value);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => return Err(format!("monitor spawn: sandbox proxy: {e}")),
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
         let mut child = command.spawn().map_err(|e| format!("monitor spawn: {e}"))?;
         let pid = child.id();
         let stdout = child.stdout.take().ok_or("monitor spawn: no stdout")?;
@@ -157,10 +211,8 @@ impl MonitorTable {
             .map(|(i, _)| i + 1)
             .unwrap_or(rest.len());
         if end > READ_BYTE_CAP {
-            end = rest[..READ_BYTE_CAP]
-                .rfind('\n')
-                .map(|i| i + 1)
-                .unwrap_or(READ_BYTE_CAP);
+            let cap = floor_char_boundary(rest, READ_BYTE_CAP);
+            end = rest[..cap].rfind('\n').map(|i| i + 1).unwrap_or(cap);
         }
         let text = rest[..end].to_string();
         Ok(MonitorRead {
@@ -172,21 +224,20 @@ impl MonitorTable {
     }
 
     /// Kill a monitor's process tree. Err when there is nothing to
-    /// kill (unknown id or already exited and reaped).
+    /// kill (unknown id or already exited and reaped). Holds the table
+    /// and exit locks across `kill_tree` to prevent PID-reuse races.
     pub fn kill(&self, id: &str) -> Result<String, String> {
-        let (pid, cmd) = {
-            let t = self.inner.lock();
-            let Some(e) = t.entries.iter().find(|e| e.id == id) else {
-                return Err(format!("no such monitor: {id}"));
-            };
-            if let Some(code) = *e.exit.lock() {
-                return Err(format!("monitor {id} already exited ({code})"));
-            }
-            (e.pid, e.cmd.clone())
+        let t = self.inner.lock();
+        let Some(e) = t.entries.iter().find(|e| e.id == id) else {
+            return Err(format!("no such monitor: {id}"));
         };
+        let exit = e.exit.lock();
+        if let Some(code) = *exit {
+            return Err(format!("monitor {id} already exited ({code})"));
+        }
         #[cfg(unix)]
-        super::bash::kill_tree(pid);
-        Ok(format!("killing monitor {id} (`{cmd}`)"))
+        super::bash::kill_tree(e.pid);
+        Ok(format!("killing monitor {id} (`{}`)", e.cmd))
     }
 
     /// Settle-tick notes: one `monitor <id>: N new lines` per active
@@ -224,6 +275,29 @@ impl MonitorTable {
     }
 }
 
+impl Drop for MonitorTable {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            let t = self.inner.lock();
+            for e in &t.entries {
+                if e.exit.lock().is_none() {
+                    super::bash::kill_tree(e.pid);
+                }
+            }
+        }
+    }
+}
+
+/// Largest valid UTF-8 char boundary `<= max`.
+fn floor_char_boundary(s: &str, max: usize) -> usize {
+    let mut i = max.min(s.len());
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
 /// Cheap cloneable view of one entry (the table lock stays with the
 /// table; these are the shared Arcs the readers touch).
 struct MonitorEntrySnapshot {
@@ -249,15 +323,37 @@ fn safe_offset(buf: &str, offset: usize) -> Option<usize> {
     Some(start)
 }
 
-/// Read a pipe to EOF, appending decoded text to the shared buffer.
+/// Read a pipe to EOF, appending decoded text to the shared buffer up
+/// to [`MAX_BUFFER_BYTES`]; excess output is drained and discarded so
+/// chatty children neither block nor OOM ka.
 fn pipe_into(mut pipe: impl Read, buffer: Arc<Mutex<String>>) {
     let mut chunk = [0u8; 4096];
+    let mut capped = false;
     loop {
         match pipe.read(&mut chunk) {
             Ok(0) | Err(_) => break,
             Ok(n) => {
+                if capped {
+                    continue;
+                }
+                let text = String::from_utf8_lossy(&chunk[..n]);
                 let mut buf = buffer.lock();
-                buf.push_str(&String::from_utf8_lossy(&chunk[..n]));
+                if buf.len() >= MAX_BUFFER_BYTES {
+                    // exact-fill chunks land here on the next read: record
+                    // the drop instead of going silent
+                    buf.push_str("\n[...monitor buffer cap reached; further output dropped]\n");
+                    capped = true;
+                    continue;
+                }
+                let room = MAX_BUFFER_BYTES - buf.len();
+                if text.len() <= room {
+                    buf.push_str(&text);
+                } else {
+                    let cut = floor_char_boundary(&text, room);
+                    buf.push_str(&text[..cut]);
+                    buf.push_str("\n[...monitor buffer cap reached; further output dropped]\n");
+                    capped = true;
+                }
             }
         }
     }
@@ -338,10 +434,16 @@ impl Hand for MonitorHand {
                 .unwrap_or("spawn")
             {
                 "spawn" => {
+                    if crate::conventions::bare_mode() {
+                        return ToolOutput::err("monitor is unavailable in safe mode");
+                    }
                     let Some(cmd) = args.get("command").and_then(Value::as_str) else {
                         return ToolOutput::err("monitor spawn: missing required 'command'");
                     };
-                    match self.table.spawn_with_env(cmd, &ctx.shell_env) {
+                    match self
+                        .table
+                        .spawn_in(cmd, Some(&ctx.cwd), &ctx.shell_env, &ctx.sandbox)
+                    {
                         Ok((id, pid)) => ToolOutput::ok(format!(
                             "monitor {id} started (pid {pid}): `{cmd}` — read it with \
                              monitor {{\"action\": \"read\", \"id\": \"{id}\"}}"
