@@ -1125,17 +1125,21 @@ mod tests {
         }
         // Explicit operator entries are NOT filtered here — wrap_command
         // keeps failing them hard at use time (fail-closed is for asks,
-        // not defaults).
-        let bad = SandboxConfig {
-            mode: Some("fs".into()),
-            allow_write: vec!["/root".to_string()],
-            ..Default::default()
-        };
-        match policy_from_config(&bad, &dir).expect("explicit entries pass policy build") {
-            Policy::Fs { allow_write, .. } => {
-                assert!(allow_write.contains(&PathBuf::from("/root")))
+        // not defaults). `/root` is a POSIX spelling: Windows normalizes
+        // it drive-qualified, so this check stays Unix-only.
+        #[cfg(not(windows))]
+        {
+            let bad = SandboxConfig {
+                mode: Some("fs".into()),
+                allow_write: vec!["/root".to_string()],
+                ..Default::default()
+            };
+            match policy_from_config(&bad, &dir).expect("explicit entries pass policy build") {
+                Policy::Fs { allow_write, .. } => {
+                    assert!(allow_write.contains(&PathBuf::from("/root")))
+                }
+                other => panic!("expected fs policy, got {other:?}"),
             }
-            other => panic!("expected fs policy, got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1167,6 +1171,20 @@ mod tests {
                 // whichever engine this host offers, it must wrap
                 if argv[0] == "bwrap" || argv[0] == "firejail" {
                     assert!(argv.iter().any(|a| a == "make"), "{argv:?}");
+                } else if argv[0].ends_with("sandbox-exec") {
+                    // seatbelt: <sandbox-exec> -p <profile> -- sh -c make
+                    let profile = &argv[2];
+                    let tmp =
+                        std::fs::canonicalize("/tmp").unwrap_or_else(|_| PathBuf::from("/tmp"));
+                    assert!(
+                        profile.contains(&format!("(subpath \"{}\")", tmp.display())),
+                        "seatbelt profile must grant the allowlist: {argv:?}"
+                    );
+                    assert!(argv.iter().any(|a| a == "make"), "{argv:?}");
+                    // enumerated /dev surface only — never the host /dev
+                    // wholesale (no /dev/shm OOM, no device nodes)
+                    assert!(!profile.contains("(subpath \"/dev\")"), "{argv:?}");
+                    assert!(!profile.contains("\"/dev/dri"), "{argv:?}");
                 } else {
                     // landlock trampoline: <exe> ka-sandbox-exec <json> -- sh -c make
                     assert_eq!(argv[1], "ka-sandbox-exec", "{argv:?}");
@@ -1253,6 +1271,12 @@ mod tests {
                     .any(|a| a == &format!("--whitelist={}", resolved.display())),
                 "{argv:?}"
             );
+        } else if argv[0].ends_with("sandbox-exec") {
+            let profile = &argv[2];
+            assert!(
+                profile.contains(&resolved.to_string_lossy().to_string()),
+                "seatbelt must grant the resolved in-tree target: {argv:?}"
+            );
         } else {
             // landlock trampoline
             let pol: TrampolinePolicy = serde_json::from_str(&argv[2]).unwrap();
@@ -1263,6 +1287,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn grants_compute_from_redirects_env_and_network() {
         let cwd = Path::new("/work/proj");
         let policy = Policy::fs(vec![PathBuf::from("/work/proj"), PathBuf::from("/tmp")]);
@@ -1283,10 +1308,12 @@ mod tests {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/home/nobody".to_string());
         let g = missing_grants(&policy, cwd, &[format!("{home}/.bashrc")], &[], false);
         assert!(g.write_paths.is_empty(), "{g:?}");
-        // env: offered only when the backend clears env and the var holds
-        // a value in the parent (HOME is set wherever the suite runs)
-        let g = missing_grants(&policy, cwd, &[], &["HOME".to_string()], false);
-        assert_eq!(g.env, vec!["HOME".to_string()], "{g:?}");
+        // env: offered only when the backend clears env (bwrap/landlock:
+        // yes; seatbelt: no) and the var holds a value in the parent
+        if caps().env_cleared {
+            let g = missing_grants(&policy, cwd, &[], &["HOME".to_string()], false);
+            assert_eq!(g.env, vec!["HOME".to_string()], "{g:?}");
+        }
         let g = missing_grants(&policy, cwd, &[], &["KA_SB_UNSET_VAR".to_string()], false);
         assert!(g.env.is_empty(), "{g:?}");
         // network: offered only when the backend denies it
@@ -1432,6 +1459,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn allowlist_prefixes_match_whole_components() {
         let cwd = Path::new("/work/proj");
         let policy = Policy::fs(vec![PathBuf::from("/work/proj"), PathBuf::from("/tmp")]);
