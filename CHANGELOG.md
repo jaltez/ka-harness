@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.12.0 — 2026-11-27
 
 ### Security
 - Read-only auto-allow fails closed on any env-assignment prefix (an `env -u X PATH=…` flag value no longer hides the assignment), quoted redirect targets are scanned, `timeout -- 5 <cmd>` keeps its command, and a downloader piped through intermediate filters (`curl … | tail … | sh`) still hardstops.
