@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.12.1 — 2026-11-27
+
+### Fixed
+- The new `cross-platform` CI job is green on macOS and Windows: the sandbox wrap tests recognise the seatbelt backend, the env-grant assertion follows `caps().env_cleared`, and the POSIX-path assertions stay on Unix. No runtime change; the 0.12.0 tag's CI stopped before the release job, so this is the first published 0.12 build.
+
 ## 0.12.0 — 2026-11-27
 
 ### Security
