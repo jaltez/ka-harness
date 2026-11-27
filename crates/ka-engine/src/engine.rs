@@ -823,8 +823,13 @@ async fn run(
     #[cfg(feature = "code")]
     let code_gate = (rules.clone(), prompt_policy, allowed_tools.clone());
     let delegate_rules = rules.clone();
-    let hooks = if crate::conventions::bare_mode() || leaf {
+    // Team members (leaf) inherit the tool-call policy hooks only: a
+    // `pre_tool_use` veto must hold for them too, while turn-, prompt-
+    // and session-scoped hooks describe the user's own session
+    let hooks = if crate::conventions::bare_mode() {
         Vec::new()
+    } else if leaf {
+        crate::child_policy::ChildPolicy::tool_hooks(&config.hooks)
     } else {
         config.hooks.clone()
     };
@@ -1003,6 +1008,18 @@ async fn run(
                 .ok();
         }
     }
+    // the ONE child posture: pathfinder, delegate agents and `/tan`
+    // jobs read it off the engine-owned slot at spawn time — rules,
+    // the live sandbox, shell env, live feature toggles, and the
+    // tool-call policy hooks. (Team members take the hooks through
+    // their template config and the rules the same way.)
+    voice.pathfinder_slot().write().policy = crate::child_policy::ChildPolicy {
+        sandbox: Some(voice.sandbox_policy().clone()),
+        rules: delegate_rules,
+        shell_env: Some(delegate_shell_env),
+        features: Some(voice.feature_slot()),
+        hooks: crate::child_policy::ChildPolicy::tool_hooks(&hooks),
+    };
     let agent_tasks = crate::hands::tasks::AgentTaskTable::new();
     let (maintenance_tx, maintenance_rx) = mpsc::channel(16);
     let tables = voice.tables().clone();
@@ -1065,15 +1082,7 @@ async fn run(
                 features.clone(),
             )
             .with_hooks(std::sync::Arc::new(hooks.clone()))
-            .with_mode_slot(ctx.state.mode_slot.clone())
-            .with_policy(crate::hands::delegate::DelegatePolicy {
-                // read at wiring time from the LIVE policy: a
-                // strand-restored `/sandbox` override has already been
-                // applied to the parent by now
-                sandbox: Some(ctx.voice.sandbox_policy().clone()),
-                rules: delegate_rules,
-                shell_env: Some(delegate_shell_env),
-            }),
+            .with_mode_slot(ctx.state.mode_slot.clone()),
         ));
         ctx.voice
             .push_hand(std::sync::Arc::new(crate::hands::tasks::TasksHand::new(
@@ -1229,6 +1238,7 @@ async fn run(
             ctx.state.mode_slot.clone(),
             code_prompt_policy,
             code_allowed_tools,
+            std::sync::Arc::new(crate::child_policy::ChildPolicy::tool_hooks(&hooks)),
             features.clone(),
             ctx.events.clone(),
             fast_role,
@@ -2140,6 +2150,10 @@ async fn apply_sandbox_mode(ctx: &mut Ctx, mode: &str) {
                 .feature_slot()
                 .write()
                 .set_sandbox_override(Some(mode.to_string()));
+            // children spawned from now on inherit the new mode: the
+            // posture rides the engine-owned slot
+            ctx.voice.pathfinder_slot().write().policy.sandbox =
+                Some(ctx.voice.sandbox_policy().clone());
             persist_features(ctx).await;
         }
         Err(e) => {

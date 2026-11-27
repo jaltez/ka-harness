@@ -25,6 +25,10 @@ pub struct PathfinderSource {
     /// gateways that route by conversation see stable traffic
     /// (engine writes it at strand attach).
     pub session_id: Option<String>,
+    /// The parent posture every nested voice is born with — rules,
+    /// sandbox, shell env, live feature toggles, tool-call hooks —
+    /// written once at engine bootstrap and read at every spawn.
+    pub policy: crate::child_policy::ChildPolicy,
 }
 
 /// The pathfinder tool.
@@ -98,6 +102,8 @@ impl Hand for PathfinderHand {
                 ka_protocol::Mode::Allow,
                 12,
             );
+            // the parent's whole posture, never a per-piece copy
+            source.policy.apply(&mut voice);
             voice.set_model_selector(&model, 4.0);
             voice.set_session_id(source.session_id.clone());
             // system rides via the voice's git line; inject the subagent

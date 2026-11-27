@@ -5057,7 +5057,7 @@ async fn run_skill_shell_lines(
 /// detached: they never block, steer, or fail the call; their outcome
 /// surfaces as a note. A free fn so concurrent per-call tasks can run
 /// post_tool_use hooks.
-async fn run_hook_scripts(
+pub(crate) async fn run_hook_scripts(
     hooks: &[crate::config::Hook],
     event: crate::config::HookEvent,
     tool: &str,

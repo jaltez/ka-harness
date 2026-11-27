@@ -4,6 +4,7 @@
 pub mod agents;
 mod canned;
 pub mod checkpoint;
+pub mod child_policy;
 pub mod config;
 pub mod conventions;
 pub mod dap;

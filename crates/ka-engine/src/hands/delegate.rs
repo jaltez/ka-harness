@@ -15,14 +15,6 @@ use super::{Clearance, Hand, HandContext, HandDef, ToolOutput};
 use crate::agents::AgentDef;
 use crate::voice::{GuardRuntime, Voice};
 
-/// Parent security posture propagated into delegated subagent voices.
-#[derive(Clone, Default)]
-pub(crate) struct DelegatePolicy {
-    pub sandbox: Option<ka_sandbox::Policy>,
-    pub rules: Vec<crate::config::Rule>,
-    pub shell_env: Option<crate::config::ShellEnvPolicy>,
-}
-
 /// The delegate tool: one hand over every discovered agent.
 pub struct DelegateHand {
     agents: Vec<AgentDef>,
@@ -36,8 +28,6 @@ pub struct DelegateHand {
     parent_mode: ka_protocol::Mode,
     /// Live parent mode slot (overrides `parent_mode` when wired by engine).
     mode_slot: Option<crate::engine::ModeSlot>,
-    /// Parent sandbox/rules/shell-env policy propagated to subagent voices.
-    policy: DelegatePolicy,
     /// Background-task registry (`background: true` delegates).
     tasks: Arc<super::tasks::AgentTaskTable>,
     /// Event sink for completion notes.
@@ -63,7 +53,6 @@ impl DelegateHand {
             source,
             parent_mode,
             mode_slot: None,
-            policy: DelegatePolicy::default(),
             tasks,
             events,
             hooks: std::sync::Arc::new(Vec::new()),
@@ -80,13 +69,6 @@ impl DelegateHand {
     /// govern isolated delegate permissions immediately.
     pub(crate) fn with_mode_slot(mut self, slot: crate::engine::ModeSlot) -> Self {
         self.mode_slot = Some(slot);
-        self
-    }
-
-    /// Propagate parent sandbox, permission rules, and shell-env policy
-    /// into delegated child voices.
-    pub(crate) fn with_policy(mut self, policy: DelegatePolicy) -> Self {
-        self.policy = policy;
         self
     }
 
@@ -228,13 +210,12 @@ track it with the tasks tool.",
                 // bound ahead of the await: the read guard must not
                 // live across the spawn (it is not Send)
                 let source = self.source.read().clone();
-                let run = arm_background_with_policy(
+                let run = arm_background(
                     def.clone(),
                     task,
                     &ctx.cwd,
                     source,
                     self.effective_mode(),
-                    self.policy.clone(),
                     self.tasks.clone(),
                     &self.events,
                     self.hooks.clone(),
@@ -277,7 +258,6 @@ track it with the tasks tool.",
                 ctx.cwd.clone(),
                 source,
                 self.effective_mode(),
-                self.policy.clone(),
                 roster,
                 |_| {},
             )
@@ -356,34 +336,6 @@ pub(crate) async fn arm_background(
     hooks: Arc<Vec<crate::config::Hook>>,
     features: crate::features::FeatureSlot,
 ) -> BackgroundRun {
-    arm_background_with_policy(
-        def,
-        task,
-        cwd,
-        source,
-        parent_mode,
-        DelegatePolicy::default(),
-        tasks,
-        events,
-        hooks,
-        features,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn arm_background_with_policy(
-    def: AgentDef,
-    task: &str,
-    cwd: &std::path::Path,
-    source: super::pathfinder::PathfinderSource,
-    parent_mode: ka_protocol::Mode,
-    policy: DelegatePolicy,
-    tasks: Arc<super::tasks::AgentTaskTable>,
-    events: &mpsc::Sender<ka_protocol::Event>,
-    hooks: Arc<Vec<crate::config::Hook>>,
-    features: crate::features::FeatureSlot,
-) -> BackgroundRun {
     let id = tasks.register(&def.name, task);
     let roster = Some(tasks.rows_except(Some(id)));
     let mut prompt = format!("{}\n\nTask: {}", def.system, task);
@@ -422,7 +374,6 @@ async fn arm_background_with_policy(
             cwd,
             source,
             parent_mode,
-            policy,
             roster,
             |tx| tasks_in.attach_cmds(id, tx),
         )
@@ -547,7 +498,6 @@ impl DelegateHand {
                         cwd: ctx.cwd.clone(),
                         source: self.source.read().clone(),
                         parent_mode: self.effective_mode(),
-                        policy: self.policy.clone(),
                     }))
                 }
                 Some(_) => picked.push(Err(format!(
@@ -589,7 +539,6 @@ impl DelegateHand {
                             job.cwd.clone(),
                             job.source,
                             job.parent_mode,
-                            job.policy,
                             None,
                             |_| (),
                         )
@@ -667,7 +616,6 @@ struct FanoutJob {
     cwd: std::path::PathBuf,
     source: super::pathfinder::PathfinderSource,
     parent_mode: ka_protocol::Mode,
-    policy: DelegatePolicy,
 }
 
 /// Run one agent on one task: a nested voice turn (read-only, or
@@ -684,7 +632,6 @@ async fn run_agent(
     cwd: std::path::PathBuf,
     source: super::pathfinder::PathfinderSource,
     parent_mode: ka_protocol::Mode,
-    policy: DelegatePolicy,
     roster: Option<Vec<String>>,
     mut on_channels: impl FnMut(mpsc::Sender<ka_protocol::Command>),
 ) -> (Result<String, String>, Option<String>, f64) {
@@ -712,7 +659,6 @@ async fn run_agent(
             &cwd,
             &source,
             parent_mode,
-            &policy,
             roster.clone(),
             &mut on_channels,
         )
@@ -776,7 +722,6 @@ async fn run_agent_once(
     cwd: &std::path::Path,
     source: &super::pathfinder::PathfinderSource,
     parent_mode: ka_protocol::Mode,
-    policy: &DelegatePolicy,
     roster: Option<Vec<String>>,
     on_channels: &mut impl FnMut(mpsc::Sender<ka_protocol::Command>),
 ) -> (Result<String, String>, Option<String>, ka_protocol::Usage) {
@@ -849,7 +794,6 @@ async fn run_agent_once(
     let max_steps = def.max_steps;
     let schema = def.output.clone();
     let source = source.clone();
-    let policy = policy.clone();
     let (usage_tx, usage_rx) = tokio::sync::oneshot::channel();
     let handle = tokio::spawn(async move {
         let mut steers = Vec::new();
@@ -870,15 +814,9 @@ async fn run_agent_once(
                 max_steps,
             )
         };
-        if let Some(sandbox) = policy.sandbox {
-            voice.set_sandbox(sandbox);
-        }
-        if !policy.rules.is_empty() {
-            voice.set_rules(policy.rules);
-        }
-        if let Some(shell_env) = policy.shell_env {
-            voice.set_shell_env(shell_env);
-        }
+        // the ONE parent posture: rules, sandbox, shell env, live
+        // feature toggles, and the tool-call policy hooks
+        source.policy.apply(&mut voice);
         voice.set_model_selector(&model, 4.0);
         voice.set_session_id(source.session_id.clone());
         if let Some(tools) = &agent_tools {

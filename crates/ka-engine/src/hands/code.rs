@@ -36,9 +36,11 @@
 //! Gate scope note: the routed gate mirrors the voice's admit gate for
 //! everything visible outside it (toggles, `[[rules]]`,
 //! `[permissions] allow`, mode, hardstops, protected paths, prompt
-//! policy). Session-remembered "always" answers, per-turn tool
-//! allowlists, hooks and the loop guard live inside the turn machinery
-//! a hand cannot reach and are intentionally not re-implemented here.
+//! policy) and runs the same `pre_tool_use` / `post_tool_use` hooks, so
+//! a policy hook cannot be routed around with a script. Session-
+//! remembered "always" answers, per-turn tool allowlists and the loop
+//! guard live inside the turn machinery a hand cannot reach and are
+//! intentionally not re-implemented here.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -49,7 +51,7 @@ use rquickjs::{AsyncContext, AsyncRuntime, Ctx, Function, Promise};
 use serde_json::{Value, json};
 
 use super::{Clearance, Hand, HandContext, HandDef, ToolOutput};
-use crate::config::{Code, PromptPolicy, Rule, Verdict, evaluate_rules};
+use crate::config::{Code, Hook, HookEvent, PromptPolicy, Rule, Verdict, evaluate_rules};
 use crate::voice::AuxRole;
 
 /// Final-value cap returned to the model: a larger script result parks
@@ -101,6 +103,10 @@ pub struct CodeRouter {
     /// The fast-role completion handle (`[roles] fast`); `None` makes
     /// `ka.models.classify` reject until the user configures one.
     fast_role: Option<AuxRole>,
+    /// The session's tool-call policy hooks (`pre_tool_use` /
+    /// `post_tool_use`): the same veto and feedback a model-issued
+    /// call gets.
+    hooks: Arc<Vec<Hook>>,
 }
 
 /// One gate verdict for a routed call.
@@ -126,6 +132,7 @@ impl CodeRouter {
         mode: crate::engine::ModeSlot,
         prompt_policy: PromptPolicy,
         allowed_tools: Vec<String>,
+        hooks: Arc<Vec<Hook>>,
         features: crate::features::FeatureSlot,
         events: tokio::sync::mpsc::Sender<Event>,
         fast_role: Option<AuxRole>,
@@ -136,6 +143,7 @@ impl CodeRouter {
             mode,
             prompt_policy,
             allowed_tools,
+            hooks,
             features,
             events,
             fast_role,
@@ -185,8 +193,81 @@ impl CodeRouter {
                  hands by name (read, grep, glob, bash, edit, …)"
             ));
         };
-        match self.gate(&*hand, name, args, hctx) {
-            Decision::Allow => hand.execute(args, hctx).await,
+        // pre_tool_use hooks — the same veto a model call gets. A block
+        // denies before the gate; `updated_input` patches the
+        // arguments; `decision: "allow"` pre-approves (an ask becomes
+        // an allow; deny-class verdicts still refuse). Mode steering is
+        // ignored: the gate reads the live mode slot and a script can
+        // answer no ask.
+        let hooks_on = self.features.read().hooks_enabled();
+        let mut args = args.clone();
+        let mut hook_allowed = false;
+        if hooks_on {
+            match self.hooks(HookEvent::PreToolUse, name, &args, hctx).await {
+                Err(reason) => {
+                    self.events
+                        .send(Event::Note {
+                            message: format!("{name} blocked by pre_tool_use hook: {reason}"),
+                        })
+                        .await
+                        .ok();
+                    return ToolOutput::err(format!("denied: blocked by hook: {reason}"));
+                }
+                Ok(steer) => {
+                    if let Some(steer) = steer {
+                        if let Some(note) = steer.note {
+                            self.events
+                                .send(Event::Note {
+                                    message: format!("hook: {note}"),
+                                })
+                                .await
+                                .ok();
+                        }
+                        if let Some(patch) = steer.updated_input {
+                            if let Some(map) = args.as_object_mut() {
+                                for (key, value) in patch {
+                                    map.insert(key, value);
+                                }
+                            }
+                        }
+                        hook_allowed = steer.allow;
+                    }
+                }
+            }
+        }
+        let verdict = if hook_allowed {
+            match self.gate(&*hand, name, &args, hctx) {
+                Decision::Ask { .. } => Decision::Allow,
+                other => other,
+            }
+        } else {
+            self.gate(&*hand, name, &args, hctx)
+        };
+        match verdict {
+            Decision::Allow => {
+                let mut output = hand.execute(&args, hctx).await;
+                // post_tool_use hooks: exit 2 flags the result as an
+                // error, clean stdout may append feedback — the same
+                // marks a model-issued call gets
+                if hooks_on {
+                    match self.hooks(HookEvent::PostToolUse, name, &args, hctx).await {
+                        Err(reason) => {
+                            output.is_error = true;
+                            output
+                                .content
+                                .push_str(&format!("\n[post-tool hook: {reason}]"));
+                        }
+                        Ok(steer) => {
+                            if let Some(feedback) = steer.and_then(|s| s.feedback) {
+                                output
+                                    .content
+                                    .push_str(&format!("\n[hook feedback]\n{feedback}"));
+                            }
+                        }
+                    }
+                }
+                output
+            }
             Decision::Deny(reason) => ToolOutput::err(format!("denied: {reason}")),
             Decision::Ask { question } => {
                 // an ask is unanswerable mid-script: the user still sees
@@ -204,11 +285,31 @@ impl CodeRouter {
                     .ok();
                 ToolOutput::err(format!(
                     "denied: {question} — permission asks cannot be answered from \
-                     a running script; pre-approve it (rule or [permissions] allow) \
-                     and re-run"
+                    a running script; pre-approve it (rule or [permissions] allow) \
+                    and re-run"
                 ))
             }
         }
+    }
+
+    /// One tool-call hook event for a routed call — the voice runs the
+    /// same scripts through the same runner.
+    async fn hooks(
+        &self,
+        event: HookEvent,
+        name: &str,
+        args: &Value,
+        hctx: &HandContext,
+    ) -> Result<Option<crate::fshooks::Steering>, String> {
+        crate::voice::run_hook_scripts(
+            &self.hooks,
+            event,
+            name,
+            args,
+            &hctx.cwd,
+            Some(&self.events),
+        )
+        .await
     }
 
     /// The scoped clearance gate, mirroring the voice's `gate()`:
@@ -910,6 +1011,7 @@ mod tests {
                 mode.clone(),
                 PromptPolicy::Ask,
                 Vec::new(),
+                Arc::new(Vec::new()),
                 crate::features::FeatureToggles::slot(disabled),
                 events,
                 fast_role,

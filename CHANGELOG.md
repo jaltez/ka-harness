@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+### Security
+- Every child voice inherits the parent's whole posture. `[[rules]]` now reach pathfinder and `/tan` jobs, and the tool-call hooks (`pre_tool_use` / `post_tool_use`) reach every child — pathfinder, delegate agents, `/tan` jobs, team members — plus the calls a `code` script routes. Before, a model could route a blocked read through a child that had forgotten the policy. Turn-, prompt- and session-scoped hooks stay with the parent, and a `/sandbox` change now reaches children spawned afterwards.
+
 ## 0.12.1 — 2026-11-27
 
 ### Fixed
